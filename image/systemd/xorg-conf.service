@@ -1,10 +1,13 @@
 [Unit]
-Description=Generate Xorg GPU configuration (nvidia vs modesetting)
+Description=Prepare Xorg device access and GPU configuration
 Before=desktop-session.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# "-" prefix: log but don't block the session on alignment errors; the
+# Xwrapper.config escape hatch is the manual fallback.
+ExecStart=-/usr/local/bin/align-device-groups.sh
 ExecStart=/usr/local/bin/xorg-gpu-conf.sh
 
 [Install]

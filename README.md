@@ -83,9 +83,17 @@ container-internal `seat0`:
   `PAMName=login`, `TTYPath=/dev/tty1`): pam_systemd registers a real logind
   session on the container's seat0 and starts the user manager, which brings
   up PipeWire. The session then runs `startx` → `xinitrc.desktop` → `mwm`.
-- Xorg runs through its suid wrapper with `needs_root_rights = yes`
-  (`image/xorg/Xwrapper.config`) so device access doesn't depend on
-  logind device handover across the container boundary.
+- Xorg runs **rootless**, as the `desktop` user (`needs_root_rights = no`
+  in `image/xorg/Xwrapper.config`). Device access works by plain group
+  permission: `/dev/dri/*` is group `video`, `/dev/input/*` is group
+  `input`, and at every boot `align-device-groups.sh` renumbers the
+  container's groups to match the gids actually on the host's device nodes
+  (numeric gids are what the kernel checks, and dynamically-allocated
+  groups like `input`/`render` need not match between host and image).
+  DRM master is acquired by the first-opener rule — nothing else on the
+  host uses the GPU — and systemd hands tty1 to the session user via
+  `TTYPath=`. Xorg still tries logind device handover first and falls back
+  to direct opens.
 
 ### Changing the VT
 
@@ -155,6 +163,8 @@ podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf   # nvidia vs modesetti
 DISPLAY=:0 xrandr                              # display up, modes listed
 DISPLAY=:0 glxinfo -B                          # GPU mode: "NVIDIA"; else llvmpipe
 fgconsole                                      # VT 1 active
+podman exec desktop ps -o user= -C Xorg        # "desktop", not root (rootless X)
+podman exec desktop journalctl -u xorg-conf -o cat | grep align  # gid alignment log
 podman exec -u desktop desktop wpctl status    # sound devices present
 # audio, one per protocol (repeat from host and from a scratch container):
 pw-play      /usr/share/sounds/alsa/Front_Center.wav   # PIPEWIRE_REMOTE set
@@ -169,6 +179,10 @@ Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 
 - The container is `--privileged` with host network — treat the image and
   everything allowed to start containers as fully trusted.
+- Xorg runs rootless (as `desktop`), so an X server compromise yields that
+  user, not root. Note the `desktop` user is still in the `input` group and
+  can read every keyboard from `/dev/input` — inherent to running the
+  display server.
 - `xhost +local:` grants any local uid access to the display; keys typed into
   the session are visible to any local process that connects. Tighten by
   removing it from `image/session/xinitrc.desktop` and distributing the xauth
@@ -181,6 +195,17 @@ Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 
 - **Xorg: "cannot open /dev/tty1"** — something on the host owns the VT;
   check `getty@tty1` is masked and no host display manager is running.
+- **Xorg: "cannot become DRM master" / `drmSetMaster failed`** — some host
+  process is *currently* holding the GPU (display manager still running or
+  re-enabled, another compositor). DRM master is released automatically
+  when its holder's fd closes, so a previously-stopped X server is never
+  the cause — a live one is. `fuser -v /dev/dri/card0` on the host shows
+  the culprit; rerun `install.sh` to re-disable the display manager.
+- **Keyboard/mouse/GPU dead with rootless X (EACCES opening devices)** —
+  gid alignment likely failed: check
+  `journalctl -u xorg-conf` inside the container for `align-device-groups`
+  lines. Escape hatch: set `needs_root_rights = yes` in
+  `/etc/X11/Xwrapper.config` (root Xorg) and report the alignment log.
 - **Xorg: "no screens found" without GPU** — no `/dev/dri/card*` with a
   connected output; check the container log for `xorg-gpu-conf` lines.
 - **Wrong GPU mode picked** — the config is regenerated on every container
