@@ -1,0 +1,11 @@
+[Unit]
+Description=Generate Xorg GPU configuration (nvidia vs modesetting)
+Before=desktop-session.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/xorg-gpu-conf.sh
+
+[Install]
+WantedBy=multi-user.target

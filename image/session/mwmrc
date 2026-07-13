@@ -1,0 +1,43 @@
+! Minimal mwm resource file (installed as ~/.mwmrc via /etc/skel).
+
+Menu DefaultRootMenu
+{
+    "Desktop"           f.title
+    "New Terminal"      f.exec "xterm &"
+    "Refresh"           f.refresh
+    "Pack Icons"        f.pack_icons
+     no-label           f.separator
+    "Restart mwm"       f.restart
+    "Quit session"      f.quit_mwm
+}
+
+Menu DefaultWindowMenu
+{
+    Restore             _R  Alt<Key>F5      f.restore
+    Move                _M  Alt<Key>F7      f.move
+    Size                _S  Alt<Key>F8      f.resize
+    Minimize            _n  Alt<Key>F9      f.minimize
+    Maximize            _x  Alt<Key>F10     f.maximize
+    Lower               _L  Alt<Key>F3      f.lower
+     no-label               f.separator
+    Close               _C  Alt<Key>F4      f.kill
+}
+
+Keys DefaultKeyBindings
+{
+    Shift<Key>Escape        window|icon     f.post_wmenu
+    Alt<Key>space           window|icon     f.post_wmenu
+    Alt<Key>Tab             root|icon|window f.next_key
+    Alt Shift<Key>Tab       root|icon|window f.prev_key
+    Alt<Key>Escape          root|icon|window f.next_key
+    Alt Shift<Key>Escape    root|icon|window f.prev_key
+    Alt<Key>F6              window          f.next_key transient
+}
+
+Buttons DefaultButtonBindings
+{
+    <Btn1Down>      icon|frame      f.raise
+    <Btn3Down>      icon|frame      f.post_wmenu
+    <Btn1Down>      root            f.menu DefaultRootMenu
+    <Btn3Down>      root            f.menu DefaultRootMenu
+}
