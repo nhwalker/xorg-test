@@ -1,0 +1,39 @@
+#!/bin/bash
+# Runs from desktop-session.service ExecStopPost= on every service stop.
+# The main process is often killed by the tty hangup when Xorg exits, so
+# diagnosis cannot live in start-session itself; this runs in a fresh
+# process with systemd's $SERVICE_RESULT / $EXIT_CODE / $EXIT_STATUS set.
+#
+# On failure: surface the tail of the rootless Xorg log (it lives under
+# $HOME, invisible to `podman logs`) plus a likely-cause verdict for the
+# known failure signatures.
+#
+# NOTE: read this output with `journalctl -t session-postmortem`; journald
+# cannot attribute ExecStopPost output to the unit once the session cgroup
+# is gone, so `journalctl -u desktop-session` will not show it.
+set -u
+
+[ "${SERVICE_RESULT:-failure}" = "success" ] && exit 0
+
+echo "postmortem: X session ended abnormally (result=${SERVICE_RESULT:-?}, code=${EXIT_CODE:-?}, status=${EXIT_STATUS:-?})"
+
+xlog=$(ls -t "$HOME"/.local/share/xorg/Xorg.*.log /var/log/Xorg.*.log 2>/dev/null | head -n 1)
+if [ -z "$xlog" ]; then
+    echo "postmortem: no Xorg log file found; startx/xauth failed before the X server produced a log"
+    exit 0
+fi
+
+echo "postmortem: ---- tail of $xlog ----"
+tail -n 40 "$xlog"
+echo "postmortem: ---- end of Xorg log ----"
+
+if grep -qE 'drmSetMaster|cannot become DRM master' "$xlog"; then
+    echo "postmortem: LIKELY CAUSE: another process holds DRM master (host display manager/compositor still running). On the host: fuser -v /dev/dri/card*"
+elif grep -qE '/dev/(dri|input)/[^ ]*.*[Pp]ermission denied' "$xlog"; then
+    echo "postmortem: LIKELY CAUSE: device group permissions (gid misalignment). Check: journalctl -u xorg-conf; id desktop; ls -ln /dev/dri /dev/input"
+elif grep -qE 'no screens found|No devices detected' "$xlog"; then
+    echo "postmortem: LIKELY CAUSE: no usable GPU (/dev/dri missing/empty, or NVIDIA injected without nvidia_drv.so). Check: journalctl -u xorg-conf (preflight and gpu-conf lines)"
+elif grep -qE 'xf86OpenConsole|Cannot open virtual console|cannot open /dev/tty' "$xlog"; then
+    echo "postmortem: LIKELY CAUSE: VT not available (host getty or display manager owns the tty). On the host: systemctl status getty@tty1"
+fi
+exit 0

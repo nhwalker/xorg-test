@@ -25,6 +25,9 @@ Environment=XDG_SESSION_TYPE=x11
 Environment=DESKTOP_VT=vt1
 Environment=DESKTOP_DISPLAY=:0
 ExecStart=/usr/local/bin/start-session
+# Postmortem diagnostics: runs in a fresh process on every stop (the main
+# process dies with the tty hangup when Xorg exits, so it can't self-report).
+ExecStopPost=-/usr/local/bin/session-postmortem
 Restart=always
 RestartSec=3
 

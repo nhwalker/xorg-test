@@ -193,6 +193,16 @@ Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 
 ## Troubleshooting
 
+**Start here:** `podman exec desktop journalctl -u xorg-conf -o cat` prints a
+boot-time preflight report — one `PASS`/`WARN`/`FAIL` line per assumption
+(devices visible, udev db mounted, gid alignment, seat tags, logind, shared
+socket dirs, NVIDIA coherence) with a remediation hint on each failure. When
+the X session dies, a postmortem dumps the tail of the Xorg log plus a
+`LIKELY CAUSE:` verdict — read it with
+`podman exec desktop journalctl -t session-postmortem` (it runs from
+`ExecStopPost=` after the session cgroup is gone, so journald does not
+attribute it to `-u desktop-session`).
+
 - **Xorg: "cannot open /dev/tty1"** — something on the host owns the VT;
   check `getty@tty1` is masked and no host display manager is running.
 - **Xorg: "cannot become DRM master" / `drmSetMaster failed`** — some host

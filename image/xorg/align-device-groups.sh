@@ -60,4 +60,26 @@ align render /dev/dri/renderD*
 align input  /dev/input/event*
 align audio  /dev/snd/controlC*
 
+# Always log the final state, changes or not: "alignment ran but access
+# still fails" should be debuggable from this table alone.
+summary() {
+    local group="$1"; shift
+    local n node="" ggid
+    for n in "$@"; do
+        if [ -e "$n" ]; then node="$n"; break; fi
+    done
+    ggid=$(getent group "$group" | cut -d: -f3)
+    if [ -n "$node" ]; then
+        log "  $group: container gid ${ggid:-<absent>}, device $node has gid $(stat -c %g "$node") mode $(stat -c %a "$node")"
+    else
+        log "  $group: container gid ${ggid:-<absent>}, no device nodes"
+    fi
+}
+log "final state:"
+summary video  /dev/dri/card*
+summary render /dev/dri/renderD*
+summary input  /dev/input/event*
+summary audio  /dev/snd/controlC*
+log "desktop user: $(id desktop)"
+
 exit 0

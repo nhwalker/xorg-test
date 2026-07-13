@@ -1,6 +1,9 @@
 #!/bin/bash
 # Entry point for desktop-session.service. Runs as the "desktop" user inside
 # a PAM login session on tty1. startx handles xauth cookie generation.
+#
+# No failure handling here: when Xorg exits, the tty hangup kills this
+# process group, so diagnosis runs from ExecStopPost= (session-postmortem).
 set -u
 
 VT="${DESKTOP_VT:-vt1}"
