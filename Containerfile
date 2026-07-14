@@ -94,6 +94,7 @@ RUN mkdir -p /etc/systemd/user/default.target.wants \
 # --- systemd ----------------------------------------------------------------
 COPY image/systemd/xorg-conf.service /etc/systemd/system/xorg-conf.service
 COPY image/systemd/desktop-session.service /etc/systemd/system/desktop-session.service
+COPY image/systemd/journal-console.service /etc/systemd/system/journal-console.service
 COPY image/systemd/logind-container.conf /etc/systemd/logind.conf.d/10-container.conf
 # The UBI base image ships logind masked (containers normally have no seat);
 # this container manages its own seat0, so unmask it.
@@ -101,6 +102,7 @@ RUN systemctl unmask systemd-logind.service dbus-org.freedesktop.login1.service 
     # keep /run/desktop-audio working even if the host mount is absent
     && echo 'd /run/desktop-audio 1777 root root -' > /etc/tmpfiles.d/desktop-audio.conf \
     && systemctl enable xorg-conf.service desktop-session.service \
+        journal-console.service \
     # host udev owns the devices; /run/udev is mounted read-only from the host
     && systemctl mask systemd-udevd.service systemd-udevd-kernel.socket \
         systemd-udevd-control.socket systemd-udev-trigger.service \

@@ -1,0 +1,21 @@
+[Unit]
+Description=Mirror the journal to the container console (podman logs)
+After=systemd-journald.service
+
+[Service]
+# /dev/console is the pty the container runtime allocated (quadlet runs
+# podman with --tty) and reads for `podman logs`. Writing to PID 1's
+# stdout is not an option: systemd redirects its own stdio to /dev/null
+# during boot, and without --tty the runtime creates no /dev/console at
+# all -- the log pipe becomes unreachable from inside.
+#
+# The forwarder's own output bypasses the journal, so it cannot loop.
+# -b dumps the whole current boot on first start; --cursor-file resumes
+# after the last forwarded entry if this unit ever restarts, so entries
+# are not duplicated.
+ExecStart=/bin/sh -c 'exec journalctl -q -b -f -o short-iso --no-hostname --cursor-file=/run/journal-console.cursor > /dev/console 2>&1'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
