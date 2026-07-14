@@ -226,7 +226,9 @@ draw on the desktop" into a one-line resource request. The plugin image
 follows the same base/application split as the desktop image —
 `Containerfile.plugin.base` holds the Go toolchain plus the module
 dependency cache (`go mod download` from go.mod/go.sum only, no source;
-the only network build), and `Containerfile.plugin` copies in the source,
+the manifests are deleted again after the download — the app stage's
+source tree provides the authoritative copies; the only network build),
+and `Containerfile.plugin` copies in the source,
 compiles offline (`--network=none`, with `GOPROXY=off` making any
 dependency miss a hard error), and ships the static binary on scratch:
 
