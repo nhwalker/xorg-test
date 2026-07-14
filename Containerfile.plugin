@@ -1,0 +1,13 @@
+# desktop-device-plugin image: static Go binary on scratch.
+# Build: podman build -t desktop-device-plugin -f Containerfile.plugin .
+
+FROM docker.io/library/golang:1.23 AS build
+WORKDIR /src
+COPY device-plugin/go.mod device-plugin/go.sum ./
+RUN go mod download
+COPY device-plugin/ .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /desktop-device-plugin .
+
+FROM scratch
+COPY --from=build /desktop-device-plugin /desktop-device-plugin
+ENTRYPOINT ["/desktop-device-plugin"]

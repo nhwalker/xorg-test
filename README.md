@@ -194,6 +194,53 @@ PASS/WARN/FAIL report), `grep postmortem:` on session failures, and the
 same `kubectl exec` spot-checks as the podman checklist below. The pod
 turns Ready only when Xorg serves `/tmp/.X11-unix/X0`.
 
+## Client pods via the desktop device plugin
+
+`charts/desktop-device-plugin` + `device-plugin/` turn "an app pod that can
+draw on the desktop" into a one-line resource request. The plugin (a
+DaemonSet, image built from `Containerfile.plugin`) registers the custom
+resource `desktop.local/display` with kubelet; when a pod requests it,
+kubelet's `Allocate()` call returns the socket-dir mounts
+(`/tmp/.X11-unix`, `/run/desktop-audio`, rw — unix `connect(2)` needs write
+access) and env (`DISPLAY=:0`, `PULSE_SERVER=…/pulse`,
+`PIPEWIRE_REMOTE=…/pipewire-0`), so the client needs **no** volumes or env
+of its own:
+
+```yaml
+resources:
+  limits:
+    desktop.local/display: 1
+```
+
+See `examples/x11-client-pod.yaml` for a complete demo pod (xterm on the
+desktop, reusing the desktop image).
+
+Semantics worth knowing:
+
+- **Slots**: the plugin advertises `slots` (default 10) virtual copies —
+  the display is shareable; the count is just the max number of concurrent
+  client pods. Resource name, slot count, DISPLAY, and paths are all chart
+  values (must match the desktop deployment's).
+- **Health gating**: slots are Healthy only while `X<display>` exists in
+  the X socket dir, so client pods stay Pending until the desktop's Xorg
+  is actually serving. Audio sockets don't gate health.
+- **Audio**: pulse and PipeWire-native clients work via the injected env
+  alone. ALSA-only apps additionally need `alsa-plugins-pulseaudio` in
+  their image plus the two-stanza `/etc/asound.conf` shown in the Audio
+  section, pointing at the injected `PULSE_SERVER` path.
+- **GL**: clients get software rendering. Hardware GL would need render
+  nodes/driver userspace in the client (out of the plugin's scope by
+  design).
+
+Install (after the desktop chart):
+
+```sh
+helm install desktop-plugin charts/desktop-device-plugin \
+    --set image.repository=<registry>/desktop-device-plugin
+kubectl describe node | grep -A1 desktop.local/display   # 10 allocatable
+kubectl apply -f examples/x11-client-pod.yaml            # xterm appears
+```
+
 ## Verification checklist (on the target host)
 
 ```sh

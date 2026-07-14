@@ -1,0 +1,25 @@
+# Demo client for the desktop device plugin: requests one desktop slot and
+# opens xterm on the containerized display. Reuses the desktop image because
+# it already has X clients installed; any image with an X11 app works the
+# same way -- no mounts or env needed, the device plugin injects them.
+#
+#   kubectl apply -f examples/x11-client-pod.yaml
+#
+# Audio from a client works the same way, e.g.:
+#   paplay /usr/share/sounds/alsa/Front_Center.wav   # via injected PULSE_SERVER
+#   pw-play ...                                      # via injected PIPEWIRE_REMOTE
+# (ALSA-only apps additionally need alsa-plugins-pulseaudio + an asound.conf
+# routing pcm.!default to the pulse socket -- see README.)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: x11-client-demo
+spec:
+  restartPolicy: Never
+  containers:
+    - name: xterm
+      image: desktop-container:latest
+      command: ["xterm", "-geometry", "80x24+200+200", "-title", "device-plugin demo"]
+      resources:
+        limits:
+          desktop.local/display: 1
