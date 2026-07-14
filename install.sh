@@ -17,7 +17,14 @@
 #
 # Usage:
 #   ./install.sh [--no-gpu] [--no-build] [--image REF]
+#   ./install.sh --host-prep-only   # for k8s: host prep without podman bits
 #   ./install.sh --uninstall
+#
+# --host-prep-only performs only the host-side preparation (seat undo,
+# logind drop-in, tmpfiles, audio client configs, CDI spec generation) and
+# skips the image build and the quadlet service install. Use it when the
+# container is deployed some other way, e.g. the Helm chart in
+# charts/desktop-container on a k3s node.
 #
 # Everything is idempotent; prior host state is recorded under
 # /var/lib/desktop-container so --uninstall can restore it.
@@ -39,6 +46,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DO_GPU=auto
 DO_BUILD=1
 UNINSTALL=0
+HOST_PREP_ONLY=0
 
 log()  { echo "[install] $*"; }
 warn() { echo "[install] WARNING: $*" >&2; }
@@ -47,6 +55,7 @@ die()  { echo "[install] ERROR: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --uninstall) UNINSTALL=1 ;;
+        --host-prep-only) HOST_PREP_ONLY=1; DO_BUILD=0 ;;
         --no-gpu)    DO_GPU=0 ;;
         --no-build)  DO_BUILD=0 ;;
         --image)     shift; IMAGE="${1:?--image needs an argument}" ;;
@@ -57,13 +66,15 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = 0 ] || die "must run as root"
-command -v podman >/dev/null || die "podman is required"
 command -v systemctl >/dev/null || die "systemd host is required"
 
-podman_minor=$(podman --version | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-case "$podman_minor" in
-    [0-3].*|4.[0-3]) die "podman >= 4.4 required for quadlet (found $podman_minor)" ;;
-esac
+if [ "$HOST_PREP_ONLY" = 0 ]; then
+    command -v podman >/dev/null || die "podman is required (or use --host-prep-only)"
+    podman_minor=$(podman --version | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    case "$podman_minor" in
+        [0-3].*|4.[0-3]) die "podman >= 4.4 required for quadlet (found $podman_minor)" ;;
+    esac
+fi
 
 # ---------------------------------------------------------------------------
 uninstall() {
@@ -214,27 +225,35 @@ if [ "$DO_GPU" != 0 ]; then
         log "NVIDIA GPU + nvidia-ctk found; generating CDI spec"
         mkdir -p /etc/cdi
         nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-        mkdir -p "$DROPIN_DIR"
-        cat > "$DROPIN_DIR/10-gpu.conf" <<'EOF'
+        gpu_enabled=1
+        missing_xdrv=0
+        if ! grep -q nvidia_drv.so /etc/cdi/nvidia.yaml; then
+            warn "CDI spec does not include nvidia_drv.so (older toolkit)"
+            missing_xdrv=1
+        fi
+        if [ "$HOST_PREP_ONLY" = 0 ]; then
+            mkdir -p "$DROPIN_DIR"
+            cat > "$DROPIN_DIR/10-gpu.conf" <<'EOF'
 # Installed by desktop-container install.sh (GPU detected).
 [Container]
 AddDevice=nvidia.com/gpu=all
 Environment=NVIDIA_DRIVER_CAPABILITIES=all
 EOF
-        gpu_enabled=1
-        if ! grep -q nvidia_drv.so /etc/cdi/nvidia.yaml; then
-            warn "CDI spec does not include nvidia_drv.so (older toolkit);"
-            warn "adding bind-mount fallback for the Xorg driver modules"
-            xdrv=$(find /usr/lib64/xorg/modules /usr/lib/xorg/modules -name nvidia_drv.so 2>/dev/null | head -n1)
-            glxsrv=$(find /usr/lib64/xorg/modules /usr/lib/xorg/modules -name 'libglxserver_nvidia.so*' 2>/dev/null | head -n1)
-            if [ -n "$xdrv" ]; then
-                {
-                    echo "Volume=$xdrv:/usr/lib64/xorg/modules/drivers/nvidia_drv.so:ro"
-                    [ -n "$glxsrv" ] && echo "Volume=$glxsrv:/usr/lib64/xorg/modules/extensions/$(basename "$glxsrv"):ro"
-                } >> "$DROPIN_DIR/10-gpu.conf"
-            else
-                warn "nvidia_drv.so not found on host either; Xorg will fall back to modesetting"
+            if [ "$missing_xdrv" = 1 ]; then
+                warn "adding bind-mount fallback for the Xorg driver modules"
+                xdrv=$(find /usr/lib64/xorg/modules /usr/lib/xorg/modules -name nvidia_drv.so 2>/dev/null | head -n1)
+                glxsrv=$(find /usr/lib64/xorg/modules /usr/lib/xorg/modules -name 'libglxserver_nvidia.so*' 2>/dev/null | head -n1)
+                if [ -n "$xdrv" ]; then
+                    {
+                        echo "Volume=$xdrv:/usr/lib64/xorg/modules/drivers/nvidia_drv.so:ro"
+                        [ -n "$glxsrv" ] && echo "Volume=$glxsrv:/usr/lib64/xorg/modules/extensions/$(basename "$glxsrv"):ro"
+                    } >> "$DROPIN_DIR/10-gpu.conf"
+                else
+                    warn "nvidia_drv.so not found on host either; Xorg will fall back to modesetting"
+                fi
             fi
+        elif [ "$missing_xdrv" = 1 ]; then
+            warn "for k8s, add the nvidia_drv.so bind mount to the pod spec or upgrade nvidia-ctk (see README)"
         fi
     else
         log "no NVIDIA GPU / nvidia-ctk on host; container will use modesetting (no acceleration)"
@@ -243,18 +262,25 @@ else
     log "--no-gpu: skipping GPU setup"
 fi
 
-# --- 7. Quadlet ---------------------------------------------------------------
-log "installing quadlet unit to $QUADLET_DIR/desktop.container"
-mkdir -p "$QUADLET_DIR"
-sed "s|^Image=.*|Image=$IMAGE|" "$REPO_DIR/quadlet/desktop.container" \
-    > "$QUADLET_DIR/desktop.container"
-systemctl daemon-reload
-log "starting desktop.service"
-systemctl start desktop.service
+# --- 7. Quadlet (skipped with --host-prep-only) -------------------------------
+if [ "$HOST_PREP_ONLY" = 0 ]; then
+    log "installing quadlet unit to $QUADLET_DIR/desktop.container"
+    mkdir -p "$QUADLET_DIR"
+    sed "s|^Image=.*|Image=$IMAGE|" "$REPO_DIR/quadlet/desktop.container" \
+        > "$QUADLET_DIR/desktop.container"
+    systemctl daemon-reload
+    log "starting desktop.service"
+    systemctl start desktop.service
 
-echo
-log "done. GPU injection: $([ "$gpu_enabled" = 1 ] && echo enabled || echo disabled)"
-log "status:  systemctl status desktop.service"
-log "logs:    podman logs desktop   /   journalctl -u desktop.service"
-log "clients: DISPLAY=:0, PULSE_SERVER=unix:/run/desktop-audio/pulse,"
-log "         PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0 (see README.md)"
+    echo
+    log "done. GPU injection: $([ "$gpu_enabled" = 1 ] && echo enabled || echo disabled)"
+    log "status:  systemctl status desktop.service"
+    log "logs:    podman logs desktop   /   journalctl -u desktop.service"
+    log "clients: DISPLAY=:0, PULSE_SERVER=unix:/run/desktop-audio/pulse,"
+    log "         PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0 (see README.md)"
+else
+    echo
+    log "host prep done (no service installed). GPU CDI spec: $([ "$gpu_enabled" = 1 ] && echo /etc/cdi/nvidia.yaml || echo none)"
+    log "deploy with the Helm chart: helm install desktop charts/desktop-container \\"
+    log "    --set image.repository=<registry>/desktop-container$([ "$gpu_enabled" = 1 ] && echo ' --set gpu.enabled=true')"
+fi

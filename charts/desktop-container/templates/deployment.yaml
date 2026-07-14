@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "desktop-container.fullname" . }}
+  labels:
+    {{- include "desktop-container.labels" . | nindent 4 }}
+spec:
+  # Exactly one desktop per display; Recreate prevents two Xorg instances
+  # fighting over the VT during upgrades.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "desktop-container.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "desktop-container.selectorLabels" . | nindent 8 }}
+      {{- if or .Values.gpu.enabled .Values.podAnnotations }}
+      annotations:
+        {{- if .Values.gpu.enabled }}
+        # CRI-O injects the NVIDIA devices + driver userspace from the CDI
+        # spec (/etc/cdi/nvidia.yaml) -- no device plugin required.
+        cdi.k8s.io/gpu: {{ .Values.gpu.cdiDevice | quote }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      # Host network namespace: kernel uevents (input hotplug) are delivered
+      # over netlink, which is per-netns.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- if .Values.initPerms.enabled }}
+      initContainers:
+        # hostPath DirectoryOrCreate creates the exported socket dirs as
+        # 0755 root; the in-container desktop user (uid 1000) must be able
+        # to create sockets in them. Reuses the desktop image: no extra pull.
+        - name: init-perms
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "chmod 1777 /export/x11 /export/audio"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: x11-socket
+              mountPath: /export/x11
+            - name: audio-socket
+              mountPath: /export/audio
+      {{- end }}
+      containers:
+        - name: desktop
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # /dev/console wired to the log stream: journal-console.service
+          # mirrors the container journal into `kubectl logs`.
+          tty: true
+          securityContext:
+            # Host /dev (dri, input, snd, tty*), open device cgroup, no
+            # SELinux separation, writable cgroupfs for systemd PID 1.
+            privileged: true
+          env:
+            # systemd's container detection (podman sets this itself).
+            - name: container
+              value: cri-o
+            {{- if .Values.gpu.enabled }}
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: {{ .Values.gpu.driverCapabilities | quote }}
+            {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            exec:
+              # Ready = Xorg is actually serving the display.
+              command: ["test", "-S", "/tmp/.X11-unix/X0"]
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            exec:
+              command: ["systemctl", "is-system-running", "--quiet"]
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # systemd expects tmpfs here (podman --systemd did this).
+            - name: run
+              mountPath: /run
+            - name: tmp
+              mountPath: /tmp
+            # Host udev db (read-only): device enumeration + seat tags.
+            # Nested under the /run tmpfs; kubelet mounts in path order.
+            - name: udev
+              mountPath: /run/udev
+              readOnly: true
+            - name: audio-socket
+              mountPath: /run/desktop-audio
+            - name: x11-socket
+              mountPath: /tmp/.X11-unix
+      volumes:
+        - name: run
+          emptyDir:
+            medium: Memory
+        - name: tmp
+          emptyDir:
+            medium: Memory
+        - name: udev
+          hostPath:
+            path: {{ .Values.hostPaths.udev }}
+            type: Directory
+        - name: x11-socket
+          hostPath:
+            path: {{ .Values.hostPaths.x11Socket }}
+            type: DirectoryOrCreate
+        - name: audio-socket
+          hostPath:
+            path: {{ .Values.hostPaths.audioSocket }}
+            type: DirectoryOrCreate
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
