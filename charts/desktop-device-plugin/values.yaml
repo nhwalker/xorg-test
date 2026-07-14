@@ -1,0 +1,29 @@
+image:
+  repository: desktop-device-plugin
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Resource client pods request, e.g.:
+#   resources: { limits: { desktop.local/display: 1 } }
+resourceName: desktop.local/display
+
+# Number of virtual slots advertised = max concurrent client pods (the
+# display is shareable; the device plugin API just allocates exclusively).
+slots: 10
+
+# DISPLAY value injected into clients; must match the desktop container.
+display: ":0"
+
+# Interval for the X-socket health check (device health gates scheduling).
+healthInterval: 5s
+
+hostPaths:
+  # Must match the desktop-container chart / quadlet exports.
+  x11Socket: /tmp/.X11-unix
+  audioSocket: /run/desktop-audio
+  # Kubelet's device-plugin registration directory.
+  kubeletPluginDir: /var/lib/kubelet/device-plugins
+
+resources: {}
+nodeSelector: {}
+tolerations: []

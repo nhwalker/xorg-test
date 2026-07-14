@@ -1,0 +1,11 @@
+apiVersion: v2
+name: desktop-device-plugin
+description: >-
+  Kubelet device plugin advertising the containerized desktop as a
+  shareable resource. Pods that request it get the X display socket,
+  audio sockets, and DISPLAY/PULSE_SERVER/PIPEWIRE_REMOTE injected.
+  Deploy alongside the desktop-container chart.
+type: application
+version: 0.1.0
+appVersion: "latest"
+kubeVersion: ">=1.25.0"

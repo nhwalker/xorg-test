@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "desktop-device-plugin.fullname" . }}
+  labels:
+    {{- include "desktop-device-plugin.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "desktop-device-plugin.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "desktop-device-plugin.selectorLabels" . | nindent 8 }}
+    spec:
+      # Keep the resource advertised even on cordoned/pressured nodes,
+      # like other device plugins.
+      priorityClassName: system-node-critical
+      containers:
+        - name: device-plugin
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RESOURCE_NAME
+              value: {{ .Values.resourceName | quote }}
+            - name: SLOTS
+              value: {{ .Values.slots | quote }}
+            - name: DISPLAY_VALUE
+              value: {{ .Values.display | quote }}
+            - name: HEALTH_INTERVAL
+              value: {{ .Values.healthInterval | quote }}
+            - name: X11_DIR
+              value: {{ .Values.hostPaths.x11Socket | quote }}
+            - name: AUDIO_DIR
+              value: {{ .Values.hostPaths.audioSocket | quote }}
+            - name: PLUGIN_DIR
+              value: {{ .Values.hostPaths.kubeletPluginDir | quote }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Registration + serving socket (needs rw).
+            - name: plugin-dir
+              mountPath: {{ .Values.hostPaths.kubeletPluginDir }}
+            # Only for the health stat of X<display>; clients get the host
+            # path injected by Allocate, not this mount.
+            - name: x11-socket
+              mountPath: {{ .Values.hostPaths.x11Socket }}
+              readOnly: true
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ .Values.hostPaths.kubeletPluginDir }}
+            type: Directory
+        - name: x11-socket
+          hostPath:
+            path: {{ .Values.hostPaths.x11Socket }}
+            type: DirectoryOrCreate
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

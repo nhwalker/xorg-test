@@ -1,0 +1,20 @@
+{{ include "desktop-device-plugin.fullname" . }} deployed.
+
+The node now advertises the resource {{ .Values.resourceName }}
+({{ .Values.slots }} slots = max concurrent client pods). Slots are
+Healthy only while the desktop's Xorg is serving
+{{ .Values.hostPaths.x11Socket }}/X{{ trimPrefix ":" .Values.display }},
+so client pods stay Pending until the desktop is up.
+
+Check:
+
+    kubectl describe node | grep -A1 {{ .Values.resourceName }}
+
+A client pod just requests the resource — mounts and DISPLAY /
+PULSE_SERVER / PIPEWIRE_REMOTE are injected automatically:
+
+    resources:
+      limits:
+        {{ .Values.resourceName }}: 1
+
+Example: examples/x11-client-pod.yaml in the repo.
