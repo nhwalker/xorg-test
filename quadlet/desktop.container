@@ -1,0 +1,34 @@
+# Quadlet unit for the containerized desktop.
+# Installed by install.sh to /etc/containers/systemd/desktop.container;
+# systemd generates "desktop.service" from it (podman >= 4.4).
+#
+# GPU: install.sh adds a drop-in at
+#   /etc/containers/systemd/desktop.container.d/10-gpu.conf
+# with AddDevice=nvidia.com/gpu=all when NVIDIA + nvidia-ctk are present.
+
+[Unit]
+Description=Containerized desktop (Xorg + mwm + PipeWire)
+
+[Container]
+Image=localhost/desktop-container:latest
+ContainerName=desktop
+# Host network namespace: kernel uevents (input hotplug for libinput) are
+# delivered over netlink, which is per-netns.
+Network=host
+# Host udev database (read-only): lets libinput/logind enumerate devices and
+# see the host's seat tags without running udevd in the container.
+Volume=/run/udev:/run/udev:ro
+# Exported X socket: host / other containers connect with DISPLAY=:0.
+Volume=/tmp/.X11-unix:/tmp/.X11-unix
+# Exported audio sockets (PipeWire native + Pulse), see README.
+Volume=/run/desktop-audio:/run/desktop-audio
+# --privileged: host /dev (dri, input, snd, tty*) visible, no SELinux
+# separation, device cgroup open. --systemd=always: proper systemd PID 1.
+PodmanArgs=--privileged --systemd=always
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+#!/bin/bash
+# Entry point for desktop-session.service. Runs as the "desktop" user inside
+# a PAM login session on tty1. startx handles xauth cookie generation.
+#
+# No failure handling here: when Xorg exits, the tty hangup kills this
+# process group, so diagnosis runs from ExecStopPost= (session-postmortem).
+set -u
+
+VT="${DESKTOP_VT:-vt1}"
+DPY="${DESKTOP_DISPLAY:-:0}"
+
+# The user manager was just started by pam_systemd; make sure the audio
+# stack is up even if socket activation never gets poked from inside.
+systemctl --user start pipewire.service pipewire-pulse.service wireplumber.service || true
+
+exec /usr/bin/startx /etc/X11/xinit/xinitrc.desktop -- "$DPY" "$VT" -keeptty -novtswitch -nolisten tcp

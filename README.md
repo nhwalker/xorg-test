@@ -1,1 +1,229 @@
-# xorg-test
+# Containerized desktop: UBI9 + Xorg + mwm + PipeWire
+
+Replaces a bare-metal desktop install with a container. The container runs a
+full systemd (PID 1) with its own `systemd-logind` seat, an Xorg server on the
+host's tty1/GPU/input devices, the Motif window manager (`mwm`), and a
+PipeWire audio stack whose sockets are shared with the host and other
+containers.
+
+Works in two modes:
+
+| Mode | Requirement | X driver |
+|---|---|---|
+| **GPU** | NVIDIA driver + [nvidia container toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) on the host | `nvidia` (driver userspace injected via CDI) |
+| **No GPU** | just `/dev/dri` on the host | `modesetting`, unaccelerated |
+
+The mode is chosen automatically at every container boot by
+`xorg-gpu-conf.sh` — the same image serves both.
+
+## Layout
+
+```
+Containerfile               image build (UBI9 + Rocky9 fill-in repos)
+install.sh                  host setup / teardown (run as root)
+quadlet/desktop.container   podman quadlet unit -> desktop.service
+image/                      files baked into the image
+  rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
+  xorg/                     Xwrapper.config, boot-time GPU config generator
+  systemd/                  xorg-conf.service, desktop-session.service, drop-ins
+  session/                  start-session, xinitrc.desktop, mwmrc
+  pipewire/                 socket-export config drop-ins
+```
+
+### Why UBI + Rocky repos?
+
+The image is based on `registry.access.redhat.com/ubi9/ubi`, but UBI's repos
+don't ship an X server, Motif, or PipeWire. `image/rocky9.repo` adds Rocky
+Linux 9 BaseOS/AppStream/CRB with `priority=200`; UBI repos default to
+priority 99 and **lower wins**, so every package UBI provides comes from Red
+Hat and Rocky only fills the gaps.
+
+## Install
+
+On the target host (RHEL/Rocky 9 or similar, podman ≥ 4.4):
+
+```sh
+sudo ./install.sh            # build image, reconfigure host, start desktop.service
+sudo ./install.sh --no-gpu   # force modesetting even if an NVIDIA GPU exists
+sudo ./install.sh --no-build --image <ref>   # use a prebuilt image
+sudo ./install.sh --uninstall                # restore the host
+```
+
+### What install.sh does to the host (all reverted by `--uninstall`)
+
+Seat handover — the host must stop claiming the devices the container needs:
+
+1. Disables `display-manager.service` (gdm/sddm/…) and sets the default boot
+   target to `multi-user.target`.
+2. Deletes `/etc/udev/rules.d/72-seat-*.rules` (created by `loginctl attach`)
+   and re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems,
+   so all devices fall back to default `seat0` tagging. Custom multi-seat
+   splits would otherwise hide devices from the container's logind.
+3. Masks `getty@tty1.service` and sets `NAutoVTs=0`, `ReserveVT=0` for host
+   logind — nothing on the host touches the VT the container's Xorg runs on.
+   Host logind itself keeps running (ssh logins etc. still work); with no
+   graphical session it holds no DRM master and no input devices.
+
+Plus: a tmpfiles.d entry for `/run/desktop-audio` and `/tmp/.X11-unix`, host
+audio client configs (see below), optional GPU CDI spec + quadlet drop-in,
+and the quadlet unit itself. Prior state (display manager, default target,
+replaced files) is saved in `/var/lib/desktop-container/`.
+
+## Seat model inside the container
+
+The container boots systemd with its own `systemd-logind` and a
+container-internal `seat0`:
+
+- `--privileged` exposes the host's `/dev` (DRM, input, sound, ttys).
+- `/run/udev` is mounted read-only from the host, so libudev/logind/libinput
+  in the container see the host's udev database including its seat tags —
+  no udevd runs in the container (it's masked).
+- `Network=host` lets libinput receive kernel uevents for input hotplug.
+- `desktop-session.service` uses the kiosk pattern (`User=desktop`,
+  `PAMName=login`, `TTYPath=/dev/tty1`): pam_systemd registers a real logind
+  session on the container's seat0 and starts the user manager, which brings
+  up PipeWire. The session then runs `startx` → `xinitrc.desktop` → `mwm`.
+- Xorg runs **rootless**, as the `desktop` user (`needs_root_rights = no`
+  in `image/xorg/Xwrapper.config`). Device access works by plain group
+  permission: `/dev/dri/*` is group `video`, `/dev/input/*` is group
+  `input`, and at every boot `align-device-groups.sh` renumbers the
+  container's groups to match the gids actually on the host's device nodes
+  (numeric gids are what the kernel checks, and dynamically-allocated
+  groups like `input`/`render` need not match between host and image).
+  DRM master is acquired by the first-opener rule — nothing else on the
+  host uses the GPU — and systemd hands tty1 to the session user via
+  `TTYPath=`. Xorg still tries logind device handover first and falls back
+  to direct opens.
+
+### Changing the VT
+
+tty1 is assumed in three places: `getty@tty1` masking in `install.sh`, and
+`TTYPath=`/`DESKTOP_VT=` in `image/systemd/desktop-session.service`. Change
+all of them (a systemd drop-in works for the unit) to move the session.
+
+## GPU notes
+
+- The image contains **no** NVIDIA bits. `install.sh` runs
+  `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` and adds a quadlet
+  drop-in with `AddDevice=nvidia.com/gpu=all` when a GPU + toolkit are found.
+- At container boot, `xorg-gpu-conf.sh` writes
+  `/etc/X11/xorg.conf.d/20-gpu.conf`: `nvidia` if device nodes **and** an
+  injected `nvidia_drv.so` are present, else `modesetting` on the first
+  connected `/dev/dri/card*`.
+- **nvidia_drv.so missing:** older toolkits don't include the Xorg driver
+  module in the CDI spec. `install.sh` detects this and appends `Volume=`
+  bind-mounts for the host's `nvidia_drv.so` / `libglxserver_nvidia.so` to
+  the GPU drop-in. If your host keeps them elsewhere, add the mounts to
+  `/etc/containers/systemd/desktop.container.d/10-gpu.conf` manually.
+
+## Using the display
+
+Xorg listens on the shared `/tmp/.X11-unix`; the session runs `xhost +local:`
+so any local process may connect (see Security below).
+
+```sh
+DISPLAY=:0 glxinfo -B                          # from the host
+podman run -e DISPLAY=:0 -v /tmp/.X11-unix:/tmp/.X11-unix <img> xclock
+```
+
+## Audio: pulse, PipeWire, and ALSA clients — container, host, or other containers
+
+PipeWire inside the container is the only owner of `/dev/snd`. It publishes
+two extra sockets in `/run/desktop-audio` (bind-mounted from the host):
+
+| Protocol | Socket | Client setup |
+|---|---|---|
+| PipeWire native | `/run/desktop-audio/pipewire-0` | `PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0` |
+| PulseAudio | `/run/desktop-audio/pulse` | `PULSE_SERVER=unix:/run/desktop-audio/pulse` |
+| ALSA | (via pulse plugin) | `/etc/asound.conf` routing `pcm.!default` to the pulse socket |
+
+- **Host**: `install.sh` already writes `/etc/pulse/client.conf.d/…` and
+  `/etc/asound.conf`, so unmodified pulse and ALSA apps just work
+  (host needs `alsa-plugins-pulseaudio`, standard on EL).
+- **Inside this container**: apps use the default per-user sockets;
+  ALSA apps go through `pipewire-alsa`.
+- **Other containers**: mount the socket dir and set the env var, e.g.
+
+```sh
+podman run -v /run/desktop-audio:/run/desktop-audio \
+    -e PULSE_SERVER=unix:/run/desktop-audio/pulse <img> paplay /usr/share/sounds/...
+```
+
+For ALSA-only apps in other containers, add the same two-stanza
+`/etc/asound.conf` as `install.sh` writes on the host (requires
+`alsa-plugins-pulseaudio` in that image).
+
+## Verification checklist (on the target host)
+
+```sh
+systemctl status desktop.service
+podman exec desktop systemctl status desktop-session xorg-conf
+podman exec desktop loginctl                   # session for "desktop" on seat0
+podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf   # nvidia vs modesetting
+DISPLAY=:0 xrandr                              # display up, modes listed
+DISPLAY=:0 glxinfo -B                          # GPU mode: "NVIDIA"; else llvmpipe
+fgconsole                                      # VT 1 active
+podman exec desktop ps -o user= -C Xorg        # "desktop", not root (rootless X)
+podman exec desktop journalctl -u xorg-conf -o cat | grep align  # gid alignment log
+podman exec -u desktop desktop wpctl status    # sound devices present
+# audio, one per protocol (repeat from host and from a scratch container):
+pw-play      /usr/share/sounds/alsa/Front_Center.wav   # PIPEWIRE_REMOTE set
+paplay       /usr/share/sounds/alsa/Front_Center.wav   # PULSE_SERVER set
+aplay        /usr/share/sounds/alsa/Front_Center.wav   # via /etc/asound.conf
+```
+
+Input hotplug: unplug/replug a keyboard; it should re-appear in the session
+(uevents arrive because the container shares the host network namespace).
+
+## Security notes
+
+- The container is `--privileged` with host network — treat the image and
+  everything allowed to start containers as fully trusted.
+- Xorg runs rootless (as `desktop`), so an X server compromise yields that
+  user, not root. Note the `desktop` user is still in the `input` group and
+  can read every keyboard from `/dev/input` — inherent to running the
+  display server.
+- `xhost +local:` grants any local uid access to the display; keys typed into
+  the session are visible to any local process that connects. Tighten by
+  removing it from `image/session/xinitrc.desktop` and distributing the xauth
+  cookie instead.
+- Exported audio sockets are world-connectable (`UMask=0000` drop-ins);
+  restrict `/run/desktop-audio` permissions in the tmpfiles.d entry if that
+  matters on your host.
+
+## Troubleshooting
+
+**Start here:** `podman exec desktop journalctl -u xorg-conf -o cat` prints a
+boot-time preflight report — one `PASS`/`WARN`/`FAIL` line per assumption
+(devices visible, udev db mounted, gid alignment, seat tags, logind, shared
+socket dirs, NVIDIA coherence) with a remediation hint on each failure. When
+the X session dies, a postmortem dumps the tail of the Xorg log plus a
+`LIKELY CAUSE:` verdict — read it with
+`podman exec desktop journalctl -t session-postmortem` (it runs from
+`ExecStopPost=` after the session cgroup is gone, so journald does not
+attribute it to `-u desktop-session`).
+
+- **Xorg: "cannot open /dev/tty1"** — something on the host owns the VT;
+  check `getty@tty1` is masked and no host display manager is running.
+- **Xorg: "cannot become DRM master" / `drmSetMaster failed`** — some host
+  process is *currently* holding the GPU (display manager still running or
+  re-enabled, another compositor). DRM master is released automatically
+  when its holder's fd closes, so a previously-stopped X server is never
+  the cause — a live one is. `fuser -v /dev/dri/card0` on the host shows
+  the culprit; rerun `install.sh` to re-disable the display manager.
+- **Keyboard/mouse/GPU dead with rootless X (EACCES opening devices)** —
+  gid alignment likely failed: check
+  `journalctl -u xorg-conf` inside the container for `align-device-groups`
+  lines. Escape hatch: set `needs_root_rights = yes` in
+  `/etc/X11/Xwrapper.config` (root Xorg) and report the alignment log.
+- **Xorg: "no screens found" without GPU** — no `/dev/dri/card*` with a
+  connected output; check the container log for `xorg-gpu-conf` lines.
+- **Wrong GPU mode picked** — the config is regenerated on every container
+  boot; restart with `systemctl restart desktop.service` after fixing the
+  device situation.
+- **No input devices** — `/run/udev` mount missing, or devices still tagged
+  for another seat: rerun `install.sh` (removes `72-seat-*.rules`) or check
+  `udevadm info /dev/input/event0 | grep -i seat`.
+- **SELinux denials** — `--privileged` disables label separation; if you
+  tightened the unit, host clients may need extra policy for the shared
+  sockets.

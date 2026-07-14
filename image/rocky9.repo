@@ -1,0 +1,33 @@
+# Rocky Linux 9 repositories used to fill in packages missing from the UBI 9
+# repos (Xorg server, motif, pipewire, ...).
+#
+# priority=200 keeps these BELOW the UBI repos (which default to priority=99,
+# lower number wins), so any package available from Red Hat UBI is always
+# preferred and Rocky only supplies what UBI doesn't ship.
+#
+# baseurls hardcode "9" instead of $releasever because UBI sets releasever to
+# a point release (e.g. "9.6") that Rocky's directory layout doesn't use.
+
+[rocky9-baseos]
+name=Rocky Linux 9 - BaseOS
+baseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+priority=200
+
+[rocky9-appstream]
+name=Rocky Linux 9 - AppStream
+baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+priority=200
+
+[rocky9-crb]
+name=Rocky Linux 9 - CRB
+baseurl=https://dl.rockylinux.org/pub/rocky/9/CRB/$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+priority=200

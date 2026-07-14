@@ -1,0 +1,17 @@
+#!/bin/sh
+# X session started by startx (see start-session).
+
+# The X socket is exported to the host via /tmp/.X11-unix; local peers
+# (host processes, other containers sharing the socket dir) don't have our
+# xauth cookie, so allow all local unix-socket connections.
+xhost +local: || true
+
+# Desktop replacement: no screen blanking / DPMS surprises by default.
+xset s off || true
+xset -dpms || true
+
+xsetroot -solid grey25 || true
+
+xterm -geometry 100x30+60+60 &
+
+exec /usr/bin/mwm
