@@ -222,9 +222,22 @@ turns Ready only when Xorg serves `/tmp/.X11-unix/X0`.
 ## Client pods via the desktop device plugin
 
 `charts/desktop-device-plugin` + `device-plugin/` turn "an app pod that can
-draw on the desktop" into a one-line resource request. The plugin (a
-DaemonSet, image built from `Containerfile.plugin`) registers the custom
-resource `desktop.local/display` with kubelet; when a pod requests it,
+draw on the desktop" into a one-line resource request. The plugin image
+follows the same base/application split as the desktop image —
+`Containerfile.plugin.base` holds the Go toolchain plus the module
+dependency cache (`go mod download` from go.mod/go.sum only, no source;
+the only network build), and `Containerfile.plugin` copies in the source,
+compiles offline (`--network=none`, with `GOPROXY=off` making any
+dependency miss a hard error), and ships the static binary on scratch:
+
+```sh
+podman build -t localhost/desktop-device-plugin-base:latest -f Containerfile.plugin.base .
+podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+```
+
+Rebuild the base only when go.mod/go.sum or the toolchain change. The
+plugin (a DaemonSet) registers the custom resource
+`desktop.local/display` with kubelet; when a pod requests it,
 kubelet's `Allocate()` call returns the socket-dir mounts
 (`/tmp/.X11-unix`, `/run/desktop-audio`, rw — unix `connect(2)` needs write
 access) and env (`DISPLAY=:0`, `PULSE_SERVER=…/pulse`,

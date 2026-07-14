@@ -1,10 +1,20 @@
-# desktop-device-plugin image: static Go binary on scratch.
-# Build: podman build -t desktop-device-plugin -f Containerfile.plugin .
+# Device-plugin APPLICATION build: copies the Go source into the prebuilt
+# dependency base (Containerfile.plugin.base), compiles offline, and ships
+# the static binary on scratch. Fully offline:
+#
+#   podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+#
+# Override the base with --build-arg BASE_IMAGE=<ref>. If the build fails
+# resolving modules, go.mod/go.sum changed since the base was built --
+# rebuild the base (with network) first.
 
-FROM docker.io/library/golang:1.23 AS build
+ARG BASE_IMAGE=localhost/desktop-device-plugin-base:latest
+
+FROM ${BASE_IMAGE} AS build
+# GOPROXY=off turns any dependency miss into a hard, clear error instead of
+# a network attempt; -mod=readonly refuses to silently edit go.mod.
+ENV GOTOOLCHAIN=local GOPROXY=off GOFLAGS=-mod=readonly
 WORKDIR /src
-COPY device-plugin/go.mod device-plugin/go.sum ./
-RUN go mod download
 COPY device-plugin/ .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /desktop-device-plugin .
 
