@@ -193,15 +193,24 @@ Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 
 ## Troubleshooting
 
-**Start here:** `podman exec desktop journalctl -u xorg-conf -o cat` prints a
-boot-time preflight report — one `PASS`/`WARN`/`FAIL` line per assumption
-(devices visible, udev db mounted, gid alignment, seat tags, logind, shared
-socket dirs, NVIDIA coherence) with a remediation hint on each failure. When
-the X session dies, a postmortem dumps the tail of the Xorg log plus a
-`LIKELY CAUSE:` verdict — read it with
-`podman exec desktop journalctl -t session-postmortem` (it runs from
-`ExecStopPost=` after the session cgroup is gone, so journald does not
-attribute it to `-u desktop-session`).
+**Start here:** `podman logs desktop` — the container's full journal is
+mirrored to the console by `journal-console.service`, a `journalctl -f`
+forwarder writing to `/dev/console`. (This is why the quadlet passes
+`--tty`: without it the runtime creates no `/dev/console`, and PID 1's
+stdout is no alternative — systemd redirects its own stdio to `/dev/null`
+during boot.) Two things to look for:
+
+- the boot-time preflight report: one `PASS`/`WARN`/`FAIL` line per
+  assumption (devices visible, udev db mounted, gid alignment, seat tags,
+  logind, shared socket dirs, NVIDIA coherence) with a remediation hint on
+  each failure — `podman logs desktop | grep preflight:`
+- the X session postmortem on every abnormal session exit: tail of the Xorg
+  log plus a `LIKELY CAUSE:` verdict — `podman logs desktop | grep postmortem:`
+
+For filtered queries, the journal itself is still available:
+`podman exec desktop journalctl -u desktop-session` (note the postmortem
+runs from `ExecStopPost=` after the session cgroup is gone, so it appears
+under `journalctl -t session-postmortem`, not under the unit).
 
 - **Xorg: "cannot open /dev/tty1"** — something on the host owns the VT;
   check `getty@tty1` is masked and no host display manager is running.

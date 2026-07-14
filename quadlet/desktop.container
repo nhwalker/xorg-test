@@ -24,7 +24,9 @@ Volume=/tmp/.X11-unix:/tmp/.X11-unix
 Volume=/run/desktop-audio:/run/desktop-audio
 # --privileged: host /dev (dri, input, snd, tty*) visible, no SELinux
 # separation, device cgroup open. --systemd=always: proper systemd PID 1.
-PodmanArgs=--privileged --systemd=always
+# --tty: gives the container a /dev/console wired to `podman logs`, which
+# journal-console.service mirrors the journal into.
+PodmanArgs=--privileged --systemd=always --tty
 
 [Service]
 Restart=always
