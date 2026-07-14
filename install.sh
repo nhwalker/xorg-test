@@ -16,9 +16,14 @@
 #   5. Installs the quadlet unit and starts desktop.service.
 #
 # Usage:
-#   ./install.sh [--no-gpu] [--no-build] [--image REF]
+#   ./install.sh [--no-gpu] [--no-build] [--no-base] [--image REF] [--base-image REF]
 #   ./install.sh --host-prep-only   # for k8s: host prep without podman bits
 #   ./install.sh --uninstall
+#
+# The image is built in two stages: Containerfile.base (UBI9 + Rocky repos +
+# all FOSS packages; the only network build) and Containerfile (application
+# config layered on top, built with --network=none). --no-base reuses an
+# existing base image so config iteration works fully offline.
 #
 # --host-prep-only performs only the host-side preparation (seat undo,
 # logind drop-in, tmpfiles, audio client configs, CDI spec generation) and
@@ -32,6 +37,7 @@
 set -euo pipefail
 
 IMAGE="localhost/desktop-container:latest"
+BASE_IMAGE="localhost/desktop-container-base:latest"
 STATE_DIR="/var/lib/desktop-container"
 QUADLET_DIR="/etc/containers/systemd"
 DROPIN_DIR="$QUADLET_DIR/desktop.container.d"
@@ -45,6 +51,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DO_GPU=auto
 DO_BUILD=1
+DO_BASE=1
 UNINSTALL=0
 HOST_PREP_ONLY=0
 
@@ -58,7 +65,9 @@ while [ $# -gt 0 ]; do
         --host-prep-only) HOST_PREP_ONLY=1; DO_BUILD=0 ;;
         --no-gpu)    DO_GPU=0 ;;
         --no-build)  DO_BUILD=0 ;;
+        --no-base)   DO_BASE=0 ;;
         --image)     shift; IMAGE="${1:?--image needs an argument}" ;;
+        --base-image) shift; BASE_IMAGE="${1:?--base-image needs an argument}" ;;
         -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
@@ -127,8 +136,17 @@ mkdir -p "$STATE_DIR"
 
 if [ "$DO_BUILD" = 1 ]; then
     [ -f "$REPO_DIR/Containerfile" ] || die "Containerfile not found next to install.sh (use --no-build with a prebuilt --image)"
-    log "building $IMAGE"
-    podman build -t "$IMAGE" -f "$REPO_DIR/Containerfile" "$REPO_DIR"
+    if [ "$DO_BASE" = 1 ] || ! podman image exists "$BASE_IMAGE"; then
+        log "building base image $BASE_IMAGE (network build: repos + packages)"
+        podman build -t "$BASE_IMAGE" -f "$REPO_DIR/Containerfile.base" "$REPO_DIR"
+    else
+        log "reusing existing base image $BASE_IMAGE (--no-base)"
+    fi
+    # The application layer is config-only by design; --network=none both
+    # proves and enforces that no build step phones home.
+    log "building $IMAGE (offline application layer)"
+    podman build --network=none --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+        -t "$IMAGE" -f "$REPO_DIR/Containerfile" "$REPO_DIR"
 else
     log "skipping build; using image $IMAGE"
 fi

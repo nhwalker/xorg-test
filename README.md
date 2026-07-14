@@ -19,7 +19,8 @@ The mode is chosen automatically at every container boot by
 ## Layout
 
 ```
-Containerfile               image build (UBI9 + Rocky9 fill-in repos)
+Containerfile.base          BASE image: UBI9 + Rocky9 repos + all packages (network build)
+Containerfile               APPLICATION layer: config/services on the base (offline build)
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
 image/                      files baked into the image
@@ -29,6 +30,30 @@ image/                      files baked into the image
   session/                  start-session, xinitrc.desktop, mwmrc
   pipewire/                 socket-export config drop-ins
 ```
+
+### Base image vs application layer
+
+The desktop image is built in two stages with separate Containerfiles:
+
+- **`Containerfile.base`** → `desktop-container-base` — everything that
+  needs the network: the Rocky GPG key fetch and every FOSS package
+  (Xorg, Motif, PipeWire, …). Rebuild only when the package set changes
+  or for security updates.
+- **`Containerfile`** → `desktop-container` — pure application logic and
+  configuration on top (`FROM` the base via the `BASE_IMAGE` build arg):
+  scripts, systemd units, user creation, config patches. It is built with
+  **`--network=none`**, which both proves and enforces that config
+  iteration works completely offline:
+
+```sh
+podman build -t localhost/desktop-container-base:latest -f Containerfile.base .
+podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+```
+
+`install.sh` runs both stages (the app layer always with `--network=none`);
+`--no-base` reuses an existing base so day-to-day config changes never
+touch the network. `--base-image REF` points the app build at a base from
+a registry instead.
 
 ### Why UBI + Rocky repos?
 
