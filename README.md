@@ -153,6 +153,47 @@ For ALSA-only apps in other containers, add the same two-stanza
 `/etc/asound.conf` as `install.sh` writes on the host (requires
 `alsa-plugins-pulseaudio` in that image).
 
+## Kubernetes (single-node k3s + CRI-O)
+
+`charts/desktop-container` deploys the same image as a Deployment
+(replicas=1, Recreate) instead of the quadlet. Everything podman's
+`--systemd`/`--privileged`/`--tty` provided is reconstructed in the pod
+spec: privileged container with host `/dev`, Memory-backed `emptyDir` on
+`/run` and `/tmp`, `tty: true` (so `journal-console.service` mirrors the
+journal into `kubectl logs`), `hostNetwork`, the same three host mounts,
+and a privileged initContainer that does tmpfiles.d's `chmod 1777` job on
+the exported socket dirs.
+
+Prerequisites on the node:
+- privileged pods allowed in the target namespace (k3s default: yes)
+- CRI-O with CDI support enabled (for GPU mode)
+- the image reachable from the node: pushed to a registry (default), or
+  imported into the runtime locally — then set `image.repository` to the
+  imported name and `image.pullPolicy=Never`
+- host prep run once: `sudo ./install.sh --host-prep-only` (seat undo,
+  audio client configs, `/etc/cdi/nvidia.yaml` generation; no podman
+  service is installed)
+
+Install:
+
+```sh
+helm install desktop charts/desktop-container \
+    --set image.repository=<registry>/desktop-container
+# with NVIDIA GPU injection via the cdi.k8s.io annotation:
+helm install desktop charts/desktop-container \
+    --set image.repository=<registry>/desktop-container --set gpu.enabled=true
+```
+
+GPU mode adds the pod annotation `cdi.k8s.io/gpu: nvidia.com/gpu=all`;
+CRI-O injects devices and driver userspace straight from the CDI spec — no
+device plugin needed. With `gpu.enabled=false` the container uses
+modesetting on `/dev/dri` exactly like the no-GPU podman flow.
+
+Verify: `kubectl logs deploy/desktop | grep preflight:` (same
+PASS/WARN/FAIL report), `grep postmortem:` on session failures, and the
+same `kubectl exec` spot-checks as the podman checklist below. The pod
+turns Ready only when Xorg serves `/tmp/.X11-unix/X0`.
+
 ## Verification checklist (on the target host)
 
 ```sh

@@ -1,0 +1,21 @@
+{{ include "desktop-container.fullname" . }} deployed.
+
+REQUIRED HOST PREP (once per node, as root, from the repo checkout):
+
+    ./install.sh --host-prep-only
+
+This disables the host display manager, frees tty1, undoes seat
+attachments, writes the audio client configs, and (with an NVIDIA GPU +
+nvidia-ctk) generates /etc/cdi/nvidia.yaml. Without it the pod's preflight
+will report FAILs and Xorg will not start.
+
+GPU injection is {{ if .Values.gpu.enabled }}ENABLED (CDI annotation: {{ .Values.gpu.cdiDevice }}){{ else }}DISABLED (modesetting, unaccelerated). Enable with --set gpu.enabled=true{{ end }}.
+
+Inspect the desktop (the full container journal is mirrored to the log):
+
+    kubectl logs deploy/{{ include "desktop-container.fullname" . }} | grep preflight:
+    kubectl logs deploy/{{ include "desktop-container.fullname" . }} | grep postmortem:
+    kubectl exec deploy/{{ include "desktop-container.fullname" . }} -- loginctl
+    kubectl exec deploy/{{ include "desktop-container.fullname" . }} -- ps -o user= -C Xorg
+
+The pod reports Ready only once Xorg is serving /tmp/.X11-unix/X0.

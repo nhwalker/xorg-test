@@ -1,0 +1,10 @@
+apiVersion: v2
+name: desktop-container
+description: >-
+  Containerized desktop (Xorg + mwm + PipeWire, systemd PID 1) for a
+  single-node cluster that owns the machine's display, input, and audio
+  devices. Requires host prep via install.sh --host-prep-only.
+type: application
+version: 0.1.0
+appVersion: "latest"
+kubeVersion: ">=1.25.0"
