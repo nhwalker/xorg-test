@@ -1,0 +1,21 @@
+# Device-plugin BASE image: Go toolchain + the module dependency cache.
+# This is the only plugin build that needs network access; the application
+# stage (Containerfile.plugin) compiles the source on top of it fully
+# offline. NO application source in here -- only go.mod/go.sum, so the base
+# needs rebuilding only when dependencies (or the Go toolchain) change.
+#
+# Build: podman build -t localhost/desktop-device-plugin-base:latest -f Containerfile.plugin.base .
+
+FROM docker.io/library/golang:1.23
+
+# Never download a different toolchain (go.mod's toolchain directive would
+# otherwise be allowed to fetch one at build time).
+ENV GOTOOLCHAIN=local
+
+WORKDIR /src
+COPY device-plugin/go.mod device-plugin/go.sum ./
+# Populate the module cache, then remove the manifests: they were only
+# input to the download. The application stage copies its own (always
+# current) go.mod/go.sum with the source, so a stale pair can never
+# linger in /src and shadow them.
+RUN go mod download && go mod verify && rm go.mod go.sum

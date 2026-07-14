@@ -1,52 +1,14 @@
-# Containerized desktop: UBI 9 base + Rocky 9 fill-in repos,
-# Xorg + mwm (Motif) + PipeWire audio, systemd as PID 1.
+# Desktop APPLICATION layer: configuration, session logic, and services on
+# top of the prebuilt base image (Containerfile.base holds all package /
+# network dependencies). This build is fully offline:
 #
-# Build:  podman build -t localhost/desktop-container:latest -f Containerfile .
-# Run:    via quadlet/desktop.container (see install.sh / README.md)
+#   podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+#
+# Override the base with --build-arg BASE_IMAGE=<ref> (e.g. a registry copy).
+# Run via quadlet/desktop.container or charts/ (see install.sh / README.md).
 
-FROM registry.access.redhat.com/ubi9/ubi
-
-# --- Rocky Linux 9 repos, at LOWER priority than the UBI repos -------------
-# UBI repos default to priority=99; rocky9.repo sets priority=200, so any
-# package Red Hat ships in UBI is always preferred and Rocky only fills in
-# what UBI lacks (Xorg server, motif, pipewire, ...).
-RUN curl -fsSL -o /etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9 \
-        https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
-    && rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
-COPY image/rocky9.repo /etc/yum.repos.d/rocky9.repo
-
-# --- Packages ---------------------------------------------------------------
-# NOTE: no NVIDIA bits here; the nvidia container toolkit injects the driver
-# userspace (and Xorg driver module) at run time when a GPU is present.
-RUN dnf -y install \
-        systemd \
-        xorg-x11-server-Xorg \
-        xorg-x11-xinit \
-        xorg-x11-xauth \
-        xorg-x11-drv-libinput \
-        mesa-dri-drivers \
-        mesa-libGL \
-        mesa-libEGL \
-        glx-utils \
-        xrandr \
-        xset \
-        xsetroot \
-        xhost \
-        xdpyinfo \
-        motif \
-        xterm \
-        xorg-x11-fonts-misc \
-        dejavu-sans-fonts \
-        pipewire \
-        pipewire-alsa \
-        pipewire-pulseaudio \
-        pipewire-utils \
-        pulseaudio-utils \
-        wireplumber \
-        alsa-utils \
-        procps-ng \
-        hostname \
-    && dnf clean all
+ARG BASE_IMAGE=localhost/desktop-container-base:latest
+FROM ${BASE_IMAGE}
 
 # --- Xorg -------------------------------------------------------------------
 # Rootless: Xorg runs as the desktop user and opens devices by group

@@ -19,7 +19,8 @@ The mode is chosen automatically at every container boot by
 ## Layout
 
 ```
-Containerfile               image build (UBI9 + Rocky9 fill-in repos)
+Containerfile.base          BASE image: UBI9 + Rocky9 repos + all packages (network build)
+Containerfile               APPLICATION layer: config/services on the base (offline build)
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
 image/                      files baked into the image
@@ -29,6 +30,30 @@ image/                      files baked into the image
   session/                  start-session, xinitrc.desktop, mwmrc
   pipewire/                 socket-export config drop-ins
 ```
+
+### Base image vs application layer
+
+The desktop image is built in two stages with separate Containerfiles:
+
+- **`Containerfile.base`** → `desktop-container-base` — everything that
+  needs the network: the Rocky GPG key fetch and every FOSS package
+  (Xorg, Motif, PipeWire, …). Rebuild only when the package set changes
+  or for security updates.
+- **`Containerfile`** → `desktop-container` — pure application logic and
+  configuration on top (`FROM` the base via the `BASE_IMAGE` build arg):
+  scripts, systemd units, user creation, config patches. It is built with
+  **`--network=none`**, which both proves and enforces that config
+  iteration works completely offline:
+
+```sh
+podman build -t localhost/desktop-container-base:latest -f Containerfile.base .
+podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+```
+
+`install.sh` runs both stages (the app layer always with `--network=none`);
+`--no-base` reuses an existing base so day-to-day config changes never
+touch the network. `--base-image REF` points the app build at a base from
+a registry instead.
 
 ### Why UBI + Rocky repos?
 
@@ -197,9 +222,24 @@ turns Ready only when Xorg serves `/tmp/.X11-unix/X0`.
 ## Client pods via the desktop device plugin
 
 `charts/desktop-device-plugin` + `device-plugin/` turn "an app pod that can
-draw on the desktop" into a one-line resource request. The plugin (a
-DaemonSet, image built from `Containerfile.plugin`) registers the custom
-resource `desktop.local/display` with kubelet; when a pod requests it,
+draw on the desktop" into a one-line resource request. The plugin image
+follows the same base/application split as the desktop image —
+`Containerfile.plugin.base` holds the Go toolchain plus the module
+dependency cache (`go mod download` from go.mod/go.sum only, no source;
+the manifests are deleted again after the download — the app stage's
+source tree provides the authoritative copies; the only network build),
+and `Containerfile.plugin` copies in the source,
+compiles offline (`--network=none`, with `GOPROXY=off` making any
+dependency miss a hard error), and ships the static binary on scratch:
+
+```sh
+podman build -t localhost/desktop-device-plugin-base:latest -f Containerfile.plugin.base .
+podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+```
+
+Rebuild the base only when go.mod/go.sum or the toolchain change. The
+plugin (a DaemonSet) registers the custom resource
+`desktop.local/display` with kubelet; when a pod requests it,
 kubelet's `Allocate()` call returns the socket-dir mounts
 (`/tmp/.X11-unix`, `/run/desktop-audio`, rw — unix `connect(2)` needs write
 access) and env (`DISPLAY=:0`, `PULSE_SERVER=…/pulse`,
