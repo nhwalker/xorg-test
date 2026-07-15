@@ -38,7 +38,7 @@ ck 'is-system-running'                       "$LIVE" "desktop: liveness renders 
 # device-plugin chart
 ck 'kind: DaemonSet'                         "$DP"  "plugin: daemonset"
 ck 'path: /var/lib/kubelet/device-plugins'   "$DP"  "plugin: kubelet dir hostPath"
-ck 'readOnly: true'                          "$DP"  "plugin: x11 mounted ro"
+nk 'readOnly: true'                          "$DP"  "plugin: x11 NOT ro (health connect needs write)"
 ck 'value: "desktop.local/display"'          "$DP"  "plugin: default resource name"
 ck 'value: "10"'                             "$DP"  "plugin: default slots"
 nk 'priorityClassName'                       "$DP"  "plugin: no priorityClassName by default"
