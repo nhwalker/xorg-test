@@ -12,15 +12,14 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || fail "must run as root (sudo)"
 SMOKE_USER="${SUDO_USER:-runner}"
 
-# GitHub's Azure runners have no virtual terminals: /dev/tty1 does not
-# exist, so the desktop session (TTYPath=/dev/tty1) cannot spawn there.
-# The session/X/postmortem path is covered by the VM e2e job instead;
-# here we still verify everything that doesn't need a VT.
-HAVE_VT=1
-if [ ! -e /dev/tty1 ]; then
-    HAVE_VT=0
-    log "host has no /dev/tty1: session asserts will be skipped (VM job covers them)"
-fi
+# VT availability must be judged from INSIDE the container: podman's
+# privileged /dev population does not necessarily expose the host's VT
+# devices (observed on GitHub runners: host has /dev/tty1, container does
+# not), and TTYPath=/dev/tty1 can only spawn against the container's /dev.
+# Without a VT the session/X/postmortem path is covered by the VM e2e job;
+# everything else is still verified here. Determined after the container
+# starts (see below).
+HAVE_VT=
 
 log "tty-less guard: journal mirror must fail loudly, not leak"
 podman rm -f nott >/dev/null 2>&1 || true
@@ -41,6 +40,18 @@ fi
 
 log "run the real install.sh (quadlet flow, shell user $SMOKE_USER)"
 SUDO_USER="$SMOKE_USER" ./install.sh --no-build --no-gpu
+
+log "wait for the container to answer, then judge VT availability from inside"
+for _ in $(seq 20); do
+    podman exec desktop true 2>/dev/null && break
+    sleep 2
+done
+if podman exec desktop test -e /dev/tty1 2>/dev/null; then
+    HAVE_VT=1
+else
+    HAVE_VT=0
+    log "container has no /dev/tty1: session asserts will be skipped (VM job covers them)"
+fi
 
 log "wait for the container to settle"
 st=""
