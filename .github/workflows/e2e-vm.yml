@@ -1,0 +1,61 @@
+# Tiers 4-5: full-stack e2e in a KVM-accelerated Rocky 9 VM with virtio
+# graphics/input/sound and SELinux enforcing - real install.sh, real Xorg,
+# audio, input hotplug, host-terminal ssh, then k3s + both charts.
+name: e2e-vm
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: read
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+jobs:
+  vm-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable kvm access
+        run: |
+          test -e /dev/kvm || { echo "no /dev/kvm on runner"; exit 1; }
+          sudo chmod 666 /dev/kvm
+      - name: install qemu + tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat
+      - name: cache rocky cloud image
+        id: rocky
+        uses: actions/cache@v4
+        with:
+          path: ci/vm/Rocky-9-GenericCloud.qcow2
+          key: rocky9-genericcloud-v1
+      - name: download rocky cloud image
+        if: steps.rocky.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o ci/vm/Rocky-9-GenericCloud.qcow2 \
+            https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+      - name: ghcr login (base cache; skipped on fork PRs)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: build images (reuse GHCR bases when possible)
+        env:
+          PUSH_BASES: "0"
+        run: |
+          sudo -E ci/build-bases.sh
+          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+          sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+          sudo podman save -o ci/vm/images.tar \
+            localhost/desktop-container:latest localhost/desktop-device-plugin:latest
+          sudo chmod 644 ci/vm/images.tar
+      - name: run VM e2e
+        run: ci/vm/vm-e2e.sh
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-e2e-artifacts
+          path: ci/vm/artifacts/
+          if-no-files-found: ignore

@@ -1,0 +1,70 @@
+# Tiers 1-3: static checks, image builds (offline gate + GHCR base cache),
+# and the podman boot-smoke suite driven by the real install.sh.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  packages: write
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: device-plugin/go.mod
+          cache-dependency-path: device-plugin/go.sum
+      - name: go fmt/vet/test
+        working-directory: device-plugin
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: shellcheck (error severity)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck
+          shellcheck -S error install.sh ci/*.sh \
+            image/xorg/*.sh image/session/host-shell-setup.sh \
+            image/session/start-session image/session/session-postmortem \
+            image/session/host-terminal
+      - name: helm lint + template assertions
+        run: |
+          helm lint charts/desktop-container charts/desktop-device-plugin
+          ci/helm-assertions.sh
+      - name: kubeconform (k8s schema validation)
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          helm template d charts/desktop-container | ./kubeconform -strict -summary
+          helm template p charts/desktop-device-plugin | ./kubeconform -strict -summary
+
+  build-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: ghcr login (skipped on fork PRs)
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: base images (content-addressed GHCR cache)
+        env:
+          PUSH_BASES: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '0' }}
+        run: sudo -E ci/build-bases.sh
+      - name: application layers (offline gate)
+        run: |
+          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+          sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+      - name: podman smoke suite (real install.sh on the ephemeral runner)
+        run: sudo -E ci/smoke-podman.sh
+      - name: collect diagnostics on failure
+        if: failure()
+        run: |
+          sudo podman ps -a || true
+          sudo podman logs desktop 2>&1 | tail -100 || true
+          sudo journalctl -u desktop.service --no-pager | tail -50 || true
