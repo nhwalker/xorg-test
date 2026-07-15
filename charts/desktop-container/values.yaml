@@ -23,6 +23,9 @@ hostPaths:
   x11Socket: /tmp/.X11-unix
   # Exported audio sockets (PipeWire native + Pulse).
   audioSocket: /run/desktop-audio
+  # Host-shell material (ssh key + username) for the 'Host Terminal' menu
+  # entry; created by install.sh --shell-user, harmless when empty.
+  hostShellDir: /etc/desktop-container
 
 # Privileged initContainer that chmods the exported socket dirs to 1777
 # (hostPath DirectoryOrCreate creates them 0755 root, which would block the

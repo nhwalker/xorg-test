@@ -22,11 +22,13 @@ COPY image/xorg/preflight-check.sh /usr/local/bin/preflight-check.sh
 # --- Session ----------------------------------------------------------------
 COPY image/session/start-session /usr/local/bin/start-session
 COPY image/session/session-postmortem /usr/local/bin/session-postmortem
+COPY image/session/host-shell-setup.sh /usr/local/bin/host-shell-setup.sh
 COPY image/session/xinitrc.desktop /etc/X11/xinit/xinitrc.desktop
 COPY image/session/mwmrc /etc/skel/.mwmrc
 RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/start-session \
         /usr/local/bin/session-postmortem /usr/local/bin/align-device-groups.sh \
-        /usr/local/bin/preflight-check.sh /etc/X11/xinit/xinitrc.desktop
+        /usr/local/bin/preflight-check.sh /usr/local/bin/host-shell-setup.sh \
+        /etc/X11/xinit/xinitrc.desktop
 
 RUN for g in input render video audio tty; do \
         getent group "$g" >/dev/null || groupadd -r "$g"; \

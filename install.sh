@@ -17,8 +17,16 @@
 #
 # Usage:
 #   ./install.sh [--no-gpu] [--no-build] [--no-base] [--image REF] [--base-image REF]
+#                [--shell-user USER]
 #   ./install.sh --host-prep-only   # for k8s: host prep without podman bits
 #   ./install.sh --uninstall
+#
+# --shell-user USER enables the desktop's "Host Terminal" menu entry: a
+# dedicated ssh keypair is generated under /etc/desktop-container (root-only
+# on the host, mounted read-only into the container) and installed with a
+# restricted authorized_keys entry for USER; the container's xterm then
+# reaches the host via loopback ssh. Defaults to $SUDO_USER when set;
+# without a resolvable user the feature is skipped.
 #
 # The image is built in two stages: Containerfile.base (UBI9 + Rocky repos +
 # all FOSS packages; the only network build) and Containerfile (application
@@ -46,6 +54,8 @@ TMPFILES_CONF="/etc/tmpfiles.d/desktop-container.conf"
 LOGIND_DROPIN="/etc/systemd/logind.conf.d/50-desktop-container.conf"
 PULSE_CLIENT_CONF="/etc/pulse/client.conf.d/50-desktop-container.conf"
 ASOUND_CONF="/etc/asound.conf"
+HOST_SHELL_DIR="/etc/desktop-container"
+SHELL_USER="${SUDO_USER:-}"
 VT="tty1"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -68,6 +78,7 @@ while [ $# -gt 0 ]; do
         --no-base)   DO_BASE=0 ;;
         --image)     shift; IMAGE="${1:?--image needs an argument}" ;;
         --base-image) shift; BASE_IMAGE="${1:?--base-image needs an argument}" ;;
+        --shell-user) shift; SHELL_USER="${1:?--shell-user needs an argument}" ;;
         -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
@@ -114,6 +125,20 @@ uninstall() {
         dm=$(cat "$STATE_DIR/display-manager")
         log "re-enabling display manager $dm (not started; reboot or start manually)"
         systemctl enable "$dm" 2>/dev/null || true
+    fi
+
+    log "removing host shell configuration"
+    if [ -f "$STATE_DIR/shell-user" ]; then
+        su=$(cat "$STATE_DIR/shell-user")
+        suh=$(getent passwd "$su" | cut -d: -f6 || true)
+        if [ -n "$suh" ] && [ -f "$suh/.ssh/authorized_keys" ]; then
+            sed -i '/desktop-container-host-shell/d' "$suh/.ssh/authorized_keys"
+        fi
+    fi
+    rm -rf "$HOST_SHELL_DIR"
+    if [ -f "$STATE_DIR/sshd-state" ]; then
+        log "disabling sshd (it was inactive before install)"
+        systemctl disable --now sshd 2>/dev/null || true
     fi
 
     log "removing audio client configuration"
@@ -237,6 +262,44 @@ EOF
 if [ ! -e /usr/lib64/alsa-lib/libasound_module_pcm_pulse.so ] \
    && [ ! -e /usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so ]; then
     warn "alsa-plugins-pulseaudio not found on host; ALSA clients won't work until it is installed"
+fi
+
+# --- 5.5 Host terminal (loopback ssh for the 'Host Terminal' menu entry) -----
+if [ -n "$SHELL_USER" ] && getent passwd "$SHELL_USER" >/dev/null; then
+    if command -v sshd >/dev/null || [ -x /usr/sbin/sshd ]; then
+        log "configuring host shell for user '$SHELL_USER'"
+        if ! systemctl is-active --quiet sshd; then
+            echo "sshd-was-inactive" > "$STATE_DIR/sshd-state"
+            systemctl enable --now sshd
+        fi
+        mkdir -p "$HOST_SHELL_DIR"
+        if [ ! -f "$HOST_SHELL_DIR/host-shell-key" ]; then
+            ssh-keygen -q -t ed25519 -N '' -C desktop-container-host-shell \
+                -f "$HOST_SHELL_DIR/host-shell-key"
+        fi
+        # Root-only on the host; the (privileged) container's boot script
+        # installs a desktop-user copy inside the container.
+        chmod 0400 "$HOST_SHELL_DIR/host-shell-key"
+        chmod 0644 "$HOST_SHELL_DIR/host-shell-key.pub"
+        echo "$SHELL_USER" > "$HOST_SHELL_DIR/shell-user"
+        echo "$SHELL_USER" > "$STATE_DIR/shell-user"
+
+        shell_home=$(getent passwd "$SHELL_USER" | cut -d: -f6)
+        shell_group=$(id -gn "$SHELL_USER")
+        install -d -m 0700 -o "$SHELL_USER" -g "$shell_group" "$shell_home/.ssh"
+        ak="$shell_home/.ssh/authorized_keys"
+        touch "$ak"; chown "$SHELL_USER:$shell_group" "$ak"; chmod 0600 "$ak"
+        if ! grep -q desktop-container-host-shell "$ak"; then
+            printf 'from="127.0.0.1,::1",no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' \
+                "$(cat "$HOST_SHELL_DIR/host-shell-key.pub")" >> "$ak"
+        fi
+    else
+        warn "openssh-server not installed; skipping host shell setup (dnf install openssh-server, then rerun)"
+    fi
+elif [ -n "$SHELL_USER" ]; then
+    warn "--shell-user '$SHELL_USER' does not exist on this host; skipping host shell setup"
+else
+    log "no --shell-user (and no SUDO_USER); skipping host shell setup ('Host Terminal' menu entry will not work)"
 fi
 
 # --- 6. GPU (NVIDIA container toolkit / CDI) ---------------------------------

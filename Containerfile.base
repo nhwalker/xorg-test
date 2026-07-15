@@ -47,4 +47,5 @@ RUN dnf -y install \
         alsa-utils \
         procps-ng \
         hostname \
+        openssh-clients \
     && dnf clean all
