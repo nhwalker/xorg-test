@@ -10,6 +10,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
 
+# EL sudo's secure_path omits /usr/local/bin, where the k3s installer and
+# our helm download land. Without this the k3s readiness loop silently
+# spins on "command not found".
+export PATH="/usr/local/bin:$PATH"
+
 log()  { echo "== vm-guest($1): $2"; }
 fail() {
     echo "FAIL: vm-guest: $*" >&2
