@@ -22,6 +22,9 @@ Volume=/run/udev:/run/udev:ro
 Volume=/tmp/.X11-unix:/tmp/.X11-unix
 # Exported audio sockets (PipeWire native + Pulse), see README.
 Volume=/run/desktop-audio:/run/desktop-audio
+# Host-shell material for the 'Host Terminal' menu entry (key + username;
+# created by install.sh --shell-user; harmless when absent/empty).
+Volume=/etc/desktop-container:/etc/desktop-container:ro
 # --privileged: host /dev (dri, input, snd, tty*) visible, no SELinux
 # separation, device cgroup open. --systemd=always: proper systemd PID 1.
 # --tty: gives the container a /dev/console wired to `podman logs`, which

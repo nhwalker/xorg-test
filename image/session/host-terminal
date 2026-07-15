@@ -1,0 +1,19 @@
+#!/bin/bash
+# 'Host Terminal' menu entry. A bare `xterm -e ssh host` closes the moment
+# ssh fails, leaving only a window-flash; this wrapper keeps the window
+# open with the reason and the enablement command.
+ssh host && exit 0
+rc=$?
+echo
+echo "host-terminal: ssh to the host failed (exit $rc)."
+echo
+echo "If this desktop was deployed without a shell user, enable it on the host:"
+echo "    ./install.sh [--host-prep-only] --shell-user <user>"
+echo
+echo "Other common causes: sshd not running on the host; SELinux context on"
+echo "the target user's ~/.ssh (host: restorecon -R ~<user>/.ssh); target"
+echo "user has a nologin shell; sshd bound to a non-loopback address."
+echo
+printf 'Press Enter to close. '
+read -r _
+exit "$rc"

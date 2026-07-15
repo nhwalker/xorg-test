@@ -305,6 +305,45 @@ kubectl describe node | grep -A1 desktop.local/display   # 10 allocatable
 kubectl apply -f examples/x11-client-pod.yaml            # xterm appears
 ```
 
+## Host terminal from the desktop
+
+The mwm root menu has a **"Host Terminal"** entry: an xterm (in the
+container, where the X stack lives — the host deliberately has no GUI
+packages) whose shell is on the **host**, via ssh over loopback (the
+container shares the host network namespace).
+
+Enable it by giving host-prep a target account:
+
+```sh
+sudo ./install.sh --shell-user alice          # podman flow
+sudo ./install.sh --host-prep-only --shell-user alice   # k8s flow
+# --shell-user defaults to $SUDO_USER (whoever ran sudo)
+```
+
+What that sets up:
+
+- a dedicated ed25519 keypair in `/etc/desktop-container/` — **root-only
+  on the host** (no non-root host user can read it) and mounted read-only
+  into the container, where a boot script installs a `desktop`-owned copy
+  and generates the `ssh host` client config (loopback, fixed user,
+  `NoHostAuthenticationForLocalhost`);
+- a restricted `authorized_keys` entry for the target user:
+  `from="127.0.0.1,::1"`, no port/agent/X11 forwarding;
+- sshd enabled if it wasn't running. `--uninstall` removes the key
+  material and the authorized_keys entry but deliberately leaves sshd
+  as-is — whether the host runs sshd is the admin's call.
+
+A failed "Host Terminal" click keeps its window open with the reason and
+the enablement command (`/usr/local/bin/host-terminal` wrapper) instead of
+flashing shut.
+
+Security framing: the desktop container is `--privileged`, so container
+root already has host-root-equivalent power; this key adds a *convenient*
+path for the unprivileged `desktop` user to a *specific* host account,
+with the ssh audit trail in the host journal. Without `--shell-user`
+everything degrades gracefully — preflight WARNs and the menu entry
+fails; the rest of the desktop is unaffected.
+
 ## Verification checklist (on the target host)
 
 ```sh

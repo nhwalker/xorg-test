@@ -93,6 +93,13 @@ for d in /tmp/.X11-unix /run/desktop-audio; do
     fi
 done
 
+# --- host terminal (loopback ssh) ---------------------------------------------
+if [ -f /etc/desktop-container/host-shell-key ]; then
+    pass "host shell material mounted (Host Terminal -> ssh as '$(cat /etc/desktop-container/shell-user 2>/dev/null || echo '?')')"
+else
+    warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: install.sh [--host-prep-only] --shell-user <user> on the host"
+fi
+
 # --- NVIDIA coherence ----------------------------------------------------------
 drv=$(find /usr/lib64 /usr/lib -name nvidia_drv.so 2>/dev/null | head -n1)
 if [ -e /dev/nvidiactl ] && [ -z "$drv" ]; then
