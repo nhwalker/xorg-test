@@ -21,6 +21,12 @@ fail() {
     podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null | tail -30 >&2 || true
     echo "---- diagnostics: preflight ----" >&2
     podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
+    if command -v k3s >/dev/null; then
+        echo "---- diagnostics: k3s state ----" >&2
+        k3s kubectl get nodes,pods -A -o wide >&2 2>/dev/null || true
+        k3s kubectl describe pod x11-client-demo x11-client-gated >&2 2>/dev/null || true
+        journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -30 >&2 || true
+    fi
     exit 1
 }
 
@@ -97,8 +103,11 @@ phase2() {
 
     log p2 "install k3s (SELinux policy interplay is out of scope: permissive for this phase)"
     setenforce 0
-    curl -sfL https://get.k3s.io | sh - >/dev/null
-    wait_for 30 5 "k3s node ready" \
+    # traefik/metrics-server: not needed, and their image pulls over the
+    # VM's user-mode NAT slow down node readiness considerably.
+    curl -sfL https://get.k3s.io \
+        | INSTALL_K3S_EXEC="--disable traefik --disable metrics-server" sh - >/dev/null
+    wait_for 60 5 "k3s node ready" \
         sh -c "k3s kubectl get nodes | grep -q ' Ready'"
 
     log p2 "import images + helm"
