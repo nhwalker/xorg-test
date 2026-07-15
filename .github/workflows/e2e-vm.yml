@@ -47,9 +47,12 @@ jobs:
           sudo -E ci/build-bases.sh
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
-          sudo podman save -o ci/vm/images.tar \
-            localhost/desktop-container:latest localhost/desktop-device-plugin:latest
-          sudo chmod 644 ci/vm/images.tar
+          # One archive per image: podman-save's docker-archive format
+          # silently collapses multiple images into the FIRST one with all
+          # tags attached (the plugin tag ends up naming the desktop image).
+          sudo podman save -o ci/vm/images-desktop.tar localhost/desktop-container:latest
+          sudo podman save -o ci/vm/images-plugin.tar localhost/desktop-device-plugin:latest
+          sudo chmod 644 ci/vm/images-desktop.tar ci/vm/images-plugin.tar
       - name: run VM e2e
         run: ci/vm/vm-e2e.sh
       - name: upload artifacts

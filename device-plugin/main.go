@@ -307,6 +307,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	// First thing, before any I/O: an empty log stream from this pod means
+	// the container is not running this binary at all.
+	log.Printf("desktop-device-plugin starting: resource=%s slots=%d pluginDir=%s x11Dir=%s",
+		cfg.resourceName, cfg.slots, cfg.pluginDir, cfg.x11Dir)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if err := run(ctx, cfg); err != nil && ctx.Err() == nil {

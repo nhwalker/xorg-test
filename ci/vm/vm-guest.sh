@@ -32,8 +32,10 @@ fail() {
         echo "---- diagnostics: node allocatable ----" >&2
         k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' >&2 2>/dev/null || true
         echo "" >&2
+        echo "---- diagnostics: pod images actually running ----" >&2
+        k3s kubectl get pods -A -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGEID:.status.containerStatuses[0].imageID' >&2 2>&1 || true
         echo "---- diagnostics: device-plugin logs ----" >&2
-        k3s kubectl logs ds/plugin-desktop-device-plugin --tail=30 >&2 2>/dev/null || true
+        k3s kubectl logs ds/plugin-desktop-device-plugin --tail=30 >&2 2>&1 || true
         echo "---- diagnostics: kubelet plugin dir ----" >&2
         ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
         k3s kubectl describe pod x11-client-demo x11-client-gated >&2 2>/dev/null || true
@@ -64,7 +66,14 @@ phase1() {
     dnf -y -q install podman pulseaudio-utils >/dev/null
 
     log p1 "load prebuilt images"
-    podman load -q -i /tmp/images.tar >/dev/null
+    podman load -q -i /tmp/images-desktop.tar >/dev/null
+    podman load -q -i /tmp/images-plugin.tar >/dev/null
+    # Guard against tag/content mix-ups in the archive plumbing (a combined
+    # podman-save archive once shipped the desktop image under BOTH tags).
+    ep=$(podman image inspect localhost/desktop-device-plugin:latest \
+        --format '{{index .Config.Entrypoint 0}}' || true)
+    [ "$ep" = /desktop-device-plugin ] \
+        || fail "plugin image has wrong entrypoint '$ep' - archive tag mix-up?"
 
     log p1 "real install.sh (quadlet, shell user ${SUDO_USER:-rocky})"
     ./install.sh --no-build --no-gpu
@@ -123,7 +132,15 @@ phase2() {
         sh -c "k3s kubectl get nodes | grep -q ' Ready'"
 
     log p2 "import images + helm"
-    k3s ctr images import /tmp/images.tar >/dev/null
+    k3s ctr images import /tmp/images-desktop.tar >/dev/null
+    k3s ctr images import /tmp/images-plugin.tar >/dev/null
+    # Same guard as phase1, containerd side: both refs must exist and be
+    # DIFFERENT images, or the plugin daemonset silently runs systemd.
+    ddig=$(k3s ctr images ls | awk '$1 == "localhost/desktop-container:latest" {print $3}')
+    pdig=$(k3s ctr images ls | awk '$1 == "localhost/desktop-device-plugin:latest" {print $3}')
+    if [ -z "$ddig" ] || [ -z "$pdig" ] || [ "$ddig" = "$pdig" ]; then
+        fail "containerd image import broken: desktop='$ddig' plugin='$pdig' (must both exist and differ)"
+    fi
     curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
         | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
 

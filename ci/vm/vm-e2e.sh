@@ -66,7 +66,8 @@ vm_ssh true || fail "VM never became reachable"
 log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
 scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null repo.tgz images.tar rocky@127.0.0.1:/tmp/
+    -o UserKnownHostsFile=/dev/null repo.tgz images-desktop.tar images-plugin.tar \
+    rocky@127.0.0.1:/tmp/
 
 log "phase 1: quadlet flow (real install.sh, real Xorg, SELinux enforcing)"
 vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-guest.sh phase1' \
