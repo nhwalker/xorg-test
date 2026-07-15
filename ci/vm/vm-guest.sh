@@ -57,10 +57,15 @@ phase1() {
     log p1 "Xorg actually serves the virtio display, rootless"
     # Generous first-boot window: cold caches, first session start.
     wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
-    podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo | head -3
-    owner=$(podman exec desktop ps -o user= -C Xorg | head -1)
-    [ "$owner" = desktop ] || fail "Xorg runs as '$owner', want desktop"
-    podman exec desktop loginctl list-sessions --no-pager | grep -q seat0 \
+    # NOTE: no `| head` / `| grep -q` on pipelines out of podman exec -
+    # under pipefail an early-exiting consumer SIGPIPEs the producer and
+    # set -e kills the script with no message.
+    podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null \
+        || fail "xdpyinfo could not talk to :0"
+    podman exec -u desktop -e DISPLAY=:0 desktop sh -c 'xdpyinfo | sed -n 1,3p' || true
+    owner=$(podman exec desktop sh -c 'ps -o user= -C Xorg | head -1' || true)
+    [ "$owner" = desktop ] || fail "Xorg runs as '${owner:-nobody}', want desktop"
+    podman exec desktop sh -c 'loginctl list-sessions --no-pager | grep -q seat0' \
         || fail "no seat0 session"
 
     log p1 "mwm session is up"
@@ -68,7 +73,7 @@ phase1() {
 
     log p1 "audio: HDA device visible, pulse socket reachable from VM host"
     podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
-        wpctl status | grep -qi 'alsa' || fail "no ALSA device in wireplumber"
+        sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
     PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
         || fail "pulse socket unreachable from VM host"
 
