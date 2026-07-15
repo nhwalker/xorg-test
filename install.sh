@@ -180,7 +180,8 @@ fi
 if [ ! -f "$STATE_DIR/default-target" ]; then
     systemctl get-default > "$STATE_DIR/default-target"
 fi
-if dm_unit=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null); then
+if [ -e /etc/systemd/system/display-manager.service ] \
+   && dm_unit=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null); then
     dm=$(basename "$dm_unit")
     log "disabling display manager: $dm"
     echo "$dm" > "$STATE_DIR/display-manager"

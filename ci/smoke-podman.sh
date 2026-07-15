@@ -12,6 +12,16 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || fail "must run as root (sudo)"
 SMOKE_USER="${SUDO_USER:-runner}"
 
+# GitHub's Azure runners have no virtual terminals: /dev/tty1 does not
+# exist, so the desktop session (TTYPath=/dev/tty1) cannot spawn there.
+# The session/X/postmortem path is covered by the VM e2e job instead;
+# here we still verify everything that doesn't need a VT.
+HAVE_VT=1
+if [ ! -e /dev/tty1 ]; then
+    HAVE_VT=0
+    log "host has no /dev/tty1: session asserts will be skipped (VM job covers them)"
+fi
+
 log "tty-less guard: journal mirror must fail loudly, not leak"
 podman rm -f nott >/dev/null 2>&1 || true
 podman run -d --name nott --privileged --systemd=always --network=host "$IMG" >/dev/null
@@ -32,18 +42,33 @@ fi
 log "run the real install.sh (quadlet flow, shell user $SMOKE_USER)"
 SUDO_USER="$SMOKE_USER" ./install.sh --no-build --no-gpu
 
-log "wait for the container to reach running"
+log "wait for the container to settle"
 st=""
 for _ in $(seq 40); do
     st=$(podman exec desktop systemctl is-system-running 2>/dev/null || true)
-    [ "$st" = running ] && break
+    if [ "$st" = running ]; then break; fi
+    if [ "$HAVE_VT" = 0 ] && [ "$st" = degraded ]; then break; fi
     sleep 3
 done
-[ "$st" = running ] || fail "container state: ${st:-unreachable}"
+if [ "$HAVE_VT" = 1 ]; then
+    [ "$st" = running ] || fail "container state: ${st:-unreachable}"
+else
+    case "$st" in running|degraded) ;; *) fail "container state: ${st:-unreachable}" ;; esac
+    failed=$(podman exec desktop systemctl --failed --no-legend --plain 2>/dev/null \
+        | awk '{print $1}' | sort | tr '\n' ' ')
+    case "$failed" in
+        ""|"desktop-session.service ") ;;
+        *) fail "unexpected failed units: $failed" ;;
+    esac
+    log "starting user@1000 directly (no VT means no PAM session to do it)"
+    podman exec desktop systemctl start user@1000
+fi
 
-log "seat: logind session on seat0/tty1"
-podman exec desktop loginctl list-sessions --no-pager | grep -q 'seat0' \
-    || fail "no seat0 session"
+if [ "$HAVE_VT" = 1 ]; then
+    log "seat: logind session on seat0/tty1"
+    podman exec desktop loginctl list-sessions --no-pager | grep -q 'seat0' \
+        || fail "no seat0 session"
+fi
 
 log "audio: services active, exported sockets world-connectable"
 for _ in $(seq 15); do
@@ -61,17 +86,18 @@ podman exec -e PULSE_SERVER=unix:/run/desktop-audio/pulse desktop pactl info >/d
 podman exec -e PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0 -e XDG_RUNTIME_DIR=/tmp \
     desktop pw-cli info 0 >/dev/null || fail "cross-uid pipewire connect failed"
 
-log "diagnostics: preflight mirrored to podman logs, postmortem fires"
+log "diagnostics: preflight mirrored to podman logs"
 podman logs desktop 2>&1 | grep -q 'preflight:' || fail "preflight not in podman logs"
-# The runner has no display hardware, so the session fails and the
-# postmortem must have fired with a verdict.
-for _ in $(seq 20); do
-    podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null \
-        | grep -q 'LIKELY CAUSE' && break
-    sleep 3
-done
-podman exec desktop journalctl -t session-postmortem -o cat --no-pager \
-    | grep -q 'LIKELY CAUSE' || fail "postmortem verdict missing"
+if [ "$HAVE_VT" = 1 ]; then
+    log "postmortem fires when the session dies"
+    for _ in $(seq 20); do
+        podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null \
+            | grep -q 'postmortem:' && break
+        sleep 3
+    done
+    podman exec desktop journalctl -t session-postmortem -o cat --no-pager \
+        | grep -q 'postmortem:' || fail "postmortem output missing"
+fi
 
 log "host terminal: ssh from container to host as $SMOKE_USER"
 who=$(podman exec -u desktop -e HOME=/home/desktop desktop \

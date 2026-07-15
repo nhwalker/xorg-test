@@ -11,7 +11,18 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
 
 log()  { echo "== vm-guest($1): $2"; }
-fail() { echo "FAIL: vm-guest: $*" >&2; exit 1; }
+fail() {
+    echo "FAIL: vm-guest: $*" >&2
+    echo "---- diagnostics: podman logs desktop (tail) ----" >&2
+    podman logs desktop 2>&1 | tail -80 >&2 || true
+    echo "---- diagnostics: Xorg log (tail) ----" >&2
+    podman exec desktop sh -c 'tail -40 /home/desktop/.local/share/xorg/Xorg.0.log' >&2 2>/dev/null || true
+    echo "---- diagnostics: postmortem ----" >&2
+    podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null | tail -30 >&2 || true
+    echo "---- diagnostics: preflight ----" >&2
+    podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
+    exit 1
+}
 
 wait_for() { # tries interval description command...
     local tries="$1" interval="$2" desc="$3"
@@ -44,7 +55,8 @@ phase1() {
     wait_for 40 3 "systemd running in container" container_running
 
     log p1 "Xorg actually serves the virtio display, rootless"
-    wait_for 30 3 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
+    # Generous first-boot window: cold caches, first session start.
+    wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
     podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo | head -3
     owner=$(podman exec desktop ps -o user= -C Xorg | head -1)
     [ "$owner" = desktop ] || fail "Xorg runs as '$owner', want desktop"
