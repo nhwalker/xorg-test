@@ -29,8 +29,15 @@ fail() {
     if command -v k3s >/dev/null; then
         echo "---- diagnostics: k3s state ----" >&2
         k3s kubectl get nodes,pods -A -o wide >&2 2>/dev/null || true
+        echo "---- diagnostics: node allocatable ----" >&2
+        k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' >&2 2>/dev/null || true
+        echo "" >&2
+        echo "---- diagnostics: device-plugin logs ----" >&2
+        k3s kubectl logs ds/plugin-desktop-device-plugin --tail=30 >&2 2>/dev/null || true
+        echo "---- diagnostics: kubelet plugin dir ----" >&2
+        ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
         k3s kubectl describe pod x11-client-demo x11-client-gated >&2 2>/dev/null || true
-        journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -30 >&2 || true
+        journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
     fi
     exit 1
 }
