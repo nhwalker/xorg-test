@@ -95,34 +95,53 @@ func TestPluginEndToEnd(t *testing.T) {
 		t.Fatalf("initial health %q, want Unhealthy (no X socket yet)", h)
 	}
 
-	// ...flips Healthy when the X socket appears.
-	if err := os.WriteFile(filepath.Join(x11Dir, "X0"), nil, 0o666); err != nil {
-		t.Fatalf("create fake X0: %v", err)
-	}
-	deadline := time.After(10 * time.Second)
-	for {
-		type recvResult struct {
-			resp *pluginapi.ListAndWatchResponse
-			err  error
-		}
-		rc := make(chan recvResult, 1)
-		go func() {
+	// Single background reader: all further stream messages flow through
+	// one channel so no update can be consumed by an orphaned Recv.
+	updates := make(chan *pluginapi.ListAndWatchResponse)
+	go func() {
+		for {
 			r, err := stream.Recv()
-			rc <- recvResult{r, err}
-		}()
-		select {
-		case r := <-rc:
-			if r.err != nil {
-				t.Fatalf("ListAndWatch recv: %v", r.err)
+			if err != nil {
+				close(updates)
+				return
 			}
-			if r.resp.Devices[0].Health == pluginapi.Healthy {
-				goto healthy
-			}
-		case <-deadline:
-			t.Fatal("devices never became Healthy after X0 appeared")
+			updates <- r
 		}
+	}()
+
+	// A stale regular file (what an ungracefully killed desktop leaves
+	// behind) must NOT count as healthy: health = a successful connect.
+	x0 := filepath.Join(x11Dir, "X0")
+	if err := os.WriteFile(x0, nil, 0o666); err != nil {
+		t.Fatalf("create stale X0 file: %v", err)
 	}
-healthy:
+	select {
+	case r := <-updates:
+		t.Fatalf("stale X0 regular file triggered an update: %v", r.Devices[0].Health)
+	case <-time.After(500 * time.Millisecond):
+		// no update while only the stale file exists: correct
+	}
+
+	// ...flips Healthy when a REAL X socket starts accepting connections.
+	if err := os.Remove(x0); err != nil {
+		t.Fatalf("remove stale X0: %v", err)
+	}
+	xlis, err := net.Listen("unix", x0)
+	if err != nil {
+		t.Fatalf("listen fake X socket: %v", err)
+	}
+	defer xlis.Close()
+	select {
+	case r, ok := <-updates:
+		if !ok {
+			t.Fatal("ListAndWatch stream closed unexpectedly")
+		}
+		if h := r.Devices[0].Health; h != pluginapi.Healthy {
+			t.Fatalf("update after X socket appeared has health %q, want Healthy", h)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("devices never became Healthy after the X socket appeared")
+	}
 
 	// 3. Allocate: exactly the two socket mounts and three env vars.
 	alloc, err := client.Allocate(ctx, &pluginapi.AllocateRequest{

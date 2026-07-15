@@ -12,10 +12,12 @@ pass() { echo "preflight: PASS: $*"; }
 warn() { echo "preflight: WARN: $*"; }
 fail() { echo "preflight: FAIL: $*"; }
 
-if command -v runuser >/dev/null; then
-    as_desktop() { runuser -u desktop -- "$@" 2>/dev/null; }
+# setpriv, not runuser: no PAM session, so no pam_unix open/close noise in
+# the journal on every boot.
+if command -v setpriv >/dev/null; then
+    as_desktop() { setpriv --reuid=desktop --regid=desktop --init-groups "$@" 2>/dev/null; }
 else
-    warn "runuser not available; user-perspective checks run as root (less accurate)"
+    warn "setpriv not available; user-perspective checks run as root (less accurate)"
     as_desktop() { "$@" 2>/dev/null; }
 fi
 
@@ -29,7 +31,7 @@ shopt -u nullglob
 if [ ${#cards[@]} -gt 0 ]; then
     pass "DRM devices visible: ${cards[*]}"
 else
-    fail "no /dev/dri/card* visible: X cannot start. Container not privileged, or host has no KMS video device and no GPU was injected"
+    fail "no /dev/dri/card* visible: X cannot start. Container not privileged, host has no KMS video device, or (NVIDIA-driver host without GPU injection) nvidia_drm.modeset=1 is missing from the kernel cmdline"
 fi
 
 if [ ${#events[@]} -gt 0 ]; then
@@ -54,7 +56,7 @@ fi
 if [ -d /run/udev/data ] && [ -n "$(ls -A /run/udev/data 2>/dev/null)" ]; then
     pass "host udev database mounted at /run/udev"
 else
-    fail "host udev database missing or empty: libinput/logind cannot enumerate devices. Quadlet must mount Volume=/run/udev:/run/udev:ro"
+    fail "host udev database missing or empty: libinput/logind cannot enumerate devices. Mount the host's /run/udev read-only into the container (quadlet Volume=/run/udev:/run/udev:ro, or the chart's hostPaths.udev)"
 fi
 
 # --- foreign seat tags (host seat attachments not undone) --------------------

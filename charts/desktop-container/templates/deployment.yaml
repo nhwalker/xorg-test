@@ -73,8 +73,10 @@ spec:
           {{- if .Values.readinessProbe.enabled }}
           readinessProbe:
             exec:
-              # Ready = Xorg is actually serving the display.
-              command: ["test", "-S", "/tmp/.X11-unix/X0"]
+              # Ready = a real X connection succeeds. A bare socket-file
+              # test would false-positive on a stale socket left by an
+              # ungracefully killed desktop.
+              command: ["xdpyinfo", "-display", ":0"]
             initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
           {{- end }}
@@ -108,9 +110,10 @@ spec:
         - name: run
           emptyDir:
             medium: Memory
+        # Disk-backed on purpose: X clients dumping large files into /tmp
+        # should not consume RAM (the X11 socket dir is a separate hostPath).
         - name: tmp
-          emptyDir:
-            medium: Memory
+          emptyDir: {}
         - name: udev
           hostPath:
             path: {{ .Values.hostPaths.udev }}

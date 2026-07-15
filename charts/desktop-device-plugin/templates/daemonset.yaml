@@ -13,9 +13,9 @@ spec:
       labels:
         {{- include "desktop-device-plugin.selectorLabels" . | nindent 8 }}
     spec:
-      # Keep the resource advertised even on cordoned/pressured nodes,
-      # like other device plugins.
-      priorityClassName: system-node-critical
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       containers:
         - name: device-plugin
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

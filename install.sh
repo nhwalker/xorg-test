@@ -127,6 +127,9 @@ uninstall() {
 
     rm -rf "$STATE_DIR"
     log "uninstalled. The container image ($IMAGE) was kept; remove with: podman rmi $IMAGE"
+    if [ -f /etc/cdi/nvidia.yaml ]; then
+        log "note: /etc/cdi/nvidia.yaml was kept (host-level CDI spec); remove with: rm /etc/cdi/nvidia.yaml"
+    fi
     exit 0
 }
 [ "$UNINSTALL" = 1 ] && uninstall
@@ -282,6 +285,16 @@ fi
 
 # --- 7. Quadlet (skipped with --host-prep-only) -------------------------------
 if [ "$HOST_PREP_ONLY" = 0 ]; then
+    # Two desktops must never run at once: they would fight over the VT and
+    # DRM master. Warn if this host looks like a kubernetes node that may
+    # also run the desktop chart.
+    for u in kubelet k3s k3s-agent; do
+        if systemctl is-active --quiet "$u" 2>/dev/null; then
+            warn "$u is active on this host: do NOT deploy the desktop-container"
+            warn "Helm chart AND this quadlet service simultaneously (two X servers"
+            warn "would contend for the VT/GPU). Use --host-prep-only for k8s hosts."
+        fi
+    done
     log "installing quadlet unit to $QUADLET_DIR/desktop.container"
     mkdir -p "$QUADLET_DIR"
     sed "s|^Image=.*|Image=$IMAGE|" "$REPO_DIR/quadlet/desktop.container" \

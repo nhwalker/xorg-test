@@ -34,7 +34,7 @@ initPerms:
 # image's STOPSIGNAL (SIGRTMIN+3).
 terminationGracePeriodSeconds: 60
 
-# Ready only when Xorg is actually serving the display.
+# Ready only when a real X connection succeeds (xdpyinfo handshake).
 readinessProbe:
   enabled: true
   initialDelaySeconds: 5

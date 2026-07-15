@@ -55,6 +55,13 @@ podman build --network=none -t localhost/desktop-container:latest -f Containerfi
 touch the network. `--base-image REF` points the app build at a base from
 a registry instead.
 
+> **Point-release drift:** the Rocky repos pin major version `9` while
+> UBI tracks the current 9.x point release. Around release boundaries the
+> two package sets can briefly conflict and the base build fails (loudly,
+> at dnf resolution). Workaround: temporarily pin the Rocky baseurls to
+> the matching point release under `dl.rockylinux.org/vault/rocky/`, or
+> wait for the mirrors to catch up.
+
 ### Why UBI + Rocky repos?
 
 The image is based on `registry.access.redhat.com/ubi9/ubi`, but UBI's repos
@@ -140,6 +147,15 @@ all of them (a systemd drop-in works for the unit) to move the session.
   bind-mounts for the host's `nvidia_drv.so` / `libglxserver_nvidia.so` to
   the GPU drop-in. If your host keeps them elsewhere, add the mounts to
   `/etc/containers/systemd/desktop.container.d/10-gpu.conf` manually.
+- **No-GPU mode on an NVIDIA-driver host:** `/dev/dri/card*` is provided
+  by the `nvidia-drm` module, which only registers a KMS node with
+  `nvidia_drm.modeset=1` on the kernel command line. Without it, the
+  modesetting fallback has no device and preflight reports
+  "no /dev/dri/card* visible".
+- **CDI spec staleness:** `/etc/cdi/nvidia.yaml` pins driver library paths
+  and versions. After a host driver update, container creation fails until
+  you rerun `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` (or
+  rerun `install.sh`).
 
 ## Using the display
 
@@ -217,7 +233,14 @@ modesetting on `/dev/dri` exactly like the no-GPU podman flow.
 Verify: `kubectl logs deploy/desktop | grep preflight:` (same
 PASS/WARN/FAIL report), `grep postmortem:` on session failures, and the
 same `kubectl exec` spot-checks as the podman checklist below. The pod
-turns Ready only when Xorg serves `/tmp/.X11-unix/X0`.
+turns Ready only when a real X connection succeeds (`xdpyinfo`), so a
+stale socket file never reads as Ready.
+
+> **One desktop per host:** never run the quadlet service and the k8s
+> deployment at the same time — two X servers would contend for the VT
+> and DRM master. On a k8s node, use `install.sh --host-prep-only` (it
+> never installs the quadlet); `install.sh` warns if it detects an active
+> kubelet/k3s when installing the podman service.
 
 ## Client pods via the desktop device plugin
 
@@ -261,9 +284,10 @@ Semantics worth knowing:
   the display is shareable; the count is just the max number of concurrent
   client pods. Resource name, slot count, DISPLAY, and paths are all chart
   values (must match the desktop deployment's).
-- **Health gating**: slots are Healthy only while `X<display>` exists in
-  the X socket dir, so client pods stay Pending until the desktop's Xorg
-  is actually serving. Audio sockets don't gate health.
+- **Health gating**: slots are Healthy only while a connection to the X
+  socket actually succeeds (a stale socket file left by a killed desktop
+  doesn't count), so client pods stay Pending until the desktop's Xorg is
+  really serving. Audio sockets don't gate health.
 - **Audio**: pulse and PipeWire-native clients work via the injected env
   alone. ALSA-only apps additionally need `alsa-plugins-pulseaudio` in
   their image plus the two-stanza `/etc/asound.conf` shown in the Audio
@@ -326,7 +350,8 @@ mirrored to the console by `journal-console.service`, a `journalctl -f`
 forwarder writing to `/dev/console`. (This is why the quadlet passes
 `--tty`: without it the runtime creates no `/dev/console`, and PID 1's
 stdout is no alternative — systemd redirects its own stdio to `/dev/null`
-during boot.) Two things to look for:
+during boot. Without a tty the unit fails loudly rather than silently
+writing the journal into a RAM-backed file.) Two things to look for:
 
 - the boot-time preflight report: one `PASS`/`WARN`/`FAIL` line per
   assumption (devices visible, udev db mounted, gid alignment, seat tags,
