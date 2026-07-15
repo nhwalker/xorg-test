@@ -134,7 +134,12 @@ done
 [ "$okc" = 1 ] || fail "exported audio sockets not connectable cross-uid"
 
 log "diagnostics: preflight mirrored to podman logs"
-podman logs desktop 2>&1 | grep -q 'preflight:' || fail "preflight not in podman logs"
+pf=0
+for _ in $(seq 10); do
+    podman logs desktop 2>&1 | grep -q 'preflight:' && { pf=1; break; }
+    sleep 3
+done
+[ "$pf" = 1 ] || fail "preflight not in podman logs (journal mirror not flushing?)"
 if [ "$HAVE_VT" = 1 ]; then
     log "postmortem fires when the session dies"
     for _ in $(seq 20); do
