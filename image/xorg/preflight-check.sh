@@ -49,7 +49,7 @@ fi
 if [ -e /dev/tty1 ]; then
     pass "/dev/tty1 present"
 else
-    fail "/dev/tty1 missing: the session cannot attach to a VT (container not privileged?)"
+    fail "/dev/tty1 missing: the session cannot attach to a VT. The runtime did not expose VT devices AND the ensure-vt-devices mknod fallback failed (kernel without VT support?)"
 fi
 
 # --- host udev database ------------------------------------------------------

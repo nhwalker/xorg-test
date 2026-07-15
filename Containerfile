@@ -16,6 +16,7 @@ FROM ${BASE_IMAGE}
 # the host device nodes' gids at boot (see Xwrapper.config comments).
 COPY image/xorg/Xwrapper.config /etc/X11/Xwrapper.config
 COPY image/xorg/xorg-gpu-conf.sh /usr/local/bin/xorg-gpu-conf.sh
+COPY image/xorg/ensure-vt-devices.sh /usr/local/bin/ensure-vt-devices.sh
 COPY image/xorg/align-device-groups.sh /usr/local/bin/align-device-groups.sh
 COPY image/xorg/preflight-check.sh /usr/local/bin/preflight-check.sh
 
@@ -26,7 +27,8 @@ COPY image/session/host-shell-setup.sh /usr/local/bin/host-shell-setup.sh
 COPY image/session/host-terminal /usr/local/bin/host-terminal
 COPY image/session/xinitrc.desktop /etc/X11/xinit/xinitrc.desktop
 COPY image/session/mwmrc /etc/skel/.mwmrc
-RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/start-session \
+RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/ensure-vt-devices.sh \
+        /usr/local/bin/start-session \
         /usr/local/bin/session-postmortem /usr/local/bin/align-device-groups.sh \
         /usr/local/bin/preflight-check.sh /usr/local/bin/host-shell-setup.sh \
         /usr/local/bin/host-terminal /etc/X11/xinit/xinitrc.desktop

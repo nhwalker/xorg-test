@@ -60,6 +60,12 @@ jobs:
         run: |
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+      - name: neutralize host AppArmor unix-chkpwd profile
+        # Ubuntu's path-attached unix-chkpwd profile confines the CONTAINER's
+        # EL9 unix_chkpwd on exec (dac_read_search denied), breaking every
+        # PAM account phase inside the container. Runner-only interference;
+        # RHEL-family hosts have no AppArmor.
+        run: sudo apparmor_parser -R /etc/apparmor.d/unix-chkpwd 2>/dev/null || true
       - name: podman smoke suite (real install.sh on the ephemeral runner)
         run: sudo -E ci/smoke-podman.sh
       - name: collect diagnostics on failure
