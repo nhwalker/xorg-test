@@ -75,8 +75,10 @@ spec:
             exec:
               # Ready = a real X connection succeeds. A bare socket-file
               # test would false-positive on a stale socket left by an
-              # ungracefully killed desktop.
-              command: ["xdpyinfo", "-display", ":0"]
+              # ungracefully killed desktop. Output discarded: kubelet logs
+              # a "short write" error every probe otherwise (xdpyinfo
+              # prints ~37KB).
+              command: ["sh", "-c", "xdpyinfo -display :0 >/dev/null"]
             initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
           {{- end }}

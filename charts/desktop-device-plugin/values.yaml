@@ -1,3 +1,5 @@
+fullnameOverride: ""
+
 image:
   repository: desktop-device-plugin
   tag: latest

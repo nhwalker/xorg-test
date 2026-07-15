@@ -122,7 +122,7 @@ phase2() {
 
     log p2 "deploy desktop chart and wait for real readiness (xdpyinfo probe)"
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    helm install desktop charts/desktop-container \
+    helm install desktop charts/desktop-container --set fullnameOverride=desktop \
         --set image.repository=localhost/desktop-container --set image.pullPolicy=Never
     wait_for 40 5 "desktop deployment ready" \
         sh -c "k3s kubectl get deploy desktop -o jsonpath='{.status.readyReplicas}' | grep -q 1"
