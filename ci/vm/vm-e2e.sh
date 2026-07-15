@@ -25,8 +25,16 @@ mon_cmd() {
     echo "$1" | socat - "UNIX-CONNECT:$MON" >/dev/null
 }
 screendump() {
-    mon_cmd "screendump $PWD/$ART/$1.ppm"
+    # -f png needs QEMU >= 7.1. Monitor errors are invisible (socat output
+    # is discarded), so check the file materialized and fall back to the
+    # universally supported PPM dump if it didn't.
+    mon_cmd "screendump $PWD/$ART/$1.png -f png"
     sleep 2
+    if ! [ -s "$ART/$1.png" ]; then
+        log "WARNING: png screendump failed (qemu < 7.1?); falling back to ppm"
+        mon_cmd "screendump $PWD/$ART/$1.ppm"
+        sleep 2
+    fi
 }
 
 log "prepare disk and cloud-init seed"
