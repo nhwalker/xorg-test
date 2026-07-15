@@ -30,7 +30,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q shellcheck
-          shellcheck -S error install.sh ci/*.sh \
+          shellcheck -S error install.sh ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/session-postmortem \
             image/session/host-terminal

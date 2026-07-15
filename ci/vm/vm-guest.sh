@@ -182,8 +182,37 @@ phase2() {
     log p2 "phase2 passed"
 }
 
-case "${1:?phase1|phase2}" in
+play_audio() {
+    log pa "play noise through all three client paths from an xterm on :0"
+    # 1.5s of full-scale stereo white noise; random s16 samples cannot be
+    # mistaken for silence by the host-side capture check.
+    python3 - <<'EOF'
+import os, wave
+w = wave.open("/tmp/noise.wav", "wb")
+w.setnchannels(2)
+w.setsampwidth(2)
+w.setframerate(44100)
+w.writeframes(os.urandom(44100 * 2 * 2 * 3 // 2))
+w.close()
+EOF
+    podman cp /tmp/noise.wav desktop:/tmp/noise.wav
+    podman exec desktop rm -f /tmp/audio-ok
+    # The xterm is the X11 app doing the playing. Its exit status does not
+    # reliably reflect the -e command, so the inner script leaves a marker
+    # only if every player path (pulse, pipewire, ALSA) succeeded.
+    podman exec -u desktop -e DISPLAY=:0 -e HOME=/home/desktop \
+        -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
+        timeout 60 xterm -T audio-proof -geometry 80x12+120+320 -e \
+        sh -c 'paplay /tmp/noise.wav && pw-play /tmp/noise.wav && aplay -q /tmp/noise.wav && touch /tmp/audio-ok' \
+        || true
+    podman exec desktop test -f /tmp/audio-ok \
+        || fail "a player failed inside the xterm (paplay/pw-play/aplay)"
+    log pa "all three client paths played"
+}
+
+case "${1:?phase1|phase2|play-audio}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
+    play-audio) play_audio ;;
     *) fail "unknown phase $1" ;;
 esac

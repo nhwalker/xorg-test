@@ -36,6 +36,12 @@ screendump() {
         sleep 2
     fi
 }
+# Audio analogue of screendump: wavcapture taps the guest's HDA output
+# into a WAV in the artifacts dir. Each start/stop cycle occupies capture
+# index 0 (verified: the index is a list position, freed by stopcapture).
+# stopcapture also finalizes the WAV header - never skip it.
+audio_capture_start() { mon_cmd "wavcapture $PWD/$ART/$1.wav snd0 44100 16 2"; sleep 1; }
+audio_capture_stop()  { mon_cmd "stopcapture 0"; sleep 1; }
 
 log "prepare disk and cloud-init seed"
 qemu-img create -f qcow2 -b "$IMG" -F qcow2 "$DISK" 20G >/dev/null
@@ -82,6 +88,19 @@ vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-gu
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase1 failed"; }
 screendump desktop-quadlet
 
+log "audio: record an xterm playing via pulse, pipewire and ALSA paths"
+audio_capture_start audio-quadlet
+# The guest call blocks until playback finishes, so the capture window
+# brackets it. On failure still stop the capture: the partial WAV is a
+# debugging artifact and stopping finalizes its header.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio' \
+    || { audio_capture_stop; fail "guest play-audio failed"; }
+audio_capture_stop
+# ~4.5s play across three players; capture only accrues frames while a
+# stream is running, so require >=3s of frames and >=5% peak amplitude.
+python3 check-audio.py "$ART/audio-quadlet.wav" 3 0.05 \
+    || fail "quadlet audio capture is empty or silent"
+
 log "input hotplug: add a virtio keyboard while X runs"
 before=$(vm_ssh 'ls /dev/input/event* | wc -l')
 mon_cmd "device_add virtio-keyboard-pci,id=hotkbd"
@@ -95,6 +114,18 @@ log "phase 2: k3s + charts (client pod on the same display)"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
+
+log "audio: client pod plays through the device-plugin-injected PULSE_SERVER"
+audio_capture_start audio-k3s-client
+# pacat reads raw s16le from stdin and honors the PULSE_SERVER env the
+# device plugin injected into the pod; 264600 bytes = exactly 1.5s.
+# Retry: the desktop pod was just recreated by the health-gating test and
+# its pipewire user session can lag Xorg by a few seconds.
+vm_ssh 'sudo k3s kubectl exec x11-client-gated -- sh -c "for i in 1 2 3 4 5; do head -c 264600 /dev/urandom | pacat --rate=44100 --format=s16le --channels=2 && exit 0; sleep 3; done; exit 1"' \
+    || { audio_capture_stop; fail "client pod playback failed"; }
+audio_capture_stop
+python3 check-audio.py "$ART/audio-k3s-client.wav" 1 0.05 \
+    || fail "k3s client audio capture is empty or silent"
 
 log "collect guest diagnostics"
 vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo k3s kubectl get pods -A -o wide' \
