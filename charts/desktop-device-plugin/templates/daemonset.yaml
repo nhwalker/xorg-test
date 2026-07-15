@@ -43,11 +43,12 @@ spec:
             # Registration + serving socket (needs rw).
             - name: plugin-dir
               mountPath: {{ .Values.hostPaths.kubeletPluginDir }}
-            # Only for the health stat of X<display>; clients get the host
-            # path injected by Allocate, not this mount.
+            # For the health CONNECT to X<display> - rw because unix
+            # connect(2) needs write access to the socket inode (a ro
+            # mount pins every slot Unhealthy). Clients get the host path
+            # injected by Allocate, not this mount.
             - name: x11-socket
               mountPath: {{ .Values.hostPaths.x11Socket }}
-              readOnly: true
       volumes:
         - name: plugin-dir
           hostPath:

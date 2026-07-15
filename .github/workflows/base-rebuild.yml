@@ -1,0 +1,47 @@
+# Weekly from-scratch rebuild of both base images: early warning for
+# Rocky/UBI point-release drift (dnf conflicts fail this loudly before
+# anyone needs a base rebuild), and keeps the GHCR :latest bases fresh
+# with security updates.
+name: base-rebuild
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: ghcr login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: rebuild bases from scratch
+        run: |
+          sudo podman build --pull --no-cache -t localhost/desktop-container-base:latest -f Containerfile.base .
+          sudo podman build --pull --no-cache -t localhost/desktop-device-plugin-base:latest -f Containerfile.plugin.base .
+      - name: offline app layers still build on the fresh bases
+        run: |
+          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+          sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+      - name: push refreshed bases (content tag + latest)
+        env:
+          PUSH_BASES: "1"
+        run: |
+          set -euo pipefail
+          tag() { sha256sum "$@" | sha256sum | cut -c1-16; }
+          for spec in \
+            "desktop-container-base Containerfile.base image/rocky9.repo" \
+            "desktop-device-plugin-base Containerfile.plugin.base device-plugin/go.mod device-plugin/go.sum"; do
+            set -- $spec
+            name=$1; shift
+            t="base-$(tag "$@")"
+            sudo podman tag "localhost/$name:latest" "$REGISTRY/$name:$t"
+            sudo podman tag "localhost/$name:latest" "$REGISTRY/$name:latest"
+            sudo podman push "$REGISTRY/$name:$t"
+            sudo podman push "$REGISTRY/$name:latest"
+          done

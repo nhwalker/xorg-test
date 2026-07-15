@@ -1,3 +1,5 @@
+fullnameOverride: ""
+
 image:
   # Registry image by default. For a local, never-pulled image (built with
   # podman and imported into the node's runtime), set repository to the

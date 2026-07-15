@@ -7,6 +7,7 @@ Type=oneshot
 RemainAfterExit=yes
 # "-" prefix: diagnostics log but never block the session; the
 # Xwrapper.config escape hatch is the manual fallback.
+ExecStart=-/usr/local/bin/ensure-vt-devices.sh
 ExecStart=-/usr/local/bin/align-device-groups.sh
 ExecStart=-/usr/local/bin/host-shell-setup.sh
 ExecStart=-/usr/local/bin/preflight-check.sh

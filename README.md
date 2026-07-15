@@ -344,6 +344,37 @@ with the ssh audit trail in the host journal. Without `--shell-user`
 everything degrades gracefully — preflight WARNs and the menu entry
 fails; the rest of the desktop is unaffected.
 
+## CI
+
+Three workflows verify everything short of NVIDIA hardware, on every PR:
+
+- **`ci.yml`** — static checks (go fmt/vet/test, shellcheck, helm lint +
+  golden template assertions in `ci/helm-assertions.sh`, kubeconform) and
+  the builds: base images are pulled from GHCR by content hash
+  (`ci/build-bases.sh`, rebuilt only when their inputs change) and the
+  application layers build with `--network=none` — the offline invariant
+  is a CI gate. Then `ci/smoke-podman.sh` runs the **real `install.sh`**
+  on the ephemeral runner (quadlet install, seat undo, sshd/key
+  provisioning) and asserts the boot: seat0 session, audio sockets +
+  cross-uid connects, preflight/postmortem in the logs, the tty-less
+  journal-mirror guard, end-to-end `ssh host`, and clean `--uninstall`.
+- **`e2e-vm.yml`** — the full stack in a KVM-booted **Rocky 9 VM** with
+  virtio display/input/sound and **SELinux enforcing**
+  (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`): real Xorg starts rootless on
+  a real KMS device, mwm runs, audio devices appear, the host-terminal
+  ssh path works under SELinux (validating the restorecon handling),
+  input hotplug is exercised via QEMU device_add, then the machine
+  switches to k3s and deploys both charts — real readiness, allocatable
+  `desktop.local/display`, a client pod on the display, and the
+  health-gating Pending behavior. Screendumps of the virtual display are
+  uploaded as artifacts.
+- **`base-rebuild.yml`** — weekly from-scratch base rebuilds pushed to
+  GHCR: early warning for Rocky/UBI point-release drift.
+
+Not covered by CI (needs the real machine): everything NVIDIA (CDI
+injection, `nvidia_drv.so`, GL acceleration) and physical-input quirks
+beyond what virtio emulates.
+
 ## Verification checklist (on the target host)
 
 ```sh
