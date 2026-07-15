@@ -19,6 +19,9 @@ spec:
   containers:
     - name: xterm
       image: desktop-container:latest
+      # :latest defaults the pull policy to Always, which tries a registry
+      # pull even when the image is already present on the node.
+      imagePullPolicy: IfNotPresent
       command: ["xterm", "-geometry", "80x24+200+200", "-title", "device-plugin demo"]
       resources:
         limits:
