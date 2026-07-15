@@ -72,7 +72,19 @@ else
         *) fail "unexpected failed units: $failed" ;;
     esac
     log "starting user@1000 directly (no VT means no PAM session to do it)"
-    podman exec desktop systemctl start user@1000
+    AUDIO_VIA_SYSTEMD=1
+    if ! podman exec desktop systemctl start user@1000 2>&1; then
+        AUDIO_VIA_SYSTEMD=0
+        log "user@1000 refused to start on this runner; its journal follows, then falling back to direct daemon start"
+        podman exec desktop journalctl -u user@1000 -u user-runtime-dir@1000 --no-pager -o cat 2>/dev/null | tail -30 || true
+        podman exec desktop mkdir -p /run/user/1000
+        podman exec desktop chown desktop:desktop /run/user/1000
+        # umask 000 stands in for the UMask= drop-in the user services carry.
+        for d in pipewire wireplumber pipewire-pulse; do
+            podman exec -d -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
+                sh -c "umask 000; exec $d"
+        done
+    fi
 fi
 
 if [ "$HAVE_VT" = 1 ]; then
@@ -82,14 +94,26 @@ if [ "$HAVE_VT" = 1 ]; then
 fi
 
 log "audio: services active, exported sockets world-connectable"
-for _ in $(seq 15); do
-    ok=$(podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
-        systemctl --user is-active pipewire wireplumber pipewire-pulse 2>/dev/null \
-        | grep -c '^active$' || true)
-    [ "$ok" = 3 ] && break
-    sleep 2
-done
-[ "$ok" = 3 ] || fail "audio services not all active"
+ok=0
+if [ "${AUDIO_VIA_SYSTEMD:-1}" = 1 ]; then
+    for _ in $(seq 15); do
+        ok=$(podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
+            systemctl --user is-active pipewire wireplumber pipewire-pulse 2>/dev/null \
+            | grep -c '^active$' || true)
+        [ "$ok" = 3 ] && break
+        sleep 2
+    done
+    [ "$ok" = 3 ] || fail "audio services not all active"
+else
+    for _ in $(seq 15); do
+        ok=$(podman exec desktop sh -c \
+            'pgrep -x pipewire >/dev/null && pgrep -x wireplumber >/dev/null && pgrep -f pipewire-pulse >/dev/null' \
+            && echo 3 || echo 0)
+        [ "$ok" = 3 ] && break
+        sleep 2
+    done
+    [ "$ok" = 3 ] || fail "audio daemons not all running (direct-start fallback)"
+fi
 podman exec desktop sh -c 'test -S /run/desktop-audio/pulse && test -S /run/desktop-audio/pipewire-0' \
     || fail "exported audio sockets missing"
 podman exec -e PULSE_SERVER=unix:/run/desktop-audio/pulse desktop pactl info >/dev/null \
