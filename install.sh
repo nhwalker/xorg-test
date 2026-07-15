@@ -136,10 +136,7 @@ uninstall() {
         fi
     fi
     rm -rf "$HOST_SHELL_DIR"
-    if [ -f "$STATE_DIR/sshd-state" ]; then
-        log "disabling sshd (it was inactive before install)"
-        systemctl disable --now sshd 2>/dev/null || true
-    fi
+    log "note: sshd is left as-is (whether this host runs sshd is the admin's call)"
 
     log "removing audio client configuration"
     rm -f "$PULSE_CLIENT_CONF"
@@ -268,10 +265,14 @@ fi
 if [ -n "$SHELL_USER" ] && getent passwd "$SHELL_USER" >/dev/null; then
     if command -v sshd >/dev/null || [ -x /usr/sbin/sshd ]; then
         log "configuring host shell for user '$SHELL_USER'"
-        if ! systemctl is-active --quiet sshd; then
-            echo "sshd-was-inactive" > "$STATE_DIR/sshd-state"
-            systemctl enable --now sshd
-        fi
+        shell_login=$(getent passwd "$SHELL_USER" | cut -d: -f7)
+        case "$shell_login" in
+            */nologin|*/false)
+                warn "user '$SHELL_USER' has shell $shell_login; ssh logins will fail - pick a login-capable user" ;;
+        esac
+        # sshd is enabled if needed but never touched by --uninstall: whether
+        # the host should keep running sshd is the admin's call, not ours.
+        systemctl is-active --quiet sshd || systemctl enable --now sshd
         mkdir -p "$HOST_SHELL_DIR"
         if [ ! -f "$HOST_SHELL_DIR/host-shell-key" ]; then
             ssh-keygen -q -t ed25519 -N '' -C desktop-container-host-shell \
@@ -292,6 +293,12 @@ if [ -n "$SHELL_USER" ] && getent passwd "$SHELL_USER" >/dev/null; then
         if ! grep -q desktop-container-host-shell "$ak"; then
             printf 'from="127.0.0.1,::1",no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' \
                 "$(cat "$HOST_SHELL_DIR/host-shell-key.pub")" >> "$ak"
+        fi
+        # SELinux: files created here by root can carry the wrong context,
+        # and sshd then silently ignores authorized_keys (AVC in the audit
+        # log is the only trace). No-op on non-SELinux hosts.
+        if command -v restorecon >/dev/null; then
+            restorecon -R "$shell_home/.ssh" || true
         fi
     else
         warn "openssh-server not installed; skipping host shell setup (dnf install openssh-server, then rerun)"

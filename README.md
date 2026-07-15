@@ -329,8 +329,13 @@ What that sets up:
   `NoHostAuthenticationForLocalhost`);
 - a restricted `authorized_keys` entry for the target user:
   `from="127.0.0.1,::1"`, no port/agent/X11 forwarding;
-- sshd enabled if it wasn't (recorded; `--uninstall` reverts it, removes
-  the key material and the authorized_keys entry).
+- sshd enabled if it wasn't running. `--uninstall` removes the key
+  material and the authorized_keys entry but deliberately leaves sshd
+  as-is — whether the host runs sshd is the admin's call.
+
+A failed "Host Terminal" click keeps its window open with the reason and
+the enablement command (`/usr/local/bin/host-terminal` wrapper) instead of
+flashing shut.
 
 Security framing: the desktop container is `--privileged`, so container
 root already has host-root-equivalent power; this key adds a *convenient*

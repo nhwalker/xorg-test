@@ -6,7 +6,7 @@ Menu DefaultRootMenu
     "New Terminal"      f.exec "xterm &"
 !   Shell on the HOST via loopback ssh (see host-shell-setup.sh); requires
 !   install.sh --shell-user on the host.
-    "Host Terminal"     f.exec "xterm -T host -e ssh host &"
+    "Host Terminal"     f.exec "xterm -T host -e /usr/local/bin/host-terminal &"
     "Refresh"           f.refresh
     "Pack Icons"        f.pack_icons
      no-label           f.separator
