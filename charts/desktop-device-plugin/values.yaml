@@ -24,6 +24,11 @@ hostPaths:
   # Kubelet's device-plugin registration directory.
   kubeletPluginDir: /var/lib/kubelet/device-plugins
 
+# Optional. Note: kubernetes only permits the built-in system-node-critical /
+# system-cluster-critical classes for pods in the kube-system namespace, so
+# set one of those only when installing this chart with -n kube-system.
+priorityClassName: ""
+
 resources: {}
 nodeSelector: {}
 tolerations: []

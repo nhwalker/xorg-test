@@ -13,4 +13,7 @@ DPY="${DESKTOP_DISPLAY:-:0}"
 # stack is up even if socket activation never gets poked from inside.
 systemctl --user start pipewire.service pipewire-pulse.service wireplumber.service || true
 
-exec /usr/bin/startx /etc/X11/xinit/xinitrc.desktop -- "$DPY" "$VT" -keeptty -novtswitch -nolisten tcp
+# No -novtswitch: Xorg must VT_ACTIVATE its own VT at startup so the session
+# becomes visible even if the console was left on another VT (chvt, rescue
+# shell); with the flag it would render invisibly on an inactive VT.
+exec /usr/bin/startx /etc/X11/xinit/xinitrc.desktop -- "$DPY" "$VT" -keeptty -nolisten tcp

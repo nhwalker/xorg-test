@@ -73,7 +73,7 @@ type desktopPlugin struct {
 
 	mu      sync.Mutex
 	healthy bool
-	watches []chan bool // one per active ListAndWatch stream
+	watches []chan struct{} // wake-up signals, one per ListAndWatch stream
 }
 
 func (p *desktopPlugin) xSocketPath() string {
@@ -85,12 +85,21 @@ func (p *desktopPlugin) xSocketPath() string {
 	return filepath.Join(p.cfg.x11Dir, "X"+num)
 }
 
+// checkHealth verifies Xorg is actually serving by connecting to the
+// socket. A bare stat would report healthy on a stale socket file left
+// behind by an ungracefully killed desktop (the host dir persists).
 func (p *desktopPlugin) checkHealth() bool {
-	_, err := os.Stat(p.xSocketPath())
-	return err == nil
+	conn, err := net.DialTimeout("unix", p.xSocketPath(), time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
-// setHealth records the current health and notifies streams on change.
+// setHealth records the current health and wakes streams on change. The
+// channels carry no data: streams read the current state themselves, so a
+// dropped wake-up can never strand a stale value (the next one re-syncs).
 func (p *desktopPlugin) setHealth(h bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -100,10 +109,16 @@ func (p *desktopPlugin) setHealth(h bool) {
 	p.healthy = h
 	for _, ch := range p.watches {
 		select {
-		case ch <- h:
+		case ch <- struct{}{}:
 		default:
 		}
 	}
+}
+
+func (p *desktopPlugin) currentHealth() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.healthy
 }
 
 func (p *desktopPlugin) devices(healthy bool) []*pluginapi.Device {
@@ -128,10 +143,9 @@ func (p *desktopPlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty
 }
 
 func (p *desktopPlugin) ListAndWatch(_ *pluginapi.Empty, stream pluginapi.DevicePlugin_ListAndWatchServer) error {
-	ch := make(chan bool, 1)
+	ch := make(chan struct{}, 1)
 	p.mu.Lock()
 	p.watches = append(p.watches, ch)
-	healthy := p.healthy
 	p.mu.Unlock()
 	defer func() {
 		p.mu.Lock()
@@ -144,12 +158,19 @@ func (p *desktopPlugin) ListAndWatch(_ *pluginapi.Empty, stream pluginapi.Device
 		p.mu.Unlock()
 	}()
 
-	if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: p.devices(healthy)}); err != nil {
+	lastSent := p.currentHealth()
+	if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: p.devices(lastSent)}); err != nil {
 		return err
 	}
 	for {
 		select {
-		case h := <-ch:
+		case <-ch:
+			// Always transmit the CURRENT state, never a queued snapshot.
+			h := p.currentHealth()
+			if h == lastSent {
+				continue
+			}
+			lastSent = h
 			if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: p.devices(h)}); err != nil {
 				return err
 			}

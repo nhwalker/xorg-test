@@ -13,7 +13,10 @@ After=systemd-journald.service
 # -b dumps the whole current boot on first start; --cursor-file resumes
 # after the last forwarded entry if this unit ever restarts, so entries
 # are not duplicated.
-ExecStart=/bin/sh -c 'exec journalctl -q -b -f -o short-iso --no-hostname --cursor-file=/run/journal-console.cursor > /dev/console 2>&1'
+# Guard: without a runtime-allocated tty there is no /dev/console character
+# device, and the redirect would CREATE A REGULAR FILE on the /dev tmpfs
+# that grows with the journal (silent memory leak). Fail loudly instead.
+ExecStart=/bin/sh -c '[ -c /dev/console ] || { echo "journal-console: /dev/console is not a character device; run the container with --tty (podman) / tty: true (k8s)" >&2; exit 1; }; exec journalctl -q -b -f -o short-iso --no-hostname --cursor-file=/run/journal-console.cursor > /dev/console 2>&1'
 Restart=always
 RestartSec=2
 
