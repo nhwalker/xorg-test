@@ -40,8 +40,14 @@ for _ in $(seq 20); do
 done
 
 log "VT devices present (ensure-vt-devices mknod fallback covers podman)"
-podman exec desktop test -e /dev/tty1 \
-    || fail "/dev/tty1 missing in container despite ensure-vt-devices"
+# Retry: ensure-vt-devices runs from xorg-conf.service, which may still be
+# starting when the container first answers exec.
+vt=0
+for _ in $(seq 15); do
+    podman exec desktop test -e /dev/tty1 2>/dev/null && { vt=1; break; }
+    sleep 2
+done
+[ "$vt" = 1 ] || fail "/dev/tty1 missing in container despite ensure-vt-devices"
 
 log "wait for the container to settle (X may or may not drive this runner's virtual GPU)"
 st=""
