@@ -1,0 +1,25 @@
+# Proof-by-construction pod for the device plugin (test-only).
+#
+# It requests the desktop resource and declares NOTHING else: no env, no
+# volumeMounts, no volumes. So at runtime, every one of DISPLAY /
+# PULSE_SERVER / PIPEWIRE_REMOTE and the /tmp/.X11-unix + /run/desktop-audio
+# sockets is present ONLY because the device plugin's Allocate injected it.
+# vm-guest.sh verify-plugin asserts exactly that, then plays a beep through
+# each audio client path from inside this pod.
+#
+# sleep infinity keeps it alive so the host can exec assertions and timed
+# playbacks into it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: plugin-verify
+spec:
+  restartPolicy: Never
+  containers:
+    - name: verify
+      image: localhost/desktop-container:latest
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          desktop.local/display: 1
