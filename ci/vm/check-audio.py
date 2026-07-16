@@ -71,7 +71,20 @@ def goertzel_mag(samples, freq, sr):
 
 dominant = None
 if expected_hz is not None and left:
-    scan = left[:32768]               # ~0.75s is plenty of frequency resolution
+    # Analyse the LOUDEST ~0.75s window, not the first one: pipewire starts
+    # playing later than pulse, so a fixed leading window can land in the
+    # silence before the tone and read the scan floor. Pick the window with
+    # the most energy (a lone startup click can't outweigh a 1.5s tone).
+    N = 32768
+    if len(left) <= N:
+        scan = left
+    else:
+        best_start, best_e = 0, -1.0
+        for start in range(0, len(left) - N + 1, 4096):
+            e = sum(s * s for s in left[start:start + N])
+            if e > best_e:
+                best_e, best_start = e, start
+        scan = left[best_start:best_start + N]
     best_f, best_m = 0.0, -1.0
     f = 100.0
     while f <= 4000.0:
