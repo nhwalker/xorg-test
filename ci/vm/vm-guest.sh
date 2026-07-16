@@ -221,8 +221,12 @@ play_audio() { # $1: pulse | pipewire | alsa | k3s-client
             # desktop pod was just recreated by the health-gating test and
             # its pipewire session can lag Xorg by a few seconds.
             gen_tone 660 /tmp/tone.raw
+            # Hard timeout per try: pacat BLOCKS (does not fail) when the
+            # injected pulse socket exists but isn't accepting yet, so an
+            # un-bounded exec hangs the whole job for hours. timeout turns
+            # a stuck connect into a retryable failure.
             for _ in 1 2 3 4 5; do
-                if k3s kubectl exec -i x11-client-gated -- \
+                if timeout 20 k3s kubectl exec -i x11-client-gated -- \
                     pacat --rate=44100 --format=s16le --channels=2 \
                     < /tmp/tone.raw; then
                     log pa "k3s client pod played via injected PULSE_SERVER"
