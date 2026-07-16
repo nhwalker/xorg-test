@@ -120,19 +120,12 @@ for path in pulse pipewire alsa; do
         || fail "$path audio capture is empty or silent"
 done
 
-log "input hotplug: add a virtio keyboard while X runs"
-before=$(vm_ssh 'ls /dev/input/event* | wc -l')
-mon_cmd "device_add virtio-keyboard-pci,id=hotkbd"
-sleep 5
-after=$(vm_ssh 'ls /dev/input/event* | wc -l')
-[ "$after" -gt "$before" ] || fail "hotplugged keyboard did not appear ($before -> $after)"
-vm_ssh 'sudo podman exec desktop sh -c "grep -c \"Adding input device\" /home/desktop/.local/share/xorg/Xorg.0.log"' \
-    > "$ART/xorg-input-count.txt" || true
-
 log "input: type into an xterm with the real virtual keyboard, verify the app got it"
 # Prove the whole input path (QEMU HID -> evdev -> Xorg -> focused app), not
 # just that a device enumerates. A sink xterm runs `read`; we click it to
-# focus (mwm is click-to-focus) and type via QMP input-send-event.
+# focus (mwm is click-to-focus) and type via QMP input-send-event. Runs
+# BEFORE the hotplug test: a rootless-X session cannot take a hotplugged
+# input device via logind, so the boot-time keyboard is the working one.
 res=$(vm_ssh 'sudo podman exec -u desktop -e DISPLAY=:0 desktop \
     sh -c "xdpyinfo | awk \"/dimensions:/{print \\\$2; exit}\""')
 [ -n "$res" ] || fail "could not read display resolution for input injection"
@@ -145,6 +138,15 @@ screendump input-typed
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check inputok' \
     || { vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null' \
          > "$ART/input-proof.txt" 2>&1 || true; fail "typed text did not reach the app"; }
+
+log "input hotplug: add a virtio keyboard while X runs"
+before=$(vm_ssh 'ls /dev/input/event* | wc -l')
+mon_cmd "device_add virtio-keyboard-pci,id=hotkbd"
+sleep 5
+after=$(vm_ssh 'ls /dev/input/event* | wc -l')
+[ "$after" -gt "$before" ] || fail "hotplugged keyboard did not appear ($before -> $after)"
+vm_ssh 'sudo podman exec desktop sh -c "grep -c \"Adding input device\" /home/desktop/.local/share/xorg/Xorg.0.log"' \
+    > "$ART/xorg-input-count.txt" || true
 
 log "phase 2: k3s + charts (client pod on the same display)"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
