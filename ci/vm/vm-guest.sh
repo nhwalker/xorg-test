@@ -326,11 +326,35 @@ play_audio_pod() { # $1: pulse | pipewire | alsa (from the requesting pod)
     fail "client pod $path playback failed after 5 tries"
 }
 
-case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin}" in
+input_sink_start() {
+    # A sink xterm reads one line and records it. Geometry must match the
+    # click coordinate the host computes (100x30 at +250+200 -> centre ~550,395).
+    log is "launch a sink xterm that records one typed line"
+    podman exec desktop rm -f /tmp/inputproof
+    podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
+        xterm -T inputtest -geometry 100x30+250+200 -e \
+        sh -c 'read x; printf "%s" "$x" > /tmp/inputproof; sleep 60'
+}
+
+input_sink_check() { # $1: expected text
+    local expected="${1:?expected text}" got=""
+    for _ in 1 2 3 4 5; do
+        got=$(podman exec desktop cat /tmp/inputproof 2>/dev/null || true)
+        [ -n "$got" ] && break
+        sleep 1
+    done
+    [ "$got" = "$expected" ] \
+        || fail "input sink recorded '$got', want '$expected' (keys did not reach the focused app)"
+    log is "the app received the typed text over the real input path: $got"
+}
+
+case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
     play-audio-pod) play_audio_pod "${2:-}" ;;
     verify-plugin) verify_plugin ;;
+    input-sink-start) input_sink_start ;;
+    input-sink-check) input_sink_check "${2:-}" ;;
     *) fail "unknown phase $1" ;;
 esac
