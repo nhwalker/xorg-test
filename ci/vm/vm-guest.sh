@@ -138,6 +138,7 @@ phase2() {
     log p2 "import images + helm"
     k3s ctr images import /tmp/images-desktop.tar >/dev/null
     k3s ctr images import /tmp/images-plugin.tar >/dev/null
+    k3s ctr images import /tmp/images-testclient.tar >/dev/null
     # Same guard as phase1, containerd side: both refs must exist and be
     # DIFFERENT images, or the plugin daemonset silently runs systemd.
     ddig=$(k3s ctr images ls | awk '$1 == "localhost/desktop-container:latest" {print $3}')
@@ -299,11 +300,11 @@ verify_plugin() {
     log vp "verify-plugin passed"
 }
 
-play_audio_pod() { # $1: pulse | pipewire | alsa (from the requesting pod)
-    # Same beep-per-path convention as the in-container test, but played
-    # from plugin-verify using ONLY the injected env - so success proves the
-    # plugin wired that client path, not the desktop image's local session.
-    local path="${1:?pulse|pipewire|alsa}" player freq
+play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default plugin-verify)
+    # Same beep-per-path convention as the in-container test, but played from a
+    # requesting pod using ONLY the injected env - so success proves the plugin
+    # wired that client path, not the desktop image's own local session.
+    local path="${1:?pulse|pipewire|alsa}" pod="${2:-$VPOD}" player freq
     case "$path" in
         pulse)    freq=440;  player='paplay /tmp/t.wav' ;;
         pipewire) freq=880;  player='pw-play /tmp/t.wav' ;;
@@ -312,18 +313,32 @@ play_audio_pod() { # $1: pulse | pipewire | alsa (from the requesting pod)
     esac
     gen_tone "$freq" /tmp/tone-pod.wav
     # Stream the WAV in over exec stdin (no kubectl cp -> no tar dependency).
-    timeout 20 k3s kubectl exec -i "$VPOD" -- sh -c 'cat > /tmp/t.wav' \
-        < /tmp/tone-pod.wav || fail "could not copy tone into the pod"
+    timeout 20 k3s kubectl exec -i "$pod" -- sh -c 'cat > /tmp/t.wav' \
+        < /tmp/tone-pod.wav || fail "could not copy tone into $pod"
     # Retry + hard timeout: the audio client can lag briefly, and a stuck
     # connect must fail rather than hang (see the earlier pacat hang).
     for _ in 1 2 3 4 5; do
-        if timeout 20 k3s kubectl exec "$VPOD" -- sh -c "$player"; then
-            log pa "client pod played ${freq}Hz via $path"
+        if timeout 20 k3s kubectl exec "$pod" -- sh -c "$player"; then
+            log pa "$pod played ${freq}Hz via $path"
             return 0
         fi
         sleep 3
     done
-    fail "client pod $path playback failed after 5 tries"
+    fail "$pod $path playback failed after 5 tries"
+}
+
+verify_testclient() {
+    log tc "apply a LEAN non-desktop client (no server stack) that requests the resource"
+    k3s kubectl apply -f ci/vm/testclient-pod.yaml
+    wait_for 30 4 "testclient running" \
+        sh -c "k3s kubectl get pod x11-testclient -o jsonpath='{.status.phase}' | grep -q Running"
+    # The image ships no Xorg server or session, so a working display here can
+    # only come from the plugin's injected DISPLAY + X-socket mount.
+    got=$(k3s kubectl exec x11-testclient -- printenv DISPLAY 2>/dev/null || true)
+    [ "$got" = ":0" ] || fail "testclient DISPLAY='$got', want :0 (plugin injection)"
+    timeout 20 k3s kubectl exec x11-testclient -- sh -c 'xdpyinfo >/dev/null' \
+        || fail "lean client could not open the display via injected env"
+    log tc "lean client opened the display with only injected env"
 }
 
 input_sink_start() {
@@ -359,7 +374,7 @@ apply_client() { # $1: pod name
 verify_scale() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml  # helm (unlike k3s kubectl) needs this
     log vs "free all slots so the capacity test accounts exactly"
-    k3s kubectl delete pod plugin-verify x11-client-gated x11-client-demo \
+    k3s kubectl delete pod plugin-verify x11-client-gated x11-client-demo x11-testclient \
         --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
     # Shrink capacity to 2 while nothing holds a slot (clean re-register; no
@@ -402,12 +417,13 @@ verify_scale() {
     log vs "verify-scale passed"
 }
 
-case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-scale|input-sink-start|input-sink-check}" in
+case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-scale|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
-    play-audio-pod) play_audio_pod "${2:-}" ;;
+    play-audio-pod) play_audio_pod "${2:-}" "${3:-}" ;;
     verify-plugin) verify_plugin ;;
+    verify-testclient) verify_testclient ;;
     verify-scale) verify_scale ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;

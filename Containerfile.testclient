@@ -1,0 +1,27 @@
+# CI-only test fixture: a LEAN client image that is NOT the desktop image.
+# It ships only the standard user-space X and audio clients - no Xorg server,
+# no pipewire daemon, no wireplumber, no session/systemd, no window manager.
+# The e2e uses it to prove the device plugin's injected env + socket mounts are
+# sufficient for an ordinary application container, not just the desktop image.
+#
+# Networked build (dnf); this is a test fixture, not a shipped artifact, so it
+# is exempt from the offline --network=none rule that governs the app layers.
+FROM registry.access.redhat.com/ubi9/ubi
+
+RUN curl -fsSL -o /etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9 \
+        https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
+    && rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+COPY image/rocky9.repo /etc/yum.repos.d/rocky9.repo
+
+# Just the clients: xdpyinfo (X connect), pulse/pipewire/alsa players, and
+# pipewire-alsa so ALSA routes to the injected PIPEWIRE_REMOTE. Deliberately
+# no xorg-x11-server-Xorg / wireplumber / motif.
+RUN dnf -y install \
+        xdpyinfo \
+        pulseaudio-utils \
+        pipewire-utils \
+        pipewire-alsa \
+        alsa-utils \
+    && dnf clean all
+
+CMD ["sleep", "infinity"]
