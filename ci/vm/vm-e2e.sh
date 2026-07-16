@@ -36,6 +36,20 @@ screendump() {
         sleep 2
     fi
 }
+assert_nonblank() { # $1: screendump basename (as passed to screendump)
+    # A live X server that is drawing nothing produces a solid frame; the
+    # grayscale standard deviation collapses to ~0. Real content (the mwm
+    # root stipple + a window) is well above the threshold. This turns the
+    # screendump from a human-eyeball artifact into a pass/fail signal.
+    local f="$ART/$1.png" sd
+    [ -s "$f" ] || f="$ART/$1.ppm"
+    [ -s "$f" ] || fail "screendump $1 was not produced"
+    sd=$(convert "$f" -colorspace Gray -format '%[fx:standard_deviation]' info: 2>/dev/null) \
+        || fail "could not analyze screendump $1 (imagemagick missing?)"
+    awk "BEGIN{ exit !($sd > 0.02) }" \
+        || fail "screendump $1 is blank/near-uniform (grayscale stddev=$sd); X is up but rendering nothing"
+    log "render: $1 is non-blank (grayscale stddev=$sd)"
+}
 # Audio analogue of screendump: wavcapture taps the guest's HDA output
 # into a WAV in the artifacts dir. Each start/stop cycle occupies capture
 # index 0 (verified: the index is a list position, freed by stopcapture).
@@ -87,6 +101,7 @@ log "phase 1: quadlet flow (real install.sh, real Xorg, SELinux enforcing)"
 vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-guest.sh phase1' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase1 failed"; }
 screendump desktop-quadlet
+assert_nonblank desktop-quadlet
 
 log "audio: record each client path (pulse, pipewire, ALSA) individually"
 # One capture cycle per player so every path is acoustically verified on
@@ -116,6 +131,7 @@ log "phase 2: k3s + charts (client pod on the same display)"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
+assert_nonblank desktop-k3s-client
 
 log "plugin: a pod requesting desktop.local/display gets DISPLAY + sockets injected"
 # The verifier pod declares no env/mounts of its own, so these assertions
@@ -124,6 +140,7 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-plugin' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod plugin-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide' \
          > "$ART/plugin-verify-fail.log" 2>&1 || true; fail "plugin injection verification failed"; }
 screendump plugin-verify-window
+assert_nonblank plugin-verify-window
 
 log "plugin: each audio path works from the requesting pod (injected env only)"
 # One capture per path, played from the verifier pod using only injected
