@@ -158,6 +158,15 @@ EOF
         fail "image load broken: desktop='$ddig' plugin='$pdig' (must both exist and differ)"
     fi
 
+    # k3s writes its flannel CNI config + plugin binaries under its own tree,
+    # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
+    # dirs so the pod network comes up (else kubelet stays NetworkNotReady).
+    mkdir -p /etc/crio/crio.conf.d
+    cat > /etc/crio/crio.conf.d/11-k3s-cni.conf <<'EOF'
+[crio.network]
+network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
+EOF
     systemctl enable --now crio >/dev/null 2>&1 || fail "crio failed to start"
     wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
 
