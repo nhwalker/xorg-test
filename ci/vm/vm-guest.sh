@@ -38,7 +38,11 @@ fail() {
         k3s kubectl logs ds/plugin-desktop-device-plugin --tail=30 >&2 2>&1 || true
         echo "---- diagnostics: kubelet plugin dir ----" >&2
         ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
-        k3s kubectl describe pod x11-client-demo x11-client-gated >&2 2>/dev/null || true
+        echo "---- diagnostics: desktop pod audio (export sockets + pipewire procs) ----" >&2
+        k3s kubectl exec deploy/desktop -- sh -c \
+            'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
+            >&2 2>&1 || true
+        k3s kubectl describe pod x11-client-demo x11-client-gated plugin-verify >&2 2>/dev/null || true
         journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
     fi
     exit 1
@@ -281,6 +285,16 @@ verify_plugin() {
         sh -c 'setsid xterm -T plugin-verify -geometry 80x24+150+150 </dev/null >/dev/null 2>&1 &' \
         || true
     sleep 3
+
+    # The pod readiness probe only gates on X, so the desktop's pipewire
+    # session may not be exporting audio yet (a socket FILE can exist without
+    # a listener - especially after the health-gating restart). Wait for the
+    # injected PULSE_SERVER to actually accept before the audio captures run.
+    log vp "wait for the desktop audio export to accept a connection (injected PULSE_SERVER)"
+    timeout 90 k3s kubectl exec "$VPOD" -- \
+        sh -c 'until pactl info >/dev/null 2>&1; do sleep 2; done' \
+        || fail "desktop pulse export never accepted a connection from the requesting pod"
+    log vp "pulse export reachable from the pod"
     log vp "verify-plugin passed"
 }
 
