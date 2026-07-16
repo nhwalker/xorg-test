@@ -182,11 +182,18 @@ phase2() {
     log p2 "phase2 passed"
 }
 
-play_audio() {
-    log pa "play noise through all three client paths from an xterm on :0"
-    # 1.5s of full-scale stereo white noise; random s16 samples cannot be
-    # mistaken for silence by the host-side capture check.
-    python3 - <<'EOF'
+play_audio() { # $1: pulse | pipewire | alsa
+    local path="${1:?pulse|pipewire|alsa}" player
+    case "$path" in
+        pulse)    player='paplay /tmp/noise.wav' ;;
+        pipewire) player='pw-play /tmp/noise.wav' ;;
+        alsa)     player='aplay -q /tmp/noise.wav' ;;
+        *) fail "unknown audio path '$path'" ;;
+    esac
+    # 1.5s of full-scale stereo white noise (once; reused across paths);
+    # random s16 samples cannot be mistaken for silence by the host check.
+    if ! podman exec desktop test -f /tmp/noise.wav 2>/dev/null; then
+        python3 - <<'EOF'
 import os, wave
 w = wave.open("/tmp/noise.wav", "wb")
 w.setnchannels(2)
@@ -195,24 +202,26 @@ w.setframerate(44100)
 w.writeframes(os.urandom(44100 * 2 * 2 * 3 // 2))
 w.close()
 EOF
-    podman cp /tmp/noise.wav desktop:/tmp/noise.wav
+        podman cp /tmp/noise.wav desktop:/tmp/noise.wav
+    fi
+    log pa "play noise via $path from an xterm on :0"
     podman exec desktop rm -f /tmp/audio-ok
     # The xterm is the X11 app doing the playing. Its exit status does not
     # reliably reflect the -e command, so the inner script leaves a marker
-    # only if every player path (pulse, pipewire, ALSA) succeeded.
+    # only when the player succeeded.
     podman exec -u desktop -e DISPLAY=:0 -e HOME=/home/desktop \
         -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
-        timeout 60 xterm -T audio-proof -geometry 80x12+120+320 -e \
-        sh -c 'paplay /tmp/noise.wav && pw-play /tmp/noise.wav && aplay -q /tmp/noise.wav && touch /tmp/audio-ok' \
+        timeout 60 xterm -T "audio-$path" -geometry 80x12+120+320 -e \
+        sh -c "$player && touch /tmp/audio-ok" \
         || true
     podman exec desktop test -f /tmp/audio-ok \
-        || fail "a player failed inside the xterm (paplay/pw-play/aplay)"
-    log pa "all three client paths played"
+        || fail "$path player failed inside the xterm"
+    log pa "$path played"
 }
 
 case "${1:?phase1|phase2|play-audio}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
-    play-audio) play_audio ;;
+    play-audio) play_audio "${2:-}" ;;
     *) fail "unknown phase $1" ;;
 esac

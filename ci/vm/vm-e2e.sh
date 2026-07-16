@@ -88,18 +88,20 @@ vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-gu
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase1 failed"; }
 screendump desktop-quadlet
 
-log "audio: record an xterm playing via pulse, pipewire and ALSA paths"
-audio_capture_start audio-quadlet
-# The guest call blocks until playback finishes, so the capture window
-# brackets it. On failure still stop the capture: the partial WAV is a
-# debugging artifact and stopping finalizes its header.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio' \
-    || { audio_capture_stop; fail "guest play-audio failed"; }
-audio_capture_stop
-# ~4.5s play across three players; capture only accrues frames while a
-# stream is running, so require >=3s of frames and >=5% peak amplitude.
-python3 check-audio.py "$ART/audio-quadlet.wav" 3 0.05 \
-    || fail "quadlet audio capture is empty or silent"
+log "audio: record each client path (pulse, pipewire, ALSA) individually"
+# One capture cycle per player so every path is acoustically verified on
+# its own - an aggregate capture would let one silent path hide behind
+# the others. Each guest call blocks until its 1.5s burst finishes, so
+# the capture window brackets it. On failure still stop the capture: the
+# partial WAV is a debugging artifact and stopping finalizes its header.
+for path in pulse pipewire alsa; do
+    audio_capture_start "audio-quadlet-$path"
+    vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio $path" \
+        || { audio_capture_stop; fail "guest play-audio $path failed"; }
+    audio_capture_stop
+    python3 check-audio.py "$ART/audio-quadlet-$path.wav" 1 0.05 \
+        || fail "$path audio capture is empty or silent"
+done
 
 log "input hotplug: add a virtio keyboard while X runs"
 before=$(vm_ssh 'ls /dev/input/event* | wc -l')
