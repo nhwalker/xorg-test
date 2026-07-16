@@ -1,3 +1,4 @@
 device-plugin/device-plugin
 ci/vm/images-*.tar
 ci/vm/*.qcow2
+__pycache__/

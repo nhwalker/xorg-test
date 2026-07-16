@@ -36,6 +36,12 @@ screendump() {
         sleep 2
     fi
 }
+# Audio analogue of screendump: wavcapture taps the guest's HDA output
+# into a WAV in the artifacts dir. Each start/stop cycle occupies capture
+# index 0 (verified: the index is a list position, freed by stopcapture).
+# stopcapture also finalizes the WAV header - never skip it.
+audio_capture_start() { mon_cmd "wavcapture $PWD/$ART/$1.wav snd0 44100 16 2"; sleep 1; }
+audio_capture_stop()  { mon_cmd "stopcapture 0"; sleep 1; }
 
 log "prepare disk and cloud-init seed"
 qemu-img create -f qcow2 -b "$IMG" -F qcow2 "$DISK" 20G >/dev/null
@@ -82,6 +88,21 @@ vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-gu
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase1 failed"; }
 screendump desktop-quadlet
 
+log "audio: record each client path (pulse, pipewire, ALSA) individually"
+# One capture cycle per player so every path is acoustically verified on
+# its own - an aggregate capture would let one silent path hide behind
+# the others. Each guest call blocks until its 1.5s burst finishes, so
+# the capture window brackets it. On failure still stop the capture: the
+# partial WAV is a debugging artifact and stopping finalizes its header.
+for path in pulse pipewire alsa; do
+    audio_capture_start "audio-quadlet-$path"
+    vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio $path" \
+        || { audio_capture_stop; fail "guest play-audio $path failed"; }
+    audio_capture_stop
+    python3 check-audio.py "$ART/audio-quadlet-$path.wav" 1 0.05 \
+        || fail "$path audio capture is empty or silent"
+done
+
 log "input hotplug: add a virtio keyboard while X runs"
 before=$(vm_ssh 'ls /dev/input/event* | wc -l')
 mon_cmd "device_add virtio-keyboard-pci,id=hotkbd"
@@ -96,8 +117,16 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
 
+log "audio: client pod plays a 660Hz tone through the injected PULSE_SERVER"
+audio_capture_start audio-k3s-client
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio k3s-client' \
+    || { audio_capture_stop; fail "client pod playback failed"; }
+audio_capture_stop
+python3 check-audio.py "$ART/audio-k3s-client.wav" 1 0.05 \
+    || fail "k3s client audio capture is empty or silent"
+
 log "collect guest diagnostics"
-vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo k3s kubectl get pods -A -o wide' \
+vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide' \
     > "$ART/guest-final-state.log" 2>&1 || true
 
 log "vm e2e passed"

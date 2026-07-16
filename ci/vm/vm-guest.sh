@@ -182,8 +182,82 @@ phase2() {
     log p2 "phase2 passed"
 }
 
-case "${1:?phase1|phase2}" in
+gen_tone() { # $1: frequency Hz, $2: outfile (.wav -> WAV, else raw s16le)
+    # 1.5s stereo sine at 60% full scale: audibly a beep in the artifact,
+    # and unmistakably non-silent for the host-side amplitude check.
+    python3 - "$1" "$2" <<'EOF'
+import math, sys, wave
+freq, out = float(sys.argv[1]), sys.argv[2]
+rate, dur, amp = 44100, 1.5, 0.6
+pcm = bytearray()
+for i in range(int(rate * dur)):
+    s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
+    b = s.to_bytes(2, "little", signed=True)
+    pcm += b + b
+if out.endswith(".wav"):
+    w = wave.open(out, "wb")
+    w.setnchannels(2)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    w.writeframes(bytes(pcm))
+    w.close()
+else:
+    with open(out, "wb") as f:
+        f.write(bytes(pcm))
+EOF
+}
+
+play_audio() { # $1: pulse | pipewire | alsa | k3s-client
+    # A distinct pitch per path, so a human listening to the artifacts can
+    # tell which route produced which beep.
+    local path="${1:?pulse|pipewire|alsa|k3s-client}" player freq
+    case "$path" in
+        pulse)    freq=440;  player='paplay /tmp/tone.wav' ;;
+        pipewire) freq=880;  player='pw-play /tmp/tone.wav' ;;
+        alsa)     freq=1320; player='aplay -q /tmp/tone.wav' ;;
+        k3s-client)
+            # Client pod path: pacat reads raw s16le on stdin and honors
+            # the PULSE_SERVER the device plugin injected. Retry: the
+            # desktop pod was just recreated by the health-gating test and
+            # its pipewire session can lag Xorg by a few seconds.
+            gen_tone 660 /tmp/tone.raw
+            # Hard timeout per try: pacat BLOCKS (does not fail) when the
+            # injected pulse socket exists but isn't accepting yet, so an
+            # un-bounded exec hangs the whole job for hours. timeout turns
+            # a stuck connect into a retryable failure.
+            for _ in 1 2 3 4 5; do
+                if timeout 20 k3s kubectl exec -i x11-client-gated -- \
+                    pacat --rate=44100 --format=s16le --channels=2 \
+                    < /tmp/tone.raw; then
+                    log pa "k3s client pod played via injected PULSE_SERVER"
+                    return 0
+                fi
+                sleep 3
+            done
+            fail "client pod playback failed after 5 tries"
+            ;;
+        *) fail "unknown audio path '$path'" ;;
+    esac
+    gen_tone "$freq" /tmp/tone.wav
+    podman cp /tmp/tone.wav desktop:/tmp/tone.wav
+    log pa "play ${freq}Hz tone via $path from an xterm on :0"
+    podman exec desktop rm -f /tmp/audio-ok
+    # The xterm is the X11 app doing the playing. Its exit status does not
+    # reliably reflect the -e command, so the inner script leaves a marker
+    # only when the player succeeded.
+    podman exec -u desktop -e DISPLAY=:0 -e HOME=/home/desktop \
+        -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
+        timeout 60 xterm -T "audio-$path" -geometry 80x12+120+320 -e \
+        sh -c "$player && touch /tmp/audio-ok" \
+        || true
+    podman exec desktop test -f /tmp/audio-ok \
+        || fail "$path player failed inside the xterm"
+    log pa "$path played"
+}
+
+case "${1:?phase1|phase2|play-audio}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
+    play-audio) play_audio "${2:-}" ;;
     *) fail "unknown phase $1" ;;
 esac
