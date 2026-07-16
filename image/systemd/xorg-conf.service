@@ -14,7 +14,7 @@ ExecStart=-/usr/local/bin/align-device-groups.sh
 # NOT re-bind over a leftover socket file, so after a restart the desktop
 # would advertise present-but-dead sockets and every audio client gets
 # ECONNREFUSED. Clear them before the user session brings PipeWire back up.
-ExecStart=-/usr/bin/rm -f /run/desktop-audio/pulse /run/desktop-audio/pipewire-0 /run/desktop-audio/pipewire-0-manager
+ExecStart=-/usr/bin/rm -f /run/desktop-audio/pulse /run/desktop-audio/pipewire-0 /run/desktop-audio/pipewire-0-manager /run/desktop-audio/pipewire-0.lock /run/desktop-audio/pipewire-0-manager.lock
 ExecStart=-/usr/local/bin/host-shell-setup.sh
 ExecStart=-/usr/local/bin/preflight-check.sh
 ExecStart=/usr/local/bin/xorg-gpu-conf.sh

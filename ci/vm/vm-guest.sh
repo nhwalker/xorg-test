@@ -268,33 +268,34 @@ verify_plugin() {
     assert_pod_env PULSE_SERVER unix:/run/desktop-audio/pulse
     assert_pod_env PIPEWIRE_REMOTE /run/desktop-audio/pipewire-0
 
-    log vp "device plugin mounted the DISPLAY + audio sockets"
+    log vp "the injected X socket is mounted and the display works"
     assert_pod_socket /tmp/.X11-unix/X0
-    assert_pod_socket /run/desktop-audio/pulse
-    assert_pod_socket /run/desktop-audio/pipewire-0
-
-    log vp "the DISPLAY actually works from the pod (xdpyinfo via injected env)"
     # sh -c so it uses the injected DISPLAY, not a hardcoded one; bounded so
     # a broken connection fails instead of hanging.
     timeout 20 k3s kubectl exec "$VPOD" -- sh -c 'xdpyinfo >/dev/null' \
         || fail "xdpyinfo could not open the display from the requesting pod"
     log vp "xdpyinfo opened :0 from the pod"
 
+    # The pod readiness probe only gates on Xorg, so the desktop's user
+    # pipewire session (which exports BOTH the pulse and the native pipewire
+    # sockets) can lag X by several seconds - especially on the freshly
+    # restarted pod from the health-gating step. Wait for both sockets to
+    # exist AND pulse to actually accept BEFORE asserting them; otherwise the
+    # socket assertions race the export and flake.
+    log vp "wait for the injected audio export (pulse + pipewire native) to come up"
+    timeout 120 k3s kubectl exec "$VPOD" -- sh -c '
+        until [ -S /run/desktop-audio/pulse ] && [ -S /run/desktop-audio/pipewire-0 ] \
+              && pactl info >/dev/null 2>&1; do sleep 2; done' \
+        || fail "injected audio export never came up in the requesting pod (pulse + pipewire sockets)"
+    log vp "device plugin mounted the audio sockets; export is live"
+    assert_pod_socket /run/desktop-audio/pulse
+    assert_pod_socket /run/desktop-audio/pipewire-0
+
     log vp "spawn an xterm from the pod so the screendump shows a client window"
     timeout 15 k3s kubectl exec "$VPOD" -- \
         sh -c 'setsid xterm -T plugin-verify -geometry 80x24+150+150 </dev/null >/dev/null 2>&1 &' \
         || true
     sleep 3
-
-    # The pod readiness probe only gates on X, so the desktop's pipewire
-    # session may not be exporting audio yet (a socket FILE can exist without
-    # a listener - especially after the health-gating restart). Wait for the
-    # injected PULSE_SERVER to actually accept before the audio captures run.
-    log vp "wait for the desktop audio export to accept a connection (injected PULSE_SERVER)"
-    timeout 90 k3s kubectl exec "$VPOD" -- \
-        sh -c 'until pactl info >/dev/null 2>&1; do sleep 2; done' \
-        || fail "desktop pulse export never accepted a connection from the requesting pod"
-    log vp "pulse export reachable from the pod"
     log vp "verify-plugin passed"
 }
 
