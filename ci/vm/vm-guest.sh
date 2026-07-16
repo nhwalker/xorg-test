@@ -423,10 +423,12 @@ verify_teardown() {
     helm uninstall plugin >/dev/null || fail "helm uninstall plugin failed"
     helm uninstall desktop >/dev/null || fail "helm uninstall desktop failed"
 
-    # Removing the device-plugin daemonset must make the node withdraw the
-    # advertised resource (a lingering resource would strand future schedules).
-    wait_for 30 4 "desktop.local/display withdrawn from the node" \
-        sh -c "! k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' | grep -q 'desktop.local/display'"
+    # Removing the device-plugin daemonset must make the node stop offering the
+    # resource. kubelet drops the allocatable COUNT to 0 promptly but often
+    # keeps the resource key in node status for a while, so assert the count is
+    # 0 (or the key is gone), not that the key vanished.
+    wait_for 30 4 "desktop.local/display no longer allocatable" \
+        sh -c "v=\$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}'); [ -z \"\$v\" ] || [ \"\$v\" = 0 ]"
     # The chart-managed workloads must be gone (get returns non-zero once
     # the objects no longer exist).
     wait_for 20 3 "desktop deployment + plugin daemonset gone" \
