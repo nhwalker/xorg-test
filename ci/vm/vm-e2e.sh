@@ -123,14 +123,16 @@ audio_capture_start audio-k3s-client
 # device plugin injected into the pod; 264600 bytes = exactly 1.5s.
 # Retry: the desktop pod was just recreated by the health-gating test and
 # its pipewire user session can lag Xorg by a few seconds.
-vm_ssh 'sudo k3s kubectl exec x11-client-gated -- sh -c "for i in 1 2 3 4 5; do head -c 264600 /dev/urandom | pacat --rate=44100 --format=s16le --channels=2 && exit 0; sleep 3; done; exit 1"' \
+# Absolute path: EL sudo's secure_path omits /usr/local/bin, where the
+# k3s installer lands (vm-guest.sh is immune - it exports PATH itself).
+vm_ssh 'sudo /usr/local/bin/k3s kubectl exec x11-client-gated -- sh -c "for i in 1 2 3 4 5; do head -c 264600 /dev/urandom | pacat --rate=44100 --format=s16le --channels=2 && exit 0; sleep 3; done; exit 1"' \
     || { audio_capture_stop; fail "client pod playback failed"; }
 audio_capture_stop
 python3 check-audio.py "$ART/audio-k3s-client.wav" 1 0.05 \
     || fail "k3s client audio capture is empty or silent"
 
 log "collect guest diagnostics"
-vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo k3s kubectl get pods -A -o wide' \
+vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide' \
     > "$ART/guest-final-state.log" 2>&1 || true
 
 log "vm e2e passed"
