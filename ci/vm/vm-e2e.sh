@@ -176,6 +176,14 @@ for path in pulse pipewire alsa; do
         || fail "client pod $path audio capture is empty or silent"
 done
 
+log "plugin: concurrent clients share the display, and slots exhaust correctly"
+# Two pods hold both slots and open the display at once; a third stays
+# Pending. Proves the shareable-device concurrency + capacity accounting.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-scale' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo /usr/local/bin/k3s kubectl describe pod x11-client-c' \
+         > "$ART/verify-scale-fail.log" 2>&1 || true; fail "concurrency/exhaustion check failed"; }
+screendump concurrent-clients
+
 log "collect guest diagnostics"
 vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide' \
     > "$ART/guest-final-state.log" 2>&1 || true
