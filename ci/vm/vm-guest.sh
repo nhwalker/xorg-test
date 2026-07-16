@@ -182,29 +182,61 @@ phase2() {
     log p2 "phase2 passed"
 }
 
-play_audio() { # $1: pulse | pipewire | alsa
-    local path="${1:?pulse|pipewire|alsa}" player
+gen_tone() { # $1: frequency Hz, $2: outfile (.wav -> WAV, else raw s16le)
+    # 1.5s stereo sine at 60% full scale: audibly a beep in the artifact,
+    # and unmistakably non-silent for the host-side amplitude check.
+    python3 - "$1" "$2" <<'EOF'
+import math, sys, wave
+freq, out = float(sys.argv[1]), sys.argv[2]
+rate, dur, amp = 44100, 1.5, 0.6
+pcm = bytearray()
+for i in range(int(rate * dur)):
+    s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
+    b = s.to_bytes(2, "little", signed=True)
+    pcm += b + b
+if out.endswith(".wav"):
+    w = wave.open(out, "wb")
+    w.setnchannels(2)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    w.writeframes(bytes(pcm))
+    w.close()
+else:
+    with open(out, "wb") as f:
+        f.write(bytes(pcm))
+EOF
+}
+
+play_audio() { # $1: pulse | pipewire | alsa | k3s-client
+    # A distinct pitch per path, so a human listening to the artifacts can
+    # tell which route produced which beep.
+    local path="${1:?pulse|pipewire|alsa|k3s-client}" player freq
     case "$path" in
-        pulse)    player='paplay /tmp/noise.wav' ;;
-        pipewire) player='pw-play /tmp/noise.wav' ;;
-        alsa)     player='aplay -q /tmp/noise.wav' ;;
+        pulse)    freq=440;  player='paplay /tmp/tone.wav' ;;
+        pipewire) freq=880;  player='pw-play /tmp/tone.wav' ;;
+        alsa)     freq=1320; player='aplay -q /tmp/tone.wav' ;;
+        k3s-client)
+            # Client pod path: pacat reads raw s16le on stdin and honors
+            # the PULSE_SERVER the device plugin injected. Retry: the
+            # desktop pod was just recreated by the health-gating test and
+            # its pipewire session can lag Xorg by a few seconds.
+            gen_tone 660 /tmp/tone.raw
+            for _ in 1 2 3 4 5; do
+                if k3s kubectl exec -i x11-client-gated -- \
+                    pacat --rate=44100 --format=s16le --channels=2 \
+                    < /tmp/tone.raw; then
+                    log pa "k3s client pod played via injected PULSE_SERVER"
+                    return 0
+                fi
+                sleep 3
+            done
+            fail "client pod playback failed after 5 tries"
+            ;;
         *) fail "unknown audio path '$path'" ;;
     esac
-    # 1.5s of full-scale stereo white noise (once; reused across paths);
-    # random s16 samples cannot be mistaken for silence by the host check.
-    if ! podman exec desktop test -f /tmp/noise.wav 2>/dev/null; then
-        python3 - <<'EOF'
-import os, wave
-w = wave.open("/tmp/noise.wav", "wb")
-w.setnchannels(2)
-w.setsampwidth(2)
-w.setframerate(44100)
-w.writeframes(os.urandom(44100 * 2 * 2 * 3 // 2))
-w.close()
-EOF
-        podman cp /tmp/noise.wav desktop:/tmp/noise.wav
-    fi
-    log pa "play noise via $path from an xterm on :0"
+    gen_tone "$freq" /tmp/tone.wav
+    podman cp /tmp/tone.wav desktop:/tmp/tone.wav
+    log pa "play ${freq}Hz tone via $path from an xterm on :0"
     podman exec desktop rm -f /tmp/audio-ok
     # The xterm is the X11 app doing the playing. Its exit status does not
     # reliably reflect the -e command, so the inner script leaves a marker

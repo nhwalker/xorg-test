@@ -117,15 +117,9 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
 
-log "audio: client pod plays through the device-plugin-injected PULSE_SERVER"
+log "audio: client pod plays a 660Hz tone through the injected PULSE_SERVER"
 audio_capture_start audio-k3s-client
-# pacat reads raw s16le from stdin and honors the PULSE_SERVER env the
-# device plugin injected into the pod; 264600 bytes = exactly 1.5s.
-# Retry: the desktop pod was just recreated by the health-gating test and
-# its pipewire user session can lag Xorg by a few seconds.
-# Absolute path: EL sudo's secure_path omits /usr/local/bin, where the
-# k3s installer lands (vm-guest.sh is immune - it exports PATH itself).
-vm_ssh 'sudo /usr/local/bin/k3s kubectl exec x11-client-gated -- sh -c "for i in 1 2 3 4 5; do head -c 264600 /dev/urandom | pacat --rate=44100 --format=s16le --channels=2 && exit 0; sleep 3; done; exit 1"' \
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio k3s-client' \
     || { audio_capture_stop; fail "client pod playback failed"; }
 audio_capture_stop
 python3 check-audio.py "$ART/audio-k3s-client.wav" 1 0.05 \
