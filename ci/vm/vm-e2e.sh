@@ -180,6 +180,13 @@ for path in pulse pipewire alsa; do
         || fail "client pod $path audio capture is empty or silent"
 done
 
+log "plugin: a client can RECORD from the desktop audio (loopback via monitor)"
+# Capture direction, not just playback: record the sink monitor while a tone
+# plays and confirm the recording carries it. Checked inside the VM.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-record' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl exec plugin-verify -- sh -c "pactl info; pactl list short sources"' \
+         > "$ART/record-fail.log" 2>&1 || true; fail "audio record-direction check failed"; }
+
 log "plugin: a LEAN non-desktop image works with only the injected env/mounts"
 # Proves the plugin's contract holds for an ordinary app container (no Xorg
 # server, pipewire daemon, session or WM), not just the desktop image.
