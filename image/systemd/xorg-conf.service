@@ -9,6 +9,12 @@ RemainAfterExit=yes
 # Xwrapper.config escape hatch is the manual fallback.
 ExecStart=-/usr/local/bin/ensure-vt-devices.sh
 ExecStart=-/usr/local/bin/align-device-groups.sh
+# The audio export sockets live in a host-shared dir that survives container
+# restarts (k8s Recreate, podman restart). PipeWire and pipewire-pulse will
+# NOT re-bind over a leftover socket file, so after a restart the desktop
+# would advertise present-but-dead sockets and every audio client gets
+# ECONNREFUSED. Clear them before the user session brings PipeWire back up.
+ExecStart=-/usr/bin/rm -f /run/desktop-audio/pulse /run/desktop-audio/pipewire-0 /run/desktop-audio/pipewire-0-manager
 ExecStart=-/usr/local/bin/host-shell-setup.sh
 ExecStart=-/usr/local/bin/preflight-check.sh
 ExecStart=/usr/local/bin/xorg-gpu-conf.sh

@@ -117,13 +117,26 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
 
-log "audio: client pod plays a 660Hz tone through the injected PULSE_SERVER"
-audio_capture_start audio-k3s-client
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio k3s-client' \
-    || { audio_capture_stop; fail "client pod playback failed"; }
-audio_capture_stop
-python3 check-audio.py "$ART/audio-k3s-client.wav" 1 0.05 \
-    || fail "k3s client audio capture is empty or silent"
+log "plugin: a pod requesting desktop.local/display gets DISPLAY + sockets injected"
+# The verifier pod declares no env/mounts of its own, so these assertions
+# prove the device plugin's Allocate injection end to end in a live pod.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-plugin' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod plugin-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide' \
+         > "$ART/plugin-verify-fail.log" 2>&1 || true; fail "plugin injection verification failed"; }
+screendump plugin-verify-window
+
+log "plugin: each audio path works from the requesting pod (injected env only)"
+# One capture per path, played from the verifier pod using only injected
+# env - proves the plugin wired pulse/pipewire/ALSA, not the desktop image's
+# own local session.
+for path in pulse pipewire alsa; do
+    audio_capture_start "audio-plugin-$path"
+    vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path" \
+        || { audio_capture_stop; fail "client pod $path playback failed"; }
+    audio_capture_stop
+    python3 check-audio.py "$ART/audio-plugin-$path.wav" 1 0.05 \
+        || fail "client pod $path audio capture is empty or silent"
+done
 
 log "collect guest diagnostics"
 vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide' \

@@ -38,7 +38,11 @@ fail() {
         k3s kubectl logs ds/plugin-desktop-device-plugin --tail=30 >&2 2>&1 || true
         echo "---- diagnostics: kubelet plugin dir ----" >&2
         ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
-        k3s kubectl describe pod x11-client-demo x11-client-gated >&2 2>/dev/null || true
+        echo "---- diagnostics: desktop pod audio (export sockets + pipewire procs) ----" >&2
+        k3s kubectl exec deploy/desktop -- sh -c \
+            'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
+            >&2 2>&1 || true
+        k3s kubectl describe pod x11-client-demo x11-client-gated plugin-verify >&2 2>/dev/null || true
         journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
     fi
     exit 1
@@ -207,35 +211,14 @@ else:
 EOF
 }
 
-play_audio() { # $1: pulse | pipewire | alsa | k3s-client
+play_audio() { # $1: pulse | pipewire | alsa (inside the desktop container)
     # A distinct pitch per path, so a human listening to the artifacts can
     # tell which route produced which beep.
-    local path="${1:?pulse|pipewire|alsa|k3s-client}" player freq
+    local path="${1:?pulse|pipewire|alsa}" player freq
     case "$path" in
         pulse)    freq=440;  player='paplay /tmp/tone.wav' ;;
         pipewire) freq=880;  player='pw-play /tmp/tone.wav' ;;
         alsa)     freq=1320; player='aplay -q /tmp/tone.wav' ;;
-        k3s-client)
-            # Client pod path: pacat reads raw s16le on stdin and honors
-            # the PULSE_SERVER the device plugin injected. Retry: the
-            # desktop pod was just recreated by the health-gating test and
-            # its pipewire session can lag Xorg by a few seconds.
-            gen_tone 660 /tmp/tone.raw
-            # Hard timeout per try: pacat BLOCKS (does not fail) when the
-            # injected pulse socket exists but isn't accepting yet, so an
-            # un-bounded exec hangs the whole job for hours. timeout turns
-            # a stuck connect into a retryable failure.
-            for _ in 1 2 3 4 5; do
-                if timeout 20 k3s kubectl exec -i x11-client-gated -- \
-                    pacat --rate=44100 --format=s16le --channels=2 \
-                    < /tmp/tone.raw; then
-                    log pa "k3s client pod played via injected PULSE_SERVER"
-                    return 0
-                fi
-                sleep 3
-            done
-            fail "client pod playback failed after 5 tries"
-            ;;
         *) fail "unknown audio path '$path'" ;;
     esac
     gen_tone "$freq" /tmp/tone.wav
@@ -255,9 +238,98 @@ play_audio() { # $1: pulse | pipewire | alsa | k3s-client
     log pa "$path played"
 }
 
-case "${1:?phase1|phase2|play-audio}" in
+# --- device-plugin injection verification (phase 2) -------------------------
+
+VPOD=plugin-verify
+
+assert_pod_env() { # $1: var, $2: expected value
+    local got
+    got=$(k3s kubectl exec "$VPOD" -- printenv "$1" 2>/dev/null || true)
+    [ "$got" = "$2" ] || fail "injected env $1='$got', want '$2'"
+    log vp "env $1=$got"
+}
+
+assert_pod_socket() { # $1: path
+    # Present, a socket, and writable: the plugin mounts rw because unix
+    # connect(2) needs write access; a ro mount would pass -S but break use.
+    k3s kubectl exec "$VPOD" -- sh -c "test -S '$1' && test -w '$1'" \
+        || fail "socket $1 missing or not writable in the requesting pod"
+    log vp "socket $1 present + writable"
+}
+
+verify_plugin() {
+    log vp "apply verifier pod: requests desktop.local/display, declares nothing else"
+    k3s kubectl apply -f ci/vm/plugin-verify-pod.yaml
+    wait_for 30 4 "verifier pod running" \
+        sh -c "k3s kubectl get pod $VPOD -o jsonpath='{.status.phase}' | grep -q Running"
+
+    log vp "device plugin injected the DISPLAY + audio env vars"
+    assert_pod_env DISPLAY :0
+    assert_pod_env PULSE_SERVER unix:/run/desktop-audio/pulse
+    assert_pod_env PIPEWIRE_REMOTE /run/desktop-audio/pipewire-0
+
+    log vp "device plugin mounted the DISPLAY + audio sockets"
+    assert_pod_socket /tmp/.X11-unix/X0
+    assert_pod_socket /run/desktop-audio/pulse
+    assert_pod_socket /run/desktop-audio/pipewire-0
+
+    log vp "the DISPLAY actually works from the pod (xdpyinfo via injected env)"
+    # sh -c so it uses the injected DISPLAY, not a hardcoded one; bounded so
+    # a broken connection fails instead of hanging.
+    timeout 20 k3s kubectl exec "$VPOD" -- sh -c 'xdpyinfo >/dev/null' \
+        || fail "xdpyinfo could not open the display from the requesting pod"
+    log vp "xdpyinfo opened :0 from the pod"
+
+    log vp "spawn an xterm from the pod so the screendump shows a client window"
+    timeout 15 k3s kubectl exec "$VPOD" -- \
+        sh -c 'setsid xterm -T plugin-verify -geometry 80x24+150+150 </dev/null >/dev/null 2>&1 &' \
+        || true
+    sleep 3
+
+    # The pod readiness probe only gates on X, so the desktop's pipewire
+    # session may not be exporting audio yet (a socket FILE can exist without
+    # a listener - especially after the health-gating restart). Wait for the
+    # injected PULSE_SERVER to actually accept before the audio captures run.
+    log vp "wait for the desktop audio export to accept a connection (injected PULSE_SERVER)"
+    timeout 90 k3s kubectl exec "$VPOD" -- \
+        sh -c 'until pactl info >/dev/null 2>&1; do sleep 2; done' \
+        || fail "desktop pulse export never accepted a connection from the requesting pod"
+    log vp "pulse export reachable from the pod"
+    log vp "verify-plugin passed"
+}
+
+play_audio_pod() { # $1: pulse | pipewire | alsa (from the requesting pod)
+    # Same beep-per-path convention as the in-container test, but played
+    # from plugin-verify using ONLY the injected env - so success proves the
+    # plugin wired that client path, not the desktop image's local session.
+    local path="${1:?pulse|pipewire|alsa}" player freq
+    case "$path" in
+        pulse)    freq=440;  player='paplay /tmp/t.wav' ;;
+        pipewire) freq=880;  player='pw-play /tmp/t.wav' ;;
+        alsa)     freq=1320; player='aplay -q /tmp/t.wav' ;;
+        *) fail "unknown audio path '$path'" ;;
+    esac
+    gen_tone "$freq" /tmp/tone-pod.wav
+    # Stream the WAV in over exec stdin (no kubectl cp -> no tar dependency).
+    timeout 20 k3s kubectl exec -i "$VPOD" -- sh -c 'cat > /tmp/t.wav' \
+        < /tmp/tone-pod.wav || fail "could not copy tone into the pod"
+    # Retry + hard timeout: the audio client can lag briefly, and a stuck
+    # connect must fail rather than hang (see the earlier pacat hang).
+    for _ in 1 2 3 4 5; do
+        if timeout 20 k3s kubectl exec "$VPOD" -- sh -c "$player"; then
+            log pa "client pod played ${freq}Hz via $path"
+            return 0
+        fi
+        sleep 3
+    done
+    fail "client pod $path playback failed after 5 tries"
+}
+
+case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
+    play-audio-pod) play_audio_pod "${2:-}" ;;
+    verify-plugin) verify_plugin ;;
     *) fail "unknown phase $1" ;;
 esac
