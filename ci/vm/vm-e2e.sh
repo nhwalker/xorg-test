@@ -15,6 +15,9 @@ SSHPORT=2222
 mkdir -p "$ART"
 
 log()  { echo "== vm-e2e: $*"; }
+# Pitch each audio path plays (must match gen_tone in vm-guest.sh), so the
+# capture check can confirm the RIGHT tone came through, not just some sound.
+freq_for() { case "$1" in pulse) echo 440;; pipewire) echo 880;; alsa) echo 1320;; *) echo 0;; esac; }
 fail() { echo "FAIL: vm-e2e: $*" >&2; exit 1; }
 
 vm_ssh() {
@@ -117,7 +120,7 @@ for path in pulse pipewire alsa; do
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio $path" \
         || { audio_capture_stop; fail "guest play-audio $path failed"; }
     audio_capture_stop
-    python3 check-audio.py "$ART/audio-quadlet-$path.wav" 1 0.05 \
+    python3 check-audio.py "$ART/audio-quadlet-$path.wav" 1 0.05 "$(freq_for "$path")" \
         || fail "$path audio capture is empty or silent"
 done
 
@@ -173,7 +176,7 @@ for path in pulse pipewire alsa; do
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path" \
         || { audio_capture_stop; fail "client pod $path playback failed"; }
     audio_capture_stop
-    python3 check-audio.py "$ART/audio-plugin-$path.wav" 1 0.05 \
+    python3 check-audio.py "$ART/audio-plugin-$path.wav" 1 0.05 "$(freq_for "$path")" \
         || fail "client pod $path audio capture is empty or silent"
 done
 
@@ -188,7 +191,7 @@ for path in pulse pipewire alsa; do
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path x11-testclient" \
         || { audio_capture_stop; fail "lean client $path playback failed"; }
     audio_capture_stop
-    python3 check-audio.py "$ART/audio-testclient-$path.wav" 1 0.05 \
+    python3 check-audio.py "$ART/audio-testclient-$path.wav" 1 0.05 "$(freq_for "$path")" \
         || fail "lean client $path audio capture is empty or silent"
 done
 
@@ -199,6 +202,11 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-scale' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo /usr/local/bin/k3s kubectl describe pod x11-client-c' \
          > "$ART/verify-scale-fail.log" 2>&1 || true; fail "concurrency/exhaustion check failed"; }
 screendump concurrent-clients
+
+log "k8s teardown: helm uninstall both charts and withdraw the resource"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"' \
+         > "$ART/teardown-fail.log" 2>&1 || true; fail "k8s teardown check failed"; }
 
 log "collect guest diagnostics"
 vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide' \

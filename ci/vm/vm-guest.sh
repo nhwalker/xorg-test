@@ -417,7 +417,27 @@ verify_scale() {
     log vs "verify-scale passed"
 }
 
-case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-scale|input-sink-start|input-sink-check}" in
+verify_teardown() {
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    log td "helm uninstall both charts"
+    helm uninstall plugin >/dev/null || fail "helm uninstall plugin failed"
+    helm uninstall desktop >/dev/null || fail "helm uninstall desktop failed"
+
+    # Removing the device-plugin daemonset must make the node stop offering the
+    # resource. kubelet drops the allocatable COUNT to 0 promptly but often
+    # keeps the resource key in node status for a while, so assert the count is
+    # 0 (or the key is gone), not that the key vanished.
+    wait_for 30 4 "desktop.local/display no longer allocatable" \
+        sh -c "v=\$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}'); [ -z \"\$v\" ] || [ \"\$v\" = 0 ]"
+    # The chart-managed workloads must be gone (get returns non-zero once
+    # the objects no longer exist).
+    wait_for 20 3 "desktop deployment + plugin daemonset gone" \
+        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1 && ! k3s kubectl get ds plugin-desktop-device-plugin >/dev/null 2>&1"
+    log td "charts uninstalled; resource withdrawn; workloads removed"
+    log td "verify-teardown passed"
+}
+
+case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-scale|verify-teardown|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -425,6 +445,7 @@ case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclie
     verify-plugin) verify_plugin ;;
     verify-testclient) verify_testclient ;;
     verify-scale) verify_scale ;;
+    verify-teardown) verify_teardown ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
     *) fail "unknown phase $1" ;;
