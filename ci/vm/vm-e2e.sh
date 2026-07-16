@@ -10,6 +10,7 @@ ART=artifacts
 IMG=Rocky-9-GenericCloud.qcow2
 DISK=disk.qcow2
 MON=mon.sock
+QMP=qmp.sock
 SSHPORT=2222
 mkdir -p "$ART"
 
@@ -81,6 +82,7 @@ qemu-system-x86_64 \
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$SSHPORT-:22" -device virtio-net-pci,netdev=n0 \
     -monitor "unix:$MON,server,nowait" \
+    -qmp "unix:$QMP,server,nowait" \
     -serial "file:$ART/serial.log" \
     -daemonize -pidfile qemu.pid
 
@@ -117,6 +119,25 @@ for path in pulse pipewire alsa; do
     python3 check-audio.py "$ART/audio-quadlet-$path.wav" 1 0.05 \
         || fail "$path audio capture is empty or silent"
 done
+
+log "input: type into an xterm with the real virtual keyboard, verify the app got it"
+# Prove the whole input path (QEMU HID -> evdev -> Xorg -> focused app), not
+# just that a device enumerates. A sink xterm runs `read`; we click it to
+# focus (mwm is click-to-focus) and type via QMP input-send-event. Runs
+# BEFORE the hotplug test: a rootless-X session cannot take a hotplugged
+# input device via logind, so the boot-time keyboard is the working one.
+res=$(vm_ssh 'sudo podman exec -u desktop -e DISPLAY=:0 desktop \
+    sh -c "xdpyinfo | awk \"/dimensions:/{print \\\$2; exit}\""')
+[ -n "$res" ] || fail "could not read display resolution for input injection"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
+sleep 2
+# Click + type at the centre of the sink window (geometry 100x30+250+200).
+python3 qmp-type.py "$QMP" "$res" 550 395 inputok
+sleep 2
+screendump input-typed
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check inputok' \
+    || { vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null' \
+         > "$ART/input-proof.txt" 2>&1 || true; fail "typed text did not reach the app"; }
 
 log "input hotplug: add a virtio keyboard while X runs"
 before=$(vm_ssh 'ls /dev/input/event* | wc -l')
