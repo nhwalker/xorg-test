@@ -437,13 +437,48 @@ verify_teardown() {
     log td "verify-teardown passed"
 }
 
-case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-scale|verify-teardown|input-sink-start|input-sink-check}" in
+verify_record() {
+    # Capture direction: a client RECORDS from the desktop's audio, not just
+    # plays. Loopback via the sink's monitor source - record it while playing a
+    # known tone into the same sink, then confirm the recording carries that
+    # tone. Runs in plugin-verify (a client pod) over the injected PULSE_SERVER.
+    local pod=plugin-verify freq=660
+    gen_tone "$freq" /tmp/rectone.wav
+    timeout 20 k3s kubectl exec -i "$pod" -- sh -c 'cat > /tmp/rt.wav' \
+        < /tmp/rectone.wav || fail "could not copy record tone into $pod"
+
+    log rec "record the sink monitor while playing a ${freq}Hz tone"
+    timeout 30 k3s kubectl exec "$pod" -- sh -c '
+        sink=$(pactl get-default-sink) || exit 3
+        parec -d "${sink}.monitor" --file-format=wav \
+            --rate=44100 --format=s16le --channels=2 /tmp/rec.wav &
+        rpid=$!
+        sleep 0.5
+        paplay /tmp/rt.wav
+        sleep 0.5
+        kill -INT "$rpid" 2>/dev/null   # SIGINT: parec finalizes the WAV header
+        wait "$rpid" 2>/dev/null
+        true
+    ' || fail "record/playback in $pod failed"
+
+    # Pull the recording into the VM and analyse it there (Rocky has python3);
+    # kubectl exec (no -t) streams the bytes verbatim.
+    timeout 20 k3s kubectl exec "$pod" -- cat /tmp/rec.wav > /tmp/rec-pulled.wav \
+        || fail "could not pull the recording from $pod"
+    python3 ci/vm/check-audio.py /tmp/rec-pulled.wav 0.5 0.02 "$freq" \
+        || fail "recorded audio is silent or not ${freq}Hz - capture path broken"
+    log rec "a client recorded the ${freq}Hz tone back from the desktop audio"
+    log rec "verify-record passed"
+}
+
+case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-record|verify-scale|verify-teardown|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
     play-audio-pod) play_audio_pod "${2:-}" "${3:-}" ;;
     verify-plugin) verify_plugin ;;
     verify-testclient) verify_testclient ;;
+    verify-record) verify_record ;;
     verify-scale) verify_scale ;;
     verify-teardown) verify_teardown ;;
     input-sink-start) input_sink_start ;;
