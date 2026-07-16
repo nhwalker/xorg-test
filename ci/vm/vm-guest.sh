@@ -348,12 +348,67 @@ input_sink_check() { # $1: expected text
     log is "the app received the typed text over the real input path: $got"
 }
 
-case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|input-sink-start|input-sink-check}" in
+apply_client() { # $1: pod name
+    # Reuse the example client (long-running xterm holds the slot), renamed
+    # and pointed at the locally-imported image.
+    sed -e "s/name: x11-client-demo/name: $1/" \
+        -e 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
+        examples/x11-client-pod.yaml | k3s kubectl apply -f -
+}
+
+verify_scale() {
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml  # helm (unlike k3s kubectl) needs this
+    log vs "free all slots so the capacity test accounts exactly"
+    k3s kubectl delete pod plugin-verify x11-client-gated x11-client-demo \
+        --ignore-not-found --wait=true >/dev/null 2>&1 || true
+
+    # Shrink capacity to 2 while nothing holds a slot (clean re-register; no
+    # allocated-device reconciliation). Proves both concurrency AND exhaustion
+    # with just 3 pods instead of 11.
+    log vs "set the plugin to 2 slots"
+    helm upgrade plugin charts/desktop-device-plugin \
+        --set image.repository=localhost/desktop-device-plugin \
+        --set image.pullPolicy=Never --set slots=2 >/dev/null
+    wait_for 30 4 "resource downshifts to 2 slots" \
+        sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}' | grep -qx 2"
+
+    log vs "two clients take both slots and run concurrently"
+    apply_client x11-client-a
+    apply_client x11-client-b
+    for n in a b; do
+        wait_for 30 4 "client $n running" \
+            sh -c "k3s kubectl get pod x11-client-$n -o jsonpath='{.status.phase}' | grep -q Running"
+    done
+    # Both must hold a LIVE connection to the one shared display at once.
+    for n in a b; do
+        timeout 20 k3s kubectl exec "x11-client-$n" -- sh -c 'xdpyinfo >/dev/null' \
+            || fail "client $n could not open the shared display"
+    done
+    log vs "both clients share the display simultaneously"
+
+    log vs "a third request cannot get a slot and stays Pending"
+    apply_client x11-client-c
+    sleep 15
+    phase=$(k3s kubectl get pod x11-client-c -o jsonpath='{.status.phase}')
+    [ "$phase" = Pending ] \
+        || fail "3rd client is '$phase', want Pending (both slots held by a+b)"
+    # ...and specifically because the resource is exhausted, not some other reason.
+    msg=$(k3s kubectl get pod x11-client-c \
+        -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null || true)
+    case "$msg" in
+        *desktop.local/display*|*[Ii]nsufficient*) log vs "unschedulable on the resource: $msg" ;;
+        *) fail "3rd client Pending for the wrong reason: '$msg'" ;;
+    esac
+    log vs "verify-scale passed"
+}
+
+case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-scale|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
     play-audio-pod) play_audio_pod "${2:-}" ;;
     verify-plugin) verify_plugin ;;
+    verify-scale) verify_scale ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
     *) fail "unknown phase $1" ;;
