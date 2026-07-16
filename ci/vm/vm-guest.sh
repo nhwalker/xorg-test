@@ -15,6 +15,10 @@ cd "$REPO"
 # spins on "command not found".
 export PATH="/usr/local/bin:$PATH"
 
+# CRI-O stream to install for phase 2 (the chart's documented runtime). Kept
+# near k3s's k8s minor; CRI-O interops across a minor or two if it drifts.
+CRIO_VERSION="${CRIO_VERSION:-v1.31}"
+
 log()  { echo "== vm-guest($1): $2"; }
 fail() {
     echo "FAIL: vm-guest: $*" >&2
@@ -126,26 +130,57 @@ phase2() {
     rm -f /etc/containers/systemd/desktop.container
     systemctl daemon-reload
 
-    log p2 "install k3s (SELinux policy interplay is out of scope: permissive for this phase)"
+    # The chart targets CRI-O (container=cri-o env, cdi.k8s.io annotation), so
+    # this phase runs k3s on an EXTERNAL CRI-O instead of the bundled
+    # containerd. (SELinux policy interplay is out of scope here: permissive.)
+    log p2 "install CRI-O ${CRIO_VERSION} (the chart's documented runtime)"
     setenforce 0
-    # traefik/metrics-server: not needed, and their image pulls over the
-    # VM's user-mode NAT slow down node readiness considerably.
-    curl -sfL https://get.k3s.io \
-        | INSTALL_K3S_EXEC="--disable traefik --disable metrics-server" sh - >/dev/null
+    cat > /etc/yum.repos.d/cri-o.repo <<EOF
+[cri-o]
+name=CRI-O ${CRIO_VERSION}
+baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/repodata/repomd.xml.key
+EOF
+    dnf -y -q install cri-o >/dev/null
+
+    # podman and CRI-O share /var/lib/containers/storage by default, so a root
+    # `podman load` is visible to CRI-O - no ctr import or skopeo needed. Load
+    # before starting crio to avoid concurrent writers to the storage.
+    log p2 "load images into shared containers-storage"
+    for t in desktop plugin testclient; do
+        podman load -q -i "/tmp/images-$t.tar" >/dev/null
+    done
+    ddig=$(podman image inspect localhost/desktop-container:latest --format '{{.Id}}' 2>/dev/null || true)
+    pdig=$(podman image inspect localhost/desktop-device-plugin:latest --format '{{.Id}}' 2>/dev/null || true)
+    if [ -z "$ddig" ] || [ -z "$pdig" ] || [ "$ddig" = "$pdig" ]; then
+        fail "image load broken: desktop='$ddig' plugin='$pdig' (must both exist and differ)"
+    fi
+
+    # k3s writes its flannel CNI config + plugin binaries under its own tree,
+    # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
+    # dirs so the pod network comes up (else kubelet stays NetworkNotReady).
+    mkdir -p /etc/crio/crio.conf.d
+    cat > /etc/crio/crio.conf.d/11-k3s-cni.conf <<'EOF'
+[crio.network]
+network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
+EOF
+    systemctl enable --now crio >/dev/null 2>&1 || fail "crio failed to start"
+    wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
+
+    log p2 "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
+        --container-runtime-endpoint=unix:///run/crio/crio.sock \
+        --kubelet-arg=cgroup-driver=systemd \
+        --disable traefik --disable metrics-server" sh - >/dev/null
     wait_for 60 5 "k3s node ready" \
         sh -c "k3s kubectl get nodes | grep -q ' Ready'"
+    # Prove the node really runs CRI-O, not the bundled containerd.
+    k3s kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' \
+        | grep -q cri-o || fail "node runtime is not cri-o"
 
-    log p2 "import images + helm"
-    k3s ctr images import /tmp/images-desktop.tar >/dev/null
-    k3s ctr images import /tmp/images-plugin.tar >/dev/null
-    k3s ctr images import /tmp/images-testclient.tar >/dev/null
-    # Same guard as phase1, containerd side: both refs must exist and be
-    # DIFFERENT images, or the plugin daemonset silently runs systemd.
-    ddig=$(k3s ctr images ls | awk '$1 == "localhost/desktop-container:latest" {print $3}')
-    pdig=$(k3s ctr images ls | awk '$1 == "localhost/desktop-device-plugin:latest" {print $3}')
-    if [ -z "$ddig" ] || [ -z "$pdig" ] || [ "$ddig" = "$pdig" ]; then
-        fail "containerd image import broken: desktop='$ddig' plugin='$pdig' (must both exist and differ)"
-    fi
     curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
         | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
 
