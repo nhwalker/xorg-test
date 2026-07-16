@@ -27,7 +27,7 @@ jobs:
       - name: install qemu + tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat
+          sudo apt-get install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat imagemagick
       - name: cache rocky cloud image
         id: rocky
         uses: actions/cache@v4
