@@ -52,9 +52,13 @@ jobs:
           # One archive per image: podman-save's docker-archive format
           # silently collapses multiple images into the FIRST one with all
           # tags attached (the plugin tag ends up naming the desktop image).
+          # Lean non-desktop client fixture (networked build; CI-only, not a
+          # product artifact, so the offline rule does not apply to it).
+          sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
           sudo podman save -o ci/vm/images-desktop.tar localhost/desktop-container:latest
           sudo podman save -o ci/vm/images-plugin.tar localhost/desktop-device-plugin:latest
-          sudo chmod 644 ci/vm/images-desktop.tar ci/vm/images-plugin.tar
+          sudo podman save -o ci/vm/images-testclient.tar localhost/desktop-testclient:latest
+          sudo chmod 644 ci/vm/images-desktop.tar ci/vm/images-plugin.tar ci/vm/images-testclient.tar
       - name: run VM e2e
         run: ci/vm/vm-e2e.sh
       - name: upload artifacts

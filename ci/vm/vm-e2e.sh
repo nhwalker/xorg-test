@@ -96,7 +96,8 @@ vm_ssh true || fail "VM never became reachable"
 log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
 scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null repo.tgz images-desktop.tar images-plugin.tar \
+    -o UserKnownHostsFile=/dev/null repo.tgz \
+    images-desktop.tar images-plugin.tar images-testclient.tar \
     rocky@127.0.0.1:/tmp/
 
 log "phase 1: quadlet flow (real install.sh, real Xorg, SELinux enforcing)"
@@ -174,6 +175,21 @@ for path in pulse pipewire alsa; do
     audio_capture_stop
     python3 check-audio.py "$ART/audio-plugin-$path.wav" 1 0.05 \
         || fail "client pod $path audio capture is empty or silent"
+done
+
+log "plugin: a LEAN non-desktop image works with only the injected env/mounts"
+# Proves the plugin's contract holds for an ordinary app container (no Xorg
+# server, pipewire daemon, session or WM), not just the desktop image.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-testclient' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient' \
+         > "$ART/testclient-fail.log" 2>&1 || true; fail "lean client display check failed"; }
+for path in pulse pipewire alsa; do
+    audio_capture_start "audio-testclient-$path"
+    vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path x11-testclient" \
+        || { audio_capture_stop; fail "lean client $path playback failed"; }
+    audio_capture_stop
+    python3 check-audio.py "$ART/audio-testclient-$path.wav" 1 0.05 \
+        || fail "lean client $path audio capture is empty or silent"
 done
 
 log "plugin: concurrent clients share the display, and slots exhaust correctly"

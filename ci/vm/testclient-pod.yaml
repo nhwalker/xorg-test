@@ -1,0 +1,18 @@
+# A lean, non-desktop client (see Containerfile.testclient) that requests the
+# desktop resource and declares NOTHING else - so the display + audio it can
+# reach come only from the device plugin's Allocate injection. Proves the
+# plugin's contract holds for an ordinary app image, not just the desktop one.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: x11-testclient
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: localhost/desktop-testclient:latest
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          desktop.local/display: 1
