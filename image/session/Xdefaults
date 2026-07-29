@@ -1,0 +1,110 @@
+! X resources for the desktop session (installed as ~/.Xdefaults via
+! /etc/skel, alongside .mwmrc). Dark theme.
+!
+! WHY ~/.Xdefaults AND NOT xrdb: Xt loads this file directly whenever the
+! root window has no RESOURCE_MANAGER property. Nothing in the session sets
+! one (xinitrc.desktop runs no xrdb), so this is read as-is and the image
+! needs no extra package. If an xrdb call is ever added to xinitrc.desktop,
+! RESOURCE_MANAGER starts existing and this file is silently ignored — load
+! it explicitly (`xrdb -merge`) at that point.
+!
+! .mwmrc holds menus and bindings; everything below is appearance/behavior.
+! mwm reads these once at startup: "Restart mwm" (f.restart) re-reads .mwmrc
+! but NOT resources, so a resource change needs a new X session.
+!
+! Palette (the root window in xinitrc.desktop uses the same base):
+!   base    #101216   root window, behind everything
+!   surface #22262d   unfocused frames, menus, icons
+!   raised  #2c3138   icon images
+!   accent  #41637f   focused frame, selected menu entry
+!   accent+ #6b8ba6   accent bevel highlight, terminal cursor
+!   text    #d7dae0   foreground on surfaces
+!   dim     #9aa1ab   foreground on unfocused frames
+!
+! CONTRAST IS LATCHED TO A TEST: ci/vm/vm-e2e.sh proves the X server is
+! really drawing by asserting the screendump's grayscale stddev is > 0.02,
+! which a dark-on-dark scheme can flatten. Measured against the real e2e
+! screendump this palette lands at ~0.051 — a 2.5x margin carried mostly by
+! the light terminal text against the near-black root, since the accent is
+! deliberately muted. Keep something bright when retuning.
+
+! --- Window frames ---------------------------------------------------------
+! Focused window: a desaturated slate blue. mwm paints the WHOLE frame with
+! the active color, not just the title bar, so a saturated accent dominates
+! the screen — this is tuned for that, not as a standalone swatch.
+!
+! The shadow pair is what gives Motif its bevel; Motif would derive it from
+! the background on its own, but the derived values wash out on dark colors,
+! so both are set explicitly throughout. With a muted fill the bevel does
+! most of the focus signalling.
+Mwm*client*activeBackground:            #41637f
+Mwm*client*activeForeground:            #eef2f6
+Mwm*client*activeTopShadowColor:        #6b8ba6
+Mwm*client*activeBottomShadowColor:     #22384a
+
+! Unfocused windows: recede toward the root.
+Mwm*client*background:                  #22262d
+Mwm*client*foreground:                  #9aa1ab
+Mwm*client*topShadowColor:              #3a4049
+Mwm*client*bottomShadowColor:           #0d0f12
+
+! --- Menus (root menu and window menu) -------------------------------------
+Mwm*menu*background:                    #22262d
+Mwm*menu*foreground:                    #d7dae0
+Mwm*menu*topShadowColor:                #3a4049
+Mwm*menu*bottomShadowColor:             #0d0f12
+Mwm*menu*activeBackground:              #41637f
+Mwm*menu*activeForeground:              #ffffff
+
+! --- Icons (mwm minimizes to root-window icons, there is no taskbar) -------
+Mwm*icon*background:                    #22262d
+Mwm*icon*foreground:                    #d7dae0
+Mwm*icon*topShadowColor:                #3a4049
+Mwm*icon*bottomShadowColor:             #0d0f12
+Mwm*iconImageBackground:                #2c3138
+
+! --- Move/resize feedback box ----------------------------------------------
+Mwm*feedback*background:                #22262d
+Mwm*feedback*foreground:                #d7dae0
+
+! --- xterm ------------------------------------------------------------------
+! This is the session's whole resource database, so app resources live here
+! too. Terminals are the only app the image ships; left stock they are a
+! white slab in the middle of a dark desktop.
+!
+! Only colors are set: xterm's geometry is load-bearing in CI (the input test
+! computes a click coordinate from the window's centre, vm-guest.sh), so
+! nothing here may change the window's size — no scrollBar toggle, no
+! scrollbar.width, no borderWidth.
+XTerm*background:                       #16191d
+XTerm*foreground:                       #d7dae0
+XTerm*cursorColor:                      #6b8ba6
+XTerm*pointerColorBackground:           #16191d
+
+! The scrollbar is on by default in this xterm build and needs its own colors:
+! the Athena scrollbar paints its thumb as a foreground/background stipple, so
+! XTerm*background alone leaves a stock-light thumb that reads as a bright
+! striped band down the left edge of every terminal (visible in the e2e
+! screendumps for 6f93287). Colors only — scrollbar.width would move the text
+! area and break the input test's click coordinate.
+XTerm*scrollbar*background:             #22262d
+XTerm*scrollbar*foreground:             #4a515c
+
+! ANSI palette: desaturated for a dark background (stock red/blue vibrate
+! badly on one). 0-7 normal, 8-15 bright.
+XTerm*color0:                           #21252b
+XTerm*color1:                           #c0554f
+XTerm*color2:                           #7fa860
+XTerm*color3:                           #cf9a4e
+XTerm*color4:                           #4f86c2
+XTerm*color5:                           #a06fbb
+XTerm*color6:                           #4aa8a0
+XTerm*color7:                           #c3c8d0
+XTerm*color8:                           #4a515c
+XTerm*color9:                           #e06c65
+XTerm*color10:                          #9cc27c
+XTerm*color11:                          #e5b567
+XTerm*color12:                          #6ba3d8
+XTerm*color13:                          #c08fdb
+XTerm*color14:                          #5fc9bf
+XTerm*color15:                          #e6e9ee

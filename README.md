@@ -27,7 +27,7 @@ image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
   systemd/                  xorg-conf.service, desktop-session.service, drop-ins
-  session/                  start-session, xinitrc.desktop, mwmrc
+  session/                  start-session, xinitrc.desktop, mwmrc, Xdefaults
   pipewire/                 socket-export config drop-ins
 ```
 
@@ -166,6 +166,88 @@ so any local process may connect (see Security below).
 DISPLAY=:0 glxinfo -B                          # from the host
 podman run -e DISPLAY=:0 -v /tmp/.X11-unix:/tmp/.X11-unix <img> xclock
 ```
+
+## Look and feel (dark theme)
+
+The session ships a dark theme. Its appearance lives in three files, the
+first two baked into `/etc/skel` and picked up by the `desktop` user at image
+build time:
+
+| File | In the image | Covers |
+|---|---|---|
+| `image/session/mwmrc` | `~/.mwmrc` | root menu, window menu, key bindings, button bindings |
+| `image/session/Xdefaults` | `~/.Xdefaults` | frame/menu/icon colors, xterm colors — and where fonts, focus policy and decorations would go |
+| `image/session/xinitrc.desktop` | `/etc/X11/xinit/xinitrc.desktop` | root window color (`xsetroot`) |
+
+The palette, shared by all three:
+
+| Role | Color | Used for |
+|---|---|---|
+| base | `#101216` | root window |
+| surface | `#22262d` | unfocused frames, menus, icons |
+| accent | `#41637f` | focused frame, selected menu entry |
+| accent+ | `#6b8ba6` | accent bevel highlight, terminal cursor |
+| text | `#d7dae0` | foreground on surfaces |
+| dim | `#9aa1ab` | foreground on unfocused frames |
+
+The accent is deliberately desaturated: mwm paints the **whole frame** with
+the active color, not just the title bar, so a saturated accent dominates the
+screen. With a muted fill the bevel highlight does most of the focus
+signalling.
+
+xterm gets a matching background, a themed scrollbar, and a desaturated
+16-color ANSI palette. Only colors are set: the e2e input test computes a
+click coordinate from the xterm's centre (`ci/vm/vm-guest.sh`), so resources
+that change the window's size (`scrollBar`, `scrollbar.width`, `borderWidth`)
+would break it.
+
+`~/.Xdefaults` is read directly by Xt because nothing in the session sets a
+`RESOURCE_MANAGER` property — the image needs no `xrdb`. **If an `xrdb` call
+is ever added to `xinitrc.desktop`, that property starts existing and this
+file is silently ignored**; load it explicitly (`xrdb -merge`) at that point.
+
+One constraint when retuning the palette: `ci/vm/vm-e2e.sh` proves the X
+server is actually drawing by asserting the screendump's grayscale stddev is
+above 0.02, and an all-dark scheme can flatten that. Measured against the
+real e2e screendump this palette lands at ~0.051, a 2.5x margin carried
+mostly by the light terminal text against the near-black root — keep
+something bright.
+
+Client windows from *other* images (the k8s client pods) get themed mwm
+frames, because mwm is ours, but keep their own stock app colors: the
+resources live in this image's `/etc/skel`, not in theirs.
+
+Other commonly wanted `Mwm*` resources, none of which are set here:
+
+```
+Mwm*keyboardFocusPolicy:  pointer    ! focus follows mouse (default: explicit)
+Mwm*focusAutoRaise:       True
+Mwm*moveOpaque:           True       ! drag contents, not a wireframe
+Mwm*fontList:             9x15bold   ! title/menu font
+Mwm*clientDecoration:     -maximize  ! per-app forms too: Mwm*XTerm*clientDecoration
+Mwm*iconPlacement:        bottom left
+```
+
+To change any of it, edit the file in `image/session/` and rebuild the
+application layer — offline, so no base rebuild and no network:
+
+```sh
+podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+sudo systemctl restart desktop.service
+```
+
+For faster iteration, edit `/home/desktop/.mwmrc` inside the running
+container and pick **"Restart mwm"** from the root menu; `f.restart` re-reads
+the menus and bindings in place. Resources are **not** re-read by
+`f.restart`, so an `~/.Xdefaults` change needs a new X session
+(`systemctl restart desktop-session.service` in the container). Either way
+the edit lives only in the container's writable layer — nothing mounts a
+persistent `/home/desktop`, so `podman rm`/recreate or a k8s pod restart
+drops it. Land the real change in the repo file.
+
+mwm is ICCCM-only: no virtual desktops, no panel or systray, no compositing,
+and no EWMH — so toolkits' fullscreen/always-on-top requests are ignored.
+Those need a different window manager in `xinitrc.desktop`, not a resource.
 
 ## Audio: pulse, PipeWire, and ALSA clients — container, host, or other containers
 

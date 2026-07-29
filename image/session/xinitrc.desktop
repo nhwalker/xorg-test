@@ -10,7 +10,10 @@ xhost +local: || true
 xset s off || true
 xset -dpms || true
 
-xsetroot -solid grey25 || true
+# Dark theme base color; the rest of the palette is in ~/.Xdefaults, which
+# Xt reads directly because nothing here sets RESOURCE_MANAGER (no xrdb).
+# Adding an xrdb call would silently shadow that file — see its header.
+xsetroot -solid '#101216' || true
 
 xterm -geometry 100x30+60+60 &
 
