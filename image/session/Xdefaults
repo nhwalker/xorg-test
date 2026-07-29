@@ -16,25 +16,31 @@
 !   base    #101216   root window, behind everything
 !   surface #22262d   unfocused frames, menus, icons
 !   raised  #2c3138   icon images
-!   accent  #3d7ebf   focused frame, selected menu entry, cursor
+!   accent  #41637f   focused frame, selected menu entry
+!   accent+ #6b8ba6   accent bevel highlight, terminal cursor
 !   text    #d7dae0   foreground on surfaces
 !   dim     #9aa1ab   foreground on unfocused frames
 !
 ! CONTRAST IS LATCHED TO A TEST: ci/vm/vm-e2e.sh proves the X server is
 ! really drawing by asserting the screendump's grayscale stddev is > 0.02,
-! which a dark-on-dark scheme can flatten. The margin here comes from the
-! bright accent title bar and the light terminal text against the near-black
-! root — keep some element bright when retuning this palette.
+! which a dark-on-dark scheme can flatten. Measured against the real e2e
+! screendump this palette lands at ~0.051 — a 2.5x margin carried mostly by
+! the light terminal text against the near-black root, since the accent is
+! deliberately muted. Keep something bright when retuning.
 
 ! --- Window frames ---------------------------------------------------------
-! Focused window: accent blue, so the input focus is obvious under
-! click-to-focus. The shadow pair is what gives Motif its bevel; Motif would
-! derive it from the background on its own, but the derived values wash out
-! on dark colors, so both are set explicitly throughout.
-Mwm*client*activeBackground:            #3d7ebf
-Mwm*client*activeForeground:            #f5f8fb
-Mwm*client*activeTopShadowColor:        #6ba3d8
-Mwm*client*activeBottomShadowColor:     #1d3d5c
+! Focused window: a desaturated slate blue. mwm paints the WHOLE frame with
+! the active color, not just the title bar, so a saturated accent dominates
+! the screen — this is tuned for that, not as a standalone swatch.
+!
+! The shadow pair is what gives Motif its bevel; Motif would derive it from
+! the background on its own, but the derived values wash out on dark colors,
+! so both are set explicitly throughout. With a muted fill the bevel does
+! most of the focus signalling.
+Mwm*client*activeBackground:            #41637f
+Mwm*client*activeForeground:            #eef2f6
+Mwm*client*activeTopShadowColor:        #6b8ba6
+Mwm*client*activeBottomShadowColor:     #22384a
 
 ! Unfocused windows: recede toward the root.
 Mwm*client*background:                  #22262d
@@ -47,7 +53,7 @@ Mwm*menu*background:                    #22262d
 Mwm*menu*foreground:                    #d7dae0
 Mwm*menu*topShadowColor:                #3a4049
 Mwm*menu*bottomShadowColor:             #0d0f12
-Mwm*menu*activeBackground:              #3d7ebf
+Mwm*menu*activeBackground:              #41637f
 Mwm*menu*activeForeground:              #ffffff
 
 ! --- Icons (mwm minimizes to root-window icons, there is no taskbar) -------
@@ -68,10 +74,11 @@ Mwm*feedback*foreground:                #d7dae0
 !
 ! Only colors are set: xterm's geometry is load-bearing in CI (the input test
 ! computes a click coordinate from the window's centre, vm-guest.sh), so
-! nothing here may change the window's size — no scrollBar, no borderWidth.
+! nothing here may change the window's size — no scrollBar toggle, no
+! scrollbar.width, no borderWidth.
 XTerm*background:                       #16191d
 XTerm*foreground:                       #d7dae0
-XTerm*cursorColor:                      #3d7ebf
+XTerm*cursorColor:                      #6b8ba6
 XTerm*pointerColorBackground:           #16191d
 
 ! The scrollbar is on by default in this xterm build and needs its own colors:

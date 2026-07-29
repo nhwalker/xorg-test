@@ -185,14 +185,21 @@ The palette, shared by all three:
 |---|---|---|
 | base | `#101216` | root window |
 | surface | `#22262d` | unfocused frames, menus, icons |
-| accent | `#3d7ebf` | focused frame, selected menu entry, cursor |
+| accent | `#41637f` | focused frame, selected menu entry |
+| accent+ | `#6b8ba6` | accent bevel highlight, terminal cursor |
 | text | `#d7dae0` | foreground on surfaces |
 | dim | `#9aa1ab` | foreground on unfocused frames |
 
-xterm gets a matching background and a desaturated 16-color ANSI palette.
-Only its colors are set: the e2e input test computes a click coordinate from
-the xterm's centre (`ci/vm/vm-guest.sh`), so resources that change the
-window's size (`scrollBar`, `borderWidth`) would break it.
+The accent is deliberately desaturated: mwm paints the **whole frame** with
+the active color, not just the title bar, so a saturated accent dominates the
+screen. With a muted fill the bevel highlight does most of the focus
+signalling.
+
+xterm gets a matching background, a themed scrollbar, and a desaturated
+16-color ANSI palette. Only colors are set: the e2e input test computes a
+click coordinate from the xterm's centre (`ci/vm/vm-guest.sh`), so resources
+that change the window's size (`scrollBar`, `scrollbar.width`, `borderWidth`)
+would break it.
 
 `~/.Xdefaults` is read directly by Xt because nothing in the session sets a
 `RESOURCE_MANAGER` property — the image needs no `xrdb`. **If an `xrdb` call
@@ -201,9 +208,14 @@ file is silently ignored**; load it explicitly (`xrdb -merge`) at that point.
 
 One constraint when retuning the palette: `ci/vm/vm-e2e.sh` proves the X
 server is actually drawing by asserting the screendump's grayscale stddev is
-above 0.02, and an all-dark scheme can flatten that. The margin here comes
-from the accent title bar and the light terminal text against the near-black
-root — keep something bright.
+above 0.02, and an all-dark scheme can flatten that. Measured against the
+real e2e screendump this palette lands at ~0.051, a 2.5x margin carried
+mostly by the light terminal text against the near-black root — keep
+something bright.
+
+Client windows from *other* images (the k8s client pods) get themed mwm
+frames, because mwm is ours, but keep their own stock app colors: the
+resources live in this image's `/etc/skel`, not in theirs.
 
 Other commonly wanted `Mwm*` resources, none of which are set here:
 
