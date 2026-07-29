@@ -74,6 +74,15 @@ XTerm*foreground:                       #d7dae0
 XTerm*cursorColor:                      #3d7ebf
 XTerm*pointerColorBackground:           #16191d
 
+! The scrollbar is on by default in this xterm build and needs its own colors:
+! the Athena scrollbar paints its thumb as a foreground/background stipple, so
+! XTerm*background alone leaves a stock-light thumb that reads as a bright
+! striped band down the left edge of every terminal (visible in the e2e
+! screendumps for 6f93287). Colors only — scrollbar.width would move the text
+! area and break the input test's click coordinate.
+XTerm*scrollbar*background:             #22262d
+XTerm*scrollbar*foreground:             #4a515c
+
 ! ANSI palette: desaturated for a dark background (stock red/blue vibrate
 ! badly on one). 0-7 normal, 8-15 bright.
 XTerm*color0:                           #21252b
