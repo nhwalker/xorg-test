@@ -27,6 +27,9 @@ COPY image/session/host-shell-setup.sh /usr/local/bin/host-shell-setup.sh
 COPY image/session/host-terminal /usr/local/bin/host-terminal
 COPY image/session/xinitrc.desktop /etc/X11/xinit/xinitrc.desktop
 COPY image/session/mwmrc /etc/skel/.mwmrc
+# Appearance (frame/menu/icon colors). Read straight from ~/.Xdefaults
+# because nothing sets RESOURCE_MANAGER — see the file's header comment.
+COPY image/session/Xdefaults /etc/skel/.Xdefaults
 RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/ensure-vt-devices.sh \
         /usr/local/bin/start-session \
         /usr/local/bin/session-postmortem /usr/local/bin/align-device-groups.sh \

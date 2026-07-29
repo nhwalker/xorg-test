@@ -1,0 +1,54 @@
+! X resources for the desktop session (installed as ~/.Xdefaults via
+! /etc/skel, alongside .mwmrc).
+!
+! WHY ~/.Xdefaults AND NOT xrdb: Xt loads this file directly whenever the
+! root window has no RESOURCE_MANAGER property. Nothing in the session sets
+! one (xinitrc.desktop runs no xrdb), so this is read as-is and the image
+! needs no extra package. If an xrdb call is ever added to xinitrc.desktop,
+! RESOURCE_MANAGER starts existing and this file is silently ignored — load
+! it explicitly (`xrdb -merge`) at that point.
+!
+! .mwmrc holds menus and bindings; everything below is appearance/behavior.
+! mwm reads these once at startup: "Restart mwm" (f.restart) re-reads .mwmrc
+! but NOT resources, so a resource change needs a new X session.
+
+! --- Window frames ---------------------------------------------------------
+! Focused window: blue accent, so the input focus is obvious under
+! click-to-focus. The shadow pair is what gives Motif its bevel; Motif would
+! derive it from the background on its own, but the derived values wash out
+! on dark colors, so both are set explicitly.
+Mwm*client*activeBackground:            #2d5c8a
+Mwm*client*activeForeground:            #f2f4f7
+Mwm*client*activeTopShadowColor:        #4a83bb
+Mwm*client*activeBottomShadowColor:     #16324c
+
+! Unfocused windows: neutral slate, a step above the grey25 root.
+Mwm*client*background:                  #4a4f57
+Mwm*client*foreground:                  #c3c8d0
+Mwm*client*topShadowColor:              #6b7079
+Mwm*client*bottomShadowColor:           #2b2f35
+
+! --- Menus (root menu and window menu) -------------------------------------
+Mwm*menu*background:                    #3a3f47
+Mwm*menu*foreground:                    #e6e9ee
+Mwm*menu*topShadowColor:                #565c66
+Mwm*menu*bottomShadowColor:             #23262b
+! The highlighted entry reuses the focused-frame accent.
+Mwm*menu*activeBackground:              #2d5c8a
+Mwm*menu*activeForeground:              #ffffff
+
+! --- Icons (mwm minimizes to root-window icons, there is no taskbar) -------
+Mwm*icon*background:                    #4a4f57
+Mwm*icon*foreground:                    #c3c8d0
+Mwm*icon*topShadowColor:                #6b7079
+Mwm*icon*bottomShadowColor:             #2b2f35
+Mwm*iconImageBackground:                #3a3f47
+
+! --- Move/resize feedback box ----------------------------------------------
+Mwm*feedback*background:                #3a3f47
+Mwm*feedback*foreground:                #e6e9ee
+
+! This is the session's whole resource database, so app resources (XTerm*...)
+! belong here too. Deliberately none for now: the e2e render check asserts a
+! grayscale stddev over the screendump (ci/vm/vm-e2e.sh), and darkening the
+! xterms toward the grey25 root eats into that margin for no functional gain.

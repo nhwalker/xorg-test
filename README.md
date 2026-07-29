@@ -27,7 +27,7 @@ image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
   systemd/                  xorg-conf.service, desktop-session.service, drop-ins
-  session/                  start-session, xinitrc.desktop, mwmrc
+  session/                  start-session, xinitrc.desktop, mwmrc, Xdefaults
   pipewire/                 socket-export config drop-ins
 ```
 
@@ -166,6 +166,56 @@ so any local process may connect (see Security below).
 DISPLAY=:0 glxinfo -B                          # from the host
 podman run -e DISPLAY=:0 -v /tmp/.X11-unix:/tmp/.X11-unix <img> xclock
 ```
+
+## Look and feel (mwm)
+
+The session's appearance lives in two files, both baked into `/etc/skel` and
+picked up by the `desktop` user at image build time:
+
+| File | In the image | Covers |
+|---|---|---|
+| `image/session/mwmrc` | `~/.mwmrc` | root menu, window menu, key bindings, button bindings |
+| `image/session/Xdefaults` | `~/.Xdefaults` | colors, fonts, focus policy, decorations, icon placement |
+
+`~/.Xdefaults` is read directly by Xt because nothing in the session sets a
+`RESOURCE_MANAGER` property — the image needs no `xrdb`. **If an `xrdb` call
+is ever added to `xinitrc.desktop`, that property starts existing and this
+file is silently ignored**; load it explicitly (`xrdb -merge`) at that point.
+
+The shipped theme colors the focused window frame with a blue accent and
+leaves unfocused frames neutral against the `grey25` root, with the menus and
+minimized-window icons matched to it. Other commonly wanted `Mwm*` resources,
+none of which are set here:
+
+```
+Mwm*keyboardFocusPolicy:  pointer    ! focus follows mouse (default: explicit)
+Mwm*focusAutoRaise:       True
+Mwm*moveOpaque:           True       ! drag contents, not a wireframe
+Mwm*fontList:             9x15bold   ! title/menu font
+Mwm*clientDecoration:     -maximize  ! per-app forms too: Mwm*XTerm*clientDecoration
+Mwm*iconPlacement:        bottom left
+```
+
+To change any of it, edit the file in `image/session/` and rebuild the
+application layer — offline, so no base rebuild and no network:
+
+```sh
+podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+sudo systemctl restart desktop.service
+```
+
+For faster iteration, edit `/home/desktop/.mwmrc` inside the running
+container and pick **"Restart mwm"** from the root menu; `f.restart` re-reads
+the menus and bindings in place. Resources are **not** re-read by
+`f.restart`, so an `~/.Xdefaults` change needs a new X session
+(`systemctl restart desktop-session.service` in the container). Either way
+the edit lives only in the container's writable layer — nothing mounts a
+persistent `/home/desktop`, so `podman rm`/recreate or a k8s pod restart
+drops it. Land the real change in the repo file.
+
+mwm is ICCCM-only: no virtual desktops, no panel or systray, no compositing,
+and no EWMH — so toolkits' fullscreen/always-on-top requests are ignored.
+Those need a different window manager in `xinitrc.desktop`, not a resource.
 
 ## Audio: pulse, PipeWire, and ALSA clients — container, host, or other containers
 
