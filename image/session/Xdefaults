@@ -1,5 +1,5 @@
 ! X resources for the desktop session (installed as ~/.Xdefaults via
-! /etc/skel, alongside .mwmrc).
+! /etc/skel, alongside .mwmrc). Dark theme.
 !
 ! WHY ~/.Xdefaults AND NOT xrdb: Xt loads this file directly whenever the
 ! root window has no RESOURCE_MANAGER property. Nothing in the session sets
@@ -11,44 +11,84 @@
 ! .mwmrc holds menus and bindings; everything below is appearance/behavior.
 ! mwm reads these once at startup: "Restart mwm" (f.restart) re-reads .mwmrc
 ! but NOT resources, so a resource change needs a new X session.
+!
+! Palette (the root window in xinitrc.desktop uses the same base):
+!   base    #101216   root window, behind everything
+!   surface #22262d   unfocused frames, menus, icons
+!   raised  #2c3138   icon images
+!   accent  #3d7ebf   focused frame, selected menu entry, cursor
+!   text    #d7dae0   foreground on surfaces
+!   dim     #9aa1ab   foreground on unfocused frames
+!
+! CONTRAST IS LATCHED TO A TEST: ci/vm/vm-e2e.sh proves the X server is
+! really drawing by asserting the screendump's grayscale stddev is > 0.02,
+! which a dark-on-dark scheme can flatten. The margin here comes from the
+! bright accent title bar and the light terminal text against the near-black
+! root — keep some element bright when retuning this palette.
 
 ! --- Window frames ---------------------------------------------------------
-! Focused window: blue accent, so the input focus is obvious under
+! Focused window: accent blue, so the input focus is obvious under
 ! click-to-focus. The shadow pair is what gives Motif its bevel; Motif would
 ! derive it from the background on its own, but the derived values wash out
-! on dark colors, so both are set explicitly.
-Mwm*client*activeBackground:            #2d5c8a
-Mwm*client*activeForeground:            #f2f4f7
-Mwm*client*activeTopShadowColor:        #4a83bb
-Mwm*client*activeBottomShadowColor:     #16324c
+! on dark colors, so both are set explicitly throughout.
+Mwm*client*activeBackground:            #3d7ebf
+Mwm*client*activeForeground:            #f5f8fb
+Mwm*client*activeTopShadowColor:        #6ba3d8
+Mwm*client*activeBottomShadowColor:     #1d3d5c
 
-! Unfocused windows: neutral slate, a step above the grey25 root.
-Mwm*client*background:                  #4a4f57
-Mwm*client*foreground:                  #c3c8d0
-Mwm*client*topShadowColor:              #6b7079
-Mwm*client*bottomShadowColor:           #2b2f35
+! Unfocused windows: recede toward the root.
+Mwm*client*background:                  #22262d
+Mwm*client*foreground:                  #9aa1ab
+Mwm*client*topShadowColor:              #3a4049
+Mwm*client*bottomShadowColor:           #0d0f12
 
 ! --- Menus (root menu and window menu) -------------------------------------
-Mwm*menu*background:                    #3a3f47
-Mwm*menu*foreground:                    #e6e9ee
-Mwm*menu*topShadowColor:                #565c66
-Mwm*menu*bottomShadowColor:             #23262b
-! The highlighted entry reuses the focused-frame accent.
-Mwm*menu*activeBackground:              #2d5c8a
+Mwm*menu*background:                    #22262d
+Mwm*menu*foreground:                    #d7dae0
+Mwm*menu*topShadowColor:                #3a4049
+Mwm*menu*bottomShadowColor:             #0d0f12
+Mwm*menu*activeBackground:              #3d7ebf
 Mwm*menu*activeForeground:              #ffffff
 
 ! --- Icons (mwm minimizes to root-window icons, there is no taskbar) -------
-Mwm*icon*background:                    #4a4f57
-Mwm*icon*foreground:                    #c3c8d0
-Mwm*icon*topShadowColor:                #6b7079
-Mwm*icon*bottomShadowColor:             #2b2f35
-Mwm*iconImageBackground:                #3a3f47
+Mwm*icon*background:                    #22262d
+Mwm*icon*foreground:                    #d7dae0
+Mwm*icon*topShadowColor:                #3a4049
+Mwm*icon*bottomShadowColor:             #0d0f12
+Mwm*iconImageBackground:                #2c3138
 
 ! --- Move/resize feedback box ----------------------------------------------
-Mwm*feedback*background:                #3a3f47
-Mwm*feedback*foreground:                #e6e9ee
+Mwm*feedback*background:                #22262d
+Mwm*feedback*foreground:                #d7dae0
 
-! This is the session's whole resource database, so app resources (XTerm*...)
-! belong here too. Deliberately none for now: the e2e render check asserts a
-! grayscale stddev over the screendump (ci/vm/vm-e2e.sh), and darkening the
-! xterms toward the grey25 root eats into that margin for no functional gain.
+! --- xterm ------------------------------------------------------------------
+! This is the session's whole resource database, so app resources live here
+! too. Terminals are the only app the image ships; left stock they are a
+! white slab in the middle of a dark desktop.
+!
+! Only colors are set: xterm's geometry is load-bearing in CI (the input test
+! computes a click coordinate from the window's centre, vm-guest.sh), so
+! nothing here may change the window's size — no scrollBar, no borderWidth.
+XTerm*background:                       #16191d
+XTerm*foreground:                       #d7dae0
+XTerm*cursorColor:                      #3d7ebf
+XTerm*pointerColorBackground:           #16191d
+
+! ANSI palette: desaturated for a dark background (stock red/blue vibrate
+! badly on one). 0-7 normal, 8-15 bright.
+XTerm*color0:                           #21252b
+XTerm*color1:                           #c0554f
+XTerm*color2:                           #7fa860
+XTerm*color3:                           #cf9a4e
+XTerm*color4:                           #4f86c2
+XTerm*color5:                           #a06fbb
+XTerm*color6:                           #4aa8a0
+XTerm*color7:                           #c3c8d0
+XTerm*color8:                           #4a515c
+XTerm*color9:                           #e06c65
+XTerm*color10:                          #9cc27c
+XTerm*color11:                          #e5b567
+XTerm*color12:                          #6ba3d8
+XTerm*color13:                          #c08fdb
+XTerm*color14:                          #5fc9bf
+XTerm*color15:                          #e6e9ee

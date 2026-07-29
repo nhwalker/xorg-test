@@ -167,25 +167,45 @@ DISPLAY=:0 glxinfo -B                          # from the host
 podman run -e DISPLAY=:0 -v /tmp/.X11-unix:/tmp/.X11-unix <img> xclock
 ```
 
-## Look and feel (mwm)
+## Look and feel (dark theme)
 
-The session's appearance lives in two files, both baked into `/etc/skel` and
-picked up by the `desktop` user at image build time:
+The session ships a dark theme. Its appearance lives in three files, the
+first two baked into `/etc/skel` and picked up by the `desktop` user at image
+build time:
 
 | File | In the image | Covers |
 |---|---|---|
 | `image/session/mwmrc` | `~/.mwmrc` | root menu, window menu, key bindings, button bindings |
-| `image/session/Xdefaults` | `~/.Xdefaults` | colors, fonts, focus policy, decorations, icon placement |
+| `image/session/Xdefaults` | `~/.Xdefaults` | frame/menu/icon colors, xterm colors — and where fonts, focus policy and decorations would go |
+| `image/session/xinitrc.desktop` | `/etc/X11/xinit/xinitrc.desktop` | root window color (`xsetroot`) |
+
+The palette, shared by all three:
+
+| Role | Color | Used for |
+|---|---|---|
+| base | `#101216` | root window |
+| surface | `#22262d` | unfocused frames, menus, icons |
+| accent | `#3d7ebf` | focused frame, selected menu entry, cursor |
+| text | `#d7dae0` | foreground on surfaces |
+| dim | `#9aa1ab` | foreground on unfocused frames |
+
+xterm gets a matching background and a desaturated 16-color ANSI palette.
+Only its colors are set: the e2e input test computes a click coordinate from
+the xterm's centre (`ci/vm/vm-guest.sh`), so resources that change the
+window's size (`scrollBar`, `borderWidth`) would break it.
 
 `~/.Xdefaults` is read directly by Xt because nothing in the session sets a
 `RESOURCE_MANAGER` property — the image needs no `xrdb`. **If an `xrdb` call
 is ever added to `xinitrc.desktop`, that property starts existing and this
 file is silently ignored**; load it explicitly (`xrdb -merge`) at that point.
 
-The shipped theme colors the focused window frame with a blue accent and
-leaves unfocused frames neutral against the `grey25` root, with the menus and
-minimized-window icons matched to it. Other commonly wanted `Mwm*` resources,
-none of which are set here:
+One constraint when retuning the palette: `ci/vm/vm-e2e.sh` proves the X
+server is actually drawing by asserting the screendump's grayscale stddev is
+above 0.02, and an all-dark scheme can flatten that. The margin here comes
+from the accent title bar and the light terminal text against the near-black
+root — keep something bright.
+
+Other commonly wanted `Mwm*` resources, none of which are set here:
 
 ```
 Mwm*keyboardFocusPolicy:  pointer    ! focus follows mouse (default: explicit)
