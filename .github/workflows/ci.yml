@@ -38,6 +38,20 @@ jobs:
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight
+      - name: quadlet variants stay in sync
+        # quadlet/desktop.container (install.sh flow) and the deploy tree's
+        # unit must keep identical [Container] sections except the deploy
+        # variant's always-on GPU lines - the "keep in sync" header comments
+        # are enforced here, not trusted.
+        run: |
+          sec() { sed -n '/^\[Container\]/,/^\[Service\]/p' "$1" | grep -vE '^\s*#|^\[|^$'; }
+          diff <(sec quadlet/desktop.container) \
+               <(sec deploy/host/etc/containers/systemd/desktop.container) > /tmp/qdiff || true
+          grep -E '^[<>]' /tmp/qdiff | sort > /tmp/qgot
+          printf '> AddDevice=nvidia.com/gpu=all\n> Environment=NVIDIA_DRIVER_CAPABILITIES=all\n' | sort > /tmp/qwant
+          diff /tmp/qgot /tmp/qwant || {
+            echo "quadlet [Container] sections drifted beyond the intended GPU lines:"; cat /tmp/qdiff; exit 1; }
+
       - name: helm lint + template assertions
         run: |
           helm lint charts/desktop-container charts/desktop-device-plugin
@@ -134,6 +148,15 @@ jobs:
         run: sudo apparmor_parser -R /etc/apparmor.d/unix-chkpwd 2>/dev/null || true
       - name: podman smoke suite (real install.sh on the ephemeral runner)
         run: sudo -E ci/smoke-podman.sh
+      - name: deploy-tree boot smoke (declarative flow, end to end)
+        # After smoke-podman's --uninstall restored the host: apply the
+        # deploy/ tree with the documented rsync, boot desktop.service from
+        # its quadlet, and verify the full composition (converger oneshots,
+        # stub CDI through a real systemd start, desktop-shell ssh both
+        # directions, desktop-preflight down to the one known runner gap).
+        # Also runs the root-only branch tests for the CDI converger and a
+        # dirty-seat seat-prep scenario.
+        run: sudo -E ci/smoke-deploy.sh
       - name: collect diagnostics on failure
         if: failure()
         run: |

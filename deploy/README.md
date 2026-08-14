@@ -84,7 +84,9 @@ wired into the boot transaction, and a host that only works after manual
 never graphical, `systemctl daemon-reload && systemd-sysusers &&
 systemd-tmpfiles --create && systemctl restart systemd-logind &&
 systemctl start desktop.service` works too (sysusers before tmpfiles: the
-desktop-shell home dir references the user). Converting a currently
+desktop-shell home dir references the user; and if sshd was already
+running, `systemctl reload sshd` — the `sshd_config.d` drop-in is only
+read at sshd start). Converting a currently
 *graphical* host live is `seat-prep.sh`'s job (see "Seat state" below) —
 it runs before every desktop start anyway, and its verification gate tells
 you if a leftover session still holds the GPU, in which case reboot.
