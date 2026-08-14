@@ -3,6 +3,11 @@
 # phase1: podman/quadlet flow with the real install.sh - real Xorg on the
 #         virtio display, audio, host-terminal ssh, all under SELinux
 #         enforcing.
+# phase-deploy: the declarative deploy/ tree on the same VM - install.sh
+#         uninstalled (which restores a live getty for seat-prep to evict),
+#         tree rsync-applied, desktop booted from its quadlet, root-owned
+#         desktop-shell ssh trust exercised under SELinux enforcing, and
+#         desktop-preflight asserted fully green.
 # phase2: k3s + both charts - device plugin health gating and a client pod
 #         opening xterm on the same display.
 set -euo pipefail
@@ -122,6 +127,78 @@ phase1() {
         xterm -T e2e-proof -geometry 80x24+80+80
     sleep 3
     log p1 "phase1 passed"
+}
+
+phase_deploy() {
+    log pd "SELinux must still be enforcing for this phase to mean anything"
+    [ "$(getenforce)" = Enforcing ] || fail "SELinux is not enforcing"
+
+    log pd "hand over: uninstall the install.sh flow (restores getty@tty1, a live dirty seat)"
+    ./install.sh --uninstall
+    if systemctl is-active --quiet desktop.service; then
+        fail "desktop.service still active after uninstall"
+    fi
+
+    log pd "install the deploy tree's host prerequisites (HOST-REQUIRES.md)"
+    dnf -y -q install rsync psmisc >/dev/null
+
+    log pd "apply the deploy tree (verbatim README command)"
+    rsync -a --chown=root:root deploy/host/ /
+    [ -L /etc/systemd/system/getty@tty1.service ] || fail "getty mask did not survive as a symlink"
+    systemctl daemon-reload
+    systemd-sysusers
+    systemd-tmpfiles --create || true
+    # the sshd_config.d drop-in (root-owned authorized_keys path) is only
+    # read at sshd start; this VM's sshd predates it
+    systemctl reload sshd
+
+    log pd "start desktop.service; seat-prep must evict the getty uninstall restarted"
+    systemctl start desktop.service
+    for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell; do
+        systemctl is-active --quiet "$u.service" || fail "$u.service not active"
+    done
+    if systemctl is-active --quiet getty@tty1.service; then
+        fail "getty@tty1 survived seat-prep"
+    fi
+
+    log pd "container reaches running"
+    wait_for 40 3 "systemd running in container" container_running
+
+    log pd "stub CDI spec resolved (no NVIDIA in the VM; marker on container PID 1)"
+    grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
+    podman exec desktop sh -c "tr '\0' '\n' </proc/1/environ | grep -qx NVIDIA_CDI_STUB=1" \
+        || fail "stub marker not on container PID 1"
+
+    log pd "Xorg serves the virtio display, rootless, under the deploy quadlet"
+    wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
+    podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null \
+        || fail "xdpyinfo could not talk to :0"
+    owner=$(podman exec desktop sh -c 'ps -o user= -C Xorg | head -1' || true)
+    [ "$owner" = desktop ] || fail "Xorg runs as '${owner:-nobody}', want desktop"
+    podman exec desktop sh -c 'loginctl list-sessions --no-pager | grep -q seat0' \
+        || fail "no seat0 session"
+    podman exec desktop ps -C mwm >/dev/null || fail "mwm not running"
+
+    log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
+    # This is the path only this phase can prove: sshd reading the key from
+    # /etc/ssh/authorized_keys.d (not a home dir) with SELinux enforcing.
+    who=$(ssh -i /etc/desktop-container/host-shell-key -o BatchMode=yes -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null desktop-shell@127.0.0.1 whoami)
+    [ "$who" = desktop-shell ] || fail "host-side ssh whoami='$who', want desktop-shell"
+    who=$(podman exec -u desktop -e HOME=/home/desktop desktop \
+        ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami)
+    [ "$who" = desktop-shell ] || fail "container 'ssh host' whoami='$who', want desktop-shell"
+
+    log pd "desktop-preflight fully green on the VM"
+    out=$(desktop-preflight) || { echo "$out"; fail "desktop-preflight reported FAILs"; }
+    echo "$out"
+    echo "$out" | grep -q 'done: 0 FAIL' || fail "preflight did not report 0 FAILs"
+
+    log pd "spawn an xterm so the screendump shows a window"
+    podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
+        xterm -T deploy-proof -geometry 80x24+80+80
+    sleep 3
+    log pd "phase-deploy passed"
 }
 
 phase2() {
@@ -506,8 +583,9 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase1|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-record|verify-scale|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-record|verify-scale|verify-teardown|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
+    phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
     play-audio-pod) play_audio_pod "${2:-}" "${3:-}" ;;

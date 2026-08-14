@@ -465,8 +465,12 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`): real Xorg starts rootless on
   a real KMS device, mwm runs, audio devices appear, the host-terminal
   ssh path works under SELinux (validating the restorecon handling),
-  input hotplug is exercised via QEMU device_add, then the machine
-  switches to k3s and deploys both charts — real readiness, allocatable
+  input hotplug is exercised via QEMU device_add; then the **declarative
+  `deploy/` tree** takes over the same machine (install.sh uninstalled,
+  tree rsync-applied, seat-prep evicting the restored getty, the
+  root-owned `desktop-shell` ssh trust proven under enforcing,
+  `desktop-preflight` asserted fully green); then the machine switches to
+  k3s and deploys both charts — real readiness, allocatable
   `desktop.local/display`, a client pod on the display, and the
   health-gating Pending behavior. Screendumps of the virtual display are
   uploaded as artifacts.
