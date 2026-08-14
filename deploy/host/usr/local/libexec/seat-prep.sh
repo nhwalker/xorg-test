@@ -41,10 +41,13 @@ fi
 # --- 2. display manager: not running, not enabled ---------------------------
 # The quadlet's Conflicts= would stop a running one anyway; disabling also
 # survives a package install or an admin re-enabling it between boots.
+# Operate on the RESOLVED unit, not the display-manager.service alias:
+# disabling the alias removes the alias symlink first, after which --now
+# cannot resolve the name and the real unit keeps running.
 if [ -e /etc/systemd/system/display-manager.service ]; then
     dm=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)")
     log "disabling display manager $dm"
-    systemctl disable --now display-manager.service || true
+    systemctl disable --now "$dm" || true
     changed=1
 fi
 

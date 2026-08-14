@@ -185,7 +185,10 @@ if [ -e /etc/systemd/system/display-manager.service ] \
     dm=$(basename "$dm_unit")
     log "disabling display manager: $dm"
     echo "$dm" > "$STATE_DIR/display-manager"
-    systemctl disable --now display-manager.service || true
+    # Disable the RESOLVED unit: disabling the display-manager.service alias
+    # removes the alias symlink first, after which --now cannot resolve the
+    # name and the real unit keeps running (caught by ci/smoke-deploy.sh).
+    systemctl disable --now "$dm" || true
 fi
 log "setting default target to multi-user.target"
 systemctl set-default multi-user.target >/dev/null
