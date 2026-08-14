@@ -35,7 +35,8 @@ jobs:
             image/session/start-session image/session/session-postmortem \
             image/session/host-terminal \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
-            deploy/host/usr/local/libexec/desktop-host-shell-setup
+            deploy/host/usr/local/libexec/desktop-host-shell-setup \
+            deploy/host/usr/local/libexec/seat-prep.sh
       - name: helm lint + template assertions
         run: |
           helm lint charts/desktop-container charts/desktop-device-plugin
@@ -90,6 +91,7 @@ jobs:
           echo "$out" | grep -q 'WantedBy=multi-user.target'
           echo "$out" | grep -q 'Conflicts=getty@tty1.service display-manager.service'
           echo "$out" | grep -q 'device.*nvidia.com/gpu=all'
+          echo "$out" | grep -q 'Wants=desktop-seat-prep.service'
           echo "$out" | grep -q 'Wants=desktop-cdi-refresh.service'
           echo "$out" | grep -q 'Wants=desktop-host-shell.service'
           # GPU-less runner: the converger must write the stub, and podman
@@ -98,6 +100,13 @@ jobs:
           sudo grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml
           sudo podman run --rm --device nvidia.com/gpu=all \
             localhost/desktop-container:latest sh -c 'test "$NVIDIA_CDI_STUB" = 1'
+          # seat-prep: converges the runner's seat state and must be
+          # idempotent (second run silent, exit 0)
+          sudo deploy/host/usr/local/libexec/seat-prep.sh
+          [ "$(sudo systemctl is-enabled getty@tty1.service || true)" = masked ]
+          [ "$(systemctl get-default)" = multi-user.target ]
+          second=$(sudo deploy/host/usr/local/libexec/seat-prep.sh | grep -v 'fuser not available' || true)
+          [ -z "$second" ]
           # host-shell: sysusers account, fresh key, root-owned restricted trust
           sudo systemd-sysusers "$PWD/deploy/host/etc/sysusers.d/desktop-container.conf"
           sudo install -Dm644 deploy/host/etc/desktop-container/shell-user /etc/desktop-container/shell-user

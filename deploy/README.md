@@ -82,10 +82,10 @@ wired into the boot transaction, and a host that only works after manual
 never graphical, `systemctl daemon-reload && systemd-sysusers &&
 systemd-tmpfiles --create && systemctl restart systemd-logind &&
 systemctl start desktop.service` works too (sysusers before tmpfiles: the
-desktop-shell home dir references the user); on a host that currently runs a display manager or getty, just
-reboot (the quadlet's `Conflicts=` would stop them, but logind's
-`NAutoVTs=`/`ReserveVT=` only take effect on logind restart, and a
-half-live seat handover is not a state worth debugging).
+desktop-shell home dir references the user). Converting a currently
+*graphical* host live is `seat-prep.sh`'s job (see "Seat state" below) —
+it runs before every desktop start anyway, and its verification gate tells
+you if a leftover session still holds the GPU, in which case reboot.
 
 There is no uninstall: reprovision the host instead (that asymmetry is the
 point of the declarative form — the file list above *is* the state).
@@ -101,6 +101,8 @@ point of the declarative form — the file list above *is* the state).
 | `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix` |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
 | `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket (install.sh writes `/etc/asound.conf` instead; the drop-in form doesn't clobber host files but is EL/Fedora packaging) |
+| `etc/systemd/system/desktop-seat-prep.service` | oneshot before `desktop.service`: converge + verify the seat (see "Seat state" below) |
+| `usr/local/libexec/seat-prep.sh` | the script that unit runs (boot-time convergence agent, not an installer) |
 | `etc/systemd/system/desktop-cdi-refresh.service` | oneshot before `desktop.service`: converge `/etc/cdi/nvidia.yaml` (real spec or no-op stub, see "GPU" above) |
 | `usr/local/libexec/desktop-cdi-refresh` | the script that unit runs (boot-time convergence agent, not an installer) |
 | `etc/sysusers.d/desktop-container.conf` | the dedicated `desktop-shell` account (see "Host Terminal" below) |
@@ -109,9 +111,32 @@ point of the declarative form — the file list above *is* the state).
 | `etc/systemd/system/desktop-host-shell.service` | oneshot before `desktop.service`: fresh keypair every boot + root-owned trust entry |
 | `usr/local/libexec/desktop-host-shell-setup` | the script that unit runs (boot-time convergence agent, not an installer) |
 
-Both oneshots are pulled in by the quadlet's own `[Unit] Wants=` lines —
+All three oneshots are pulled in by the quadlet's own `[Unit] Wants=` lines —
 deliberately not by quadlet *drop-ins*, which pre-5.0 podman ignores — so
 nothing needs enablement: copying the files is the whole installation.
+
+## Seat state: converged every boot, assumed never
+
+`seat-prep.sh` (run by `desktop-seat-prep.service` before every desktop
+start, and safe to run by hand when converting a live host) makes no
+assumptions about the seat state it finds. Whatever is there — a running
+display manager, spawned gettys, `loginctl attach` seat splits, a
+graphical default target — is walked back to what the quadlet needs:
+seat-attachment udev rules removed (with a device retrigger), the display
+manager disabled and stopped, `multi-user.target` re-asserted as default,
+`getty@tty1` masked and stopped, and logind restarted to pick up
+`NAutoVTs=0`/`ReserveVT=0` when anything actually changed. Steady-state
+boots change nothing and log nothing.
+
+Convergence deletes rather than backs up (no `/var/lib` state, same
+philosophy as the rest of the tree), and it ends with a verification gate:
+if some process this script doesn't know about still holds a DRM device or
+the VT — a compositor, a session that outlived its display manager — it
+fails loudly naming the culprit, instead of letting the desktop boot into
+`drmSetMaster failed`. `desktop.service` still starts (`Wants=`, not
+`Requires=`), hits the same conflict, and the seat-prep log explains why.
+The static `default.target` / getty-mask symlinks in the tree remain the
+boot-time baseline; the script is what makes them true again after drift.
 
 ## Host Terminal: always on, dedicated account, boot-fresh key
 
@@ -141,12 +166,6 @@ admin's/provisioning's call, as with install.sh.
 
 ## What install.sh does that this tree deliberately doesn't
 
-- **Disable a display manager / undo `loginctl attach` seat rules.** A
-  production host is provisioned headless from the start: no display
-  manager installed, no `/etc/udev/rules.d/72-seat-*.rules`. The quadlet
-  carries `Conflicts=display-manager.service getty@tty1.service` as a
-  runtime backstop, but converting a formerly-graphical host is
-  install.sh's job, not this tree's.
 - **The `nvidia_drv.so` bind-mount fallback for old toolkits.** Pin your
   toolkit version instead, or add the `Volume=` lines shown in the quadlet
   unit's GPU comment. (GPU detection itself IS carried over, as the
@@ -178,6 +197,7 @@ deploy-specific bits:
 systemctl status desktop.service            # generated from the quadlet
 systemctl is-enabled getty@tty1.service     # masked
 systemctl get-default                       # multi-user.target
+systemctl status desktop-seat-prep          # seat converged; culprit named if not
 systemctl status desktop-cdi-refresh        # ran; log says real spec vs stub
 head -5 /etc/cdi/nvidia.yaml                # real (nvidia-ctk) or stub marker
 systemctl status desktop-host-shell         # fresh key generated this boot

@@ -25,6 +25,12 @@ Description=Containerized desktop (Xorg + mwm + PipeWire)
 # tree keep both units from ever starting.
 Conflicts=getty@tty1.service display-manager.service
 After=getty@tty1.service display-manager.service
+# Seat convergence: walk back whatever seat state the host is in (display
+# manager, gettys, loginctl seat splits, graphical default target) and
+# verify DRM/the VT are takeable before the desktop starts - see
+# usr/local/libexec/seat-prep.sh in this tree.
+Wants=desktop-seat-prep.service
+After=desktop-seat-prep.service
 # CDI spec convergence: real spec on GPU hosts, no-op stub elsewhere, so
 # the unconditional AddDevice= below always resolves (see that unit and
 # usr/local/libexec/desktop-cdi-refresh in this tree).
