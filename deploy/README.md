@@ -101,6 +101,7 @@ point of the declarative form — the file list above *is* the state).
 | `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix` |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
 | `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket (install.sh writes `/etc/asound.conf` instead; the drop-in form doesn't clobber host files but is EL/Fedora packaging) |
+| `usr/local/bin/desktop-preflight` | read-only debug tool: PASS/WARN/FAIL per host-side assumption; not wired into boot |
 | `etc/systemd/system/desktop-seat-prep.service` | oneshot before `desktop.service`: converge + verify the seat (see "Seat state" below) |
 | `usr/local/libexec/seat-prep.sh` | the script that unit runs (boot-time convergence agent, not an installer) |
 | `etc/systemd/system/desktop-cdi-refresh.service` | oneshot before `desktop.service`: converge `/etc/cdi/nvidia.yaml` (real spec or no-op stub, see "GPU" above) |
@@ -190,10 +191,13 @@ Image=registry.example.com/desktop-container@sha256:...
 
 ## Verify
 
-Same checklist as the main README ("Verification checklist"), plus the
+First stop: `desktop-preflight` (ships with the tree, root, read-only) —
+one PASS/WARN/FAIL line per host-side assumption with a remediation hint,
+exit 1 on any FAIL. Then the main README's checklist, plus the
 deploy-specific bits:
 
 ```sh
+desktop-preflight                           # the whole host-side story
 systemctl status desktop.service            # generated from the quadlet
 systemctl is-enabled getty@tty1.service     # masked
 systemctl get-default                       # multi-user.target

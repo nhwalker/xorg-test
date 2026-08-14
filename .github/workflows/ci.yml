@@ -36,7 +36,8 @@ jobs:
             image/session/host-terminal \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
-            deploy/host/usr/local/libexec/seat-prep.sh
+            deploy/host/usr/local/libexec/seat-prep.sh \
+            deploy/host/usr/local/bin/desktop-preflight
       - name: helm lint + template assertions
         run: |
           helm lint charts/desktop-container charts/desktop-device-plugin
@@ -113,6 +114,17 @@ jobs:
           sudo deploy/host/usr/local/libexec/desktop-host-shell-setup
           sudo grep -q 'from="127.0.0.1,::1".*desktop-container-host-shell' \
             /etc/ssh/authorized_keys.d/desktop-shell
+          # host-preflight (debug tool): must run to completion and correctly
+          # report this partially-applied runner - quadlet not installed
+          # (FAIL) but the pieces the step applied green (stub CDI spec,
+          # desktop-shell account, seat state)
+          pf=$(sudo deploy/host/usr/local/bin/desktop-preflight || true)
+          echo "$pf"
+          echo "$pf" | grep -q 'done: [0-9]* FAIL'
+          echo "$pf" | grep -q 'FAIL: quadlet unit missing'
+          echo "$pf" | grep -q 'PASS: GPU-less host: stub CDI spec'
+          echo "$pf" | grep -q 'PASS: desktop-shell account exists'
+          echo "$pf" | grep -q 'PASS: default target is multi-user.target'
 
       - name: neutralize host AppArmor unix-chkpwd profile
         # Ubuntu's path-attached unix-chkpwd profile confines the CONTAINER's
