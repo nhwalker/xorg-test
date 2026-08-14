@@ -25,6 +25,11 @@ Description=Containerized desktop (Xorg + mwm + PipeWire)
 # tree keep both units from ever starting.
 Conflicts=getty@tty1.service display-manager.service
 After=getty@tty1.service display-manager.service
+# CDI spec convergence: real spec on GPU hosts, no-op stub elsewhere, so
+# the unconditional AddDevice= below always resolves (see that unit and
+# usr/local/libexec/desktop-cdi-refresh in this tree).
+Wants=desktop-cdi-refresh.service
+After=desktop-cdi-refresh.service
 
 [Container]
 Image=localhost/desktop-container:latest
@@ -42,6 +47,17 @@ Volume=/run/desktop-audio:/run/desktop-audio
 # Host-shell material for the 'Host Terminal' menu entry (key + username;
 # provisioned by the deploy/host-shell overlay; harmless when absent/empty).
 Volume=/etc/desktop-container:/etc/desktop-container:ro
+# GPU, always on: most deployments have an NVIDIA GPU, and the rest resolve
+# this against the stub CDI spec desktop-cdi-refresh writes (which injects
+# only the NVIDIA_CDI_STUB=1 marker), so the same unit serves both. The env
+# var is inert without the NVIDIA stack.
+# Older nvidia container toolkits omit the Xorg driver module from the CDI
+# spec (preflight then warns 'nvidia_drv.so NOT injected'): pin a toolkit
+# that includes it, or bind-mount the host's copies:
+#   Volume=/usr/lib64/xorg/modules/drivers/nvidia_drv.so:/usr/lib64/xorg/modules/drivers/nvidia_drv.so:ro
+#   Volume=/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:ro
+AddDevice=nvidia.com/gpu=all
+Environment=NVIDIA_DRIVER_CAPABILITIES=all
 # --privileged: host /dev (dri, input, snd, tty*) visible, no SELinux
 # separation, device cgroup open. --systemd=always: proper systemd PID 1.
 # --tty: gives the container a /dev/console wired to `podman logs`, which

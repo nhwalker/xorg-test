@@ -1,0 +1,56 @@
+#!/bin/bash
+# Converge /etc/cdi/nvidia.yaml before every desktop start (run by
+# desktop-cdi-refresh.service; see deploy/README.md).
+#
+# The quadlet unit carries AddDevice=nvidia.com/gpu=all unconditionally, so
+# a spec defining that device must ALWAYS exist or container creation fails.
+# Two outcomes:
+#   - GPU + nvidia container toolkit present: `nvidia-ctk cdi generate`
+#     writes the real spec. Regenerating every boot keeps it coherent after
+#     host driver updates (a stale spec fails container creation).
+#   - otherwise: write a STUB spec whose only edit is the marker env
+#     NVIDIA_CDI_STUB=1 - AddDevice= resolves and injects nothing (CDI
+#     rejects a device with no edits at all, so the marker is also what
+#     makes the stub valid). The container's preflight uses the marker to
+#     FAIL loudly when NVIDIA hardware is visible anyway, i.e. when the
+#     stub means "broken host toolkit", not "no GPU".
+set -euo pipefail
+
+SPEC=/etc/cdi/nvidia.yaml
+
+if command -v nvidia-ctk >/dev/null && [ -e /dev/nvidiactl ]; then
+    mkdir -p /etc/cdi
+    if nvidia-ctk cdi generate --output="$SPEC"; then
+        echo "generated real CDI spec at $SPEC"
+        exit 0
+    fi
+    echo "WARNING: nvidia-ctk cdi generate failed" >&2
+fi
+
+# No working GPU stack right now. Never downgrade an existing real spec
+# while there is any sign of NVIDIA hardware: losing a race against driver
+# module load (or a transient nvidia-ctk failure) must not silently cost
+# GPU acceleration - a possibly-stale real spec fails loudly at container
+# creation instead, which is the better failure.
+if [ -f "$SPEC" ] && ! grep -q NVIDIA_CDI_STUB "$SPEC"; then
+    if [ -e /dev/nvidiactl ] || grep -q '^nvidia ' /proc/modules 2>/dev/null; then
+        echo "keeping existing real CDI spec: NVIDIA hardware present but toolkit unusable this boot" >&2
+        exit 0
+    fi
+fi
+
+mkdir -p /etc/cdi
+cat > "$SPEC" <<'EOF'
+# Stub CDI spec written by desktop-cdi-refresh: no NVIDIA GPU stack on this
+# host. Satisfies the quadlet's unconditional AddDevice=nvidia.com/gpu=all
+# while injecting only the marker env var. Regenerated on every boot - a
+# GPU host that lands here has a missing/broken nvidia container toolkit.
+cdiVersion: 0.5.0
+kind: nvidia.com/gpu
+devices:
+  - name: all
+    containerEdits:
+      env:
+        - NVIDIA_CDI_STUB=1
+EOF
+echo "no NVIDIA GPU stack: wrote stub CDI spec at $SPEC"
