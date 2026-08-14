@@ -113,8 +113,10 @@ for _ in $(seq 20); do
 done
 [ "$up" = 1 ] || fail "container never answered exec"
 
-log "stub CDI resolved through the systemd start (marker env visible inside)"
-podman exec desktop sh -c 'test "$NVIDIA_CDI_STUB" = 1' \
+log "stub CDI resolved through the systemd start (marker env on PID 1)"
+# CDI env edits apply to the container's INIT process; podman exec sessions
+# do not get them - read PID 1's environment, not the exec env.
+podman exec desktop sh -c "tr '\0' '\n' </proc/1/environ | grep -qx NVIDIA_CDI_STUB=1" \
     || fail "NVIDIA_CDI_STUB not injected via AddDevice + stub spec"
 
 log "wait for the container to settle (same envelope as smoke-podman)"
