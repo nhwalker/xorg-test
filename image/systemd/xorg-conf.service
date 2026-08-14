@@ -7,6 +7,10 @@ Type=oneshot
 RemainAfterExit=yes
 # "-" prefix: diagnostics log but never block the session; the
 # Xwrapper.config escape hatch is the manual fallback.
+# First: the session user's numeric identity, which every step below either
+# reports on (preflight), writes files as (host-shell-setup) or adds groups
+# to (align-device-groups). No-op unless the host exported an account.
+ExecStart=-/usr/local/bin/align-desktop-user.sh
 ExecStart=-/usr/local/bin/ensure-vt-devices.sh
 ExecStart=-/usr/local/bin/align-device-groups.sh
 # The audio export sockets live in a host-shared dir that survives container

@@ -43,6 +43,13 @@ After=desktop-cdi-refresh.service
 # container's menu entry degrades gracefully.
 Wants=desktop-host-shell.service
 After=desktop-host-shell.service
+# Session user identity: exports the uid/gid/password of the host account
+# named in /etc/desktop-container/desktop-user, which the container adopts at
+# boot (deploy/README.md "Desktop user identity"). No account named there =
+# nothing exported = the image's built-in uid 1000, so this is safe to leave
+# on for every host.
+Wants=desktop-user-sync.service
+After=desktop-user-sync.service
 
 [Container]
 Image=localhost/desktop-container:latest

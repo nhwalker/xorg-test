@@ -1,0 +1,17 @@
+# Part of the desktop-container deploy tree (deploy/README.md).
+[Unit]
+Description=Export host user identity for the desktop container
+# Converges /etc/desktop-container/desktop-user.env (+ .hash) from the host
+# account named in /etc/desktop-container/desktop-user, so the container's
+# session user can adopt a uid that was not knowable at image build time.
+# Pulled in by desktop.container's [Unit] Wants=; with no account named the
+# export is cleared and the container keeps its built-in uid 1000.
+Before=desktop.service
+# The account is expected to already exist; ordering after sysusers only
+# covers hosts that create it declaratively.
+After=systemd-sysusers.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/desktop-user-sync

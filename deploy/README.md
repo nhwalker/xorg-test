@@ -116,8 +116,11 @@ point of the declarative form — the file list above *is* the state).
 | `etc/desktop-container/shell-user` | account name the container's `ssh host` targets (static: `desktop-shell`) |
 | `etc/systemd/system/desktop-host-shell.service` | oneshot before `desktop.service`: fresh keypair every boot + root-owned trust entry |
 | `usr/local/libexec/desktop-host-shell-setup` | the script that unit runs (boot-time convergence agent, not an installer) |
+| `etc/desktop-container/desktop-user` | host account the container's session user mirrors (shipped empty = off, see "Desktop user identity" below) |
+| `etc/systemd/system/desktop-user-sync.service` | oneshot before `desktop.service`: export that account's uid/gid/password for the container to adopt |
+| `usr/local/libexec/desktop-user-sync` | the script that unit runs (boot-time convergence agent, not an installer) |
 
-All three oneshots are pulled in by the quadlet's own `[Unit] Wants=` lines —
+All four oneshots are pulled in by the quadlet's own `[Unit] Wants=` lines —
 deliberately not by quadlet *drop-ins*, which pre-5.0 podman ignores — so
 nothing needs enablement: copying the files is the whole installation.
 
@@ -170,6 +173,78 @@ sshd itself: the unit `Wants=sshd.service` (started each boot while the
 desktop is deployed), but whether sshd is *enabled* on the host stays the
 admin's/provisioning's call, as with install.sh.
 
+## Desktop user identity: mirroring a host account
+
+The image bakes `desktop` in at uid 1000 (`useradd -u 1000`) because a
+build has to pick something. Which host account the desktop actually
+stands in for is a *deploy-time* fact, so this tree converges it at boot
+instead — same shape as the CDI spec and the host-shell key.
+
+Name one existing host account in
+`/etc/desktop-container/desktop-user`:
+
+```sh
+echo alice > /etc/desktop-container/desktop-user
+systemctl restart desktop-user-sync.service desktop.service
+```
+
+`desktop-user-sync.service` then exports, into the directory the quadlet
+already bind-mounts read-only into the container:
+
+- `desktop-user.env` — uid, primary gid + group name, GECOS, login shell
+  (0644)
+- `desktop-user.hash` — that account's `/etc/shadow` password field
+  (0400, root)
+
+and the container's `align-desktop-user.sh` (first `ExecStart=` of
+`xorg-conf.service`, before anything reads or writes as the session user)
+applies them with `groupmod`/`usermod`/`chpasswd`, then rechowns
+`/home/desktop`.
+
+**Numbers, not names.** The login name inside the container stays
+`desktop` whatever the host account is called — every unit, path and
+helper in the image references it. What follows the host account is the
+*numeric* identity, which is the only thing the kernel compares for
+ownership on `/tmp/.X11-unix`, `/run/desktop-audio` and any host volume
+you add, plus the password hash, so `su desktop` inside the container
+takes the host user's password. Naming the host account `desktop` makes
+the two match end to end, but nothing requires it.
+
+What it deliberately does not do:
+
+- **No account creation.** A named-but-missing account fails the unit
+  loudly (the desktop still boots, on its built-in identity).
+- **No supplementary groups.** The container's group memberships are the
+  device groups, renumbered at boot by `align-device-groups.sh`; host
+  groups would collide with them by name for no gain. If the host account's
+  primary gid is already an image group's (gid 100 `users`, say), that group
+  becomes the session user's primary group rather than being renumbered —
+  the number on the files is what matters, the name it resolves to inside
+  the container does not.
+- **No shared home.** `/home/desktop` stays container-local, just owned by
+  the new uid. Bind-mounting the host user's home is a `Volume=` line away
+  if you want it — the uid alignment is what makes that mount usable.
+- **No hash translation.** The `/etc/shadow` field is copied verbatim, so
+  the container's libcrypt has to understand the scheme the host hashed
+  with (UBI 9's libxcrypt covers `$6$` sha512 and `$y$` yescrypt, which is
+  every mainstream host default). One it cannot verify just never accepts
+  the password; the adopted scheme id is logged for exactly that reason.
+- **No live refresh.** The export is regenerated per boot (or on a manual
+  `systemctl restart desktop-user-sync.service`); a running container
+  keeps the values it started with, so a host password change reaches the
+  desktop at the next `desktop.service` restart.
+
+Shipped empty, i.e. off: with no account named, the export is cleared and
+the container keeps uid 1000 exactly as before. The container-side script
+is likewise a no-op without the mounted material, so the install.sh and
+k8s paths are unaffected.
+
+Refusals are logged, never guessed around — `podman logs desktop | grep
+align-desktop-user` shows a uid/gid already held by an image account, a
+non-numeric or root identity, or a `usermod` that failed, and the desktop
+comes up on its built-in identity. `preflight:` carries the one-line
+verdict.
+
 ## What install.sh does that this tree deliberately doesn't
 
 - **The `nvidia_drv.so` bind-mount fallback for old toolkits.** Pin your
@@ -212,13 +287,16 @@ systemctl status desktop-cdi-refresh        # ran; log says real spec vs stub
 head -5 /etc/cdi/nvidia.yaml                # real (nvidia-ctk) or stub marker
 systemctl status desktop-host-shell         # fresh key generated this boot
 ls -l /etc/ssh/authorized_keys.d/           # root-owned desktop-shell entry
+systemctl status desktop-user-sync          # mirrored account, or "no account named"
+cat /etc/desktop-container/desktop-user.env # what the container will adopt
+podman exec desktop id desktop              # what it actually did adopt
 podman logs desktop | grep preflight:       # container-side assumptions;
                                             # FAILs on stub spec + visible GPU
 ```
 
 ## How CI validates this tree
 
-- `ci.yml` static job: shellcheck on all four scripts, plus a guard that
+- `ci.yml` static job: shellcheck on all five scripts, plus a guard that
   the `[Container]` sections of this quadlet and `quadlet/desktop.container`
   (the install.sh flow) only differ by the intended GPU lines.
 - `ci.yml` build-smoke: a quadlet `-dryrun` fast-fail, then
