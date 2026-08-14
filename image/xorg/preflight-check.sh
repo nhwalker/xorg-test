@@ -97,7 +97,7 @@ done
 if [ -f /etc/desktop-container/host-shell-key ]; then
     pass "host shell material mounted (Host Terminal -> ssh as '$(cat /etc/desktop-container/shell-user 2>/dev/null || echo '?')')"
 else
-    warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: install.sh [--host-prep-only] --shell-user <user> on the host"
+    warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: install.sh [--host-prep-only] --shell-user <user>, or the desktop-host-shell lines in the deploy tree's quadlet (deploy/README.md)"
 fi
 
 # --- NVIDIA coherence ----------------------------------------------------------

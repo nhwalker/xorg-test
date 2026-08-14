@@ -17,24 +17,21 @@ provisioning). See "Overriding the image reference" below.
 
 ## Requirements
 
-- podman >= 4.4; **podman >= 5.0 additionally for the `host-shell/`
-  overlay and the image-pinning drop-in** — quadlet only learned to merge
-  drop-in directories (`desktop.container.d/*.conf`) in 5.0, and older
-  versions ignore them *silently*. On RHEL/Rocky that means 9.5 or newer
-  (9.4's podman 4.9 predates it). After applying, `systemctl cat
-  desktop.service` and check the drop-in content actually landed in the
-  generated unit. The GPU path does NOT depend on drop-ins (see below).
+- podman >= 4.4. Nothing the tree itself ships depends on quadlet drop-in
+  directories — quadlet only learned to merge those in podman 5.0 and
+  older versions ignore them *silently*, which is why every feature here
+  lives in the base unit and no-ops at runtime instead. The one documented
+  drop-in (the optional image pin below) therefore needs podman >= 5.0
+  (RHEL/Rocky 9.5+); after applying one, `systemctl cat desktop.service`
+  and check it actually landed in the generated unit.
 - the desktop image already present in podman's storage.
 
 ## Layout
 
-```
-host/         every desktop host, with or without a GPU
-host-shell/   overlay: hosts where the "Host Terminal" menu entry should work
-```
-
-Each directory mirrors the host filesystem from `/`. Overlays are additive —
-apply `host/` first, then the overlays that match the host class.
+One tree, `host/`, for every desktop host — with or without a GPU, Host
+Terminal always provisioned. It mirrors the host filesystem from `/`.
+Anything per-host-class is handled by runtime no-ops (GPU) or a commented
+off-switch (Host Terminal), not by different file sets.
 
 ## GPU: one tree serves GPU and GPU-less hosts
 
@@ -68,8 +65,6 @@ marker plus visible NVIDIA hardware — as `preflight: FAIL` in
 ```sh
 # as root, from the repo:
 rsync -a --chown=root:root deploy/host/ /
-rsync -a --chown=root:root deploy/host-shell/ /    # if Host Terminal is wanted
-echo alice > /etc/desktop-container/shell-user     # host-shell: per-host config
 
 systemctl daemon-reload
 reboot
@@ -84,9 +79,10 @@ symlinks, see below).
 A reboot is the clean path and the honest production test — everything is
 wired into the boot transaction, and a host that only works after manual
 `systemctl start`s is misprovisioned. To apply live on a host that was
-never graphical, `systemctl daemon-reload && systemctl restart
-systemd-tmpfiles-setup systemd-logind && systemctl start desktop.service`
-works too; on a host that currently runs a display manager or getty, just
+never graphical, `systemctl daemon-reload && systemd-sysusers &&
+systemd-tmpfiles --create && systemctl restart systemd-logind &&
+systemctl start desktop.service` works too (sysusers before tmpfiles: the
+desktop-shell home dir references the user); on a host that currently runs a display manager or getty, just
 reboot (the quadlet's `Conflicts=` would stop them, but logind's
 `NAutoVTs=`/`ReserveVT=` only take effect on logind restart, and a
 half-live seat handover is not a state worth debugging).
@@ -105,18 +101,43 @@ point of the declarative form — the file list above *is* the state).
 | `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix` |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
 | `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket (install.sh writes `/etc/asound.conf` instead; the drop-in form doesn't clobber host files but is EL/Fedora packaging) |
-| `etc/systemd/system/desktop-cdi-refresh.service` | oneshot before `desktop.service`: converge `/etc/cdi/nvidia.yaml` (real spec or no-op stub, see "GPU" above); pulled in by the quadlet's `[Unit] Wants=`, needs no enablement |
+| `etc/systemd/system/desktop-cdi-refresh.service` | oneshot before `desktop.service`: converge `/etc/cdi/nvidia.yaml` (real spec or no-op stub, see "GPU" above) |
 | `usr/local/libexec/desktop-cdi-refresh` | the script that unit runs (boot-time convergence agent, not an installer) |
+| `etc/sysusers.d/desktop-container.conf` | the dedicated `desktop-shell` account (see "Host Terminal" below) |
+| `etc/ssh/sshd_config.d/40-desktop-container.conf` | root-owned `authorized_keys` location for `desktop-shell` |
+| `etc/desktop-container/shell-user` | account name the container's `ssh host` targets (static: `desktop-shell`) |
+| `etc/systemd/system/desktop-host-shell.service` | oneshot before `desktop.service`: fresh keypair every boot + root-owned trust entry |
+| `usr/local/libexec/desktop-host-shell-setup` | the script that unit runs (boot-time convergence agent, not an installer) |
 
-| File (overlay) | Purpose |
-|---|---|
-| `host-shell/…/desktop.container.d/20-host-shell.conf` | quadlet drop-in: pulls in the key-provisioning unit (**podman >= 5.0**) |
-| `host-shell/…/desktop-host-shell.service` | oneshot before `desktop.service`: converge keypair + restricted `authorized_keys` for the account in `/etc/desktop-container/shell-user` |
-| `host-shell/usr/local/libexec/desktop-host-shell-setup` | the script that unit runs (boot-time convergence agent, not an installer) |
+Both oneshots are pulled in by the quadlet's own `[Unit] Wants=` lines —
+deliberately not by quadlet *drop-ins*, which pre-5.0 podman ignores — so
+nothing needs enablement: copying the files is the whole installation.
 
-The overlay oneshot is pulled in by its quadlet drop-in (`Wants=`/`After=`
-on `desktop.service`), so it needs no enablement either: copying the files
-is the whole installation.
+## Host Terminal: always on, dedicated account, boot-fresh key
+
+The desktop's "Host Terminal" menu entry lands in **`desktop-shell`**, a
+deliberately boring unprivileged account created declaratively by
+sysusers.d (no groups, no sudo, locked password — the container is
+`--privileged` anyway, so this path is convenience + audit trail, not a
+boundary). Differences from the install.sh flow:
+
+- **Fresh key every boot.** `desktop-host-shell.service` regenerates the
+  ed25519 keypair under `/etc/desktop-container` on every boot; key
+  material never outlives the boot that made it, and there is no rotation
+  procedure to remember.
+- **Root-owned trust.** The restricted entry (`from=` loopback only, no
+  forwarding) is written to `/etc/ssh/authorized_keys.d/desktop-shell`,
+  wired by the sshd_config.d drop-in — nothing under `/home` is touched
+  and the account cannot extend its own access.
+- **Always on.** No per-host input. The off-switch is in
+  `etc/containers/systemd/desktop.container`: comment out the two
+  `Wants=`/`After=desktop-host-shell.service` lines. With no key
+  generated, nothing can log into the account and the container's menu
+  entry degrades gracefully.
+
+sshd itself: the unit `Wants=sshd.service` (started each boot while the
+desktop is deployed), but whether sshd is *enabled* on the host stays the
+admin's/provisioning's call, as with install.sh.
 
 ## What install.sh does that this tree deliberately doesn't
 
@@ -159,7 +180,8 @@ systemctl is-enabled getty@tty1.service     # masked
 systemctl get-default                       # multi-user.target
 systemctl status desktop-cdi-refresh        # ran; log says real spec vs stub
 head -5 /etc/cdi/nvidia.yaml                # real (nvidia-ctk) or stub marker
-systemctl status desktop-host-shell         # host-shell overlay, if applied
+systemctl status desktop-host-shell         # fresh key generated this boot
+ls -l /etc/ssh/authorized_keys.d/           # root-owned desktop-shell entry
 podman logs desktop | grep preflight:       # container-side assumptions;
                                             # FAILs on stub spec + visible GPU
 ```

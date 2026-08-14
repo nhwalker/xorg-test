@@ -30,6 +30,13 @@ After=getty@tty1.service display-manager.service
 # usr/local/libexec/desktop-cdi-refresh in this tree).
 Wants=desktop-cdi-refresh.service
 After=desktop-cdi-refresh.service
+# Host Terminal, always on: a fresh loopback-ssh keypair is generated every
+# boot for the dedicated 'desktop-shell' account (see deploy/README.md
+# "Host Terminal"). To ship hosts WITHOUT it, comment out the next two
+# lines: with no key generated, nothing can log into the account and the
+# container's menu entry degrades gracefully.
+Wants=desktop-host-shell.service
+After=desktop-host-shell.service
 
 [Container]
 Image=localhost/desktop-container:latest
@@ -44,8 +51,9 @@ Volume=/run/udev:/run/udev:ro
 Volume=/tmp/.X11-unix:/tmp/.X11-unix
 # Exported audio sockets (PipeWire native + Pulse), see README.
 Volume=/run/desktop-audio:/run/desktop-audio
-# Host-shell material for the 'Host Terminal' menu entry (key + username;
-# provisioned by the deploy/host-shell overlay; harmless when absent/empty).
+# Host-shell material for the 'Host Terminal' menu entry: the static
+# shell-user file from this tree plus the boot-fresh keypair written by
+# desktop-host-shell.service (harmless when absent/empty).
 Volume=/etc/desktop-container:/etc/desktop-container:ro
 # GPU, always on: most deployments have an NVIDIA GPU, and the rest resolve
 # this against the stub CDI spec desktop-cdi-refresh writes (which injects

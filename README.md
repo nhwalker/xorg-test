@@ -417,6 +417,11 @@ sudo ./install.sh --host-prep-only --shell-user alice   # k8s flow
 # --shell-user defaults to $SUDO_USER (whoever ran sudo)
 ```
 
+(The declarative `deploy/` tree does this differently: a dedicated
+unprivileged `desktop-shell` account, a fresh key on every boot, and
+root-owned trust under `/etc/ssh/authorized_keys.d` — always on, with a
+commented off-switch. See `deploy/README.md` "Host Terminal".)
+
 What that sets up:
 
 - a dedicated ed25519 keypair in `/etc/desktop-container/` — **root-only

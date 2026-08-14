@@ -34,8 +34,8 @@ jobs:
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/session-postmortem \
             image/session/host-terminal \
-            deploy/host-shell/usr/local/libexec/desktop-host-shell-setup \
-            deploy/host/usr/local/libexec/desktop-cdi-refresh
+            deploy/host/usr/local/libexec/desktop-cdi-refresh \
+            deploy/host/usr/local/libexec/desktop-host-shell-setup
       - name: helm lint + template assertions
         run: |
           helm lint charts/desktop-container charts/desktop-device-plugin
@@ -64,18 +64,16 @@ jobs:
           sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
       - name: deploy tree quadlet dry-run + CDI stub check
         # Validate the declarative deploy/ tree: the quadlet generator must
-        # accept the unit, the always-on GPU wiring must land in the
-        # generated service on ANY podman (it lives in the base unit, not a
-        # drop-in), and the stub CDI spec written by desktop-cdi-refresh on
-        # a GPU-less host must actually satisfy AddDevice=nvidia.com/gpu=all
-        # at container creation. The host-shell drop-in merge needs podman
-        # >= 5.0 (first version to merge quadlet drop-ins).
+        # accept the unit, and everything must land in the generated service
+        # on ANY podman version - all features live in the base unit
+        # precisely because pre-5.0 quadlet silently ignores drop-in dirs.
+        # Then the stub CDI spec written by desktop-cdi-refresh on this
+        # GPU-less runner must actually satisfy AddDevice=nvidia.com/gpu=all
+        # at container creation, and the host-shell converger must produce a
+        # working sysusers account + root-owned trust file.
         run: |
           tmp=$(mktemp -d)
           install -m644 deploy/host/etc/containers/systemd/desktop.container "$tmp/"
-          mkdir "$tmp/desktop.container.d"
-          install -m644 deploy/host-shell/etc/containers/systemd/desktop.container.d/*.conf \
-                        "$tmp/desktop.container.d/"
           q=$(ls /usr/libexec/podman/quadlet /usr/lib/podman/quadlet 2>/dev/null | head -n1)
           out=$(QUADLET_UNIT_DIRS="$tmp" "$q" -dryrun -no-kmsg-log)
           echo "$out" | grep -q -- --privileged
@@ -83,17 +81,19 @@ jobs:
           echo "$out" | grep -q 'Conflicts=getty@tty1.service display-manager.service'
           echo "$out" | grep -q 'device.*nvidia.com/gpu=all'
           echo "$out" | grep -q 'Wants=desktop-cdi-refresh.service'
-          if [ "$(podman --version | grep -oE '[0-9]+' | head -n1)" -ge 5 ]; then
-            echo "$out" | grep -q 'desktop-host-shell.service'
-          else
-            echo "podman < 5.0: host-shell drop-in merge not validated (unsupported here)"
-          fi
+          echo "$out" | grep -q 'Wants=desktop-host-shell.service'
           # GPU-less runner: the converger must write the stub, and podman
           # must resolve AddDevice against it end-to-end.
           sudo deploy/host/usr/local/libexec/desktop-cdi-refresh
           sudo grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml
           sudo podman run --rm --device nvidia.com/gpu=all \
             localhost/desktop-container:latest sh -c 'test "$NVIDIA_CDI_STUB" = 1'
+          # host-shell: sysusers account, fresh key, root-owned restricted trust
+          sudo systemd-sysusers "$PWD/deploy/host/etc/sysusers.d/desktop-container.conf"
+          sudo install -Dm644 deploy/host/etc/desktop-container/shell-user /etc/desktop-container/shell-user
+          sudo deploy/host/usr/local/libexec/desktop-host-shell-setup
+          sudo grep -q 'from="127.0.0.1,::1".*desktop-container-host-shell' \
+            /etc/ssh/authorized_keys.d/desktop-shell
 
       - name: neutralize host AppArmor unix-chkpwd profile
         # Ubuntu's path-attached unix-chkpwd profile confines the CONTAINER's
