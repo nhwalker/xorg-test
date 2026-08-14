@@ -23,6 +23,9 @@ Containerfile.base          BASE image: UBI9 + Rocky9 repos + all packages (netw
 Containerfile               APPLICATION layer: config/services on the base (offline build)
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
+deploy/                     declarative deployment: the same host end state as
+                            plain files (quadlet + systemd drop-ins/masks), no
+                            install script, image assumed prebuilt
 image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
@@ -81,6 +84,15 @@ sudo ./install.sh --no-build --image <ref>   # use a prebuilt image
 sudo ./install.sh --uninstall                # restore the host
 ```
 
+### Declarative install (production)
+
+`install.sh` converts an existing host and can undo itself. For hosts that
+are *provisioned* rather than converted — the planned production shape —
+use the `deploy/` tree instead: the same end state as plain files (quadlet,
+getty mask, logind/tmpfiles/audio drop-ins, converge-at-boot oneshots for
+CDI and host-shell key material), applied with rsync/RPM/Ansible, no
+install script, image assumed already built. See `deploy/README.md`.
+
 ### What install.sh does to the host (all reverted by `--uninstall`)
 
 Seat handover — the host must stop claiming the devices the container needs:
@@ -138,6 +150,9 @@ all of them (a systemd drop-in works for the unit) to move the session.
 - The image contains **no** NVIDIA bits. `install.sh` runs
   `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` and adds a quadlet
   drop-in with `AddDevice=nvidia.com/gpu=all` when a GPU + toolkit are found.
+  Beware: quadlet only merges drop-ins with podman >= 5.0 (RHEL/Rocky 9.5+);
+  older podman ignores the GPU drop-in **silently** and the desktop comes up
+  unaccelerated. `systemctl cat desktop.service` shows what actually landed.
 - At container boot, `xorg-gpu-conf.sh` writes
   `/etc/X11/xorg.conf.d/20-gpu.conf`: `nvidia` if device nodes **and** an
   injected `nvidia_drv.so` are present, else `modesetting` on the first

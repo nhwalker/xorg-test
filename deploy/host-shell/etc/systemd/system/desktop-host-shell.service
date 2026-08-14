@@ -1,0 +1,20 @@
+# desktop-container deploy tree, host-shell overlay (deploy/README.md).
+[Unit]
+Description=Provision host-shell key material for the desktop container
+# Converges the host side of the "Host Terminal" feature at every boot:
+# dedicated ed25519 keypair under /etc/desktop-container (root-only on the
+# host, mounted read-only into the container) plus a restricted
+# authorized_keys entry for the account named in
+# /etc/desktop-container/shell-user. Pulled in by the 20-host-shell.conf
+# quadlet drop-in, so it needs no [Install]/enable of its own.
+ConditionPathExists=/etc/desktop-container/shell-user
+Before=desktop.service
+# The container reaches the host over loopback ssh; keep sshd running while
+# the desktop is deployed. (Started per boot - whether sshd is *enabled* on
+# this host stays the admin's call, as with install.sh.)
+Wants=sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/desktop-host-shell-setup

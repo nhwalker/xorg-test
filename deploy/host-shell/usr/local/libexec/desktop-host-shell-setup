@@ -1,0 +1,54 @@
+#!/bin/bash
+# Converge the host side of the desktop's "Host Terminal" feature (run at
+# boot by desktop-host-shell.service; see deploy/README.md).
+#
+# Reads the target account from /etc/desktop-container/shell-user, generates
+# the dedicated ed25519 keypair on first boot, and (re)installs a restricted
+# authorized_keys entry for that account. Idempotent, and refreshes rather
+# than appends, so rotating the key (delete it, reboot) heals the entry too.
+# The container-side half is image/session/host-shell-setup.sh, which
+# consumes host-shell-key + shell-user from the same directory.
+set -euo pipefail
+
+DIR=/etc/desktop-container
+
+user=$(tr -d '[:space:]' < "$DIR/shell-user")
+if [ -z "$user" ]; then
+    echo "$DIR/shell-user is empty; nothing to do" >&2
+    exit 0
+fi
+if ! getent passwd "$user" >/dev/null; then
+    echo "configured shell-user '$user' does not exist on this host" >&2
+    exit 1
+fi
+case "$(getent passwd "$user" | cut -d: -f7)" in
+    */nologin|*/false)
+        echo "WARNING: '$user' has a non-login shell; ssh logins will fail - pick a login-capable user" >&2 ;;
+esac
+
+if [ ! -f "$DIR/host-shell-key" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C desktop-container-host-shell \
+        -f "$DIR/host-shell-key"
+fi
+# Root-only on the host; the (privileged) container's boot script installs a
+# desktop-user copy inside the container.
+chmod 0400 "$DIR/host-shell-key"
+chmod 0644 "$DIR/host-shell-key.pub"
+
+home=$(getent passwd "$user" | cut -d: -f6)
+group=$(id -gn "$user")
+install -d -m 0700 -o "$user" -g "$group" "$home/.ssh"
+ak="$home/.ssh/authorized_keys"
+touch "$ak"
+chown "$user:$group" "$ak"
+chmod 0600 "$ak"
+sed -i '/desktop-container-host-shell/d' "$ak"
+printf 'from="127.0.0.1,::1",no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' \
+    "$(cat "$DIR/host-shell-key.pub")" >> "$ak"
+
+# SELinux: files created here by root can carry the wrong context, and sshd
+# then silently ignores authorized_keys (an AVC in the audit log is the only
+# trace). No-op on non-SELinux hosts.
+if command -v restorecon >/dev/null; then
+    restorecon -R "$home/.ssh" || true
+fi

@@ -33,7 +33,8 @@ jobs:
           shellcheck -S error install.sh ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/session-postmortem \
-            image/session/host-terminal
+            image/session/host-terminal \
+            deploy/host-shell/usr/local/libexec/desktop-host-shell-setup
       - name: helm lint + template assertions
         run: |
           helm lint charts/desktop-container charts/desktop-device-plugin
@@ -60,6 +61,31 @@ jobs:
         run: |
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+      - name: deploy tree quadlet dry-run
+        # Validate the declarative deploy/ tree: the quadlet generator must
+        # accept the unit (with both overlay drop-in dirs staged), and on
+        # podman >= 5.0 (first version to merge quadlet drop-ins) the
+        # overlays must actually land in the generated service.
+        run: |
+          tmp=$(mktemp -d)
+          install -m644 deploy/host/etc/containers/systemd/desktop.container "$tmp/"
+          mkdir "$tmp/desktop.container.d"
+          install -m644 deploy/host-gpu/etc/containers/systemd/desktop.container.d/*.conf \
+                        deploy/host-shell/etc/containers/systemd/desktop.container.d/*.conf \
+                        "$tmp/desktop.container.d/"
+          q=$(ls /usr/libexec/podman/quadlet /usr/lib/podman/quadlet 2>/dev/null | head -n1)
+          out=$(QUADLET_UNIT_DIRS="$tmp" "$q" -dryrun -no-kmsg-log)
+          echo "$out" | grep -q -- --privileged
+          echo "$out" | grep -q 'WantedBy=multi-user.target'
+          echo "$out" | grep -q 'Conflicts=getty@tty1.service display-manager.service'
+          if [ "$(podman --version | grep -oE '[0-9]+' | head -n1)" -ge 5 ]; then
+            echo "$out" | grep -q 'nvidia.com/gpu=all'
+            echo "$out" | grep -q 'desktop-cdi-refresh.service'
+            echo "$out" | grep -q 'desktop-host-shell.service'
+          else
+            echo "podman < 5.0: drop-in merge not validated (unsupported here)"
+          fi
+
       - name: neutralize host AppArmor unix-chkpwd profile
         # Ubuntu's path-attached unix-chkpwd profile confines the CONTAINER's
         # EL9 unix_chkpwd on exec (dac_read_search denied), breaking every

@@ -1,0 +1,56 @@
+# Containerized desktop, declarative deployment (see deploy/README.md).
+# Lives at /etc/containers/systemd/desktop.container; systemd's quadlet
+# generator turns it into "desktop.service" at daemon-reload (podman >= 4.4;
+# the drop-in overlays are silently IGNORED before podman 5.0 - see
+# deploy/README.md "Requirements"). The [Install] section is honored by the
+# generator itself, so there is no "systemctl enable" step for quadlet
+# units - the service comes up on every boot of multi-user.target.
+#
+# Nothing in the deploy tree builds or pulls images: provisioning must have
+# put the image in podman's storage already (podman load / podman pull).
+# Override the reference per host class with a drop-in:
+#   /etc/containers/systemd/desktop.container.d/50-image.conf
+#     [Container]
+#     Image=registry.example.com/desktop-container@sha256:...
+#
+# Keep the [Container] section in sync with quadlet/desktop.container (the
+# install.sh flow); the [Unit] seat backstop below is the only intended
+# difference.
+
+[Unit]
+Description=Containerized desktop (Xorg + mwm + PipeWire)
+# Runtime backstop for the seat handover: nothing else may hold the VT or
+# DRM master while the desktop runs. On a correctly provisioned host these
+# are no-ops - the getty@tty1 mask and the multi-user default target in this
+# tree keep both units from ever starting.
+Conflicts=getty@tty1.service display-manager.service
+After=getty@tty1.service display-manager.service
+
+[Container]
+Image=localhost/desktop-container:latest
+ContainerName=desktop
+# Host network namespace: kernel uevents (input hotplug for libinput) are
+# delivered over netlink, which is per-netns.
+Network=host
+# Host udev database (read-only): lets libinput/logind enumerate devices and
+# see the host's seat tags without running udevd in the container.
+Volume=/run/udev:/run/udev:ro
+# Exported X socket: host / other containers connect with DISPLAY=:0.
+Volume=/tmp/.X11-unix:/tmp/.X11-unix
+# Exported audio sockets (PipeWire native + Pulse), see README.
+Volume=/run/desktop-audio:/run/desktop-audio
+# Host-shell material for the 'Host Terminal' menu entry (key + username;
+# provisioned by the deploy/host-shell overlay; harmless when absent/empty).
+Volume=/etc/desktop-container:/etc/desktop-container:ro
+# --privileged: host /dev (dri, input, snd, tty*) visible, no SELinux
+# separation, device cgroup open. --systemd=always: proper systemd PID 1.
+# --tty: gives the container a /dev/console wired to `podman logs`, which
+# journal-console.service mirrors the journal into.
+PodmanArgs=--privileged --systemd=always --tty
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
