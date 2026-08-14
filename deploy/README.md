@@ -25,6 +25,8 @@ provisioning). See "Overriding the image reference" below.
   (RHEL/Rocky 9.5+); after applying one, `systemctl cat desktop.service`
   and check it actually landed in the generated unit.
 - the desktop image already present in podman's storage.
+- host packages: see `HOST-REQUIRES.md` (the bare-minimum `dnf install`
+  line, per host class).
 
 ## Layout
 
