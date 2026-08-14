@@ -74,7 +74,17 @@ jobs:
         run: |
           tmp=$(mktemp -d)
           install -m644 deploy/host/etc/containers/systemd/desktop.container "$tmp/"
-          q=$(ls /usr/libexec/podman/quadlet /usr/lib/podman/quadlet 2>/dev/null | head -n1)
+          # the quadlet generator's install dir varies by packaging
+          # (libexec vs lib vs /usr/local); search rather than assume
+          q=""
+          for c in /usr/libexec/podman/quadlet /usr/lib/podman/quadlet \
+                   /usr/lib64/podman/quadlet /usr/local/libexec/podman/quadlet \
+                   /usr/local/lib/podman/quadlet; do
+            [ -x "$c" ] && { q=$c; break; }
+          done
+          [ -n "$q" ] || q=$(sudo find /usr -type f -name quadlet 2>/dev/null | head -n1)
+          [ -n "$q" ] || { echo "podman quadlet generator not found on runner"; podman --version; exit 1; }
+          echo "using quadlet generator: $q"
           out=$(QUADLET_UNIT_DIRS="$tmp" "$q" -dryrun -no-kmsg-log)
           echo "$out" | grep -q -- --privileged
           echo "$out" | grep -q 'WantedBy=multi-user.target'
