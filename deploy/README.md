@@ -8,8 +8,9 @@ tmpfiles.d entries. Lay it onto the filesystem with whatever provisioning
 you already use (rsync, RPM/ostree packaging, Ansible `copy`, image build),
 reload systemd, and the desktop comes up on every boot of
 `multi-user.target`. Nothing here is a script that runs once at install
-time; the few steps that are inherently runtime (CDI spec generation, ssh
-key material) are systemd oneshot units that converge at every boot.
+time; the steps that are inherently runtime — seat convergence, CDI spec
+generation, ssh key material — are systemd oneshot units that converge at
+every boot.
 
 Nothing in the tree builds or pulls images: **the desktop image must
 already be in podman's storage** (`podman load` / `podman pull` during
@@ -203,6 +204,7 @@ deploy-specific bits:
 ```sh
 desktop-preflight                           # the whole host-side story
 systemctl status desktop.service            # generated from the quadlet
+systemctl cat desktop.service               # what the quadlet actually generated
 systemctl is-enabled getty@tty1.service     # masked
 systemctl get-default                       # multi-user.target
 systemctl status desktop-seat-prep          # seat converged; culprit named if not
@@ -213,3 +215,22 @@ ls -l /etc/ssh/authorized_keys.d/           # root-owned desktop-shell entry
 podman logs desktop | grep preflight:       # container-side assumptions;
                                             # FAILs on stub spec + visible GPU
 ```
+
+## How CI validates this tree
+
+- `ci.yml` static job: shellcheck on all four scripts, plus a guard that
+  the `[Container]` sections of this quadlet and `quadlet/desktop.container`
+  (the install.sh flow) only differ by the intended GPU lines.
+- `ci.yml` build-smoke: a quadlet `-dryrun` fast-fail, then
+  `ci/smoke-deploy.sh` — CDI converger branch tests (stub / generate /
+  transient-failure / no-downgrade), seat-prep against a staged dirty seat,
+  and the full composition on the runner: rsync-apply (the verbatim command
+  above), boot from this quadlet, all three oneshots, stub marker on
+  container PID 1, `desktop-shell` ssh from the host and from inside the
+  container, `desktop-preflight` green, and a service restart.
+- `e2e-vm.yml` phase-deploy: the same flow on a Rocky 9 VM with **SELinux
+  enforcing** and a real KMS display — seat-prep evicting a genuinely
+  running getty, rootless Xorg + mwm + seat0 under this quadlet, the
+  root-owned `desktop-shell` trust path through a real sshd under
+  enforcing, `desktop-preflight` at 0 FAILs, and a non-blank screendump
+  artifact.

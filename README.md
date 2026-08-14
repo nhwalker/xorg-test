@@ -89,9 +89,11 @@ sudo ./install.sh --uninstall                # restore the host
 `install.sh` converts an existing host and can undo itself. For hosts that
 are *provisioned* rather than converted — the planned production shape —
 use the `deploy/` tree instead: the same end state as plain files (quadlet,
-getty mask, logind/tmpfiles/audio drop-ins, converge-at-boot oneshots for
-CDI and host-shell key material), applied with rsync/RPM/Ansible, no
-install script, image assumed already built. See `deploy/README.md`.
+getty mask, logind/tmpfiles/audio drop-ins, sysusers) plus three
+converge-at-boot oneshots (seat state, CDI spec, host-shell key material)
+and a read-only `desktop-preflight` debug tool — applied with
+rsync/RPM/Ansible, no install script, image assumed already built. One
+tree serves GPU and GPU-less hosts alike. See `deploy/README.md`.
 
 ### What install.sh does to the host (all reverted by `--uninstall`)
 
@@ -460,6 +462,14 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   provisioning) and asserts the boot: seat0 session, audio sockets +
   cross-uid connects, preflight/postmortem in the logs, the tty-less
   journal-mirror guard, end-to-end `ssh host`, and clean `--uninstall`.
+  After that, `ci/smoke-deploy.sh` proves the **declarative `deploy/`
+  tree** on the same restored runner: script-level branch tests (CDI
+  converger no-downgrade rules, seat-prep on a staged dirty seat), then
+  the full composition — rsync-apply, boot from the tree's quadlet,
+  converger oneshots, stub-CDI marker on container PID 1, `desktop-shell`
+  ssh in both directions, `desktop-preflight` green, service restart. A
+  static-job guard also keeps the two quadlet variants' `[Container]`
+  sections in sync.
 - **`e2e-vm.yml`** — the full stack in a KVM-booted **Rocky 9 VM** with
   virtio display/input/sound and **SELinux enforcing**
   (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`): real Xorg starts rootless on
