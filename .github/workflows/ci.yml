@@ -153,7 +153,7 @@ jobs:
         # deploy/ tree with the documented rsync, boot desktop.service from
         # its quadlet, and verify the full composition (converger oneshots,
         # stub CDI through a real systemd start, desktop-shell ssh both
-        # directions, desktop-preflight down to the one known runner gap).
+        # directions, desktop-preflight fully green).
         # Also runs the root-only branch tests for the CDI converger and a
         # dirty-seat seat-prep scenario.
         run: sudo -E ci/smoke-deploy.sh

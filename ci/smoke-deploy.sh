@@ -151,12 +151,18 @@ for _ in $(seq 10); do
 done
 [ "$cwho" = desktop-shell ] || fail "container ssh host returned '$cwho', want desktop-shell"
 
-log "desktop-preflight: green except the runner's known gap (no KMS device)"
+log "desktop-preflight: fully green (no-KMS FAIL tolerated on KMS-less runners)"
+# Azure runners expose a Hyper-V DRM device, so preflight is normally 0
+# FAILs here and X genuinely runs; a runner image without /dev/dri may
+# legitimately report the single no-KMS FAIL instead. Anything else is red.
 pf=$(deploy/host/usr/local/bin/desktop-preflight || true)
 echo "$pf"
 nfail=$(echo "$pf" | grep -c 'FAIL:' || true)
-[ "$nfail" = 1 ] || fail "expected exactly 1 preflight FAIL on this runner, got $nfail"
-echo "$pf" | grep -q 'FAIL: no /dev/dri/card\*' || fail "the one FAIL is not the expected no-KMS gap"
+if [ "$nfail" != 0 ]; then
+    if [ "$nfail" != 1 ] || ! echo "$pf" | grep -q 'FAIL: no /dev/dri/card\*'; then
+        fail "unexpected preflight FAILs on this runner ($nfail)"
+    fi
+fi
 
 log "desktop.service survives a restart"
 systemctl restart desktop.service
