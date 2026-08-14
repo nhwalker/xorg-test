@@ -23,6 +23,9 @@ Containerfile.base          BASE image: UBI9 + Rocky9 repos + all packages (netw
 Containerfile               APPLICATION layer: config/services on the base (offline build)
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
+deploy/                     declarative deployment: the same host end state as
+                            plain files (quadlet + systemd drop-ins/masks), no
+                            install script, image assumed prebuilt
 image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
@@ -81,6 +84,17 @@ sudo ./install.sh --no-build --image <ref>   # use a prebuilt image
 sudo ./install.sh --uninstall                # restore the host
 ```
 
+### Declarative install (production)
+
+`install.sh` converts an existing host and can undo itself. For hosts that
+are *provisioned* rather than converted — the planned production shape —
+use the `deploy/` tree instead: the same end state as plain files (quadlet,
+getty mask, logind/tmpfiles/audio drop-ins, sysusers) plus three
+converge-at-boot oneshots (seat state, CDI spec, host-shell key material)
+and a read-only `desktop-preflight` debug tool — applied with
+rsync/RPM/Ansible, no install script, image assumed already built. One
+tree serves GPU and GPU-less hosts alike. See `deploy/README.md`.
+
 ### What install.sh does to the host (all reverted by `--uninstall`)
 
 Seat handover — the host must stop claiming the devices the container needs:
@@ -138,6 +152,9 @@ all of them (a systemd drop-in works for the unit) to move the session.
 - The image contains **no** NVIDIA bits. `install.sh` runs
   `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` and adds a quadlet
   drop-in with `AddDevice=nvidia.com/gpu=all` when a GPU + toolkit are found.
+  Beware: quadlet only merges drop-ins with podman >= 5.0 (RHEL/Rocky 9.5+);
+  older podman ignores the GPU drop-in **silently** and the desktop comes up
+  unaccelerated. `systemctl cat desktop.service` shows what actually landed.
 - At container boot, `xorg-gpu-conf.sh` writes
   `/etc/X11/xorg.conf.d/20-gpu.conf`: `nvidia` if device nodes **and** an
   injected `nvidia_drv.so` are present, else `modesetting` on the first
@@ -402,6 +419,11 @@ sudo ./install.sh --host-prep-only --shell-user alice   # k8s flow
 # --shell-user defaults to $SUDO_USER (whoever ran sudo)
 ```
 
+(The declarative `deploy/` tree does this differently: a dedicated
+unprivileged `desktop-shell` account, a fresh key on every boot, and
+root-owned trust under `/etc/ssh/authorized_keys.d` — always on, with a
+commented off-switch. See `deploy/README.md` "Host Terminal".)
+
 What that sets up:
 
 - a dedicated ed25519 keypair in `/etc/desktop-container/` — **root-only
@@ -440,13 +462,25 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   provisioning) and asserts the boot: seat0 session, audio sockets +
   cross-uid connects, preflight/postmortem in the logs, the tty-less
   journal-mirror guard, end-to-end `ssh host`, and clean `--uninstall`.
+  After that, `ci/smoke-deploy.sh` proves the **declarative `deploy/`
+  tree** on the same restored runner: script-level branch tests (CDI
+  converger no-downgrade rules, seat-prep on a staged dirty seat), then
+  the full composition — rsync-apply, boot from the tree's quadlet,
+  converger oneshots, stub-CDI marker on container PID 1, `desktop-shell`
+  ssh in both directions, `desktop-preflight` green, service restart. A
+  static-job guard also keeps the two quadlet variants' `[Container]`
+  sections in sync.
 - **`e2e-vm.yml`** — the full stack in a KVM-booted **Rocky 9 VM** with
   virtio display/input/sound and **SELinux enforcing**
   (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`): real Xorg starts rootless on
   a real KMS device, mwm runs, audio devices appear, the host-terminal
   ssh path works under SELinux (validating the restorecon handling),
-  input hotplug is exercised via QEMU device_add, then the machine
-  switches to k3s and deploys both charts — real readiness, allocatable
+  input hotplug is exercised via QEMU device_add; then the **declarative
+  `deploy/` tree** takes over the same machine (install.sh uninstalled,
+  tree rsync-applied, seat-prep evicting the restored getty, the
+  root-owned `desktop-shell` ssh trust proven under enforcing,
+  `desktop-preflight` asserted fully green); then the machine switches to
+  k3s and deploys both charts — real readiness, allocatable
   `desktop.local/display`, a client pod on the display, and the
   health-gating Pending behavior. Screendumps of the virtual display are
   uploaded as artifacts.

@@ -97,10 +97,20 @@ done
 if [ -f /etc/desktop-container/host-shell-key ]; then
     pass "host shell material mounted (Host Terminal -> ssh as '$(cat /etc/desktop-container/shell-user 2>/dev/null || echo '?')')"
 else
-    warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: install.sh [--host-prep-only] --shell-user <user> on the host"
+    warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: install.sh [--host-prep-only] --shell-user <user>, or the desktop-host-shell lines in the deploy tree's quadlet (deploy/README.md)"
 fi
 
 # --- NVIDIA coherence ----------------------------------------------------------
+# NVIDIA_CDI_STUB=1 is injected by the deploy tree's stub CDI spec, written
+# when the host has no working GPU stack. Hardware visible anyway (via
+# --privileged /dev) means the stub is hiding a broken host, not a missing
+# GPU - the one silent-degradation case worth a FAIL. CDI env edits land on
+# PID 1; whether systemd forwards them to services is not a contract worth
+# depending on, so read PID 1's environment directly.
+cdi_stub=$(tr '\0' '\n' </proc/1/environ 2>/dev/null | sed -n 's/^NVIDIA_CDI_STUB=//p')
+if [ "${cdi_stub:-${NVIDIA_CDI_STUB:-}}" = 1 ] && [ -e /dev/nvidiactl ]; then
+    fail "NVIDIA hardware visible but the host injected a STUB CDI spec: nvidia container toolkit missing/broken on the host (desktop-cdi-refresh fell back). GPU acceleration is OFF; fix the host toolkit and restart"
+fi
 drv=$(find /usr/lib64 /usr/lib -name nvidia_drv.so 2>/dev/null | head -n1)
 if [ -e /dev/nvidiactl ] && [ -z "$drv" ]; then
     warn "NVIDIA device nodes present but nvidia_drv.so NOT injected: X falls back to unaccelerated modesetting. Toolkit CDI spec lacks the X driver, see README ('nvidia_drv.so missing')"

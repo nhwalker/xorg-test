@@ -1,0 +1,47 @@
+#!/bin/bash
+# Converge the host side of the desktop's "Host Terminal" feature (run at
+# every boot by desktop-host-shell.service; see deploy/README.md).
+#
+# Generates a FRESH ed25519 keypair on every boot - the key material in
+# /etc/desktop-container never outlives the boot that made it - and writes
+# the matching restricted entry to the root-owned
+# /etc/ssh/authorized_keys.d/<account> (path wired up by this tree's
+# sshd_config.d drop-in). The target account (normally the sysusers.d-
+# created 'desktop-shell') comes from /etc/desktop-container/shell-user,
+# which this tree ships as a static file and the container also reads.
+# The container-side half is image/session/host-shell-setup.sh.
+set -euo pipefail
+
+DIR=/etc/desktop-container
+
+user=$(tr -d '[:space:]' < "$DIR/shell-user")
+if [ -z "$user" ]; then
+    echo "$DIR/shell-user is empty; nothing to do" >&2
+    exit 0
+fi
+if ! getent passwd "$user" >/dev/null; then
+    echo "account '$user' missing: sysusers.d fragment not applied?" >&2
+    exit 1
+fi
+
+rm -f "$DIR/host-shell-key" "$DIR/host-shell-key.pub"
+ssh-keygen -q -t ed25519 -N '' -C desktop-container-host-shell \
+    -f "$DIR/host-shell-key"
+# Root-only on the host; the (privileged) container's boot script installs a
+# desktop-user copy inside the container.
+chmod 0400 "$DIR/host-shell-key"
+chmod 0644 "$DIR/host-shell-key.pub"
+
+mkdir -p /etc/ssh/authorized_keys.d
+ak="/etc/ssh/authorized_keys.d/$user"
+printf 'from="127.0.0.1,::1",no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' \
+    "$(cat "$DIR/host-shell-key.pub")" > "$ak"
+chmod 0644 "$ak"
+
+# SELinux: freshly created files can carry the wrong context, and sshd then
+# silently ignores the authorized_keys file (an AVC in the audit log is the
+# only trace). No-op on non-SELinux hosts.
+if command -v restorecon >/dev/null; then
+    restorecon -R "$DIR" "$ak" || true
+fi
+echo "host shell converged: fresh key for '$user', trust at $ak"

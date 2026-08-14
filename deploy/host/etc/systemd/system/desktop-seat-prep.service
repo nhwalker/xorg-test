@@ -1,0 +1,16 @@
+# Part of the desktop-container deploy tree (deploy/README.md).
+[Unit]
+Description=Converge host seat state for the containerized desktop
+# Walks ANY initial seat state - running display manager, spawned gettys,
+# loginctl seat splits, graphical default target - back to what the
+# desktop's quadlet needs, then verifies nothing holds DRM or the VT.
+# Pulled in by desktop.container's [Unit] Wants=, so it needs no
+# [Install]/enable of its own. A failure here means the seat could NOT be
+# freed; desktop.service still starts (Wants=, not Requires=) and its Xorg
+# will hit the same conflict - this unit's log names the culprit process.
+Before=desktop.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/seat-prep.sh

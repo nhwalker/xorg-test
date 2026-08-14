@@ -1,0 +1,19 @@
+# Part of the desktop-container deploy tree (deploy/README.md).
+[Unit]
+Description=Converge the NVIDIA CDI spec for the containerized desktop
+# Every host runs this (no GPU overlay): it writes the real CDI spec where
+# the GPU + toolkit exist and a no-op stub spec everywhere else, so the
+# quadlet's unconditional AddDevice=nvidia.com/gpu=all always resolves.
+# Pulled in by desktop.container's [Unit] Wants=, so it needs no
+# [Install]/enable of its own. Runs unconditionally - the script, not a
+# unit Condition, decides real vs stub, because the no-downgrade logic
+# needs to run even when the GPU stack looks absent.
+Before=desktop.service
+# Reduce the odds of racing the NVIDIA kernel module load on GPU hosts
+# (the script's keep-real-spec rule covers the remainder).
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/desktop-cdi-refresh

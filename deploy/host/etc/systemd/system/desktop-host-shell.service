@@ -1,0 +1,20 @@
+# Part of the desktop-container deploy tree (deploy/README.md).
+[Unit]
+Description=Provision host-shell key material for the desktop container
+# Always on: generates a FRESH loopback-ssh keypair on every boot and
+# installs its restricted, root-owned authorized_keys entry for the
+# dedicated desktop-shell account (created by sysusers.d). Pulled in by
+# desktop.container's [Unit] Wants= - the off-switch for the whole Host
+# Terminal feature lives THERE, not here. Re-running this unit mid-uptime
+# rotates the key; the running container keeps the old (now useless) copy
+# until desktop.service restarts.
+Before=desktop.service
+# The container reaches the host over loopback ssh; keep sshd running while
+# the desktop is deployed. (Started per boot - whether sshd is *enabled* on
+# this host stays the admin's call.)
+Wants=sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/desktop-host-shell-setup

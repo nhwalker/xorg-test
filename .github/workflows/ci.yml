@@ -33,7 +33,25 @@ jobs:
           shellcheck -S error install.sh ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/session-postmortem \
-            image/session/host-terminal
+            image/session/host-terminal \
+            deploy/host/usr/local/libexec/desktop-cdi-refresh \
+            deploy/host/usr/local/libexec/desktop-host-shell-setup \
+            deploy/host/usr/local/libexec/seat-prep.sh \
+            deploy/host/usr/local/bin/desktop-preflight
+      - name: quadlet variants stay in sync
+        # quadlet/desktop.container (install.sh flow) and the deploy tree's
+        # unit must keep identical [Container] sections except the deploy
+        # variant's always-on GPU lines - the "keep in sync" header comments
+        # are enforced here, not trusted.
+        run: |
+          sec() { sed -n '/^\[Container\]/,/^\[Service\]/p' "$1" | grep -vE '^\s*#|^\[|^$'; }
+          diff <(sec quadlet/desktop.container) \
+               <(sec deploy/host/etc/containers/systemd/desktop.container) > /tmp/qdiff || true
+          grep -E '^[<>]' /tmp/qdiff | sort > /tmp/qgot
+          printf '> AddDevice=nvidia.com/gpu=all\n> Environment=NVIDIA_DRIVER_CAPABILITIES=all\n' | sort > /tmp/qwant
+          diff /tmp/qgot /tmp/qwant || {
+            echo "quadlet [Container] sections drifted beyond the intended GPU lines:"; cat /tmp/qdiff; exit 1; }
+
       - name: helm lint + template assertions
         run: |
           helm lint charts/desktop-container charts/desktop-device-plugin
@@ -60,6 +78,68 @@ jobs:
         run: |
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+      - name: deploy tree quadlet dry-run + CDI stub check
+        # Validate the declarative deploy/ tree: the quadlet generator must
+        # accept the unit, and everything must land in the generated service
+        # on ANY podman version - all features live in the base unit
+        # precisely because pre-5.0 quadlet silently ignores drop-in dirs.
+        # Then the stub CDI spec written by desktop-cdi-refresh on this
+        # GPU-less runner must actually satisfy AddDevice=nvidia.com/gpu=all
+        # at container creation, and the host-shell converger must produce a
+        # working sysusers account + root-owned trust file.
+        run: |
+          tmp=$(mktemp -d)
+          install -m644 deploy/host/etc/containers/systemd/desktop.container "$tmp/"
+          # the quadlet generator's install dir varies by packaging
+          # (libexec vs lib vs /usr/local); search rather than assume
+          q=""
+          for c in /usr/libexec/podman/quadlet /usr/lib/podman/quadlet \
+                   /usr/lib64/podman/quadlet /usr/local/libexec/podman/quadlet \
+                   /usr/local/lib/podman/quadlet; do
+            [ -x "$c" ] && { q=$c; break; }
+          done
+          [ -n "$q" ] || q=$(sudo find /usr -type f -name quadlet 2>/dev/null | head -n1)
+          [ -n "$q" ] || { echo "podman quadlet generator not found on runner"; podman --version; exit 1; }
+          echo "using quadlet generator: $q"
+          out=$(QUADLET_UNIT_DIRS="$tmp" "$q" -dryrun -no-kmsg-log)
+          echo "$out" | grep -q -- --privileged
+          echo "$out" | grep -q 'WantedBy=multi-user.target'
+          echo "$out" | grep -q 'Conflicts=getty@tty1.service display-manager.service'
+          echo "$out" | grep -q 'device.*nvidia.com/gpu=all'
+          echo "$out" | grep -q 'Wants=desktop-seat-prep.service'
+          echo "$out" | grep -q 'Wants=desktop-cdi-refresh.service'
+          echo "$out" | grep -q 'Wants=desktop-host-shell.service'
+          # GPU-less runner: the converger must write the stub, and podman
+          # must resolve AddDevice against it end-to-end.
+          sudo deploy/host/usr/local/libexec/desktop-cdi-refresh
+          sudo grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml
+          sudo podman run --rm --device nvidia.com/gpu=all \
+            localhost/desktop-container:latest sh -c 'test "$NVIDIA_CDI_STUB" = 1'
+          # seat-prep: converges the runner's seat state and must be
+          # idempotent (second run silent, exit 0)
+          sudo deploy/host/usr/local/libexec/seat-prep.sh
+          [ "$(sudo systemctl is-enabled getty@tty1.service || true)" = masked ]
+          [ "$(systemctl get-default)" = multi-user.target ]
+          second=$(sudo deploy/host/usr/local/libexec/seat-prep.sh | grep -v 'fuser not available' || true)
+          [ -z "$second" ]
+          # host-shell: sysusers account, fresh key, root-owned restricted trust
+          sudo systemd-sysusers "$PWD/deploy/host/etc/sysusers.d/desktop-container.conf"
+          sudo install -Dm644 deploy/host/etc/desktop-container/shell-user /etc/desktop-container/shell-user
+          sudo deploy/host/usr/local/libexec/desktop-host-shell-setup
+          sudo grep -q 'from="127.0.0.1,::1".*desktop-container-host-shell' \
+            /etc/ssh/authorized_keys.d/desktop-shell
+          # host-preflight (debug tool): must run to completion and correctly
+          # report this partially-applied runner - quadlet not installed
+          # (FAIL) but the pieces the step applied green (stub CDI spec,
+          # desktop-shell account, seat state)
+          pf=$(sudo deploy/host/usr/local/bin/desktop-preflight || true)
+          echo "$pf"
+          echo "$pf" | grep -q 'done: [0-9]* FAIL'
+          echo "$pf" | grep -q 'FAIL: quadlet unit missing'
+          echo "$pf" | grep -q 'PASS: GPU-less host: stub CDI spec'
+          echo "$pf" | grep -q 'PASS: desktop-shell account exists'
+          echo "$pf" | grep -q 'PASS: default target is multi-user.target'
+
       - name: neutralize host AppArmor unix-chkpwd profile
         # Ubuntu's path-attached unix-chkpwd profile confines the CONTAINER's
         # EL9 unix_chkpwd on exec (dac_read_search denied), breaking every
@@ -68,6 +148,15 @@ jobs:
         run: sudo apparmor_parser -R /etc/apparmor.d/unix-chkpwd 2>/dev/null || true
       - name: podman smoke suite (real install.sh on the ephemeral runner)
         run: sudo -E ci/smoke-podman.sh
+      - name: deploy-tree boot smoke (declarative flow, end to end)
+        # After smoke-podman's --uninstall restored the host: apply the
+        # deploy/ tree with the documented rsync, boot desktop.service from
+        # its quadlet, and verify the full composition (converger oneshots,
+        # stub CDI through a real systemd start, desktop-shell ssh both
+        # directions, desktop-preflight fully green).
+        # Also runs the root-only branch tests for the CDI converger and a
+        # dirty-seat seat-prep scenario.
+        run: sudo -E ci/smoke-deploy.sh
       - name: collect diagnostics on failure
         if: failure()
         run: |

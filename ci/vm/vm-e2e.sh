@@ -152,6 +152,18 @@ after=$(vm_ssh 'ls /dev/input/event* | wc -l')
 vm_ssh 'sudo podman exec desktop sh -c "grep -c \"Adding input device\" /home/desktop/.local/share/xorg/Xorg.0.log"' \
     > "$ART/xorg-input-count.txt" || true
 
+log "phase deploy: declarative tree replaces the install.sh flow (SELinux enforcing)"
+# Audio/input plumbing is identical under either flow (already proven in
+# phase 1); this phase proves what only it can: the deploy tree converting
+# a just-uninstalled (getty-restored) host, the root-owned desktop-shell
+# ssh trust under enforcing SELinux, the stub CDI path next to a REAL
+# KMS display, and desktop-preflight fully green.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase-deploy' \
+    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
+         > "$ART/guest-deploy-fail.log" 2>&1 || true; fail "guest phase-deploy failed"; }
+screendump desktop-deploy
+assert_nonblank desktop-deploy
+
 log "phase 2: k3s + charts (client pod on the same display)"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }

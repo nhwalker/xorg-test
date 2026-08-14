@@ -1,0 +1,212 @@
+#!/bin/bash
+# Host-side preflight for the declarative deployment (deploy/README.md):
+# one PASS/WARN/FAIL line per assumption the deploy tree makes about this
+# host, with a remediation hint on anything not green.
+#
+# Read-only debug utility: checks state, never changes it, and is
+# deliberately NOT wired into the systemd path - the converger oneshots
+# fix, this only reports. Complements the container's own boot-time
+# preflight (the inside view): run this on the host, read that one with
+# `podman logs desktop | grep preflight:`.
+#
+# Exit: 0 when no FAILs, 1 otherwise.
+set -u
+
+VT="${DESKTOP_VT:-tty1}"
+QUADLET=/etc/containers/systemd/desktop.container
+fails=0
+pass() { echo "host-preflight: PASS: $*"; }
+warn() { echo "host-preflight: WARN: $*"; }
+fail() { echo "host-preflight: FAIL: $*"; fails=$((fails + 1)); }
+
+[ "$(id -u)" = 0 ] || { echo "host-preflight: run as root (podman storage and key material are root-only)" >&2; exit 2; }
+
+# --- podman + quadlet generation ---------------------------------------------
+dropins_ok=0
+if command -v podman >/dev/null; then
+    pv=$(podman --version | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    case "$pv" in
+        [0-3].*|4.[0-3]) fail "podman $pv: quadlet needs >= 4.4" ;;
+        4.*) pass "podman $pv (>= 4.4; quadlet drop-ins would need >= 5.0)" ;;
+        *)   pass "podman $pv (>= 5.0, quadlet drop-ins supported)"; dropins_ok=1 ;;
+    esac
+else
+    fail "podman not installed"
+fi
+
+if [ -f "$QUADLET" ]; then
+    pass "quadlet unit present ($QUADLET)"
+else
+    fail "quadlet unit missing at $QUADLET: deploy tree not applied"
+fi
+if systemctl cat desktop.service >/dev/null 2>&1; then
+    pass "desktop.service generated from the quadlet"
+else
+    fail "desktop.service unknown to systemd: run systemctl daemon-reload (or quadlet generation failed)"
+fi
+if ls "$QUADLET.d"/*.conf >/dev/null 2>&1; then
+    if [ "$dropins_ok" = 1 ]; then
+        pass "quadlet drop-ins present in $QUADLET.d (podman merges them)"
+    else
+        fail "quadlet drop-ins in $QUADLET.d are SILENTLY IGNORED by podman < 5.0; verify with: systemctl cat desktop.service"
+    fi
+fi
+
+img=$(grep -h '^Image=' "$QUADLET" "$QUADLET.d"/*.conf 2>/dev/null | tail -n1 | cut -d= -f2-)
+if [ -n "${img:-}" ]; then
+    if podman image exists "$img" 2>/dev/null; then
+        pass "image in podman storage: $img"
+    else
+        fail "image NOT in podman storage: $img - the deploy tree never builds or pulls; podman pull/load it"
+    fi
+fi
+
+for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell; do
+    systemctl cat "$u.service" >/dev/null 2>&1 \
+        && pass "$u.service installed" \
+        || fail "$u.service missing: deploy tree not fully applied"
+done
+
+# --- seat state ---------------------------------------------------------------
+dt=$(systemctl get-default 2>/dev/null || true)
+if [ "$dt" = multi-user.target ]; then
+    pass "default target is multi-user.target"
+else
+    fail "default target is '${dt:-unknown}', not multi-user.target (seat-prep.sh converges this at desktop start)"
+fi
+ge=$(systemctl is-enabled "getty@$VT.service" 2>/dev/null || true)
+if [ "$ge" = masked ]; then
+    pass "getty@$VT.service masked"
+else
+    fail "getty@$VT.service is '${ge:-unknown}', not masked (seat-prep.sh converges this at desktop start)"
+fi
+if systemctl is-active --quiet "getty@$VT.service" 2>/dev/null; then
+    fail "a getty is RUNNING on $VT right now - it will fight Xorg for the VT"
+fi
+if [ -e /etc/systemd/system/display-manager.service ]; then
+    if systemctl is-active --quiet display-manager.service 2>/dev/null; then
+        fail "a display manager is RUNNING - it holds DRM master; seat-prep.sh stops it at desktop start"
+    else
+        warn "a display manager is installed (inactive); expect seat-prep.sh to keep it disabled"
+    fi
+else
+    pass "no display manager installed"
+fi
+seat_rules=$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null || true)
+if [ -n "$seat_rules" ]; then
+    fail "custom seat attachment rules present ($seat_rules) - devices hidden from the container's seat0; seat-prep.sh removes them at desktop start"
+else
+    pass "no loginctl-attach seat rules"
+fi
+[ -f /etc/systemd/logind.conf.d/50-desktop-container.conf ] \
+    && pass "logind NAutoVTs/ReserveVT drop-in present" \
+    || fail "logind drop-in missing: host logind may spawn gettys on VT switches"
+
+# DRM/VT holders are only a problem when the desktop is NOT the holder.
+if systemctl is-active --quiet desktop.service 2>/dev/null; then
+    pass "desktop.service active (skipping DRM/VT holder check: Xorg legitimately holds them)"
+elif command -v fuser >/dev/null; then
+    shopt -s nullglob
+    holders=""
+    for dev in /dev/dri/card* "/dev/$VT"; do
+        [ -e "$dev" ] || continue
+        pids=$(fuser "$dev" 2>/dev/null) && [ -n "${pids// /}" ] && holders="$holders $dev"
+    done
+    shopt -u nullglob
+    if [ -n "$holders" ]; then
+        fail "processes hold$holders while desktop.service is inactive - Xorg would fail drmSetMaster (fuser -v shows who)"
+    else
+        pass "no DRM/VT holders"
+    fi
+else
+    warn "fuser not available (install psmisc); cannot check DRM/VT holders"
+fi
+
+# --- GPU / CDI ----------------------------------------------------------------
+shopt -s nullglob; cards=(/dev/dri/card*); shopt -u nullglob
+if [ ! -e /dev/nvidiactl ] && [ ${#cards[@]} -eq 0 ]; then
+    fail "no /dev/dri/card* and no NVIDIA device: X has no KMS device (NVIDIA-driver host? nvidia_drm.modeset=1 missing from kernel cmdline)"
+fi
+if [ -f /etc/cdi/nvidia.yaml ]; then
+    if grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml; then
+        if [ -e /dev/nvidiactl ]; then
+            fail "STUB CDI spec but NVIDIA hardware present: container toolkit missing/broken (desktop-cdi-refresh fell back); GPU acceleration is OFF"
+        else
+            pass "GPU-less host: stub CDI spec in place (AddDevice= resolves, injects nothing)"
+        fi
+    else
+        if [ -e /dev/nvidiactl ]; then
+            pass "real CDI spec + NVIDIA device nodes present"
+        else
+            warn "real CDI spec but no /dev/nvidiactl (driver not loaded yet, or GPU removed); desktop-cdi-refresh reconciles at desktop start"
+        fi
+    fi
+else
+    fail "/etc/cdi/nvidia.yaml missing: AddDevice=nvidia.com/gpu=all cannot resolve; run: systemctl start desktop-cdi-refresh"
+fi
+if [ -e /dev/nvidiactl ] && ! command -v nvidia-ctk >/dev/null; then
+    warn "NVIDIA device present but nvidia-ctk not installed: only a stub spec can be generated"
+fi
+
+# --- shared dirs + audio client config ----------------------------------------
+for d in /run/desktop-audio /tmp/.X11-unix; do
+    if [ -d "$d" ]; then
+        m=$(stat -c %a "$d")
+        [ "$m" = 1777 ] && pass "$d present (1777)" \
+            || warn "$d mode is $m, expected 1777 (cross-uid clients may fail to connect)"
+    else
+        fail "$d missing: systemd-tmpfiles --create (tree's tmpfiles.d not applied?)"
+    fi
+done
+[ -f /etc/pulse/client.conf.d/50-desktop-container.conf ] \
+    && pass "host Pulse client config present" \
+    || warn "host Pulse client config missing: host pulse clients won't reach the container"
+[ -f /etc/alsa/conf.d/60-desktop-container.conf ] \
+    && pass "host ALSA client config present" \
+    || warn "host ALSA client config missing: host alsa clients won't reach the container"
+if [ ! -e /usr/lib64/alsa-lib/libasound_module_pcm_pulse.so ] \
+   && [ ! -e /usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so ]; then
+    warn "alsa-plugins-pulseaudio not installed: host ALSA clients cannot use the pulse route"
+fi
+if systemctl is-active --quiet desktop.service 2>/dev/null; then
+    [ -S /run/desktop-audio/pipewire-0 ] && [ -S /run/desktop-audio/pulse ] \
+        && pass "audio sockets exported (pipewire-0, pulse)" \
+        || warn "desktop active but audio sockets not (yet) in /run/desktop-audio"
+fi
+
+# --- host terminal ------------------------------------------------------------
+getent passwd desktop-shell >/dev/null \
+    && pass "desktop-shell account exists" \
+    || fail "desktop-shell account missing: systemd-sysusers (tree's sysusers.d not applied?)"
+[ -f /etc/ssh/sshd_config.d/40-desktop-container.conf ] \
+    && pass "sshd authorized_keys.d drop-in present" \
+    || fail "sshd drop-in missing: root-owned trust path not wired"
+if command -v sshd >/dev/null || [ -x /usr/sbin/sshd ]; then
+    systemctl is-active --quiet sshd 2>/dev/null \
+        && pass "sshd active" \
+        || warn "sshd not active (desktop-host-shell starts it at desktop start via Wants=)"
+else
+    fail "openssh-server not installed: 'Host Terminal' cannot work"
+fi
+if [ -f /etc/desktop-container/host-shell-key ]; then
+    kp=$(stat -c %a /etc/desktop-container/host-shell-key)
+    [ "$kp" = 400 ] && pass "host-shell key present (0400)" \
+        || warn "host-shell key mode is $kp, expected 0400"
+    [ -f /etc/ssh/authorized_keys.d/desktop-shell ] \
+        && pass "root-owned trust entry present" \
+        || fail "key exists but /etc/ssh/authorized_keys.d/desktop-shell missing: rerun desktop-host-shell.service"
+else
+    warn "no host-shell key yet (generated fresh at every desktop start by desktop-host-shell.service)"
+fi
+
+# --- desktop.service ----------------------------------------------------------
+if systemctl is-active --quiet desktop.service 2>/dev/null; then
+    pass "desktop.service active"
+elif systemctl is-failed --quiet desktop.service 2>/dev/null; then
+    fail "desktop.service FAILED: journalctl -u desktop.service, then podman logs desktop"
+else
+    warn "desktop.service not started (systemctl start desktop.service, or reboot)"
+fi
+
+echo "host-preflight: done: $fails FAIL(s)"
+[ "$fails" = 0 ]

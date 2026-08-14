@@ -1,6 +1,8 @@
 # Quadlet unit for the containerized desktop.
 # Installed by install.sh to /etc/containers/systemd/desktop.container;
 # systemd generates "desktop.service" from it (podman >= 4.4).
+# Keep the [Container] section in sync with the declarative variant at
+# deploy/host/etc/containers/systemd/desktop.container.
 #
 # GPU: install.sh adds a drop-in at
 #   /etc/containers/systemd/desktop.container.d/10-gpu.conf

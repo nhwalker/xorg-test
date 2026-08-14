@@ -1,0 +1,86 @@
+# Containerized desktop, declarative deployment (see deploy/README.md).
+# Lives at /etc/containers/systemd/desktop.container; systemd's quadlet
+# generator turns it into "desktop.service" at daemon-reload (podman >= 4.4;
+# the drop-in overlays are silently IGNORED before podman 5.0 - see
+# deploy/README.md "Requirements"). The [Install] section is honored by the
+# generator itself, so there is no "systemctl enable" step for quadlet
+# units - the service comes up on every boot of multi-user.target.
+#
+# Nothing in the deploy tree builds or pulls images: provisioning must have
+# put the image in podman's storage already (podman load / podman pull).
+# Override the reference per host class with a drop-in:
+#   /etc/containers/systemd/desktop.container.d/50-image.conf
+#     [Container]
+#     Image=registry.example.com/desktop-container@sha256:...
+#
+# Keep the [Container] section in sync with quadlet/desktop.container (the
+# install.sh flow); the [Unit] seat backstop below is the only intended
+# difference.
+
+[Unit]
+Description=Containerized desktop (Xorg + mwm + PipeWire)
+# Runtime backstop for the seat handover: nothing else may hold the VT or
+# DRM master while the desktop runs. On a correctly provisioned host these
+# are no-ops - the getty@tty1 mask and the multi-user default target in this
+# tree keep both units from ever starting.
+Conflicts=getty@tty1.service display-manager.service
+After=getty@tty1.service display-manager.service
+# Seat convergence: walk back whatever seat state the host is in (display
+# manager, gettys, loginctl seat splits, graphical default target) and
+# verify DRM/the VT are takeable before the desktop starts - see
+# usr/local/libexec/seat-prep.sh in this tree.
+Wants=desktop-seat-prep.service
+After=desktop-seat-prep.service
+# CDI spec convergence: real spec on GPU hosts, no-op stub elsewhere, so
+# the unconditional AddDevice= below always resolves (see that unit and
+# usr/local/libexec/desktop-cdi-refresh in this tree).
+Wants=desktop-cdi-refresh.service
+After=desktop-cdi-refresh.service
+# Host Terminal, always on: a fresh loopback-ssh keypair is generated every
+# boot for the dedicated 'desktop-shell' account (see deploy/README.md
+# "Host Terminal"). To ship hosts WITHOUT it, comment out the next two
+# lines: with no key generated, nothing can log into the account and the
+# container's menu entry degrades gracefully.
+Wants=desktop-host-shell.service
+After=desktop-host-shell.service
+
+[Container]
+Image=localhost/desktop-container:latest
+ContainerName=desktop
+# Host network namespace: kernel uevents (input hotplug for libinput) are
+# delivered over netlink, which is per-netns.
+Network=host
+# Host udev database (read-only): lets libinput/logind enumerate devices and
+# see the host's seat tags without running udevd in the container.
+Volume=/run/udev:/run/udev:ro
+# Exported X socket: host / other containers connect with DISPLAY=:0.
+Volume=/tmp/.X11-unix:/tmp/.X11-unix
+# Exported audio sockets (PipeWire native + Pulse), see README.
+Volume=/run/desktop-audio:/run/desktop-audio
+# Host-shell material for the 'Host Terminal' menu entry: the static
+# shell-user file from this tree plus the boot-fresh keypair written by
+# desktop-host-shell.service (harmless when absent/empty).
+Volume=/etc/desktop-container:/etc/desktop-container:ro
+# GPU, always on: most deployments have an NVIDIA GPU, and the rest resolve
+# this against the stub CDI spec desktop-cdi-refresh writes (which injects
+# only the NVIDIA_CDI_STUB=1 marker), so the same unit serves both. The env
+# var is inert without the NVIDIA stack.
+# Older nvidia container toolkits omit the Xorg driver module from the CDI
+# spec (preflight then warns 'nvidia_drv.so NOT injected'): pin a toolkit
+# that includes it, or bind-mount the host's copies:
+#   Volume=/usr/lib64/xorg/modules/drivers/nvidia_drv.so:/usr/lib64/xorg/modules/drivers/nvidia_drv.so:ro
+#   Volume=/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:ro
+AddDevice=nvidia.com/gpu=all
+Environment=NVIDIA_DRIVER_CAPABILITIES=all
+# --privileged: host /dev (dri, input, snd, tty*) visible, no SELinux
+# separation, device cgroup open. --systemd=always: proper systemd PID 1.
+# --tty: gives the container a /dev/console wired to `podman logs`, which
+# journal-console.service mirrors the journal into.
+PodmanArgs=--privileged --systemd=always --tty
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

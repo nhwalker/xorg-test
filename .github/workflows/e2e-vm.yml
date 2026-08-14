@@ -1,6 +1,8 @@
 # Tiers 4-5: full-stack e2e in a KVM-accelerated Rocky 9 VM with virtio
 # graphics/input/sound and SELinux enforcing - real install.sh, real Xorg,
-# audio, input hotplug, host-terminal ssh, then k3s + both charts.
+# audio, input hotplug, host-terminal ssh, then the declarative deploy/
+# tree (root-owned desktop-shell trust under enforcing, preflight green),
+# then k3s + both charts.
 name: e2e-vm
 on:
   pull_request:
