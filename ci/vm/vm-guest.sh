@@ -111,18 +111,6 @@ phase1() {
     log p1 "mwm session is up"
     podman exec desktop ps -C mwm >/dev/null || fail "mwm not running"
 
-    log pd "the live X session runs as the mirrored host uid, under SELinux enforcing"
-    cuid=$(podman exec desktop id -u desktop)
-    [ "$cuid" = 4242 ] || fail "container desktop user is uid $cuid, want the mirrored 4242"
-    xuid=$(podman exec desktop sh -c 'ps -o uid= -C Xorg | head -1' | tr -d ' ')
-    [ "$xuid" = 4242 ] || fail "Xorg runs as uid ${xuid:-?}, want the mirrored 4242"
-    # The point of the whole feature: what the session writes to the shared
-    # mounts is owned by the host account, as seen from the HOST.
-    sockuid=$(stat -c %u /tmp/.X11-unix/X0)
-    [ "$sockuid" = 4242 ] || fail "exported X socket is owned by uid $sockuid on the host, want 4242"
-    [ "$(podman exec desktop sh -c 'getent shadow desktop | cut -d: -f2')" \
-        = "$(getent shadow vmdesktop | cut -d: -f2)" ] || fail "host password hash not adopted"
-
     log p1 "audio: HDA device visible, pulse socket reachable from VM host"
     podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
         sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
@@ -195,6 +183,18 @@ phase_deploy() {
     podman exec desktop sh -c 'loginctl list-sessions --no-pager | grep -q seat0' \
         || fail "no seat0 session"
     podman exec desktop ps -C mwm >/dev/null || fail "mwm not running"
+
+    log pd "the live X session runs as the mirrored host uid, under SELinux enforcing"
+    cuid=$(podman exec desktop id -u desktop)
+    [ "$cuid" = 4242 ] || fail "container desktop user is uid $cuid, want the mirrored 4242"
+    xuid=$(podman exec desktop sh -c 'ps -o uid= -C Xorg | head -1' | tr -d ' ')
+    [ "$xuid" = 4242 ] || fail "Xorg runs as uid ${xuid:-?}, want the mirrored 4242"
+    # The point of the whole feature: what the session writes to the shared
+    # mounts is owned by the host account, as seen from the HOST.
+    sockuid=$(stat -c %u /tmp/.X11-unix/X0)
+    [ "$sockuid" = 4242 ] || fail "exported X socket is owned by uid $sockuid on the host, want 4242"
+    [ "$(podman exec desktop sh -c 'getent shadow desktop | cut -d: -f2')" \
+        = "$(getent shadow vmdesktop | cut -d: -f2)" ] || fail "host password hash not adopted"
 
     log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
     # This is the path only this phase can prove: sshd reading the key from
