@@ -101,6 +101,16 @@ Override per host with assignments in
 `/etc/desktop-container/display-cdi.conf` (`DISPLAY_VALUE`, `X11_DIR`,
 `AUDIO_DIR`) — they must match what the desktop actually exports.
 
+**SELinux caveat.** This tree does not label the exported socket dirs, so
+on an enforcing host a *confined* client resolves the device, receives the
+mounts and env, and is then denied on `connect(2)` — `unable to open
+display ":0"`. CDI cannot express a relabel (no `:z` equivalent in
+`containerEdits`), so fixing it properly means labeling
+`/tmp/.X11-unix` and `/run/desktop-audio` `container_file_t` on the host.
+Until then, clients need label separation off (`--security-opt
+label=disable`, or a privileged pod). The desktop container is unaffected
+— it is `--privileged`. See README.md "Client containers via CDI".
+
 ## Apply
 
 ```sh

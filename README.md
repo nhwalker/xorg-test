@@ -407,6 +407,18 @@ Semantics worth knowing:
   clients: `sudo ./install.sh --host-prep-only`, or apply the `deploy/`
   tree. A pod annotated for a device with no spec fails at container
   creation with a clear CDI error.
+- **SELinux: confined clients need the export dirs labeled.** On an
+  enforcing host the exported socket dirs carry host labels, so a confined
+  container is denied when it connects — it gets `DISPLAY` and the mounts,
+  then fails with `unable to open display ":0"`. CDI cannot fix this from
+  the spec: `containerEdits` has no equivalent of `-v src:dst:z`, so the
+  labeling is host-side. Until the dirs are labeled `container_file_t`
+  (`semanage fcontext` + `restorecon`), clients need label separation
+  turned off — `--security-opt label=disable` for podman, an
+  `seLinuxOptions`/privileged pod spec for kubernetes. The desktop
+  container itself is unaffected: `--privileged` already disables label
+  separation. This predates the CDI path — the device plugin's bind mounts
+  had the same exposure.
 - **Audio**: pulse and PipeWire-native clients work via the injected env
   alone. ALSA-only apps additionally need `alsa-plugins-pulseaudio` in
   their image plus the two-stanza `/etc/asound.conf` shown in the Audio

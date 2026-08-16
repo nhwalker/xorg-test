@@ -36,6 +36,10 @@ fail() {
     podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null | tail -30 >&2 || true
     echo "---- diagnostics: preflight ----" >&2
     podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
+    # phase1 and phase-deploy run enforcing, where a denial is often the
+    # whole story and is invisible in every other log here.
+    echo "---- diagnostics: recent SELinux denials ----" >&2
+    ausearch -m avc -ts recent 2>/dev/null | tail -20 >&2 || echo "(none / ausearch unavailable)" >&2
     if command -v k3s >/dev/null; then
         echo "---- diagnostics: k3s state ----" >&2
         k3s kubectl get nodes,pods -A -o wide >&2 2>/dev/null || true
@@ -125,15 +129,43 @@ phase1() {
     # container that passes no -v and no -e reaches the display purely
     # because the runtime applied the spec's containerEdits. Same mechanism
     # k8s uses via the annotation, minus kubernetes.
+    #
+    # label=disable is required here, and is NOT papering over a broken
+    # spec: the exported socket dirs carry host labels, so a CONFINED
+    # container is denied by SELinux however it obtained the mounts. Every
+    # other client in this suite is exempt the same way - the desktop
+    # container via --privileged, the k8s client pods via phase2 running
+    # permissive. The probe below records the confined case instead of
+    # asserting it; see "Client containers via CDI" in README.md.
     log p1 "a podman client resolves desktop.local/display=all and opens :0"
-    out=$(podman run --rm --device desktop.local/display=all \
-        localhost/desktop-container:latest \
-        sh -c 'printenv DISPLAY; xdpyinfo >/dev/null && echo XDPYINFO_OK') \
+    out=$(podman run --rm --security-opt label=disable \
+        --device desktop.local/display=all \
+        localhost/desktop-container:latest sh -c '
+            printenv DISPLAY
+            printenv PULSE_SERVER
+            test -S /tmp/.X11-unix/X0 && echo SOCKET_OK
+            test -d /run/desktop-audio && echo AUDIO_DIR_OK
+            xdpyinfo >/dev/null && echo XDPYINFO_OK') \
         || fail "podman CDI client failed (see output above)"
-    echo "$out" | grep -qx ':0' || fail "CDI did not inject DISPLAY=:0 (got: $out)"
-    echo "$out" | grep -qx XDPYINFO_OK \
-        || fail "CDI client could not open the display (got: $out)"
+    for want in ':0' 'unix:/run/desktop-audio/pulse' SOCKET_OK AUDIO_DIR_OK XDPYINFO_OK; do
+        echo "$out" | grep -qx "$want" \
+            || fail "CDI client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
+    done
     log p1 "podman CDI client reached the display with no -v/-e of its own"
+
+    # Informational, never fatal: the confined case needs the export dirs
+    # labeled container_file_t, which CDI cannot arrange itself (there is no
+    # equivalent of -v src:dst:z in containerEdits). Logged so the day the
+    # host grows those labels this flips visibly, and so the AVC behind the
+    # current behavior is captured rather than assumed.
+    if podman run --rm --device desktop.local/display=all \
+        localhost/desktop-container:latest sh -c 'xdpyinfo >/dev/null' 2>/dev/null
+    then
+        log p1 "NOTE: a CONFINED client reached the display too (host is labeled for it)"
+    else
+        log p1 "NOTE: a CONFINED client cannot reach the display under enforcing SELinux (expected; see README)"
+        ausearch -m avc -ts recent 2>/dev/null | tail -5 || true
+    fi
 
     log p1 "spawn an xterm so the screendump shows a window"
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
