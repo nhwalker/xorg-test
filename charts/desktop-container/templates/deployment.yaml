@@ -21,7 +21,8 @@ spec:
       annotations:
         {{- if .Values.gpu.enabled }}
         # CRI-O injects the NVIDIA devices + driver userspace from the CDI
-        # spec (/etc/cdi/nvidia.yaml) -- no device plugin required.
+        # spec (/etc/cdi/nvidia.yaml). Client pods reach THIS desktop by the
+        # same mechanism, with cdi.k8s.io/display -> /etc/cdi/desktop.yaml.
         cdi.k8s.io/gpu: {{ .Values.gpu.cdiDevice | quote }}
         {{- end }}
         {{- with .Values.podAnnotations }}

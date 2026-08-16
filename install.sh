@@ -13,7 +13,10 @@
 #      configs (Pulse client.conf drop-in + asound.conf via the pulse
 #      plugin) so pulse/pipewire/alsa clients on the host reach the
 #      container's PipeWire.
-#   5. Installs the quadlet unit and starts desktop.service.
+#   5. Writes /etc/cdi/desktop.yaml, the CDI spec other containers resolve
+#      to get the desktop's display and audio (see README "Client
+#      containers via CDI").
+#   6. Installs the quadlet unit and starts desktop.service.
 #
 # Usage:
 #   ./install.sh [--no-gpu] [--no-build] [--no-base] [--image REF] [--base-image REF]
@@ -34,7 +37,7 @@
 # existing base image so config iteration works fully offline.
 #
 # --host-prep-only performs only the host-side preparation (seat undo,
-# logind drop-in, tmpfiles, audio client configs, CDI spec generation) and
+# logind drop-in, tmpfiles, audio client configs, both CDI specs) and
 # skips the image build and the quadlet service install. Use it when the
 # container is deployed some other way, e.g. the Helm chart in
 # charts/desktop-container on a k3s node.
@@ -54,6 +57,7 @@ TMPFILES_CONF="/etc/tmpfiles.d/desktop-container.conf"
 LOGIND_DROPIN="/etc/systemd/logind.conf.d/50-desktop-container.conf"
 PULSE_CLIENT_CONF="/etc/pulse/client.conf.d/50-desktop-container.conf"
 ASOUND_CONF="/etc/asound.conf"
+DISPLAY_CDI_SPEC="/etc/cdi/desktop.yaml"
 HOST_SHELL_DIR="/etc/desktop-container"
 SHELL_USER="${SUDO_USER:-}"
 VT="tty1"
@@ -146,6 +150,9 @@ uninstall() {
         rm -f "$ASOUND_CONF"
     fi
     rm -f "$TMPFILES_CONF"
+    # Ours entirely (generated, never hand-written), unlike nvidia.yaml
+    # below which the toolkit may also own - so this one just goes.
+    rm -f "$DISPLAY_CDI_SPEC"
 
     rm -rf "$STATE_DIR"
     log "uninstalled. The container image ($IMAGE) was kept; remove with: podman rmi $IMAGE"
@@ -229,6 +236,16 @@ d /run/desktop-audio 1777 root root -
 d /tmp/.X11-unix 1777 root root -
 EOF
 systemd-tmpfiles --create "$TMPFILES_CONF"
+
+# --- 4.5 Client CDI spec (desktop.local/display) -----------------------------
+# How OTHER containers get this desktop's display and audio: they resolve
+# the CDI device desktop.local/display=all and the runtime applies the
+# socket-dir mounts + DISPLAY/PULSE_SERVER/PIPEWIRE_REMOTE. Written here for
+# both flows - a k8s node prepared with --host-prep-only needs it just as
+# much, since that is where client pods live. The generator is the deploy
+# tree's script, run directly so the two flows cannot drift.
+log "writing client CDI spec ($DISPLAY_CDI_SPEC)"
+"$REPO_DIR/deploy/host/usr/local/libexec/desktop-display-cdi"
 
 # --- 5. Host audio client configuration --------------------------------------
 log "writing Pulse client config ($PULSE_CLIENT_CONF)"
@@ -383,9 +400,13 @@ if [ "$HOST_PREP_ONLY" = 0 ]; then
     log "logs:    podman logs desktop   /   journalctl -u desktop.service"
     log "clients: DISPLAY=:0, PULSE_SERVER=unix:/run/desktop-audio/pulse,"
     log "         PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0 (see README.md)"
+    log "container clients: podman run --device desktop.local/display=all <image>"
 else
     echo
     log "host prep done (no service installed). GPU CDI spec: $([ "$gpu_enabled" = 1 ] && echo /etc/cdi/nvidia.yaml || echo none)"
+    log "client CDI spec: $DISPLAY_CDI_SPEC (desktop.local/display=all)"
     log "deploy with the Helm chart: helm install desktop charts/desktop-container \\"
     log "    --set image.repository=<registry>/desktop-container$([ "$gpu_enabled" = 1 ] && echo ' --set gpu.enabled=true')"
+    log "client pods: add the annotation cdi.k8s.io/display: \"desktop.local/display=all\""
+    log "    (see examples/x11-client-pod.yaml)"
 fi

@@ -1,5 +1,8 @@
 #!/bin/bash
-# Golden assertions over helm template output for both charts.
+# Golden assertions over helm template output for the desktop chart, plus
+# the client-side manifests (which are plain YAML, not a chart: the display
+# reaches client pods through the host CDI spec and an annotation, so there
+# is nothing to install for them).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -10,9 +13,6 @@ DT=$(helm template d charts/desktop-container)
 GPU=$(helm template d charts/desktop-container --set gpu.enabled=true)
 NOPROBE=$(helm template d charts/desktop-container --set readinessProbe.enabled=false)
 LIVE=$(helm template d charts/desktop-container --set livenessProbe.enabled=true)
-DP=$(helm template p charts/desktop-device-plugin)
-DPP=$(helm template p charts/desktop-device-plugin --set priorityClassName=system-node-critical \
-      --set resourceName=corp.example/desk --set slots=3)
 
 # desktop chart
 ck 'privileged: true'                        "$DT"  "desktop: privileged"
@@ -35,15 +35,27 @@ ck 'NVIDIA_DRIVER_CAPABILITIES'              "$GPU" "desktop: NVIDIA env with gp
 nk 'readinessProbe'                          "$NOPROBE" "desktop: probe disappears when disabled"
 ck 'is-system-running'                       "$LIVE" "desktop: liveness renders when enabled"
 
-# device-plugin chart
-ck 'kind: DaemonSet'                         "$DP"  "plugin: daemonset"
-ck 'path: /var/lib/kubelet/device-plugins'   "$DP"  "plugin: kubelet dir hostPath"
-nk 'readOnly: true'                          "$DP"  "plugin: x11 NOT ro (health connect needs write)"
-ck 'value: "desktop.local/display"'          "$DP"  "plugin: default resource name"
-ck 'value: "10"'                             "$DP"  "plugin: default slots"
-nk 'priorityClassName'                       "$DP"  "plugin: no priorityClassName by default"
-ck 'priorityClassName: system-node-critical' "$DPP" "plugin: priorityClassName renders when set"
-ck 'value: "corp.example/desk"'              "$DPP" "plugin: custom resource name"
-ck 'value: "3"'                              "$DPP" "plugin: custom slots"
+# --- client manifests + the CDI spec they resolve against --------------------
+# The device name is a contract between the generator and every client
+# manifest; nothing at template time would catch the two drifting apart.
+GEN=deploy/host/usr/local/libexec/desktop-display-cdi
+KIND=$(sed -n 's/^CDI_KIND="\(.*\)"$/\1/p' "$GEN")
+DEV=$(sed -n 's/^CDI_DEVICE="\(.*\)"$/\1/p' "$GEN")
+[ -n "$KIND" ] && [ -n "$DEV" ] || { echo "FAIL: could not read CDI_KIND/CDI_DEVICE from $GEN"; exit 1; }
+echo "PASS: generator advertises $KIND=$DEV"
+
+for m in examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml; do
+    # Comments stripped: these files DESCRIBE what they deliberately omit
+    # ("no env, no volumeMounts"), which would otherwise match below.
+    M=$(grep -v '^[[:space:]]*#' "$m")
+    ck "cdi.k8s.io/.*: \"$KIND=$DEV\"" "$M" "$m: annotation matches the generated device"
+    # Proof-by-construction: these pods must keep declaring NOTHING that
+    # could hand them the display by another route, or they stop proving
+    # that CDI is what wired them up.
+    nk 'volumeMounts'                  "$M" "$m: no volumeMounts of its own"
+    nk '^  volumes:'                   "$M" "$m: no volumes of its own"
+    nk '^      env:'                   "$M" "$m: no env of its own"
+    nk 'desktop.local/display: 1'      "$M" "$m: no leftover device-plugin resource request"
+done
 
 echo "== all helm assertions passed"

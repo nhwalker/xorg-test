@@ -33,6 +33,10 @@ fi
 log "run the real install.sh (quadlet flow, shell user $SMOKE_USER)"
 SUDO_USER="$SMOKE_USER" ./install.sh --no-build --no-gpu
 
+log "install.sh wrote the client CDI spec (how other containers reach the desktop)"
+grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
+    || fail "install.sh did not write a usable /etc/cdi/desktop.yaml"
+
 log "wait for the container to answer"
 for _ in $(seq 20); do
     podman exec desktop true 2>/dev/null && break
@@ -165,6 +169,11 @@ if [ -e /etc/containers/systemd/desktop.container ]; then
 fi
 if grep -q desktop-container-host-shell "/home/$SMOKE_USER/.ssh/authorized_keys" 2>/dev/null; then
     fail "authorized_keys entry not removed"
+fi
+# The client spec is generated, never hand-written, so uninstall owns it
+# outright (unlike /etc/cdi/nvidia.yaml, which the toolkit may also own).
+if [ -e /etc/cdi/desktop.yaml ]; then
+    fail "client CDI spec not removed by --uninstall"
 fi
 
 log "smoke suite passed"

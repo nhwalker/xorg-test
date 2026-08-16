@@ -1,6 +1,6 @@
 #!/bin/bash
-# Pull-or-build the two base images, content-addressed by their inputs.
-# A base is reused from GHCR when nothing that goes into it changed;
+# Pull-or-build the desktop base image, content-addressed by its inputs.
+# The base is reused from GHCR when nothing that goes into it changed;
 # otherwise it is rebuilt (and pushed when PUSH_BASES=1).
 set -euo pipefail
 
@@ -31,5 +31,3 @@ ensure_base() {
 }
 
 ensure_base desktop-container-base Containerfile.base image/rocky9.repo
-ensure_base desktop-device-plugin-base Containerfile.plugin.base \
-    device-plugin/go.mod device-plugin/go.sum

@@ -2,7 +2,7 @@
 # graphics/input/sound and SELinux enforcing - real install.sh, real Xorg,
 # audio, input hotplug, host-terminal ssh, then the declarative deploy/
 # tree (root-owned desktop-shell trust under enforcing, preflight green),
-# then k3s + both charts.
+# then k3s + the desktop chart with client pods wired up by CDI.
 name: e2e-vm
 on:
   pull_request:
@@ -50,17 +50,16 @@ jobs:
         run: |
           sudo -E ci/build-bases.sh
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
-          sudo podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
-          # One archive per image: podman-save's docker-archive format
-          # silently collapses multiple images into the FIRST one with all
-          # tags attached (the plugin tag ends up naming the desktop image).
           # Lean non-desktop client fixture (networked build; CI-only, not a
           # product artifact, so the offline rule does not apply to it).
           sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
+          # One archive per image: podman-save's docker-archive format
+          # silently collapses multiple images into the FIRST one with all
+          # tags attached (the testclient tag would end up naming the
+          # desktop image).
           sudo podman save -o ci/vm/images-desktop.tar localhost/desktop-container:latest
-          sudo podman save -o ci/vm/images-plugin.tar localhost/desktop-device-plugin:latest
           sudo podman save -o ci/vm/images-testclient.tar localhost/desktop-testclient:latest
-          sudo chmod 644 ci/vm/images-desktop.tar ci/vm/images-plugin.tar ci/vm/images-testclient.tar
+          sudo chmod 644 ci/vm/images-desktop.tar ci/vm/images-testclient.tar
       - name: run VM e2e
         run: ci/vm/vm-e2e.sh
       - name: upload artifacts
