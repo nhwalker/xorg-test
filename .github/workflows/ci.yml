@@ -32,10 +32,12 @@ jobs:
           sudo apt-get install -y -q shellcheck
           shellcheck -S error install.sh ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
+            image/session/align-desktop-user.sh \
             image/session/start-session image/session/session-postmortem \
             image/session/host-terminal \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
+            deploy/host/usr/local/libexec/desktop-user-sync \
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight
       - name: quadlet variants stay in sync
@@ -109,6 +111,7 @@ jobs:
           echo "$out" | grep -q 'Wants=desktop-seat-prep.service'
           echo "$out" | grep -q 'Wants=desktop-cdi-refresh.service'
           echo "$out" | grep -q 'Wants=desktop-host-shell.service'
+          echo "$out" | grep -q 'Wants=desktop-user-sync.service'
           # GPU-less runner: the converger must write the stub, and podman
           # must resolve AddDevice against it end-to-end.
           sudo deploy/host/usr/local/libexec/desktop-cdi-refresh

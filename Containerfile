@@ -24,6 +24,9 @@ COPY image/xorg/preflight-check.sh /usr/local/bin/preflight-check.sh
 COPY image/session/start-session /usr/local/bin/start-session
 COPY image/session/session-postmortem /usr/local/bin/session-postmortem
 COPY image/session/host-shell-setup.sh /usr/local/bin/host-shell-setup.sh
+# The session user's uid/gid/password are converged at boot from host-exported
+# material; useradd below only fixes a placeholder (see the script's header).
+COPY image/session/align-desktop-user.sh /usr/local/bin/align-desktop-user.sh
 COPY image/session/host-terminal /usr/local/bin/host-terminal
 COPY image/session/xinitrc.desktop /etc/X11/xinit/xinitrc.desktop
 COPY image/session/mwmrc /etc/skel/.mwmrc
@@ -34,6 +37,7 @@ RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/ensure-vt-devices.
         /usr/local/bin/start-session \
         /usr/local/bin/session-postmortem /usr/local/bin/align-device-groups.sh \
         /usr/local/bin/preflight-check.sh /usr/local/bin/host-shell-setup.sh \
+        /usr/local/bin/align-desktop-user.sh \
         /usr/local/bin/host-terminal /etc/X11/xinit/xinitrc.desktop
 
 RUN for g in input render video audio tty; do \

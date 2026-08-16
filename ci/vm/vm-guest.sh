@@ -152,9 +152,14 @@ phase_deploy() {
     # read at sshd start; this VM's sshd predates it
     systemctl reload sshd
 
+    log pd "mirror a host account: the session uid is not knowable at image build time"
+    id vmdesktop >/dev/null 2>&1 || useradd -m -u 4242 vmdesktop
+    echo 'vmdesktop:vm-smoke-pw' | chpasswd
+    echo vmdesktop > /etc/desktop-container/desktop-user
+
     log pd "start desktop.service; seat-prep must evict the getty uninstall restarted"
     systemctl start desktop.service
-    for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell; do
+    for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell desktop-user-sync; do
         systemctl is-active --quiet "$u.service" || fail "$u.service not active"
     done
     if systemctl is-active --quiet getty@tty1.service; then
@@ -178,6 +183,18 @@ phase_deploy() {
     podman exec desktop sh -c 'loginctl list-sessions --no-pager | grep -q seat0' \
         || fail "no seat0 session"
     podman exec desktop ps -C mwm >/dev/null || fail "mwm not running"
+
+    log pd "the live X session runs as the mirrored host uid, under SELinux enforcing"
+    cuid=$(podman exec desktop id -u desktop)
+    [ "$cuid" = 4242 ] || fail "container desktop user is uid $cuid, want the mirrored 4242"
+    xuid=$(podman exec desktop sh -c 'ps -o uid= -C Xorg | head -1' | tr -d ' ')
+    [ "$xuid" = 4242 ] || fail "Xorg runs as uid ${xuid:-?}, want the mirrored 4242"
+    # The point of the whole feature: what the session writes to the shared
+    # mounts is owned by the host account, as seen from the HOST.
+    sockuid=$(stat -c %u /tmp/.X11-unix/X0)
+    [ "$sockuid" = 4242 ] || fail "exported X socket is owned by uid $sockuid on the host, want 4242"
+    [ "$(podman exec desktop sh -c 'getent shadow desktop | cut -d: -f2')" \
+        = "$(getent shadow vmdesktop | cut -d: -f2)" ] || fail "host password hash not adopted"
 
     log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
     # This is the path only this phase can prove: sshd reading the key from
@@ -204,6 +221,15 @@ phase_deploy() {
 phase2() {
     log p2 "hand the display over: stop quadlet desktop"
     systemctl stop desktop.service
+    # phase-deploy ran the session as a mirrored host uid; a socket it failed
+    # to clean up would be unlinkable by the chart's (uid 1000) X server in
+    # the sticky shared dir.
+    rm -f /tmp/.X11-unix/X*
+    # It also staged a mirrored host identity in /etc/desktop-container, which
+    # the CHART mounts too; the k8s checks below assume the built-in uid 1000.
+    rm -f /etc/desktop-container/desktop-user \
+          /etc/desktop-container/desktop-user.env \
+          /etc/desktop-container/desktop-user.hash
     rm -f /etc/containers/systemd/desktop.container
     systemctl daemon-reload
 

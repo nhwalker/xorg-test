@@ -30,7 +30,8 @@ image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
   systemd/                  xorg-conf.service, desktop-session.service, drop-ins
-  session/                  start-session, xinitrc.desktop, mwmrc, Xdefaults
+  session/                  start-session, xinitrc.desktop, mwmrc, Xdefaults,
+                            align-desktop-user.sh (boot-time uid/password sync)
   pipewire/                 socket-export config drop-ins
 ```
 
@@ -404,6 +405,30 @@ kubectl describe node | grep -A1 desktop.local/display   # 10 allocatable
 kubectl apply -f examples/x11-client-pod.yaml            # xterm appears
 ```
 
+## Desktop user identity (deploy/ tree)
+
+The session runs as `desktop`, uid 1000 — a number the image build had to
+invent. Where the desktop stands in for a real person's host account, the
+declarative `deploy/` tree can hand the container that account's **uid,
+primary gid and password hash** at boot, so files the session writes to the
+shared mounts (and to any host volume you add) are owned by that host user,
+and `su desktop` inside the container takes their password:
+
+```sh
+echo alice > /etc/desktop-container/desktop-user
+systemctl restart desktop-user-sync.service desktop.service
+```
+
+The login name inside the container stays `desktop` regardless — only the
+numbers and the password follow the host account, which is all the kernel
+compares for ownership. Shipped empty (feature off), and the container-side
+script (`image/session/align-desktop-user.sh`, first step of
+`xorg-conf.service`) is a no-op without the host-exported material, so the
+`install.sh` and Kubernetes paths keep the built-in uid 1000 — though both
+mount the same `/etc/desktop-container` directory, so a host that *has* the
+export picks it up there as well. Full mechanics,
+refusal rules and limits: `deploy/README.md` "Desktop user identity".
+
 ## Host terminal from the desktop
 
 The mwm root menu has a **"Host Terminal"** entry: an xterm (in the
@@ -528,6 +553,12 @@ Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 - Exported audio sockets are world-connectable (`UMask=0000` drop-ins);
   restrict `/run/desktop-audio` permissions in the tmpfiles.d entry if that
   matters on your host.
+- Mirroring a host account (deploy tree) copies that account's `/etc/shadow`
+  hash into `/etc/desktop-container/desktop-user.hash` (0400, root) and into
+  the container's own shadow file. It is readable by container root — which
+  under `--privileged` is host root anyway — but it does put one host user's
+  hash inside the image's writable layer. Leave the selector empty to keep
+  password material on the host.
 
 ## Troubleshooting
 

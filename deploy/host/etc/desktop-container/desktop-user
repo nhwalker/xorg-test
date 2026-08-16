@@ -1,0 +1,18 @@
+# Part of the desktop-container deploy tree (deploy/README.md, "Desktop user
+# identity"). Name ONE existing host account here, on a line of its own, and
+# the container's "desktop" session user adopts its uid, primary gid and
+# password hash at every boot -- so files the desktop writes to shared mounts
+# are owned by that host user, and su/sudo inside the container take that
+# user's password.
+#
+#   echo alice > /etc/desktop-container/desktop-user
+#   systemctl restart desktop-user-sync.service desktop.service
+#
+# The account must already exist on the host (this tree never creates it) and
+# must not be root. Its NAME is not adopted: the login name inside the
+# container stays "desktop" regardless, only the numbers and the password
+# follow. A host account literally named "desktop" therefore matches all the
+# way through, but nothing requires it.
+#
+# Empty (the shipped state) = feature off: the container keeps the uid 1000
+# baked into the image, exactly as it behaved before this file existed.

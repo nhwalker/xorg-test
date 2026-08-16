@@ -96,11 +96,42 @@ systemd-tmpfiles --create || true   # unrelated runner entries may fail; ours as
 # the sshd_config.d drop-in is read at sshd start; this runner's sshd predates it
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
+# --- desktop user identity: shipped state, then a mirrored host account ------
+log "desktop-user-sync: shipped (comments-only) selector exports nothing"
+# captured, not piped: grep -q can SIGPIPE the producer under pipefail
+out=$(/usr/local/libexec/desktop-user-sync)
+echo "$out" | grep -q 'no account named' || fail "empty selector did not report the feature-off path: $out"
+[ ! -e /etc/desktop-container/desktop-user.env ] || fail "export written with no account named"
+
+log "desktop-user-sync: mirror a host account with a non-default uid"
+id ci-desktop-user >/dev/null 2>&1 || useradd -m -u 4242 -s /bin/bash ci-desktop-user
+echo 'ci-desktop-user:ci-smoke-pw' | chpasswd
+echo ci-desktop-user > /etc/desktop-container/desktop-user
+systemctl start desktop-user-sync.service
+grep -q '^DESKTOP_UID=4242' /etc/desktop-container/desktop-user.env \
+    || fail "uid not exported: $(cat /etc/desktop-container/desktop-user.env 2>/dev/null)"
+grep -q '^DESKTOP_HOST_USER=ci-desktop-user' /etc/desktop-container/desktop-user.env \
+    || fail "host user name not exported"
+[ "$(stat -c %a /etc/desktop-container/desktop-user.hash)" = 400 ] \
+    || fail "exported password hash is not root-only"
+hosthash=$(cat /etc/desktop-container/desktop-user.hash)
+case "$hosthash" in \$*) ;; *) fail "exported hash does not look like a crypt string" ;; esac
+
+log "desktop-user-sync: a named-but-missing account fails visibly"
+echo no-such-account-here > /etc/desktop-container/desktop-user
+if /usr/local/libexec/desktop-user-sync 2>/dev/null; then
+    fail "missing account did not fail the converger"
+fi
+[ ! -e /etc/desktop-container/desktop-user.env ] || fail "stale export survived a missing account"
+# back to the real account for the boot below
+echo ci-desktop-user > /etc/desktop-container/desktop-user
+systemctl restart desktop-user-sync.service
+
 log "start desktop.service (generated from the tree's quadlet)"
 systemctl start desktop.service
 
 log "converger oneshots all pulled in and succeeded"
-for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell; do
+for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell desktop-user-sync; do
     systemctl is-active --quiet "$u.service" \
         || { systemctl status "$u.service" --no-pager || true; fail "$u.service not active"; }
 done
@@ -133,6 +164,22 @@ case "$failed" in
     ""|"desktop-session.service ") ;;
     *) fail "unexpected failed units: $failed" ;;
 esac
+
+log "desktop user adopted the host account's uid, gid and password hash"
+cuid=$(podman exec desktop id -u desktop)
+[ "$cuid" = 4242 ] || fail "container desktop user is uid $cuid, want 4242"
+[ "$(podman exec desktop id -g desktop)" = "$(id -g ci-desktop-user)" ] \
+    || fail "container desktop user gid does not match the host account"
+howner=$(podman exec desktop stat -c %u:%g /home/desktop)
+[ "$howner" = "4242:$(id -g ci-desktop-user)" ] || fail "/home/desktop still owned by $howner"
+chash=$(podman exec desktop sh -c 'getent shadow desktop | cut -d: -f2')
+[ "$chash" = "$hosthash" ] || fail "container password hash does not match the host's"
+# The shared mounts are what the numeric identity exists for.
+podman exec -u desktop desktop sh -c 'touch /run/desktop-audio/.uid-probe' \
+    || fail "desktop user cannot write the exported audio dir"
+probe=$(stat -c %u /run/desktop-audio/.uid-probe)
+rm -f /run/desktop-audio/.uid-probe
+[ "$probe" = 4242 ] || fail "file written from the container is owned by $probe on the host, want 4242"
 
 log "host terminal: loopback ssh as desktop-shell with the boot-fresh key"
 [ -f /etc/desktop-container/host-shell-key ] || fail "boot-fresh key missing"

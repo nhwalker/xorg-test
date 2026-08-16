@@ -93,6 +93,22 @@ for d in /tmp/.X11-unix /run/desktop-audio; do
     fi
 done
 
+# --- session user identity ------------------------------------------------------
+# Numeric identity is what ownership on the shared mounts (and any host
+# volume) is compared against, so report it either way -- "the desktop wrote
+# files nobody on the host can read" starts here.
+if [ -f /etc/desktop-container/desktop-user.env ]; then
+    want=$(sed -n 's/^DESKTOP_UID=//p' /etc/desktop-container/desktop-user.env | tail -n1)
+    hu=$(sed -n 's/^DESKTOP_HOST_USER=//p' /etc/desktop-container/desktop-user.env | tail -n1)
+    if [ "$want" = "$(id -u desktop)" ]; then
+        pass "desktop user mirrors host account '$hu' ($(id -u desktop):$(id -g desktop))"
+    else
+        fail "desktop user is uid $(id -u desktop) but the host exported $want for '$hu': alignment was refused or failed, see the align-desktop-user lines above"
+    fi
+else
+    pass "desktop user uses the image's built-in identity ($(id -u desktop):$(id -g desktop)); no host account mirrored"
+fi
+
 # --- host terminal (loopback ssh) ---------------------------------------------
 if [ -f /etc/desktop-container/host-shell-key ]; then
     pass "host shell material mounted (Host Terminal -> ssh as '$(cat /etc/desktop-container/shell-user 2>/dev/null || echo '?')')"
