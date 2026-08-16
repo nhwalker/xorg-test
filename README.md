@@ -22,7 +22,8 @@ The mode is chosen automatically at every container boot by
 Containerfile.base          BASE image: UBI9 + Rocky9 repos + all packages (network build)
 Containerfile               APPLICATION layer: config/services on the base (offline build)
 Containerfile.plugin[.base] cdi-device-plugin image (same base/app offline split)
-cdi-device-plugin/          generic CDI device plugin: one CDI device -> one k8s resource
+cdi-device-plugin/          generic CDI device plugin: one CDI device -> one k8s
+                            resource; reusable on its own, see its README
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
 deploy/                     declarative deployment: the same host end state as
@@ -325,6 +326,11 @@ Prerequisites on the node:
 - host prep run once: `sudo ./install.sh --host-prep-only` (seat undo,
   audio client configs, `/etc/cdi/nvidia.yaml` and `/etc/cdi/desktop.yaml`
   generation; no podman service is installed)
+- for client pods (and for GPU mode): a device plugin advertising the CDI
+  device as a resource — `charts/cdi-device-plugin`, or NVIDIA's own for
+  `nvidia.com/gpu`. Kubernetes has no pod field that names a CDI device,
+  so nothing reaches CDI injection without one; see "Client containers
+  via CDI"
 
 Install:
 
@@ -429,7 +435,9 @@ kubectl apply -f examples/x11-client-pod.yaml            # xterm appears
 > metadata. A device plugin (or DRA) is the only supported route.
 
 The plugin is deliberately generic: it knows nothing about displays. Point
-it at any CDI device on the node and install one release per device.
+it at any CDI device on the node and install one release per device — it
+is usable outside this project, and `cdi-device-plugin/README.md`
+documents it standalone.
 
 - **Resource name** defaults to the device's CDI kind
   (`desktop.local/display`), overridable with `resourceName` when that

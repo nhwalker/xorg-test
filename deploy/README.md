@@ -90,7 +90,8 @@ resources:
 
 A `cdi.k8s.io/...` pod annotation does NOT work and fails silently -
 kubelet builds a container's CRI annotations from device-plugin output
-only, so the annotation never reaches CDI injection.
+only, so the annotation never reaches CDI injection. See
+`cdi-device-plugin/README.md` for the details and the upstream citations.
 
 Two things make this unit unlike its siblings:
 
