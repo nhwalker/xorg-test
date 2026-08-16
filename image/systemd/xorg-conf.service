@@ -7,11 +7,20 @@ Type=oneshot
 RemainAfterExit=yes
 # "-" prefix: diagnostics log but never block the session; the
 # Xwrapper.config escape hatch is the manual fallback.
-# First: the session user's numeric identity, which every step below either
-# reports on (preflight), writes files as (host-shell-setup) or adds groups
-# to (align-device-groups). No-op unless the host exported an account.
-ExecStart=-/usr/local/bin/align-desktop-user.sh
+#
+# KEEP ensure-vt-devices FIRST. logind decides whether seat0 has VTs exactly
+# once, when it starts: manager_connect_console() tests for /dev/tty0 and
+# gives up for good if it is missing. The runtime does not expose the VT
+# nodes, so this script racing logind's startup is what makes the difference
+# between a seat0 session and "Failed to create session: Seat has no VTs but
+# VT number not 0" (Xorg still starts via group permissions, so the only
+# symptom is the missing session). Anything slower placed ahead of it -- the
+# identity alignment below spawns usermod/groupmod/chpasswd -- loses that race.
 ExecStart=-/usr/local/bin/ensure-vt-devices.sh
+# The session user's numeric identity, ahead of every step that reports on it
+# (preflight), writes files as it (host-shell-setup) or adds groups to it
+# (align-device-groups). No-op unless the host exported an account.
+ExecStart=-/usr/local/bin/align-desktop-user.sh
 ExecStart=-/usr/local/bin/align-device-groups.sh
 # The audio export sockets live in a host-shared dir that survives container
 # restarts (k8s Recreate, podman restart). PipeWire and pipewire-pulse will
