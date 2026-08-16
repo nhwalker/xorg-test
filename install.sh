@@ -407,6 +407,6 @@ else
     log "client CDI spec: $DISPLAY_CDI_SPEC (desktop.local/display=all)"
     log "deploy with the Helm chart: helm install desktop charts/desktop-container \\"
     log "    --set image.repository=<registry>/desktop-container$([ "$gpu_enabled" = 1 ] && echo ' --set gpu.enabled=true')"
-    log "client pods: add the annotation cdi.k8s.io/display: \"desktop.local/display=all\""
-    log "    (see examples/x11-client-pod.yaml)"
+    log "client pods: install charts/cdi-device-plugin for desktop.local/display=all,"
+    log "    then request 'desktop.local/display: 1' (see examples/x11-client-pod.yaml)"
 fi

@@ -77,11 +77,20 @@ declares nothing of its own:
 podman run --rm --device desktop.local/display=all <image> xterm
 ```
 
+In kubernetes there is no pod field naming a CDI device, so a device
+plugin bridges the gap (`charts/cdi-device-plugin` in this repo): it
+advertises the device as an extended resource and names it back to the
+runtime at allocation time. A client pod then just requests it:
+
 ```yaml
-metadata:
-  annotations:
-    cdi.k8s.io/display: "desktop.local/display=all"   # CRI-O resolves it
+resources:
+  limits:
+    desktop.local/display: 1
 ```
+
+A `cdi.k8s.io/...` pod annotation does NOT work and fails silently -
+kubelet builds a container's CRI annotations from device-plugin output
+only, so the annotation never reaches CDI injection.
 
 Two things make this unit unlike its siblings:
 

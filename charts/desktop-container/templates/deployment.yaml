@@ -17,17 +17,9 @@ spec:
     metadata:
       labels:
         {{- include "desktop-container.selectorLabels" . | nindent 8 }}
-      {{- if or .Values.gpu.enabled .Values.podAnnotations }}
+      {{- with .Values.podAnnotations }}
       annotations:
-        {{- if .Values.gpu.enabled }}
-        # CRI-O injects the NVIDIA devices + driver userspace from the CDI
-        # spec (/etc/cdi/nvidia.yaml). Client pods reach THIS desktop by the
-        # same mechanism, with cdi.k8s.io/display -> /etc/cdi/desktop.yaml.
-        cdi.k8s.io/gpu: {{ .Values.gpu.cdiDevice | quote }}
-        {{- end }}
-        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
       {{- end }}
     spec:
       # Host network namespace: kernel uevents (input hotplug) are delivered
@@ -90,7 +82,20 @@ spec:
             initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
           {{- end }}
-          {{- with .Values.resources }}
+          {{- /*
+            Requesting the GPU resource is what triggers injection: the
+            device plugin behind it names the CDI device and CRI-O applies
+            /etc/cdi/nvidia.yaml. A pod annotation cannot do this (see
+            gpu.resourceName in values.yaml). Merged into any user-supplied
+            .Values.resources rather than emitted as a second limits: key.
+          */}}
+          {{- $res := deepCopy (.Values.resources | default dict) }}
+          {{- if .Values.gpu.enabled }}
+          {{- $limits := (get $res "limits") | default dict }}
+          {{- $_ := set $limits .Values.gpu.resourceName 1 }}
+          {{- $_ := set $res "limits" $limits }}
+          {{- end }}
+          {{- with $res }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}

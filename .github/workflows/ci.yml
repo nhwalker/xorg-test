@@ -16,6 +16,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cdi-device-plugin/go.mod
+          cache-dependency-path: cdi-device-plugin/go.sum
+      - name: go fmt/vet/test
+        working-directory: cdi-device-plugin
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
       - name: shellcheck (error severity)
         run: |
           sudo apt-get update -q
@@ -46,13 +56,16 @@ jobs:
       - name: helm lint + template assertions
         run: |
           helm lint charts/desktop-container
+          helm lint charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all
           ci/helm-assertions.sh
       - name: kubeconform (k8s schema validation)
-        # The client manifests are plain YAML (annotation only, no chart),
-        # so they are validated directly rather than through helm template.
+        # The client manifests are plain YAML (a resource request, no
+        # chart), so they are validated directly, not via helm template.
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
           helm template d charts/desktop-container | ./kubeconform -strict -summary
+          helm template p charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all \
+            | ./kubeconform -strict -summary
           ./kubeconform -strict -summary \
             examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml
 
@@ -68,9 +81,10 @@ jobs:
         env:
           PUSH_BASES: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '0' }}
         run: sudo -E ci/build-bases.sh
-      - name: application layer (offline gate)
+      - name: application layers (offline gate)
         run: |
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+          sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
       - name: deploy tree quadlet dry-run + CDI spec checks
         # Validate the declarative deploy/ tree: the quadlet generator must
         # accept the unit, and everything must land in the generated service

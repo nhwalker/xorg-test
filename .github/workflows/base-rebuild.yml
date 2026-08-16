@@ -20,21 +20,28 @@ jobs:
       - uses: actions/checkout@v4
       - name: ghcr login
         run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: rebuild base from scratch
+      - name: rebuild bases from scratch
         run: |
           sudo podman build --pull --no-cache -t localhost/desktop-container-base:latest -f Containerfile.base .
-      - name: offline app layer still builds on the fresh base
+          sudo podman build --pull --no-cache -t localhost/cdi-device-plugin-base:latest -f Containerfile.plugin.base .
+      - name: offline app layers still build on the fresh bases
         run: |
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
-      - name: push refreshed base (content tag + latest)
+          sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+      - name: push refreshed bases (content tag + latest)
         env:
           PUSH_BASES: "1"
         run: |
           set -euo pipefail
           tag() { sha256sum "$@" | sha256sum | cut -c1-16; }
-          name=desktop-container-base
-          t="base-$(tag Containerfile.base image/rocky9.repo)"
-          sudo podman tag "localhost/$name:latest" "$REGISTRY/$name:$t"
-          sudo podman tag "localhost/$name:latest" "$REGISTRY/$name:latest"
-          sudo podman push "$REGISTRY/$name:$t"
-          sudo podman push "$REGISTRY/$name:latest"
+          for spec in \
+            "desktop-container-base Containerfile.base image/rocky9.repo" \
+            "cdi-device-plugin-base Containerfile.plugin.base cdi-device-plugin/go.mod cdi-device-plugin/go.sum"; do
+            set -- $spec
+            name=$1; shift
+            t="base-$(tag "$@")"
+            sudo podman tag "localhost/$name:latest" "$REGISTRY/$name:$t"
+            sudo podman tag "localhost/$name:latest" "$REGISTRY/$name:latest"
+            sudo podman push "$REGISTRY/$name:$t"
+            sudo podman push "$REGISTRY/$name:latest"
+          done

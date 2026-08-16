@@ -100,7 +100,7 @@ log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
 scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null repo.tgz \
-    images-desktop.tar images-testclient.tar \
+    images-desktop.tar images-plugin.tar images-testclient.tar \
     rocky@127.0.0.1:/tmp/
 
 log "phase 1: quadlet flow (real install.sh, real Xorg, SELinux enforcing)"
@@ -164,23 +164,23 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase-deploy' \
 screendump desktop-deploy
 assert_nonblank desktop-deploy
 
-log "phase 2: k3s + the desktop chart (annotated client pod on the same display)"
+log "phase 2: k3s + desktop chart + cdi-device-plugin (client pod on the same display)"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
 assert_nonblank desktop-k3s-client
 
-log "cdi: an annotated pod gets DISPLAY + sockets injected by the runtime"
+log "cdi: a requesting pod gets DISPLAY + sockets injected by the runtime"
 # The verifier pod declares no env/mounts of its own and an identical pod
-# WITHOUT the annotation is checked to get nothing, so these assertions
-# prove CRI-O's CDI injection end to end in a live pod.
+# WITHOUT the resource request is checked to get nothing, so these
+# assertions prove the plugin -> CRI-O CDI path end to end in a live pod.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-cdi' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod cdi-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo cat /etc/cdi/desktop.yaml' \
          > "$ART/cdi-verify-fail.log" 2>&1 || true; fail "CDI injection verification failed"; }
 screendump cdi-verify-window
 assert_nonblank cdi-verify-window
 
-log "cdi: each audio path works from the annotated pod (injected env only)"
+log "cdi: each audio path works from the requesting pod (injected env only)"
 # One capture per path, played from the verifier pod using only injected
 # env - proves the CDI spec wired pulse/pipewire/ALSA, not the desktop
 # image's own local session.
@@ -215,18 +215,18 @@ for path in pulse pipewire alsa; do
         || fail "lean client $path audio capture is empty or silent"
 done
 
-log "cdi: concurrent clients share one display with no cap in the way"
-# Three annotated pods open the display, and two of them re-open it while
+log "cdi: concurrent clients share one display"
+# Three requesting pods open the display, and two of them re-open it while
 # the third holds a connection. Proves the shareable-device concurrency the
-# CDI path relies on (nothing hands out exclusive slots any more).
+# advertised count is there to permit.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-concurrency' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo /usr/local/bin/k3s kubectl describe pod x11-client-c' \
          > "$ART/verify-concurrency-fail.log" 2>&1 || true; fail "concurrency check failed"; }
 screendump concurrent-clients
 
-log "k8s teardown: helm uninstall the desktop chart; host CDI spec survives"
+log "k8s teardown: uninstall both charts; resource withdrawn, host CDI spec survives"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
-    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo cat /etc/cdi/desktop.yaml' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop.yaml' \
          > "$ART/teardown-fail.log" 2>&1 || true; fail "k8s teardown check failed"; }
 
 log "collect guest diagnostics"

@@ -1,8 +1,7 @@
 #!/bin/bash
-# Golden assertions over helm template output for the desktop chart, plus
-# the client-side manifests (which are plain YAML, not a chart: the display
-# reaches client pods through the host CDI spec and an annotation, so there
-# is nothing to install for them).
+# Golden assertions over helm template output for the desktop and
+# cdi-device-plugin charts, plus the client manifests (plain YAML: a client
+# only requests a resource, so there is nothing to install for it).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -11,8 +10,13 @@ nk() { echo "$2" | grep -q "$1" && { echo "FAIL: $3"; exit 1; } || echo "PASS: $
 
 DT=$(helm template d charts/desktop-container)
 GPU=$(helm template d charts/desktop-container --set gpu.enabled=true)
+GPURES=$(helm template d charts/desktop-container --set gpu.enabled=true \
+         --set resources.limits.memory=2Gi --set resources.requests.cpu=500m)
 NOPROBE=$(helm template d charts/desktop-container --set readinessProbe.enabled=false)
 LIVE=$(helm template d charts/desktop-container --set livenessProbe.enabled=true)
+DP=$(helm template p charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all --set count=10)
+DPO=$(helm template p charts/cdi-device-plugin --set cdiDevice=nvidia.com/gpu=all \
+      --set resourceName=desktop.local/gpu --set priorityClassName=system-node-critical)
 
 # desktop chart
 ck 'privileged: true'                        "$DT"  "desktop: privileged"
@@ -28,34 +32,65 @@ ck 'chmod 1777 /export/x11 /export/audio'    "$DT"  "desktop: initContainer chmo
 ck 'type: Recreate'                          "$DT"  "desktop: Recreate"
 ck 'value: cri-o'                            "$DT"  "desktop: container env"
 ck 'xdpyinfo'                                "$DT"  "desktop: connect-based readiness"
-nk 'cdi.k8s.io'                              "$DT"  "desktop: no CDI annotation by default"
 nk 'NVIDIA_DRIVER_CAPABILITIES'              "$DT"  "desktop: no NVIDIA env by default"
-ck 'cdi.k8s.io/gpu: "nvidia.com/gpu=all"'    "$GPU" "desktop: CDI annotation with gpu.enabled"
+nk 'nvidia.com/gpu'                          "$DT"  "desktop: no GPU resource by default"
+ck 'nvidia.com/gpu: 1'                       "$GPU" "desktop: GPU resource request with gpu.enabled"
 ck 'NVIDIA_DRIVER_CAPABILITIES'              "$GPU" "desktop: NVIDIA env with gpu.enabled"
+# A pod-spec annotation never reaches the runtime's CDI injection (kubelet
+# builds CRI container annotations from device-plugin output only), so its
+# reappearance anywhere would be a silent regression to a broken mechanism.
+nk 'cdi.k8s.io'                              "$DT"  "desktop: no CDI annotation by default"
+nk 'cdi.k8s.io'                              "$GPU" "desktop: GPU uses a resource, NOT an annotation"
+# The GPU limit must merge into user-supplied resources, not emit a second
+# limits: key (which would be invalid YAML with a silent last-wins parse).
+ck 'memory: 2Gi'                             "$GPURES" "desktop: user resources survive gpu.enabled"
+ck 'cpu: 500m'                               "$GPURES" "desktop: user requests survive gpu.enabled"
+ck 'nvidia.com/gpu: 1'                       "$GPURES" "desktop: GPU limit merged alongside them"
+[ "$(echo "$GPURES" | grep -c 'limits:')" = 1 ] \
+    && echo "PASS: desktop: exactly one limits: key when merging" \
+    || { echo "FAIL: desktop: duplicate limits: key when merging"; exit 1; }
 nk 'readinessProbe'                          "$NOPROBE" "desktop: probe disappears when disabled"
 ck 'is-system-running'                       "$LIVE" "desktop: liveness renders when enabled"
 
-# --- client manifests + the CDI spec they resolve against --------------------
-# The device name is a contract between the generator and every client
-# manifest; nothing at template time would catch the two drifting apart.
-GEN=deploy/host/usr/local/libexec/desktop-display-cdi
-KIND=$(sed -n 's/^CDI_KIND="\(.*\)"$/\1/p' "$GEN")
-DEV=$(sed -n 's/^CDI_DEVICE="\(.*\)"$/\1/p' "$GEN")
-[ -n "$KIND" ] && [ -n "$DEV" ] || { echo "FAIL: could not read CDI_KIND/CDI_DEVICE from $GEN"; exit 1; }
-echo "PASS: generator advertises $KIND=$DEV"
+# --- cdi-device-plugin chart -------------------------------------------------
+ck 'kind: DaemonSet'                         "$DP"  "plugin: daemonset"
+ck 'path: /var/lib/kubelet/device-plugins'   "$DP"  "plugin: kubelet dir hostPath"
+ck 'value: "desktop.local/display=all"'      "$DP"  "plugin: CDI device passed through"
+ck 'value: "desktop.local/display"'          "$DP"  "plugin: resource name defaults to the CDI kind"
+ck 'value: "10"'                             "$DP"  "plugin: count passed through"
+ck 'value: "/etc/cdi,/var/run/cdi"'          "$DP"  "plugin: default spec dirs"
+ck 'readOnly: true'                          "$DP"  "plugin: CDI specs mounted read-only"
+nk 'priorityClassName'                       "$DP"  "plugin: no priorityClassName by default"
+ck 'value: "desktop.local/gpu"'              "$DPO" "plugin: resource name override wins over the kind"
+ck 'priorityClassName: system-node-critical' "$DPO" "plugin: priorityClassName renders when set"
+# cdiDevice is the one value with no sensible default; rendering without it
+# would produce a plugin that can never resolve anything.
+helm template p charts/cdi-device-plugin >/dev/null 2>&1 \
+    && { echo "FAIL: plugin: chart rendered without cdiDevice"; exit 1; } \
+    || echo "PASS: plugin: chart refuses to render without cdiDevice"
+helm template p charts/cdi-device-plugin --set cdiDevice=missing-equals >/dev/null 2>&1 \
+    && { echo "FAIL: plugin: chart accepted an unqualified cdiDevice"; exit 1; } \
+    || echo "PASS: plugin: chart rejects an unqualified cdiDevice"
+
+# --- client manifests --------------------------------------------------------
+# The resource name is a contract between the plugin release and every
+# client manifest; nothing at template time would catch them drifting apart.
+RES=$(echo "$DP" | sed -n 's/.*value: "\(desktop\.local\/display\)"$/\1/p' | head -1)
+[ -n "$RES" ] || { echo "FAIL: could not read the advertised resource name from the chart"; exit 1; }
+echo "PASS: plugin advertises $RES"
 
 for m in examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml; do
     # Comments stripped: these files DESCRIBE what they deliberately omit
     # ("no env, no volumeMounts"), which would otherwise match below.
     M=$(grep -v '^[[:space:]]*#' "$m")
-    ck "cdi.k8s.io/.*: \"$KIND=$DEV\"" "$M" "$m: annotation matches the generated device"
+    ck "$RES: 1"                       "$M" "$m: requests the advertised resource"
     # Proof-by-construction: these pods must keep declaring NOTHING that
     # could hand them the display by another route, or they stop proving
     # that CDI is what wired them up.
     nk 'volumeMounts'                  "$M" "$m: no volumeMounts of its own"
     nk '^  volumes:'                   "$M" "$m: no volumes of its own"
     nk '^      env:'                   "$M" "$m: no env of its own"
-    nk 'desktop.local/display: 1'      "$M" "$m: no leftover device-plugin resource request"
+    nk 'cdi\.k8s\.io'                  "$M" "$m: no CDI annotation (it would be silently ignored)"
 done
 
 echo "== all helm assertions passed"

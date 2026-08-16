@@ -1,0 +1,25 @@
+{{ include "cdi-device-plugin.fullname" . }} deployed.
+
+The node now advertises {{ include "cdi-device-plugin.resourceName" . }}
+({{ .Values.count }} interchangeable {{ if gt (int .Values.count) 1 }}copies{{ else }}copy{{ end }}) for the CDI device
+{{ .Values.cdiDevice }}.
+
+The resource is Healthy only while that device resolves in
+{{ join ", " .Values.cdiSpecDirs }}, so pods stay Pending rather than
+failing at container creation on a node whose spec is missing.
+
+Check:
+
+    kubectl describe node | grep -A1 {{ include "cdi-device-plugin.resourceName" . }}
+
+A client pod just requests it; everything it receives -- mounts, env,
+device nodes -- comes from the CDI spec, not from this chart:
+
+    resources:
+      limits:
+        {{ include "cdi-device-plugin.resourceName" . }}: 1
+
+Install one release per CDI device, e.g. alongside this one:
+
+    helm install <name> charts/cdi-device-plugin \
+        --set cdiDevice=<vendor/class=device> --set count=<n>

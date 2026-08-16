@@ -8,9 +8,9 @@
 #         tree rsync-applied, desktop booted from its quadlet, root-owned
 #         desktop-shell ssh trust exercised under SELinux enforcing, and
 #         desktop-preflight asserted fully green.
-# phase2: k3s + the desktop chart - client pods reaching the same display
-#         through the CDI device desktop.local/display=all, injected by
-#         CRI-O from /etc/cdi/desktop.yaml.
+# phase2: k3s + the desktop chart + cdi-device-plugin - client pods
+#         requesting desktop.local/display and reaching the same display,
+#         with CRI-O injecting from /etc/cdi/desktop.yaml.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -50,6 +50,10 @@ fail() {
         k3s kubectl get pods -A -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGEID:.status.containerStatuses[0].imageID' >&2 2>&1 || true
         echo "---- diagnostics: client CDI spec ----" >&2
         cat /etc/cdi/desktop.yaml >&2 2>/dev/null || echo "(no /etc/cdi/desktop.yaml)" >&2
+        echo "---- diagnostics: cdi-device-plugin logs ----" >&2
+        k3s kubectl logs -l app.kubernetes.io/name=cdi-device-plugin --tail=30 >&2 2>&1 || true
+        echo "---- diagnostics: kubelet plugin dir ----" >&2
+        ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
         echo "---- diagnostics: crio CDI view ----" >&2
         journalctl -u crio --no-pager -o cat 2>/dev/null | grep -i cdi | tail -20 >&2 || true
         echo "---- diagnostics: desktop pod audio (export sockets + pipewire procs) ----" >&2
@@ -128,7 +132,7 @@ phase1() {
     # The whole client contract in one command, under podman: a SEPARATE
     # container that passes no -v and no -e reaches the display purely
     # because the runtime applied the spec's containerEdits. Same mechanism
-    # k8s uses via the annotation, minus kubernetes.
+    # k8s uses via the device plugin, minus kubernetes.
     #
     # label=disable is required here, and is NOT papering over a broken
     # spec: the exported socket dirs carry host labels, so a CONFINED
@@ -261,11 +265,10 @@ phase2() {
     rm -f /etc/containers/systemd/desktop.container
     systemctl daemon-reload
 
-    # Client pods reach the display through a cdi.k8s.io annotation, which
-    # only the CRI resolves - so this phase runs k3s on an EXTERNAL CRI-O
-    # instead of the bundled containerd (also what the chart targets:
-    # container=cri-o env, the GPU annotation). CRI-O scans /etc/cdi by
-    # default, which is where both specs live.
+    # Client pods reach the display through CDI, which only the CRI
+    # resolves - so this phase runs k3s on an EXTERNAL CRI-O instead of the
+    # bundled containerd (also what the desktop chart targets: container=cri-o
+    # env). CRI-O scans /etc/cdi, which is where both specs live.
     # (SELinux policy interplay is out of scope here: permissive.)
     log p2 "install CRI-O ${CRIO_VERSION} (the chart's documented runtime)"
     setenforce 0
@@ -283,16 +286,20 @@ EOF
     # `podman load` is visible to CRI-O - no ctr import or skopeo needed. Load
     # before starting crio to avoid concurrent writers to the storage.
     log p2 "load images into shared containers-storage"
-    for t in desktop testclient; do
+    for t in desktop plugin testclient; do
         podman load -q -i "/tmp/images-$t.tar" >/dev/null
     done
     # Guard against tag/content mix-ups in the archive plumbing (a combined
     # podman-save archive once shipped the desktop image under BOTH tags).
     ddig=$(podman image inspect localhost/desktop-container:latest --format '{{.Id}}' 2>/dev/null || true)
-    tdig=$(podman image inspect localhost/desktop-testclient:latest --format '{{.Id}}' 2>/dev/null || true)
-    if [ -z "$ddig" ] || [ -z "$tdig" ] || [ "$ddig" = "$tdig" ]; then
-        fail "image load broken: desktop='$ddig' testclient='$tdig' (must both exist and differ)"
+    pdig=$(podman image inspect localhost/cdi-device-plugin:latest --format '{{.Id}}' 2>/dev/null || true)
+    if [ -z "$ddig" ] || [ -z "$pdig" ] || [ "$ddig" = "$pdig" ]; then
+        fail "image load broken: desktop='$ddig' plugin='$pdig' (must both exist and differ)"
     fi
+    ep=$(podman image inspect localhost/cdi-device-plugin:latest \
+        --format '{{index .Config.Entrypoint 0}}' || true)
+    [ "$ep" = /cdi-device-plugin ] \
+        || fail "plugin image has wrong entrypoint '$ep' - archive tag mix-up?"
 
     # Everything downstream depends on this file; assert it before k3s so a
     # missing spec fails here instead of as an opaque pod creation error.
@@ -349,10 +356,17 @@ EOF
     wait_for 40 5 "desktop deployment ready" \
         sh -c "k3s kubectl get deploy desktop -o jsonpath='{.status.readyReplicas}' | grep -q 1"
 
+    log p2 "deploy the generic CDI device plugin; the resource becomes allocatable"
+    helm install cdi charts/cdi-device-plugin \
+        --set image.repository=localhost/cdi-device-plugin --set image.pullPolicy=Never \
+        --set cdiDevice=desktop.local/display=all --set count=10
+    wait_for 30 4 "desktop.local/display allocatable" \
+        sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}' | grep -q 10"
+
     log p2 "client pod schedules and opens xterm on the desktop"
-    # The example pod carries only the cdi.k8s.io annotation - no resource
-    # request, no volumes, no env - so it running an X client at all is the
-    # CDI injection working.
+    # The example pod declares only the resource request - no volumes, no
+    # env - so it running an X client at all means the plugin named the CDI
+    # device and CRI-O applied the spec.
     sed 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
         examples/x11-client-pod.yaml | k3s kubectl apply -f -
     wait_for 30 4 "client pod running" \
@@ -428,12 +442,12 @@ assert_pod_socket() { # $1: path
     # Present, a socket, and writable: the spec mounts rw because unix
     # connect(2) needs write access; a ro mount would pass -S but break use.
     k3s kubectl exec "$VPOD" -- sh -c "test -S '$1' && test -w '$1'" \
-        || fail "socket $1 missing or not writable in the annotated pod"
+        || fail "socket $1 missing or not writable in the requesting pod"
     log vp "socket $1 present + writable"
 }
 
 verify_cdi() {
-    log vp "apply verifier pod: cdi.k8s.io annotation only, declares nothing else"
+    log vp "apply verifier pod: requests desktop.local/display, declares nothing else"
     k3s kubectl apply -f ci/vm/cdi-verify-pod.yaml
     wait_for 30 4 "verifier pod running" \
         sh -c "k3s kubectl get pod $VPOD -o jsonpath='{.status.phase}' | grep -q Running"
@@ -448,28 +462,31 @@ verify_cdi() {
     # sh -c so it uses the injected DISPLAY, not a hardcoded one; bounded so
     # a broken connection fails instead of hanging.
     timeout 20 k3s kubectl exec "$VPOD" -- sh -c 'xdpyinfo >/dev/null' \
-        || fail "xdpyinfo could not open the display from the annotated pod"
+        || fail "xdpyinfo could not open the display from the requesting pod"
     log vp "xdpyinfo opened :0 from the pod"
 
-    # Negative control: without the annotation the SAME image gets none of
-    # it. Without this, a stray hostPath or a baked-in env in the desktop
-    # image would make every assertion above pass for the wrong reason.
-    log vp "control: an identical pod WITHOUT the annotation gets nothing"
+    # Negative control: without the resource request the SAME image gets
+    # none of it. Without this, a stray hostPath or a baked-in env in the
+    # desktop image would make every assertion above pass for the wrong
+    # reason. (It is also what caught the annotation-only design silently
+    # injecting nothing: there, verify and control behaved identically.)
+    log vp "control: an identical pod WITHOUT the resource request gets nothing"
     k3s kubectl delete pod cdi-control --ignore-not-found >/dev/null 2>&1 || true
-    grep -v 'cdi\.k8s\.io/display' ci/vm/cdi-verify-pod.yaml \
-        | sed -e 's/^  name: cdi-verify$/  name: cdi-control/' \
-              -e '/^  annotations:$/d' \
+    # resources: is the last block in the manifest, so cutting from it to
+    # EOF leaves an otherwise identical pod.
+    sed -e 's/^  name: cdi-verify$/  name: cdi-control/' \
+        -e '/^      resources:$/,$d' ci/vm/cdi-verify-pod.yaml \
         | k3s kubectl apply -f -
     wait_for 30 4 "control pod running" \
         sh -c "k3s kubectl get pod cdi-control -o jsonpath='{.status.phase}' | grep -q Running"
     if k3s kubectl exec cdi-control -- printenv DISPLAY >/dev/null 2>&1; then
-        fail "control pod has DISPLAY set without the annotation - injection is not what we measured"
+        fail "control pod has DISPLAY set without requesting the resource - injection is not what we measured"
     fi
     if k3s kubectl exec cdi-control -- test -S /tmp/.X11-unix/X0 2>/dev/null; then
-        fail "control pod can see the X socket without the annotation"
+        fail "control pod can see the X socket without requesting the resource"
     fi
     k3s kubectl delete pod cdi-control --wait=true >/dev/null 2>&1 || true
-    log vp "control pod saw no DISPLAY and no X socket - the annotation is the cause"
+    log vp "control pod saw no DISPLAY and no X socket - the request is the cause"
 
     # The pod readiness probe only gates on Xorg, so the desktop's user
     # pipewire session (which exports BOTH the pulse and the native pipewire
@@ -496,7 +513,7 @@ verify_cdi() {
 
 play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default cdi-verify)
     # Same beep-per-path convention as the in-container test, but played from an
-    # annotated pod using ONLY the injected env - so success proves the CDI spec
+    # requesting pod using ONLY the injected env - so success proves the CDI spec
     # wired that client path, not the desktop image's own local session.
     local path="${1:?pulse|pipewire|alsa}" pod="${2:-$VPOD}" player freq
     case "$path" in
@@ -522,7 +539,7 @@ play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default cdi-verify)
 }
 
 verify_testclient() {
-    log tc "apply a LEAN non-desktop client (no server stack) carrying the annotation"
+    log tc "apply a LEAN non-desktop client (no server stack) requesting the resource"
     k3s kubectl apply -f ci/vm/testclient-pod.yaml
     wait_for 30 4 "testclient running" \
         sh -c "k3s kubectl get pod x11-testclient -o jsonpath='{.status.phase}' | grep -q Running"
@@ -601,20 +618,27 @@ verify_concurrency() {
 
 verify_teardown() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    log td "helm uninstall the desktop chart"
+    log td "helm uninstall both charts"
+    helm uninstall cdi >/dev/null || fail "helm uninstall cdi failed"
     helm uninstall desktop >/dev/null || fail "helm uninstall desktop failed"
 
-    # The chart-managed workload must be gone (get returns non-zero once the
-    # object no longer exists).
-    wait_for 20 3 "desktop deployment gone" \
-        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1"
+    # Removing the plugin must make the node stop offering the resource.
+    # kubelet drops the allocatable COUNT to 0 promptly but often keeps the
+    # resource key in node status for a while, so assert the count is 0 (or
+    # the key is gone), not that the key vanished.
+    wait_for 30 4 "desktop.local/display no longer allocatable" \
+        sh -c "v=\$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}'); [ -z \"\$v\" ] || [ \"\$v\" = 0 ]"
+    # The chart-managed workloads must be gone (get returns non-zero once
+    # the objects no longer exist).
+    wait_for 20 3 "desktop deployment + plugin daemonset gone" \
+        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1 && ! k3s kubectl get ds cdi-cdi-device-plugin >/dev/null 2>&1"
 
-    # The CDI spec is host state, not chart state: uninstalling the desktop
-    # must NOT remove it (nothing in k8s owns it). Clients that keep the
-    # annotation simply find no socket behind the mount.
+    # The CDI spec is HOST state, not chart state: uninstalling must not
+    # remove it (nothing in k8s owns it). This is the seam that makes one
+    # spec definition serve podman and kubernetes alike.
     grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
         || fail "helm uninstall removed the host CDI spec - it is host state"
-    log td "chart uninstalled; workload removed; host CDI spec untouched"
+    log td "charts uninstalled; resource withdrawn; host CDI spec untouched"
     log td "verify-teardown passed"
 }
 
