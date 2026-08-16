@@ -311,17 +311,22 @@ EOF
 network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
 plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
 EOF
-    systemctl enable --now crio >/dev/null 2>&1 || fail "crio failed to start"
+    # Everything downstream rests on CRI-O scanning /etc/cdi. That IS the
+    # default, but state it explicitly rather than depend on it: the default
+    # does not appear in `crio config` output (the man page documents the
+    # option as cdi_spec_dirs=[], with the real list applied internally), so
+    # relying on it is both invisible and unverifiable from outside.
+    # An unknown key here would stop crio starting, which the next line
+    # catches - a loud, immediate failure rather than a puzzling one later.
+    cat > /etc/crio/crio.conf.d/12-cdi.conf <<'EOF'
+[crio.runtime]
+cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+EOF
+    systemctl enable --now crio >/dev/null 2>&1 \
+        || { journalctl -u crio --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
+             fail "crio failed to start (bad crio.conf.d drop-in?)"; }
     wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
-
-    # Everything in this phase rests on CRI-O scanning /etc/cdi (its
-    # default). Assert it here against the running config: otherwise the
-    # first symptom is a pod failing to create with an unresolvable-device
-    # error, several steps away from the cause. Matched on the path rather
-    # than the option name, which has moved between CRI-O versions.
-    crio config 2>/dev/null | grep -q '/etc/cdi' \
-        || fail "CRI-O ${CRIO_VERSION} is not scanning /etc/cdi: set cdi_spec_dirs in /etc/crio/crio.conf.d"
-    log p2 "crio scans /etc/cdi for device specs"
+    log p2 "crio configured to scan /etc/cdi for device specs"
 
     log p2 "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
     curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\

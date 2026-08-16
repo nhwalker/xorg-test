@@ -307,8 +307,16 @@ the exported socket dirs.
 
 Prerequisites on the node:
 - privileged pods allowed in the target namespace (k3s default: yes)
-- CRI-O with CDI support enabled, scanning `/etc/cdi` (its default) —
-  required for GPU mode, and for client containers (see below)
+- CRI-O scanning `/etc/cdi` — required for GPU mode and for client
+  containers (see below). This is the default, but the default is not
+  echoed in `crio config` output, so it is worth stating explicitly in a
+  drop-in rather than assuming:
+
+  ```toml
+  # /etc/crio/crio.conf.d/12-cdi.conf
+  [crio.runtime]
+  cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+  ```
 - the image reachable from the node: pushed to a registry (default), or
   imported into the runtime locally — then set `image.repository` to the
   imported name and `image.pullPolicy=Never`
