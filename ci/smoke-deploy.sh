@@ -6,15 +6,17 @@
 # Assumes localhost/desktop-container:latest already built.
 #
 # Also carries the script-level branch tests that need root and a live
-# systemd (CDI converger no-downgrade rules, seat-prep on a deliberately
-# dirty seat) - the quadlet dry-run step earlier in the job covers only
-# the happy paths.
+# systemd (CDI converger no-downgrade rules, display-CDI overrides and
+# atomic write, seat-prep on a deliberately dirty seat) - the quadlet
+# dry-run step earlier in the job covers only the happy paths.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CDI=deploy/host/usr/local/libexec/desktop-cdi-refresh
+DISPLAY_CDI=deploy/host/usr/local/libexec/desktop-display-cdi
 SEATPREP=deploy/host/usr/local/libexec/seat-prep.sh
 SPEC=/etc/cdi/nvidia.yaml
+DISPLAY_SPEC=/etc/cdi/desktop.yaml
 log()  { echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -52,6 +54,43 @@ grep -q GENERATED "$SPEC" || fail "real spec lost while hardware visible"
 rm -f /dev/nvidiactl
 "$CDI" >/dev/null
 grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub not restored after hardware removal"
+
+# --- display CDI generator branch tests --------------------------------------
+log "display cdi: defaults"
+rm -f "$DISPLAY_SPEC"
+"$DISPLAY_CDI" >/dev/null
+grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" || fail "display spec kind wrong"
+grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "display spec missing default DISPLAY"
+grep -q 'hostPath: /tmp/.X11-unix' "$DISPLAY_SPEC" || fail "display spec missing X11 mount"
+grep -q 'hostPath: /run/desktop-audio' "$DISPLAY_SPEC" || fail "display spec missing audio mount"
+# rw, not ro: a read-only bind would let a client see the socket and then
+# fail connect(2) on it - the single most likely silent regression here.
+grep -q '"rbind", "rw"' "$DISPLAY_SPEC" || fail "display spec mounts are not rw"
+
+log "display cdi: the override file is honored"
+mkdir -p /etc/desktop-container
+cat > /etc/desktop-container/display-cdi.conf <<'EOF'
+DISPLAY_VALUE=:3
+AUDIO_DIR=/run/other-audio
+EOF
+"$DISPLAY_CDI" >/dev/null
+grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" || fail "override DISPLAY not applied"
+grep -q 'PULSE_SERVER=unix:/run/other-audio/pulse' "$DISPLAY_SPEC" \
+    || fail "override AUDIO_DIR not applied to PULSE_SERVER"
+
+log "display cdi: a bad DISPLAY value is rejected, leaving the old spec intact"
+echo 'DISPLAY_VALUE=nonsense' > /etc/desktop-container/display-cdi.conf
+if "$DISPLAY_CDI" >/dev/null 2>&1; then
+    fail "generator accepted a malformed DISPLAY_VALUE"
+fi
+grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" \
+    || fail "failed run clobbered the previous spec (must be atomic)"
+# No temp files left behind by the rejected run.
+leftovers=$(find /etc/cdi -name 'desktop.yaml.*' | wc -l)
+[ "$leftovers" = 0 ] || fail "generator left $leftovers temp file(s) in /etc/cdi"
+rm -f /etc/desktop-container/display-cdi.conf
+"$DISPLAY_CDI" >/dev/null
+grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "defaults not restored after removing the override"
 
 # --- seat-prep on a deliberately dirty seat ----------------------------------
 log "seat-prep: converges seat rules + a running display manager"
@@ -100,10 +139,17 @@ log "start desktop.service (generated from the tree's quadlet)"
 systemctl start desktop.service
 
 log "converger oneshots all pulled in and succeeded"
-for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell; do
+for u in desktop-seat-prep desktop-cdi-refresh desktop-display-cdi desktop-host-shell; do
     systemctl is-active --quiet "$u.service" \
         || { systemctl status "$u.service" --no-pager || true; fail "$u.service not active"; }
 done
+# desktop-display-cdi is the one oneshot that must ALSO run where there is
+# no desktop.service (a k8s node): the tree ships it pre-enabled, and that
+# only holds if the rsync preserved the .wants symlink.
+[ "$(systemctl is-enabled desktop-display-cdi.service)" = enabled ] \
+    || fail "desktop-display-cdi.service not enabled for multi-user.target after rsync"
+grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" \
+    || fail "client CDI spec missing after the tree boot"
 
 log "wait for the container to answer"
 up=0

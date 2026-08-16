@@ -1,7 +1,8 @@
-# A lean, non-desktop client (see Containerfile.testclient) that requests the
-# desktop resource and declares NOTHING else - so the display + audio it can
-# reach come only from the device plugin's Allocate injection. Proves the
-# plugin's contract holds for an ordinary app image, not just the desktop one.
+# A lean, non-desktop client (see Containerfile.testclient) that requests
+# desktop.local/display and declares NOTHING else - no env, no volumeMounts -
+# so the display + audio it can reach come only from the CDI spec's
+# containerEdits, routed by the device plugin. Proves the contract holds for
+# an ordinary app image, not just the desktop one.
 apiVersion: v1
 kind: Pod
 metadata:

@@ -31,5 +31,5 @@ ensure_base() {
 }
 
 ensure_base desktop-container-base Containerfile.base image/rocky9.repo
-ensure_base desktop-device-plugin-base Containerfile.plugin.base \
-    device-plugin/go.mod device-plugin/go.sum
+ensure_base cdi-device-plugin-base Containerfile.plugin.base \
+    cdi-device-plugin/go.mod cdi-device-plugin/go.sum

@@ -1,10 +1,11 @@
-# Proof-by-construction pod for the device plugin (test-only).
+# Proof-by-construction pod for the desktop CDI device (test-only).
 #
-# It requests the desktop resource and declares NOTHING else: no env, no
+# It requests desktop.local/display and declares NOTHING else: no env, no
 # volumeMounts, no volumes. So at runtime, every one of DISPLAY /
 # PULSE_SERVER / PIPEWIRE_REMOTE and the /tmp/.X11-unix + /run/desktop-audio
-# sockets is present ONLY because the device plugin's Allocate injected it.
-# vm-guest.sh verify-plugin asserts exactly that, then plays a beep through
+# sockets is present ONLY because the device plugin named the CDI device and
+# CRI-O applied the containerEdits from /etc/cdi/desktop.yaml.
+# vm-guest.sh verify-cdi asserts exactly that, then plays a beep through
 # each audio client path from inside this pod.
 #
 # sleep infinity keeps it alive so the host can exec assertions and timed
@@ -12,7 +13,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: plugin-verify
+  name: cdi-verify
 spec:
   restartPolicy: Never
   containers:

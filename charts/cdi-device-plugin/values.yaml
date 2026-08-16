@@ -1,0 +1,46 @@
+fullnameOverride: ""
+
+image:
+  repository: cdi-device-plugin
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# REQUIRED. The CDI device this release advertises, as a fully qualified
+# CDI name (vendor/class=device). It must exist in one of cdiSpecDirs on
+# the node -- the plugin reports the resource Unhealthy while it does not,
+# so pods stay Pending instead of failing at container creation.
+cdiDevice: ""
+
+# Extended resource name pods request. Defaults to the device's CDI kind
+# (the vendor/class part of cdiDevice). Override to avoid colliding with
+# another plugin already advertising that name -- e.g. set
+# desktop.local/gpu when NVIDIA's own plugin owns nvidia.com/gpu.
+resourceName: ""
+
+# Interchangeable copies of the device to advertise. The device plugin API
+# allocates exclusively, so for a SHAREABLE device (a display, say) this is
+# the maximum number of concurrent client pods; for a genuinely exclusive
+# device leave it at 1.
+count: 1
+
+# Where to look for CDI specs. Must match the runtime's own spec dirs
+# (CRI-O's cdi_spec_dirs, containerd's equivalent) or the plugin's health
+# check and the runtime's injection can disagree.
+cdiSpecDirs:
+  - /etc/cdi
+  - /var/run/cdi
+
+# How often the CDI spec dirs are rescanned for the device.
+healthInterval: 5s
+
+# Kubelet's device-plugin registration directory.
+kubeletPluginDir: /var/lib/kubelet/device-plugins
+
+# Optional. Note: kubernetes only permits the built-in system-node-critical /
+# system-cluster-critical classes for pods in the kube-system namespace, so
+# set one of those only when installing this chart with -n kube-system.
+priorityClassName: ""
+
+resources: {}
+nodeSelector: {}
+tolerations: []

@@ -1,0 +1,78 @@
+{{- if not .Values.cdiDevice }}
+{{- fail "cdiDevice is required, e.g. --set cdiDevice=desktop.local/display=all" }}
+{{- end }}
+{{- if not (contains "=" .Values.cdiDevice) }}
+{{- fail (printf "cdiDevice %q must be a fully qualified CDI name, vendor/class=device" .Values.cdiDevice) }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "cdi-device-plugin.fullname" . }}
+  labels:
+    {{- include "cdi-device-plugin.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "cdi-device-plugin.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cdi-device-plugin.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      containers:
+        - name: cdi-device-plugin
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: CDI_DEVICE
+              value: {{ .Values.cdiDevice | quote }}
+            - name: RESOURCE_NAME
+              value: {{ include "cdi-device-plugin.resourceName" . | quote }}
+            - name: COUNT
+              value: {{ .Values.count | quote }}
+            - name: CDI_SPEC_DIRS
+              value: {{ join "," .Values.cdiSpecDirs | quote }}
+            - name: HEALTH_INTERVAL
+              value: {{ .Values.healthInterval | quote }}
+            - name: PLUGIN_DIR
+              value: {{ .Values.kubeletPluginDir | quote }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Registration + serving socket (needs rw).
+            - name: plugin-dir
+              mountPath: {{ .Values.kubeletPluginDir }}
+            # The CDI specs, read-only: the plugin only ever resolves the
+            # device to decide health. Writing specs is the node's job.
+            {{- range $i, $dir := .Values.cdiSpecDirs }}
+            - name: {{ printf "cdi-spec-%d" $i }}
+              mountPath: {{ $dir }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ .Values.kubeletPluginDir }}
+            type: Directory
+        {{- range $i, $dir := .Values.cdiSpecDirs }}
+        # DirectoryOrCreate: a node may legitimately have only one of the
+        # spec dirs, and a missing hostPath would block the pod instead of
+        # simply resolving no devices there.
+        - name: {{ printf "cdi-spec-%d" $i }}
+          hostPath:
+            path: {{ $dir }}
+            type: DirectoryOrCreate
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,13 @@
+apiVersion: v2
+name: cdi-device-plugin
+description: >-
+  Generic kubelet device plugin that makes one CDI device on the node
+  requestable as one extended resource. Carries no knowledge of any
+  particular device: Allocate() names the CDI device and the runtime
+  applies the spec's containerEdits, so the CDI spec stays the single
+  definition shared by podman and kubernetes clients. Install one release
+  per device.
+type: application
+version: 0.1.0
+appVersion: "latest"
+kubeVersion: ">=1.28.0"

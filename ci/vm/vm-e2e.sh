@@ -164,43 +164,44 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase-deploy' \
 screendump desktop-deploy
 assert_nonblank desktop-deploy
 
-log "phase 2: k3s + charts (client pod on the same display)"
+log "phase 2: k3s + desktop chart + cdi-device-plugin (client pod on the same display)"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
 assert_nonblank desktop-k3s-client
 
-log "plugin: a pod requesting desktop.local/display gets DISPLAY + sockets injected"
-# The verifier pod declares no env/mounts of its own, so these assertions
-# prove the device plugin's Allocate injection end to end in a live pod.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-plugin' \
-    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod plugin-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide' \
-         > "$ART/plugin-verify-fail.log" 2>&1 || true; fail "plugin injection verification failed"; }
-screendump plugin-verify-window
-assert_nonblank plugin-verify-window
+log "cdi: a requesting pod gets DISPLAY + sockets injected by the runtime"
+# The verifier pod declares no env/mounts of its own and an identical pod
+# WITHOUT the resource request is checked to get nothing, so these
+# assertions prove the plugin -> CRI-O CDI path end to end in a live pod.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-cdi' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod cdi-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo cat /etc/cdi/desktop.yaml' \
+         > "$ART/cdi-verify-fail.log" 2>&1 || true; fail "CDI injection verification failed"; }
+screendump cdi-verify-window
+assert_nonblank cdi-verify-window
 
-log "plugin: each audio path works from the requesting pod (injected env only)"
+log "cdi: each audio path works from the requesting pod (injected env only)"
 # One capture per path, played from the verifier pod using only injected
-# env - proves the plugin wired pulse/pipewire/ALSA, not the desktop image's
-# own local session.
+# env - proves the CDI spec wired pulse/pipewire/ALSA, not the desktop
+# image's own local session.
 for path in pulse pipewire alsa; do
-    audio_capture_start "audio-plugin-$path"
+    audio_capture_start "audio-cdi-$path"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path" \
         || { audio_capture_stop; fail "client pod $path playback failed"; }
     audio_capture_stop
-    python3 check-audio.py "$ART/audio-plugin-$path.wav" 1 0.05 "$(freq_for "$path")" \
+    python3 check-audio.py "$ART/audio-cdi-$path.wav" 1 0.05 "$(freq_for "$path")" \
         || fail "client pod $path audio capture is empty or silent"
 done
 
-log "plugin: a client can RECORD from the desktop audio (loopback via monitor)"
+log "cdi: a client can RECORD from the desktop audio (loopback via monitor)"
 # Capture direction, not just playback: record the sink monitor while a tone
 # plays and confirm the recording carries it. Checked inside the VM.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-record' \
-    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl exec plugin-verify -- sh -c "pactl info; pactl list short sources"' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl exec cdi-verify -- sh -c "pactl info; pactl list short sources"' \
          > "$ART/record-fail.log" 2>&1 || true; fail "audio record-direction check failed"; }
 
-log "plugin: a LEAN non-desktop image works with only the injected env/mounts"
-# Proves the plugin's contract holds for an ordinary app container (no Xorg
+log "cdi: a LEAN non-desktop image works with only the injected env/mounts"
+# Proves the CDI contract holds for an ordinary app container (no Xorg
 # server, pipewire daemon, session or WM), not just the desktop image.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-testclient' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient' \
@@ -214,17 +215,18 @@ for path in pulse pipewire alsa; do
         || fail "lean client $path audio capture is empty or silent"
 done
 
-log "plugin: concurrent clients share the display, and slots exhaust correctly"
-# Two pods hold both slots and open the display at once; a third stays
-# Pending. Proves the shareable-device concurrency + capacity accounting.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-scale' \
+log "cdi: concurrent clients share one display"
+# Three requesting pods open the display, and two of them re-open it while
+# the third holds a connection. Proves the shareable-device concurrency the
+# advertised count is there to permit.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-concurrency' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo /usr/local/bin/k3s kubectl describe pod x11-client-c' \
-         > "$ART/verify-scale-fail.log" 2>&1 || true; fail "concurrency/exhaustion check failed"; }
+         > "$ART/verify-concurrency-fail.log" 2>&1 || true; fail "concurrency check failed"; }
 screendump concurrent-clients
 
-log "k8s teardown: helm uninstall both charts and withdraw the resource"
+log "k8s teardown: uninstall both charts; resource withdrawn, host CDI spec survives"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
-    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop.yaml' \
          > "$ART/teardown-fail.log" 2>&1 || true; fail "k8s teardown check failed"; }
 
 log "collect guest diagnostics"

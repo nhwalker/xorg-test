@@ -21,6 +21,9 @@ The mode is chosen automatically at every container boot by
 ```
 Containerfile.base          BASE image: UBI9 + Rocky9 repos + all packages (network build)
 Containerfile               APPLICATION layer: config/services on the base (offline build)
+Containerfile.plugin[.base] cdi-device-plugin image (same base/app offline split)
+cdi-device-plugin/          generic CDI device plugin: one CDI device -> one k8s
+                            resource; reusable on its own, see its README
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
 deploy/                     declarative deployment: the same host end state as
@@ -89,8 +92,9 @@ sudo ./install.sh --uninstall                # restore the host
 `install.sh` converts an existing host and can undo itself. For hosts that
 are *provisioned* rather than converted — the planned production shape —
 use the `deploy/` tree instead: the same end state as plain files (quadlet,
-getty mask, logind/tmpfiles/audio drop-ins, sysusers) plus three
-converge-at-boot oneshots (seat state, CDI spec, host-shell key material)
+getty mask, logind/tmpfiles/audio drop-ins, sysusers) plus four
+converge-at-boot oneshots (seat state, GPU CDI spec, client CDI spec,
+host-shell key material)
 and a read-only `desktop-preflight` debug tool — applied with
 rsync/RPM/Ansible, no install script, image assumed already built. One
 tree serves GPU and GPU-less hosts alike. See `deploy/README.md`.
@@ -306,28 +310,54 @@ the exported socket dirs.
 
 Prerequisites on the node:
 - privileged pods allowed in the target namespace (k3s default: yes)
-- CRI-O with CDI support enabled (for GPU mode)
+- CRI-O scanning `/etc/cdi` — required for GPU mode and for client
+  containers (see below). This is the default, but the default is not
+  echoed in `crio config` output, so it is worth stating explicitly in a
+  drop-in rather than assuming:
+
+  ```toml
+  # /etc/crio/crio.conf.d/12-cdi.conf
+  [crio.runtime]
+  cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+  ```
 - the image reachable from the node: pushed to a registry (default), or
   imported into the runtime locally — then set `image.repository` to the
   imported name and `image.pullPolicy=Never`
 - host prep run once: `sudo ./install.sh --host-prep-only` (seat undo,
-  audio client configs, `/etc/cdi/nvidia.yaml` generation; no podman
-  service is installed)
+  audio client configs, `/etc/cdi/nvidia.yaml` and `/etc/cdi/desktop.yaml`
+  generation; no podman service is installed)
+- for client pods (and for GPU mode): a device plugin advertising the CDI
+  device as a resource — `charts/cdi-device-plugin`, or NVIDIA's own for
+  `nvidia.com/gpu`. Kubernetes has no pod field that names a CDI device,
+  so nothing reaches CDI injection without one; see "Client containers
+  via CDI"
 
 Install:
 
 ```sh
 helm install desktop charts/desktop-container \
     --set image.repository=<registry>/desktop-container
-# with NVIDIA GPU injection via the cdi.k8s.io annotation:
+# with NVIDIA GPU injection:
 helm install desktop charts/desktop-container \
     --set image.repository=<registry>/desktop-container --set gpu.enabled=true
 ```
 
-GPU mode adds the pod annotation `cdi.k8s.io/gpu: nvidia.com/gpu=all`;
-CRI-O injects devices and driver userspace straight from the CDI spec — no
-device plugin needed. With `gpu.enabled=false` the container uses
-modesetting on `/dev/dri` exactly like the no-GPU podman flow.
+GPU mode makes the pod request `gpu.resourceName` (default
+`nvidia.com/gpu`, what NVIDIA's own device plugin advertises); the plugin
+behind that resource names the CDI device and CRI-O injects the devices
+and driver userspace from `/etc/cdi/nvidia.yaml`. On a node without
+NVIDIA's plugin, serve the same spec with `charts/cdi-device-plugin` and
+point `gpu.resourceName` at it. With `gpu.enabled=false` the container
+uses modesetting on `/dev/dri` exactly like the no-GPU podman flow.
+Client pods reach this desktop the same way — see "Client containers via
+CDI".
+
+> **Changed:** this used to be documented as the pod annotation
+> `cdi.k8s.io/gpu: nvidia.com/gpu=all`, which never worked — kubelet does
+> not pass pod annotations to the runtime's CDI injection, so the pod
+> started with no GPU and no error. The mechanism was never exercised in
+> CI because no runner has a GPU. See the note under "Client containers
+> via CDI".
 
 Verify: `kubectl logs deploy/desktop | grep preflight:` (same
 PASS/WARN/FAIL report), `grep postmortem:` on session failures, and the
@@ -341,32 +371,46 @@ stale socket file never reads as Ready.
 > never installs the quadlet); `install.sh` warns if it detects an active
 > kubelet/k3s when installing the podman service.
 
-## Client pods via the desktop device plugin
+## Client containers via CDI
 
-`charts/desktop-device-plugin` + `device-plugin/` turn "an app pod that can
-draw on the desktop" into a one-line resource request. The plugin image
-follows the same base/application split as the desktop image —
-`Containerfile.plugin.base` holds the Go toolchain plus the module
-dependency cache (`go mod download` from go.mod/go.sum only, no source;
-the manifests are deleted again after the download — the app stage's
-source tree provides the authoritative copies; the only network build),
-and `Containerfile.plugin` copies in the source,
-compiles offline (`--network=none`, with `GOPROXY=off` making any
-dependency miss a hard error), and ships the static binary on scratch:
+Any container gets the desktop's display and audio by resolving one
+[CDI](https://github.com/cncf-tags/container-device-interface) device:
+**`desktop.local/display=all`**. `/etc/cdi/desktop.yaml` on the node
+defines what that means, and the container runtime does the injection.
+
+`desktop-display-cdi` writes that spec (the `deploy/` tree ships it as a
+boot-time oneshot; `install.sh` writes it during host prep, including
+`--host-prep-only`). Its `containerEdits` are exactly what a client needs:
+
+- mounts `/tmp/.X11-unix` and `/run/desktop-audio`, **rw** — unix
+  `connect(2)` needs write access to the socket inode, so a read-only
+  mount would let a client see the display and then fail to open it;
+- env `DISPLAY=:0`, `PULSE_SERVER=unix:/run/desktop-audio/pulse`,
+  `PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0`.
+
+So a client declares **no** volumes and **no** env of its own. Under
+podman it names the device directly:
 
 ```sh
-podman build -t localhost/desktop-device-plugin-base:latest -f Containerfile.plugin.base .
-podman build --network=none -t localhost/desktop-device-plugin:latest -f Containerfile.plugin .
+podman run --rm --device desktop.local/display=all <image> xterm
 ```
 
-Rebuild the base only when go.mod/go.sum or the toolchain change. The
-plugin (a DaemonSet) registers the custom resource
-`desktop.local/display` with kubelet; when a pod requests it,
-kubelet's `Allocate()` call returns the socket-dir mounts
-(`/tmp/.X11-unix`, `/run/desktop-audio`, rw — unix `connect(2)` needs write
-access) and env (`DISPLAY=:0`, `PULSE_SERVER=…/pulse`,
-`PIPEWIRE_REMOTE=…/pipewire-0`), so the client needs **no** volumes or env
-of its own:
+### Kubernetes: the device plugin
+
+Kubernetes has no pod field that names a CDI device, so `charts/cdi-device-plugin`
+bridges the gap. It advertises one CDI device as one extended resource, and
+its `Allocate()` returns `CDIDevices` naming that device — kubelet passes
+those through the CRI, and CRI-O applies the spec. The plugin never
+constructs mounts or env, so the spec stays the single definition shared
+with the podman flow:
+
+```sh
+helm install cdi charts/cdi-device-plugin \
+    --set image.repository=<registry>/cdi-device-plugin \
+    --set cdiDevice=desktop.local/display=all --set count=10
+```
+
+A client pod then only makes a request:
 
 ```yaml
 resources:
@@ -375,34 +419,68 @@ resources:
 ```
 
 See `examples/x11-client-pod.yaml` for a complete demo pod (xterm on the
-desktop, reusing the desktop image).
+desktop, reusing the desktop image):
 
-Semantics worth knowing:
+```sh
+kubectl describe node | grep -A1 desktop.local/display   # 10 allocatable
+kubectl apply -f examples/x11-client-pod.yaml            # xterm appears
+```
 
-- **Slots**: the plugin advertises `slots` (default 10) virtual copies —
-  the display is shareable; the count is just the max number of concurrent
-  client pods. Resource name, slot count, DISPLAY, and paths are all chart
-  values (must match the desktop deployment's).
-- **Health gating**: slots are Healthy only while a connection to the X
-  socket actually succeeds (a stale socket file left by a killed desktop
-  doesn't count), so client pods stay Pending until the desktop's Xorg is
-  really serving. Audio sockets don't gate health.
+> **Why not a `cdi.k8s.io/...` pod annotation?** Because it silently does
+> nothing. Kubelet builds a container's CRI annotations from device-plugin
+> output only — upstream calls them "generated by other components (i.e.,
+> not users)" — so a pod-spec annotation never reaches the runtime's CDI
+> injection, and containers start with nothing injected and no error.
+> There is no container-level annotation either: `v1.Container` has no
+> metadata. A device plugin (or DRA) is the only supported route.
+
+The plugin is deliberately generic: it knows nothing about displays. Point
+it at any CDI device on the node and install one release per device — it
+is usable outside this project, and `cdi-device-plugin/README.md`
+documents it standalone.
+
+- **Resource name** defaults to the device's CDI kind
+  (`desktop.local/display`), overridable with `resourceName` when that
+  would collide with another plugin — e.g. use `desktop.local/gpu` when
+  NVIDIA's own plugin already owns `nvidia.com/gpu`.
+- **`count`** is how many interchangeable copies to advertise. Device
+  plugin allocation is exclusive, so for a *shareable* device like the
+  display it is simply the maximum number of concurrent client pods; for
+  an exclusive device leave it at 1.
+- **Health is spec presence.** The resource is Healthy only while the
+  device resolves in the CDI spec dirs, so pods stay Pending rather than
+  failing at container creation on a node whose spec is missing. The check
+  is the same lookup the runtime performs.
+
+Other semantics worth knowing:
+
+- **The spec is host state.** It describes the export contract — paths and
+  `DISPLAY` — not the desktop's current status, so it is a pure function of
+  configuration with nothing to converge, and `helm uninstall` does not
+  touch it. Override per host by dropping assignments (`DISPLAY_VALUE=:1`,
+  `AUDIO_DIR=...`) into `/etc/desktop-container/display-cdi.conf` and
+  rerunning the generator; the values must match what the desktop exports.
+- **Node prep is required.** The spec must exist on every node that runs
+  clients: `sudo ./install.sh --host-prep-only`, or apply the `deploy/`
+  tree.
+- **SELinux: confined clients need the export dirs labeled.** On an
+  enforcing host the exported socket dirs carry host labels, so a confined
+  container is denied when it connects — it gets `DISPLAY` and the mounts,
+  then fails with `unable to open display ":0"`. CDI cannot fix this from
+  the spec: `containerEdits` has no equivalent of `-v src:dst:z`, so the
+  labeling is host-side. Until the dirs are labeled `container_file_t`
+  (`semanage fcontext` + `restorecon`), clients need label separation
+  turned off — `--security-opt label=disable` for podman, an
+  `seLinuxOptions`/privileged pod spec for kubernetes. The desktop
+  container itself is unaffected: `--privileged` already disables label
+  separation.
 - **Audio**: pulse and PipeWire-native clients work via the injected env
   alone. ALSA-only apps additionally need `alsa-plugins-pulseaudio` in
   their image plus the two-stanza `/etc/asound.conf` shown in the Audio
   section, pointing at the injected `PULSE_SERVER` path.
 - **GL**: clients get software rendering. Hardware GL would need render
-  nodes/driver userspace in the client (out of the plugin's scope by
-  design).
-
-Install (after the desktop chart):
-
-```sh
-helm install desktop-plugin charts/desktop-device-plugin \
-    --set image.repository=<registry>/desktop-device-plugin
-kubectl describe node | grep -A1 desktop.local/display   # 10 allocatable
-kubectl apply -f examples/x11-client-pod.yaml            # xterm appears
-```
+  nodes/driver userspace in the client (deliberately out of scope — the
+  GPU is a separate CDI device, `nvidia.com/gpu`).
 
 ## Host terminal from the desktop
 
@@ -452,19 +530,25 @@ fails; the rest of the desktop is unaffected.
 
 Three workflows verify everything short of NVIDIA hardware, on every PR:
 
-- **`ci.yml`** — static checks (go fmt/vet/test, shellcheck, helm lint +
-  golden template assertions in `ci/helm-assertions.sh`, kubeconform) and
-  the builds: base images are pulled from GHCR by content hash
-  (`ci/build-bases.sh`, rebuilt only when their inputs change) and the
-  application layers build with `--network=none` — the offline invariant
-  is a CI gate. Then `ci/smoke-podman.sh` runs the **real `install.sh`**
+- **`ci.yml`** — static checks (go fmt/vet/test for the plugin,
+  shellcheck, helm lint + golden template assertions in
+  `ci/helm-assertions.sh`, kubeconform over both charts and the client
+  manifests) and the builds: base images are pulled from GHCR by content
+  hash (`ci/build-bases.sh`, rebuilt only when their inputs change) and
+  the application layers build with `--network=none` — the offline
+  invariant is a CI gate. The same job resolves both CDI devices against a
+  real podman: the NVIDIA stub, and the client spec injecting display +
+  audio into an unrelated container (with a no-device control proving
+  nothing is baked into the image).
+  Then `ci/smoke-podman.sh` runs the **real `install.sh`**
   on the ephemeral runner (quadlet install, seat undo, sshd/key
   provisioning) and asserts the boot: seat0 session, audio sockets +
   cross-uid connects, preflight/postmortem in the logs, the tty-less
   journal-mirror guard, end-to-end `ssh host`, and clean `--uninstall`.
   After that, `ci/smoke-deploy.sh` proves the **declarative `deploy/`
   tree** on the same restored runner: script-level branch tests (CDI
-  converger no-downgrade rules, seat-prep on a staged dirty seat), then
+  converger no-downgrade rules, client-spec overrides and atomic write,
+  seat-prep on a staged dirty seat), then
   the full composition — rsync-apply, boot from the tree's quadlet,
   converger oneshots, stub-CDI marker on container PID 1, `desktop-shell`
   ssh in both directions, `desktop-preflight` green, service restart. A
@@ -480,10 +564,12 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   tree rsync-applied, seat-prep evicting the restored getty, the
   root-owned `desktop-shell` ssh trust proven under enforcing,
   `desktop-preflight` asserted fully green); then the machine switches to
-  k3s and deploys both charts — real readiness, allocatable
-  `desktop.local/display`, a client pod on the display, and the
-  health-gating Pending behavior. Screendumps of the virtual display are
-  uploaded as artifacts.
+  k3s and deploys the desktop chart plus `cdi-device-plugin` — real
+  readiness, the resource becoming allocatable, then client pods drawing
+  on the display and playing/recording audio purely through CDI injection,
+  checked against an identical control pod that requests nothing and must
+  get nothing. Screendumps of the virtual display are uploaded as
+  artifacts.
 - **`base-rebuild.yml`** — weekly from-scratch base rebuilds pushed to
   GHCR: early warning for Rocky/UBI point-release drift.
 

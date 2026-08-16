@@ -1,7 +1,7 @@
 # CI-only test fixture: a LEAN client image that is NOT the desktop image.
 # It ships only the standard user-space X and audio clients - no Xorg server,
 # no pipewire daemon, no wireplumber, no session/systemd, no window manager.
-# The e2e uses it to prove the device plugin's injected env + socket mounts are
+# The e2e uses it to prove the CDI spec's injected env + socket mounts are
 # sufficient for an ordinary application container, not just the desktop image.
 #
 # Networked build (dnf); this is a test fixture, not a shipped artifact, so it

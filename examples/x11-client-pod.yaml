@@ -1,9 +1,18 @@
-# Demo client for the desktop device plugin: requests one desktop slot and
-# opens xterm on the containerized display. Reuses the desktop image because
-# it already has X clients installed; any image with an X11 app works the
-# same way -- no mounts or env needed, the device plugin injects them.
+# Demo client for the desktop display: opens xterm on the containerized
+# display. Reuses the desktop image because it already has X clients
+# installed; any image with an X11 app works the same way -- the only thing
+# that makes the display reachable is the resource request below.
 #
 #   kubectl apply -f examples/x11-client-pod.yaml
+#
+# Requesting desktop.local/display makes kubelet call the cdi-device-plugin,
+# which names the CDI device desktop.local/display=all; CRI-O then applies
+# that spec's containerEdits to this pod: the /tmp/.X11-unix and
+# /run/desktop-audio bind mounts plus DISPLAY / PULSE_SERVER /
+# PIPEWIRE_REMOTE. Nothing else in this manifest mentions them.
+#
+# (A pod annotation cannot do this: kubelet builds a container's CRI
+# annotations from device-plugin output only, never from the pod spec.)
 #
 # Audio from a client works the same way, e.g.:
 #   paplay /usr/share/sounds/alsa/Front_Center.wav   # via injected PULSE_SERVER
@@ -22,7 +31,7 @@ spec:
       # :latest defaults the pull policy to Always, which tries a registry
       # pull even when the image is already present on the node.
       imagePullPolicy: IfNotPresent
-      command: ["xterm", "-geometry", "80x24+200+200", "-title", "device-plugin demo"]
+      command: ["xterm", "-geometry", "80x24+200+200", "-title", "CDI demo"]
       resources:
         limits:
           desktop.local/display: 1

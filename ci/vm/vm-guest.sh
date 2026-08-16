@@ -8,8 +8,9 @@
 #         tree rsync-applied, desktop booted from its quadlet, root-owned
 #         desktop-shell ssh trust exercised under SELinux enforcing, and
 #         desktop-preflight asserted fully green.
-# phase2: k3s + both charts - device plugin health gating and a client pod
-#         opening xterm on the same display.
+# phase2: k3s + the desktop chart + cdi-device-plugin - client pods
+#         requesting desktop.local/display and reaching the same display,
+#         with CRI-O injecting from /etc/cdi/desktop.yaml.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -35,6 +36,10 @@ fail() {
     podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null | tail -30 >&2 || true
     echo "---- diagnostics: preflight ----" >&2
     podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
+    # phase1 and phase-deploy run enforcing, where a denial is often the
+    # whole story and is invisible in every other log here.
+    echo "---- diagnostics: recent SELinux denials ----" >&2
+    ausearch -m avc -ts recent 2>/dev/null | tail -20 >&2 || echo "(none / ausearch unavailable)" >&2
     if command -v k3s >/dev/null; then
         echo "---- diagnostics: k3s state ----" >&2
         k3s kubectl get nodes,pods -A -o wide >&2 2>/dev/null || true
@@ -43,15 +48,19 @@ fail() {
         echo "" >&2
         echo "---- diagnostics: pod images actually running ----" >&2
         k3s kubectl get pods -A -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGEID:.status.containerStatuses[0].imageID' >&2 2>&1 || true
-        echo "---- diagnostics: device-plugin logs ----" >&2
-        k3s kubectl logs ds/plugin-desktop-device-plugin --tail=30 >&2 2>&1 || true
+        echo "---- diagnostics: client CDI spec ----" >&2
+        cat /etc/cdi/desktop.yaml >&2 2>/dev/null || echo "(no /etc/cdi/desktop.yaml)" >&2
+        echo "---- diagnostics: cdi-device-plugin logs ----" >&2
+        k3s kubectl logs -l app.kubernetes.io/name=cdi-device-plugin --tail=30 >&2 2>&1 || true
         echo "---- diagnostics: kubelet plugin dir ----" >&2
         ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
+        echo "---- diagnostics: crio CDI view ----" >&2
+        journalctl -u crio --no-pager -o cat 2>/dev/null | grep -i cdi | tail -20 >&2 || true
         echo "---- diagnostics: desktop pod audio (export sockets + pipewire procs) ----" >&2
         k3s kubectl exec deploy/desktop -- sh -c \
             'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
             >&2 2>&1 || true
-        k3s kubectl describe pod x11-client-demo x11-client-gated plugin-verify >&2 2>/dev/null || true
+        k3s kubectl describe pod x11-client-demo cdi-verify >&2 2>/dev/null || true
         journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
     fi
     exit 1
@@ -80,13 +89,6 @@ phase1() {
 
     log p1 "load prebuilt images"
     podman load -q -i /tmp/images-desktop.tar >/dev/null
-    podman load -q -i /tmp/images-plugin.tar >/dev/null
-    # Guard against tag/content mix-ups in the archive plumbing (a combined
-    # podman-save archive once shipped the desktop image under BOTH tags).
-    ep=$(podman image inspect localhost/desktop-device-plugin:latest \
-        --format '{{index .Config.Entrypoint 0}}' || true)
-    [ "$ep" = /desktop-device-plugin ] \
-        || fail "plugin image has wrong entrypoint '$ep' - archive tag mix-up?"
 
     log p1 "real install.sh (quadlet, shell user ${SUDO_USER:-rocky})"
     ./install.sh --no-build --no-gpu
@@ -122,6 +124,53 @@ phase1() {
         ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami)
     [ "$who" = "${SUDO_USER:-rocky}" ] || fail "ssh host whoami='$who'"
 
+    log p1 "install.sh wrote the client CDI spec"
+    [ -f /etc/cdi/desktop.yaml ] || fail "install.sh did not write /etc/cdi/desktop.yaml"
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
+        || fail "client CDI spec has the wrong kind"
+
+    # The whole client contract in one command, under podman: a SEPARATE
+    # container that passes no -v and no -e reaches the display purely
+    # because the runtime applied the spec's containerEdits. Same mechanism
+    # k8s uses via the device plugin, minus kubernetes.
+    #
+    # label=disable is required here, and is NOT papering over a broken
+    # spec: the exported socket dirs carry host labels, so a CONFINED
+    # container is denied by SELinux however it obtained the mounts. Every
+    # other client in this suite is exempt the same way - the desktop
+    # container via --privileged, the k8s client pods via phase2 running
+    # permissive. The probe below records the confined case instead of
+    # asserting it; see "Client containers via CDI" in README.md.
+    log p1 "a podman client resolves desktop.local/display=all and opens :0"
+    out=$(podman run --rm --security-opt label=disable \
+        --device desktop.local/display=all \
+        localhost/desktop-container:latest sh -c '
+            printenv DISPLAY
+            printenv PULSE_SERVER
+            test -S /tmp/.X11-unix/X0 && echo SOCKET_OK
+            test -d /run/desktop-audio && echo AUDIO_DIR_OK
+            xdpyinfo >/dev/null && echo XDPYINFO_OK') \
+        || fail "podman CDI client failed (see output above)"
+    for want in ':0' 'unix:/run/desktop-audio/pulse' SOCKET_OK AUDIO_DIR_OK XDPYINFO_OK; do
+        echo "$out" | grep -qx "$want" \
+            || fail "CDI client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
+    done
+    log p1 "podman CDI client reached the display with no -v/-e of its own"
+
+    # Informational, never fatal: the confined case needs the export dirs
+    # labeled container_file_t, which CDI cannot arrange itself (there is no
+    # equivalent of -v src:dst:z in containerEdits). Logged so the day the
+    # host grows those labels this flips visibly, and so the AVC behind the
+    # current behavior is captured rather than assumed.
+    if podman run --rm --device desktop.local/display=all \
+        localhost/desktop-container:latest sh -c 'xdpyinfo >/dev/null' 2>/dev/null
+    then
+        log p1 "NOTE: a CONFINED client reached the display too (host is labeled for it)"
+    else
+        log p1 "NOTE: a CONFINED client cannot reach the display under enforcing SELinux (expected; see README)"
+        ausearch -m avc -ts recent 2>/dev/null | tail -5 || true
+    fi
+
     log p1 "spawn an xterm so the screendump shows a window"
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
         xterm -T e2e-proof -geometry 80x24+80+80
@@ -154,9 +203,14 @@ phase_deploy() {
 
     log pd "start desktop.service; seat-prep must evict the getty uninstall restarted"
     systemctl start desktop.service
-    for u in desktop-seat-prep desktop-cdi-refresh desktop-host-shell; do
+    for u in desktop-seat-prep desktop-cdi-refresh desktop-display-cdi desktop-host-shell; do
         systemctl is-active --quiet "$u.service" || fail "$u.service not active"
     done
+    # The tree ships this one pre-enabled (multi-user.target.wants symlink)
+    # because a k8s node never starts desktop.service at all - assert the
+    # symlink survived the rsync, not just that the unit happens to be up.
+    [ "$(systemctl is-enabled desktop-display-cdi.service)" = enabled ] \
+        || fail "desktop-display-cdi.service is not enabled for multi-user.target"
     if systemctl is-active --quiet getty@tty1.service; then
         fail "getty@tty1 survived seat-prep"
     fi
@@ -168,6 +222,10 @@ phase_deploy() {
     grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
     podman exec desktop sh -c "tr '\0' '\n' </proc/1/environ | grep -qx NVIDIA_CDI_STUB=1" \
         || fail "stub marker not on container PID 1"
+
+    log pd "the tree's oneshot wrote the client CDI spec"
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
+        || fail "desktop-display-cdi did not write a usable /etc/cdi/desktop.yaml"
 
     log pd "Xorg serves the virtio display, rootless, under the deploy quadlet"
     wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
@@ -207,9 +265,11 @@ phase2() {
     rm -f /etc/containers/systemd/desktop.container
     systemctl daemon-reload
 
-    # The chart targets CRI-O (container=cri-o env, cdi.k8s.io annotation), so
-    # this phase runs k3s on an EXTERNAL CRI-O instead of the bundled
-    # containerd. (SELinux policy interplay is out of scope here: permissive.)
+    # Client pods reach the display through CDI, which only the CRI
+    # resolves - so this phase runs k3s on an EXTERNAL CRI-O instead of the
+    # bundled containerd (also what the desktop chart targets: container=cri-o
+    # env). CRI-O scans /etc/cdi, which is where both specs live.
+    # (SELinux policy interplay is out of scope here: permissive.)
     log p2 "install CRI-O ${CRIO_VERSION} (the chart's documented runtime)"
     setenforce 0
     cat > /etc/yum.repos.d/cri-o.repo <<EOF
@@ -229,11 +289,25 @@ EOF
     for t in desktop plugin testclient; do
         podman load -q -i "/tmp/images-$t.tar" >/dev/null
     done
+    # Guard against tag/content mix-ups in the archive plumbing (a combined
+    # podman-save archive once shipped the desktop image under BOTH tags).
     ddig=$(podman image inspect localhost/desktop-container:latest --format '{{.Id}}' 2>/dev/null || true)
-    pdig=$(podman image inspect localhost/desktop-device-plugin:latest --format '{{.Id}}' 2>/dev/null || true)
+    pdig=$(podman image inspect localhost/cdi-device-plugin:latest --format '{{.Id}}' 2>/dev/null || true)
     if [ -z "$ddig" ] || [ -z "$pdig" ] || [ "$ddig" = "$pdig" ]; then
         fail "image load broken: desktop='$ddig' plugin='$pdig' (must both exist and differ)"
     fi
+    ep=$(podman image inspect localhost/cdi-device-plugin:latest \
+        --format '{{index .Config.Entrypoint 0}}' || true)
+    [ "$ep" = /cdi-device-plugin ] \
+        || fail "plugin image has wrong entrypoint '$ep' - archive tag mix-up?"
+
+    # Everything downstream depends on this file; assert it before k3s so a
+    # missing spec fails here instead of as an opaque pod creation error.
+    # phase-deploy's desktop-display-cdi.service wrote it and the tree is
+    # still applied - only the quadlet unit was removed above.
+    log p2 "client CDI spec is on the node"
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
+        || fail "/etc/cdi/desktop.yaml missing or malformed before k3s install"
 
     # k3s writes its flannel CNI config + plugin binaries under its own tree,
     # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
@@ -244,8 +318,22 @@ EOF
 network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
 plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
 EOF
-    systemctl enable --now crio >/dev/null 2>&1 || fail "crio failed to start"
+    # Everything downstream rests on CRI-O scanning /etc/cdi. That IS the
+    # default, but state it explicitly rather than depend on it: the default
+    # does not appear in `crio config` output (the man page documents the
+    # option as cdi_spec_dirs=[], with the real list applied internally), so
+    # relying on it is both invisible and unverifiable from outside.
+    # An unknown key here would stop crio starting, which the next line
+    # catches - a loud, immediate failure rather than a puzzling one later.
+    cat > /etc/crio/crio.conf.d/12-cdi.conf <<'EOF'
+[crio.runtime]
+cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+EOF
+    systemctl enable --now crio >/dev/null 2>&1 \
+        || { journalctl -u crio --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
+             fail "crio failed to start (bad crio.conf.d drop-in?)"; }
     wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
+    log p2 "crio configured to scan /etc/cdi for device specs"
 
     log p2 "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
     curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
@@ -268,33 +356,21 @@ EOF
     wait_for 40 5 "desktop deployment ready" \
         sh -c "k3s kubectl get deploy desktop -o jsonpath='{.status.readyReplicas}' | grep -q 1"
 
-    log p2 "deploy device plugin; resource becomes allocatable"
-    helm install plugin charts/desktop-device-plugin \
-        --set image.repository=localhost/desktop-device-plugin --set image.pullPolicy=Never
+    log p2 "deploy the generic CDI device plugin; the resource becomes allocatable"
+    helm install cdi charts/cdi-device-plugin \
+        --set image.repository=localhost/cdi-device-plugin --set image.pullPolicy=Never \
+        --set cdiDevice=desktop.local/display=all --set count=10
     wait_for 30 4 "desktop.local/display allocatable" \
         sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}' | grep -q 10"
 
     log p2 "client pod schedules and opens xterm on the desktop"
+    # The example pod declares only the resource request - no volumes, no
+    # env - so it running an X client at all means the plugin named the CDI
+    # device and CRI-O applied the spec.
     sed 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
         examples/x11-client-pod.yaml | k3s kubectl apply -f -
     wait_for 30 4 "client pod running" \
         sh -c "k3s kubectl get pod x11-client-demo -o jsonpath='{.status.phase}' | grep -q Running"
-
-    log p2 "health gating: no desktop -> slots unhealthy -> new clients Pending"
-    k3s kubectl scale deploy desktop --replicas=0
-    k3s kubectl delete pod x11-client-demo --wait=true
-    sleep 20
-    sed -e 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
-        -e 's|name: x11-client-demo|name: x11-client-gated|' \
-        examples/x11-client-pod.yaml | k3s kubectl apply -f -
-    sleep 15
-    phase=$(k3s kubectl get pod x11-client-gated -o jsonpath='{.status.phase}')
-    [ "$phase" = Pending ] || fail "gated client is '$phase', want Pending with desktop down"
-
-    log p2 "desktop returns -> gated client runs"
-    k3s kubectl scale deploy desktop --replicas=1
-    wait_for 40 5 "gated client running" \
-        sh -c "k3s kubectl get pod x11-client-gated -o jsonpath='{.status.phase}' | grep -q Running"
     sleep 5
     log p2 "phase2 passed"
 }
@@ -351,9 +427,9 @@ play_audio() { # $1: pulse | pipewire | alsa (inside the desktop container)
     log pa "$path played"
 }
 
-# --- device-plugin injection verification (phase 2) -------------------------
+# --- CDI injection verification (phase 2) -----------------------------------
 
-VPOD=plugin-verify
+VPOD=cdi-verify
 
 assert_pod_env() { # $1: var, $2: expected value
     local got
@@ -363,20 +439,20 @@ assert_pod_env() { # $1: var, $2: expected value
 }
 
 assert_pod_socket() { # $1: path
-    # Present, a socket, and writable: the plugin mounts rw because unix
+    # Present, a socket, and writable: the spec mounts rw because unix
     # connect(2) needs write access; a ro mount would pass -S but break use.
     k3s kubectl exec "$VPOD" -- sh -c "test -S '$1' && test -w '$1'" \
         || fail "socket $1 missing or not writable in the requesting pod"
     log vp "socket $1 present + writable"
 }
 
-verify_plugin() {
+verify_cdi() {
     log vp "apply verifier pod: requests desktop.local/display, declares nothing else"
-    k3s kubectl apply -f ci/vm/plugin-verify-pod.yaml
+    k3s kubectl apply -f ci/vm/cdi-verify-pod.yaml
     wait_for 30 4 "verifier pod running" \
         sh -c "k3s kubectl get pod $VPOD -o jsonpath='{.status.phase}' | grep -q Running"
 
-    log vp "device plugin injected the DISPLAY + audio env vars"
+    log vp "CDI injected the DISPLAY + audio env vars"
     assert_pod_env DISPLAY :0
     assert_pod_env PULSE_SERVER unix:/run/desktop-audio/pulse
     assert_pod_env PIPEWIRE_REMOTE /run/desktop-audio/pipewire-0
@@ -389,6 +465,29 @@ verify_plugin() {
         || fail "xdpyinfo could not open the display from the requesting pod"
     log vp "xdpyinfo opened :0 from the pod"
 
+    # Negative control: without the resource request the SAME image gets
+    # none of it. Without this, a stray hostPath or a baked-in env in the
+    # desktop image would make every assertion above pass for the wrong
+    # reason. (It is also what caught the annotation-only design silently
+    # injecting nothing: there, verify and control behaved identically.)
+    log vp "control: an identical pod WITHOUT the resource request gets nothing"
+    k3s kubectl delete pod cdi-control --ignore-not-found >/dev/null 2>&1 || true
+    # resources: is the last block in the manifest, so cutting from it to
+    # EOF leaves an otherwise identical pod.
+    sed -e 's/^  name: cdi-verify$/  name: cdi-control/' \
+        -e '/^      resources:$/,$d' ci/vm/cdi-verify-pod.yaml \
+        | k3s kubectl apply -f -
+    wait_for 30 4 "control pod running" \
+        sh -c "k3s kubectl get pod cdi-control -o jsonpath='{.status.phase}' | grep -q Running"
+    if k3s kubectl exec cdi-control -- printenv DISPLAY >/dev/null 2>&1; then
+        fail "control pod has DISPLAY set without requesting the resource - injection is not what we measured"
+    fi
+    if k3s kubectl exec cdi-control -- test -S /tmp/.X11-unix/X0 2>/dev/null; then
+        fail "control pod can see the X socket without requesting the resource"
+    fi
+    k3s kubectl delete pod cdi-control --wait=true >/dev/null 2>&1 || true
+    log vp "control pod saw no DISPLAY and no X socket - the request is the cause"
+
     # The pod readiness probe only gates on Xorg, so the desktop's user
     # pipewire session (which exports BOTH the pulse and the native pipewire
     # sockets) can lag X by several seconds - especially on the freshly
@@ -400,21 +499,21 @@ verify_plugin() {
         until [ -S /run/desktop-audio/pulse ] && [ -S /run/desktop-audio/pipewire-0 ] \
               && pactl info >/dev/null 2>&1; do sleep 2; done' \
         || fail "injected audio export never came up in the requesting pod (pulse + pipewire sockets)"
-    log vp "device plugin mounted the audio sockets; export is live"
+    log vp "CDI mounted the audio sockets; export is live"
     assert_pod_socket /run/desktop-audio/pulse
     assert_pod_socket /run/desktop-audio/pipewire-0
 
     log vp "spawn an xterm from the pod so the screendump shows a client window"
     timeout 15 k3s kubectl exec "$VPOD" -- \
-        sh -c 'setsid xterm -T plugin-verify -geometry 80x24+150+150 </dev/null >/dev/null 2>&1 &' \
+        sh -c 'setsid xterm -T cdi-verify -geometry 80x24+150+150 </dev/null >/dev/null 2>&1 &' \
         || true
     sleep 3
-    log vp "verify-plugin passed"
+    log vp "verify-cdi passed"
 }
 
-play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default plugin-verify)
-    # Same beep-per-path convention as the in-container test, but played from a
-    # requesting pod using ONLY the injected env - so success proves the plugin
+play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default cdi-verify)
+    # Same beep-per-path convention as the in-container test, but played from an
+    # requesting pod using ONLY the injected env - so success proves the CDI spec
     # wired that client path, not the desktop image's own local session.
     local path="${1:?pulse|pipewire|alsa}" pod="${2:-$VPOD}" player freq
     case "$path" in
@@ -440,14 +539,14 @@ play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default plugin-verify)
 }
 
 verify_testclient() {
-    log tc "apply a LEAN non-desktop client (no server stack) that requests the resource"
+    log tc "apply a LEAN non-desktop client (no server stack) requesting the resource"
     k3s kubectl apply -f ci/vm/testclient-pod.yaml
     wait_for 30 4 "testclient running" \
         sh -c "k3s kubectl get pod x11-testclient -o jsonpath='{.status.phase}' | grep -q Running"
     # The image ships no Xorg server or session, so a working display here can
-    # only come from the plugin's injected DISPLAY + X-socket mount.
+    # only come from the CDI spec's injected DISPLAY + X-socket mount.
     got=$(k3s kubectl exec x11-testclient -- printenv DISPLAY 2>/dev/null || true)
-    [ "$got" = ":0" ] || fail "testclient DISPLAY='$got', want :0 (plugin injection)"
+    [ "$got" = ":0" ] || fail "testclient DISPLAY='$got', want :0 (CDI injection)"
     timeout 20 k3s kubectl exec x11-testclient -- sh -c 'xdpyinfo >/dev/null' \
         || fail "lean client could not open the display via injected env"
     log tc "lean client opened the display with only injected env"
@@ -476,76 +575,70 @@ input_sink_check() { # $1: expected text
 }
 
 apply_client() { # $1: pod name
-    # Reuse the example client (long-running xterm holds the slot), renamed
-    # and pointed at the locally-imported image.
+    # Reuse the example client (a long-running xterm), renamed and pointed
+    # at the locally-imported image.
     sed -e "s/name: x11-client-demo/name: $1/" \
         -e 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
         examples/x11-client-pod.yaml | k3s kubectl apply -f -
 }
 
-verify_scale() {
-    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml  # helm (unlike k3s kubectl) needs this
-    log vs "free all slots so the capacity test accounts exactly"
-    k3s kubectl delete pod plugin-verify x11-client-gated x11-client-demo x11-testclient \
+verify_concurrency() {
+    # The display is shareable and CDI imposes no cap, so the property to
+    # prove is that several independent clients hold LIVE connections to the
+    # one display at the same time - not that a counter runs out.
+    log vs "start from a clean slate"
+    k3s kubectl delete pod cdi-verify x11-client-demo x11-testclient \
         --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
-    # Shrink capacity to 2 while nothing holds a slot (clean re-register; no
-    # allocated-device reconciliation). Proves both concurrency AND exhaustion
-    # with just 3 pods instead of 11.
-    log vs "set the plugin to 2 slots"
-    helm upgrade plugin charts/desktop-device-plugin \
-        --set image.repository=localhost/desktop-device-plugin \
-        --set image.pullPolicy=Never --set slots=2 >/dev/null
-    wait_for 30 4 "resource downshifts to 2 slots" \
-        sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}' | grep -qx 2"
-
-    log vs "two clients take both slots and run concurrently"
-    apply_client x11-client-a
-    apply_client x11-client-b
-    for n in a b; do
+    log vs "three clients open the shared display concurrently"
+    for n in a b c; do apply_client "x11-client-$n"; done
+    for n in a b c; do
         wait_for 30 4 "client $n running" \
             sh -c "k3s kubectl get pod x11-client-$n -o jsonpath='{.status.phase}' | grep -q Running"
     done
-    # Both must hold a LIVE connection to the one shared display at once.
-    for n in a b; do
+    for n in a b c; do
         timeout 20 k3s kubectl exec "x11-client-$n" -- sh -c 'xdpyinfo >/dev/null' \
             || fail "client $n could not open the shared display"
     done
-    log vs "both clients share the display simultaneously"
-
-    log vs "a third request cannot get a slot and stays Pending"
-    apply_client x11-client-c
-    sleep 15
-    phase=$(k3s kubectl get pod x11-client-c -o jsonpath='{.status.phase}')
-    [ "$phase" = Pending ] \
-        || fail "3rd client is '$phase', want Pending (both slots held by a+b)"
-    # ...and specifically because the resource is exhausted, not some other reason.
-    msg=$(k3s kubectl get pod x11-client-c \
-        -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null || true)
-    case "$msg" in
-        *desktop.local/display*|*[Ii]nsufficient*) log vs "unschedulable on the resource: $msg" ;;
-        *) fail "3rd client Pending for the wrong reason: '$msg'" ;;
-    esac
-    log vs "verify-scale passed"
+    # ...and all three at once, not merely one after another: each holds an
+    # X connection open while the next one connects.
+    timeout 40 k3s kubectl exec x11-client-a -- \
+        sh -c 'xterm -T hold-a -geometry 40x8+40+400 & sleep 25' >/dev/null 2>&1 &
+    holder=$!
+    sleep 5
+    for n in b c; do
+        timeout 20 k3s kubectl exec "x11-client-$n" -- sh -c 'xdpyinfo >/dev/null' \
+            || { kill "$holder" 2>/dev/null; fail "client $n lost the display while a held it"; }
+    done
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    log vs "three concurrent clients on one display, no cap in the way"
+    log vs "verify-concurrency passed"
 }
 
 verify_teardown() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
     log td "helm uninstall both charts"
-    helm uninstall plugin >/dev/null || fail "helm uninstall plugin failed"
+    helm uninstall cdi >/dev/null || fail "helm uninstall cdi failed"
     helm uninstall desktop >/dev/null || fail "helm uninstall desktop failed"
 
-    # Removing the device-plugin daemonset must make the node stop offering the
-    # resource. kubelet drops the allocatable COUNT to 0 promptly but often
-    # keeps the resource key in node status for a while, so assert the count is
-    # 0 (or the key is gone), not that the key vanished.
+    # Removing the plugin must make the node stop offering the resource.
+    # kubelet drops the allocatable COUNT to 0 promptly but often keeps the
+    # resource key in node status for a while, so assert the count is 0 (or
+    # the key is gone), not that the key vanished.
     wait_for 30 4 "desktop.local/display no longer allocatable" \
         sh -c "v=\$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}'); [ -z \"\$v\" ] || [ \"\$v\" = 0 ]"
     # The chart-managed workloads must be gone (get returns non-zero once
     # the objects no longer exist).
     wait_for 20 3 "desktop deployment + plugin daemonset gone" \
-        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1 && ! k3s kubectl get ds plugin-desktop-device-plugin >/dev/null 2>&1"
-    log td "charts uninstalled; resource withdrawn; workloads removed"
+        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1 && ! k3s kubectl get ds cdi-cdi-device-plugin >/dev/null 2>&1"
+
+    # The CDI spec is HOST state, not chart state: uninstalling must not
+    # remove it (nothing in k8s owns it). This is the seam that makes one
+    # spec definition serve podman and kubernetes alike.
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
+        || fail "helm uninstall removed the host CDI spec - it is host state"
+    log td "charts uninstalled; resource withdrawn; host CDI spec untouched"
     log td "verify-teardown passed"
 }
 
@@ -553,8 +646,8 @@ verify_record() {
     # Capture direction: a client RECORDS from the desktop's audio, not just
     # plays. Loopback via the sink's monitor source - record it while playing a
     # known tone into the same sink, then confirm the recording carries that
-    # tone. Runs in plugin-verify (a client pod) over the injected PULSE_SERVER.
-    local pod=plugin-verify freq=660
+    # tone. Runs in cdi-verify (a client pod) over the injected PULSE_SERVER.
+    local pod=cdi-verify freq=660
     gen_tone "$freq" /tmp/rectone.wav
     timeout 20 k3s kubectl exec -i "$pod" -- sh -c 'cat > /tmp/rt.wav' \
         < /tmp/rectone.wav || fail "could not copy record tone into $pod"
@@ -583,16 +676,16 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-plugin|verify-testclient|verify-record|verify-scale|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
     play-audio-pod) play_audio_pod "${2:-}" "${3:-}" ;;
-    verify-plugin) verify_plugin ;;
+    verify-cdi) verify_cdi ;;
     verify-testclient) verify_testclient ;;
     verify-record) verify_record ;;
-    verify-scale) verify_scale ;;
+    verify-concurrency) verify_concurrency ;;
     verify-teardown) verify_teardown ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;

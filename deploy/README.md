@@ -63,6 +63,64 @@ failing. The container's preflight flags exactly that case — the stub
 marker plus visible NVIDIA hardware — as `preflight: FAIL` in
 `podman logs desktop`; monitoring on GPU hosts should key on it.
 
+## Client containers: the other CDI spec
+
+`desktop-cdi-refresh` writes the spec this desktop *consumes* (the GPU).
+`desktop-display-cdi` writes the spec other containers consume to reach
+*this desktop*: `/etc/cdi/desktop.yaml`, defining
+`desktop.local/display=all` with the `/tmp/.X11-unix` + `/run/desktop-audio`
+bind mounts (rw — unix `connect(2)` needs write access to the socket
+inode) and `DISPLAY` / `PULSE_SERVER` / `PIPEWIRE_REMOTE`. A client then
+declares nothing of its own:
+
+```sh
+podman run --rm --device desktop.local/display=all <image> xterm
+```
+
+In kubernetes there is no pod field naming a CDI device, so a device
+plugin bridges the gap (`charts/cdi-device-plugin` in this repo): it
+advertises the device as an extended resource and names it back to the
+runtime at allocation time. A client pod then just requests it:
+
+```yaml
+resources:
+  limits:
+    desktop.local/display: 1
+```
+
+A `cdi.k8s.io/...` pod annotation does NOT work and fails silently -
+kubelet builds a container's CRI annotations from device-plugin output
+only, so the annotation never reaches CDI injection. See
+`cdi-device-plugin/README.md` for the details and the upstream citations.
+
+Two things make this unit unlike its siblings:
+
+- **It ships enabled.** The others are pulled in by `desktop.container`'s
+  `Wants=`, which is enough because they only matter when the quadlet
+  desktop starts. This one also matters where there is no quadlet at all —
+  a kubernetes node runs the desktop as a pod, and its client pods still
+  need the spec — so the tree carries a `multi-user.target.wants` symlink
+  alongside the `Wants=`.
+- **There is nothing to converge.** The spec is a pure function of the
+  paths and `DISPLAY` the desktop exports, not a report on its state, so
+  it is simply rewritten (atomically, via temp file + rename) on every
+  boot. Writing it while the desktop is down is correct: a client that
+  starts early gets its mounts and finds no socket behind them.
+
+Override per host with assignments in
+`/etc/desktop-container/display-cdi.conf` (`DISPLAY_VALUE`, `X11_DIR`,
+`AUDIO_DIR`) — they must match what the desktop actually exports.
+
+**SELinux caveat.** This tree does not label the exported socket dirs, so
+on an enforcing host a *confined* client resolves the device, receives the
+mounts and env, and is then denied on `connect(2)` — `unable to open
+display ":0"`. CDI cannot express a relabel (no `:z` equivalent in
+`containerEdits`), so fixing it properly means labeling
+`/tmp/.X11-unix` and `/run/desktop-audio` `container_file_t` on the host.
+Until then, clients need label separation off (`--security-opt
+label=disable`, or a privileged pod). The desktop container is unaffected
+— it is `--privileged`. See README.md "Client containers via CDI".
+
 ## Apply
 
 ```sh
@@ -111,6 +169,9 @@ point of the declarative form — the file list above *is* the state).
 | `usr/local/libexec/seat-prep.sh` | the script that unit runs (boot-time convergence agent, not an installer) |
 | `etc/systemd/system/desktop-cdi-refresh.service` | oneshot before `desktop.service`: converge `/etc/cdi/nvidia.yaml` (real spec or no-op stub, see "GPU" above) |
 | `usr/local/libexec/desktop-cdi-refresh` | the script that unit runs (boot-time convergence agent, not an installer) |
+| `etc/systemd/system/desktop-display-cdi.service` | oneshot writing `/etc/cdi/desktop.yaml`, the spec **client** containers resolve to reach this desktop (see "Client containers" below); the only oneshot shipped enabled for `multi-user.target`, because k8s nodes never start `desktop.service` |
+| `etc/systemd/system/multi-user.target.wants/desktop-display-cdi.service` → `../desktop-display-cdi.service` | that enablement, as a symlink, so the tree stays a pure `rsync` with no `systemctl enable` step |
+| `usr/local/libexec/desktop-display-cdi` | the script that unit runs (pure config → spec; overridable via `/etc/desktop-container/display-cdi.conf`) |
 | `etc/sysusers.d/desktop-container.conf` | the dedicated `desktop-shell` account (see "Host Terminal" below) |
 | `etc/ssh/sshd_config.d/40-desktop-container.conf` | root-owned `authorized_keys` location for `desktop-shell` |
 | `etc/desktop-container/shell-user` | account name the container's `ssh host` targets (static: `desktop-shell`) |

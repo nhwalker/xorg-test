@@ -36,6 +36,12 @@ After=desktop-seat-prep.service
 # usr/local/libexec/desktop-cdi-refresh in this tree).
 Wants=desktop-cdi-refresh.service
 After=desktop-cdi-refresh.service
+# Client-side CDI spec (desktop.local/display): what OTHER containers
+# resolve to get this desktop's X socket and audio. Independent of the
+# desktop itself - it ships enabled for multi-user.target too, because a
+# kubernetes node runs the desktop as a pod and never starts this unit.
+Wants=desktop-display-cdi.service
+After=desktop-display-cdi.service
 # Host Terminal, always on: a fresh loopback-ssh keypair is generated every
 # boot for the dedicated 'desktop-shell' account (see deploy/README.md
 # "Host Terminal"). To ship hosts WITHOUT it, comment out the next two
