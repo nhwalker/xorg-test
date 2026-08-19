@@ -27,9 +27,13 @@ jobs:
           go vet ./...
           go test ./...
       - name: shellcheck (error severity)
+        # No apt install: the runner image ships shellcheck (0.9.0 on
+        # ubuntu-24.04). Installing it anyway cost this job its entire
+        # 20-minute budget twice when an apt mirror stalled, for a binary
+        # that was already on the box. If a future image drops it, the
+        # invocation below fails with command-not-found, which says so.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q shellcheck
+          shellcheck --version
           shellcheck -S error install.sh ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/session-postmortem \
