@@ -144,17 +144,18 @@ assert_orientation_vs_reference() { # $1: capture; $2: reference screendump base
     [ -s "$ref" ] || ref="$ART/$2.ppm"
     [ -s "$ref" ] || { log "WARNING: no reference screendump $2; skipping the cross-check"; return 0; }
     local cap_geom ref_geom
-    cap_geom=$(identify -format '%wx%h' "$1")
-    ref_geom=$(identify -format '%wx%h' "$ref")
+    cap_geom=$(identify -format '%wx%h' "$1") || fail "could not read the size of $1"
+    ref_geom=$(identify -format '%wx%h' "$ref") || fail "could not read the size of $ref"
     if [ "$cap_geom" != "$ref_geom" ]; then
         log "WARNING: capture is $cap_geom but the reference screendump is $ref_geom; skipping the cross-check"
         return 0
     fi
     local s0 s1 s2 s3
-    s0=$(rmse "$1" "$ref" "")
-    s1=$(rmse "$1" "$ref" "-flip")
-    s2=$(rmse "$1" "$ref" "-flop")
-    s3=$(rmse "$1" "$ref" "-rotate 180")
+    s0=$(rmse "$1" "$ref" "")           || fail "could not score the capture against the reference screendump"
+    s1=$(rmse "$1" "$ref" "-flip")      || fail "could not score the capture against the flipped screendump"
+    s2=$(rmse "$1" "$ref" "-flop")      || fail "could not score the capture against the mirrored screendump"
+    s3=$(rmse "$1" "$ref" "-rotate 180") || fail "could not score the capture against the rotated screendump"
+    rm -f "$ART/.ref.png"
     awk -v s0="$s0" -v s1="$s1" -v s2="$s2" -v s3="$s3" '
         BEGIN {
             worst = s1; if (s2 < worst) worst = s2; if (s3 < worst) worst = s3;
@@ -165,15 +166,24 @@ assert_orientation_vs_reference() { # $1: capture; $2: reference screendump base
     log "orientation: the capture matches QEMU's own screendump far better than any flipped variant"
 }
 
-# rmse scores two images, optionally transforming the second first.
+# rmse scores two images, optionally transforming the second first, and prints
+# the normalised 0..1 distance.
+#
+# `compare` exits NON-ZERO whenever the images differ at all, which is the
+# normal case here - the cursor alone guarantees it - so its status must be
+# discarded explicitly. Under this script's `set -e`, letting it escape makes
+# `s=$(rmse ...)` abort the whole run with no message at all.
 rmse() { # $1: image; $2: reference; $3: imagemagick transform for the reference
-    local ref="$2"
+    local ref="$2" out score
     if [ -n "$3" ]; then
         # shellcheck disable=SC2086
-        convert "$2" $3 "$ART/.ref.png" || return 1
+        convert "$2" $3 "$ART/.ref.png" || { echo "rmse: could not transform the reference" >&2; return 1; }
         ref="$ART/.ref.png"
     fi
-    compare -metric RMSE "$1" "$ref" null: 2>&1 | sed -n 's/.*(\([0-9.]*\)).*/\1/p'
+    out=$(compare -metric RMSE "$1" "$ref" null: 2>&1 || true)
+    score=$(sed -n 's/.*(\([0-9.]*\)).*/\1/p' <<<"$out")
+    [ -n "$score" ] || { echo "rmse: could not read a score from: $out" >&2; return 1; }
+    printf '%s\n' "$score"
 }
 
 # Audio analogue of screendump: wavcapture taps the guest's HDA output
