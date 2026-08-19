@@ -6,17 +6,18 @@
 # Assumes localhost/desktop-container:latest already built.
 #
 # Also carries the script-level branch tests that need root and a live
-# systemd (CDI converger no-downgrade rules, display-CDI overrides and
-# atomic write, seat-prep on a deliberately dirty seat) - the quadlet
+# systemd (CDI converger no-downgrade rules, client-CDI split/overrides
+# and atomic write, seat-prep on a deliberately dirty seat) - the quadlet
 # dry-run step earlier in the job covers only the happy paths.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CDI=deploy/host/usr/local/libexec/desktop-cdi-refresh
-DISPLAY_CDI=deploy/host/usr/local/libexec/desktop-display-cdi
+CLIENT_CDI=deploy/host/usr/local/libexec/desktop-client-cdi
 SEATPREP=deploy/host/usr/local/libexec/seat-prep.sh
 SPEC=/etc/cdi/nvidia.yaml
-DISPLAY_SPEC=/etc/cdi/desktop.yaml
+DISPLAY_SPEC=/etc/cdi/desktop-display.yaml
+AUDIO_SPEC=/etc/cdi/desktop-audio.yaml
 log()  { echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -55,41 +56,59 @@ rm -f /dev/nvidiactl
 "$CDI" >/dev/null
 grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub not restored after hardware removal"
 
-# --- display CDI generator branch tests --------------------------------------
-log "display cdi: defaults"
-rm -f "$DISPLAY_SPEC"
-"$DISPLAY_CDI" >/dev/null
+# --- client CDI generator branch tests ---------------------------------------
+log "client cdi: defaults write two disjoint specs"
+rm -f "$DISPLAY_SPEC" "$AUDIO_SPEC"
+"$CLIENT_CDI" >/dev/null
 grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" || fail "display spec kind wrong"
+grep -q 'kind: desktop.local/audio'   "$AUDIO_SPEC"   || fail "audio spec kind wrong"
 grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "display spec missing default DISPLAY"
 grep -q 'hostPath: /tmp/.X11-unix' "$DISPLAY_SPEC" || fail "display spec missing X11 mount"
-grep -q 'hostPath: /run/desktop-audio' "$DISPLAY_SPEC" || fail "display spec missing audio mount"
+grep -q 'hostPath: /run/desktop-audio' "$AUDIO_SPEC" || fail "audio spec missing audio mount"
+# The whole point of the split: neither device carries the other's edits.
+if grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' "$DISPLAY_SPEC"; then
+    fail "display spec leaks audio edits"
+fi
+if grep -qE 'DISPLAY=|X11-unix' "$AUDIO_SPEC"; then
+    fail "audio spec leaks display edits"
+fi
 # rw, not ro: a read-only bind would let a client see the socket and then
 # fail connect(2) on it - the single most likely silent regression here.
 grep -q '"rbind", "rw"' "$DISPLAY_SPEC" || fail "display spec mounts are not rw"
+grep -q '"rbind", "rw"' "$AUDIO_SPEC"   || fail "audio spec mounts are not rw"
 
-log "display cdi: the override file is honored"
+log "client cdi: the superseded combined spec is removed"
+printf 'cdiVersion: 0.5.0\nkind: desktop.local/display\ndevices: []\n' > /etc/cdi/desktop.yaml
+"$CLIENT_CDI" >/dev/null
+if [ -e /etc/cdi/desktop.yaml ]; then
+    fail "legacy combined spec survived: it would still grant audio to display clients"
+fi
+
+log "client cdi: the override file is honored by both specs"
 mkdir -p /etc/desktop-container
-cat > /etc/desktop-container/display-cdi.conf <<'EOF'
+cat > /etc/desktop-container/client-cdi.conf <<'EOF'
 DISPLAY_VALUE=:3
 AUDIO_DIR=/run/other-audio
 EOF
-"$DISPLAY_CDI" >/dev/null
+"$CLIENT_CDI" >/dev/null
 grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" || fail "override DISPLAY not applied"
-grep -q 'PULSE_SERVER=unix:/run/other-audio/pulse' "$DISPLAY_SPEC" \
+grep -q 'PULSE_SERVER=unix:/run/other-audio/pulse' "$AUDIO_SPEC" \
     || fail "override AUDIO_DIR not applied to PULSE_SERVER"
 
-log "display cdi: a bad DISPLAY value is rejected, leaving the old spec intact"
-echo 'DISPLAY_VALUE=nonsense' > /etc/desktop-container/display-cdi.conf
-if "$DISPLAY_CDI" >/dev/null 2>&1; then
+log "client cdi: a bad DISPLAY value is rejected, leaving both specs intact"
+echo 'DISPLAY_VALUE=nonsense' > /etc/desktop-container/client-cdi.conf
+if "$CLIENT_CDI" >/dev/null 2>&1; then
     fail "generator accepted a malformed DISPLAY_VALUE"
 fi
 grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" \
-    || fail "failed run clobbered the previous spec (must be atomic)"
+    || fail "failed run clobbered the display spec (validation must precede any write)"
+grep -q '/run/other-audio' "$AUDIO_SPEC" \
+    || fail "failed run clobbered the audio spec (validation must precede any write)"
 # No temp files left behind by the rejected run.
-leftovers=$(find /etc/cdi -name 'desktop.yaml.*' | wc -l)
+leftovers=$(find /etc/cdi -name 'desktop-*.yaml.*' | wc -l)
 [ "$leftovers" = 0 ] || fail "generator left $leftovers temp file(s) in /etc/cdi"
-rm -f /etc/desktop-container/display-cdi.conf
-"$DISPLAY_CDI" >/dev/null
+rm -f /etc/desktop-container/client-cdi.conf
+"$CLIENT_CDI" >/dev/null
 grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "defaults not restored after removing the override"
 
 # --- seat-prep on a deliberately dirty seat ----------------------------------
@@ -139,17 +158,19 @@ log "start desktop.service (generated from the tree's quadlet)"
 systemctl start desktop.service
 
 log "converger oneshots all pulled in and succeeded"
-for u in desktop-seat-prep desktop-cdi-refresh desktop-display-cdi desktop-host-shell; do
+for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell; do
     systemctl is-active --quiet "$u.service" \
         || { systemctl status "$u.service" --no-pager || true; fail "$u.service not active"; }
 done
-# desktop-display-cdi is the one oneshot that must ALSO run where there is
+# desktop-client-cdi is the one oneshot that must ALSO run where there is
 # no desktop.service (a k8s node): the tree ships it pre-enabled, and that
 # only holds if the rsync preserved the .wants symlink.
-[ "$(systemctl is-enabled desktop-display-cdi.service)" = enabled ] \
-    || fail "desktop-display-cdi.service not enabled for multi-user.target after rsync"
+[ "$(systemctl is-enabled desktop-client-cdi.service)" = enabled ] \
+    || fail "desktop-client-cdi.service not enabled for multi-user.target after rsync"
 grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" \
-    || fail "client CDI spec missing after the tree boot"
+    || fail "display CDI spec missing after the tree boot"
+grep -q 'kind: desktop.local/audio' "$AUDIO_SPEC" \
+    || fail "audio CDI spec missing after the tree boot"
 
 log "wait for the container to answer"
 up=0

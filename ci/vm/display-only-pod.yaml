@@ -1,0 +1,23 @@
+# Narrow client (test-only): requests ONLY the display capability.
+#
+# The point is what it must NOT get. vm-guest.sh verify-split asserts this
+# pod has DISPLAY and a usable X socket, and has no PULSE_SERVER, no
+# PIPEWIRE_REMOTE and no /run/desktop-audio at all -- i.e. that
+# desktop.local/display grants the display and nothing else.
+#
+# Without this, "we split the device" would be a claim about two YAML
+# files rather than an observed property of a running container.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: display-only
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: localhost/desktop-container:latest
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          desktop.local/display: 1

@@ -1,12 +1,16 @@
 # Proof-by-construction pod for the desktop CDI device (test-only).
 #
-# It requests desktop.local/display and declares NOTHING else: no env, no
+# It requests BOTH capabilities and declares NOTHING else: no env, no
 # volumeMounts, no volumes. So at runtime, every one of DISPLAY /
 # PULSE_SERVER / PIPEWIRE_REMOTE and the /tmp/.X11-unix + /run/desktop-audio
-# sockets is present ONLY because the device plugin named the CDI device and
-# CRI-O applied the containerEdits from /etc/cdi/desktop.yaml.
-# vm-guest.sh verify-cdi asserts exactly that, then plays a beep through
-# each audio client path from inside this pod.
+# sockets is present ONLY because the device plugins named the CDI devices
+# and CRI-O applied the containerEdits from /etc/cdi/desktop-display.yaml
+# and /etc/cdi/desktop-audio.yaml. vm-guest.sh verify-cdi asserts exactly
+# that, then plays a beep through each audio client path from inside this
+# pod.
+#
+# The narrow pods next to this one (display-only, audio-only) prove the two
+# devices grant only their own half.
 #
 # sleep infinity keeps it alive so the host can exec assertions and timed
 # playbacks into it.
@@ -24,3 +28,4 @@ spec:
       resources:
         limits:
           desktop.local/display: 1
+          desktop.local/audio: 1

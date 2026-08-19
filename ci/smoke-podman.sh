@@ -33,9 +33,20 @@ fi
 log "run the real install.sh (quadlet flow, shell user $SMOKE_USER)"
 SUDO_USER="$SMOKE_USER" ./install.sh --no-build --no-gpu
 
-log "install.sh wrote the client CDI spec (how other containers reach the desktop)"
-grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
-    || fail "install.sh did not write a usable /etc/cdi/desktop.yaml"
+log "install.sh wrote both client CDI specs (display and audio, separately)"
+grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+    || fail "install.sh did not write a usable /etc/cdi/desktop-display.yaml"
+grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+    || fail "install.sh did not write a usable /etc/cdi/desktop-audio.yaml"
+# The capability split is only real if the edits do not bleed across.
+# if-statements, not `grep && fail`: see the note further down - under
+# set -e a false AND-list terminates the script on the SUCCESS path.
+if grep -q PULSE_SERVER /etc/cdi/desktop-display.yaml; then
+    fail "display spec carries audio env: the split leaks"
+fi
+if grep -q DISPLAY= /etc/cdi/desktop-audio.yaml; then
+    fail "audio spec carries DISPLAY: the split leaks"
+fi
 
 log "wait for the container to answer"
 for _ in $(seq 20); do
@@ -170,10 +181,12 @@ fi
 if grep -q desktop-container-host-shell "/home/$SMOKE_USER/.ssh/authorized_keys" 2>/dev/null; then
     fail "authorized_keys entry not removed"
 fi
-# The client spec is generated, never hand-written, so uninstall owns it
-# outright (unlike /etc/cdi/nvidia.yaml, which the toolkit may also own).
-if [ -e /etc/cdi/desktop.yaml ]; then
-    fail "client CDI spec not removed by --uninstall"
-fi
+# The client specs are generated, never hand-written, so uninstall owns
+# them outright (unlike /etc/cdi/nvidia.yaml, which the toolkit may also own).
+for spec in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml; do
+    if [ -e "$spec" ]; then
+        fail "client CDI spec $spec not removed by --uninstall"
+    fi
+done
 
 log "smoke suite passed"

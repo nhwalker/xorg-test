@@ -1,0 +1,22 @@
+# Narrow client (test-only): requests ONLY the audio capability.
+#
+# This is the case the split exists for. An audio-only workload has no
+# business holding the X socket: with `xhost +local:` any client on the
+# display can read every keystroke, screenshot other windows and inject
+# events. vm-guest.sh verify-split asserts this pod has PULSE_SERVER,
+# PIPEWIRE_REMOTE and working audio sockets, and has no DISPLAY and no
+# /tmp/.X11-unix at all.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: audio-only
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: localhost/desktop-container:latest
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          desktop.local/audio: 1

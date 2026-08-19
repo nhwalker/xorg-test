@@ -1,20 +1,30 @@
-# Demo client for the desktop display: opens xterm on the containerized
-# display. Reuses the desktop image because it already has X clients
-# installed; any image with an X11 app works the same way -- the only thing
-# that makes the display reachable is the resource request below.
+# Demo client for the desktop: opens xterm on the containerized display and
+# can also play sound. Reuses the desktop image because it already has X
+# clients installed; any image with an X11 app works the same way -- the
+# only thing that makes the desktop reachable is the resource requests
+# below.
 #
 #   kubectl apply -f examples/x11-client-pod.yaml
 #
-# Requesting desktop.local/display makes kubelet call the cdi-device-plugin,
-# which names the CDI device desktop.local/display=all; CRI-O then applies
-# that spec's containerEdits to this pod: the /tmp/.X11-unix and
-# /run/desktop-audio bind mounts plus DISPLAY / PULSE_SERVER /
-# PIPEWIRE_REMOTE. Nothing else in this manifest mentions them.
+# The two resources are separate capabilities, and you should request only
+# what you need:
+#
+#   desktop.local/display   DISPLAY + the X socket
+#   desktop.local/audio     PULSE_SERVER/PIPEWIRE_REMOTE + the audio sockets
+#
+# Drop the audio line for a GUI app that makes no sound: audio includes
+# RECORDING, so it hands over the microphone. Drop the display line for a
+# sound-only workload: X11 here lets any client keylog and screenshot the
+# whole session.
+#
+# Requesting a resource makes kubelet call cdi-device-plugin, which names
+# the matching CDI device; CRI-O then applies that device's containerEdits
+# to this pod. Nothing else in this manifest mentions mounts or env.
 #
 # (A pod annotation cannot do this: kubelet builds a container's CRI
 # annotations from device-plugin output only, never from the pod spec.)
 #
-# Audio from a client works the same way, e.g.:
+# Audio from a client, once the audio resource is requested:
 #   paplay /usr/share/sounds/alsa/Front_Center.wav   # via injected PULSE_SERVER
 #   pw-play ...                                      # via injected PIPEWIRE_REMOTE
 # (ALSA-only apps additionally need alsa-plugins-pulseaudio + an asound.conf
@@ -35,3 +45,4 @@ spec:
       resources:
         limits:
           desktop.local/display: 1
+          desktop.local/audio: 1

@@ -164,7 +164,7 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase-deploy' \
 screendump desktop-deploy
 assert_nonblank desktop-deploy
 
-log "phase 2: k3s + desktop chart + cdi-device-plugin (client pod on the same display)"
+log "phase 2: k3s + desktop chart + a cdi-device-plugin release per capability"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
@@ -175,10 +175,18 @@ log "cdi: a requesting pod gets DISPLAY + sockets injected by the runtime"
 # WITHOUT the resource request is checked to get nothing, so these
 # assertions prove the plugin -> CRI-O CDI path end to end in a live pod.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-cdi' \
-    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod cdi-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo cat /etc/cdi/desktop.yaml' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod cdi-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          > "$ART/cdi-verify-fail.log" 2>&1 || true; fail "CDI injection verification failed"; }
 screendump cdi-verify-window
 assert_nonblank cdi-verify-window
+
+log "cdi: each device grants ONLY its own capability"
+# The narrow pods are the point of the split: display-only must reach the X
+# display and have no audio at all; audio-only must play sound and be unable
+# to open the display (X11 here would let it keylog the whole session).
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-split' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod display-only audio-only; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
+         > "$ART/verify-split-fail.log" 2>&1 || true; fail "capability split verification failed"; }
 
 log "cdi: each audio path works from the requesting pod (injected env only)"
 # One capture per path, played from the verifier pod using only injected
@@ -224,9 +232,9 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-concurrency' \
          > "$ART/verify-concurrency-fail.log" 2>&1 || true; fail "concurrency check failed"; }
 screendump concurrent-clients
 
-log "k8s teardown: uninstall both charts; resource withdrawn, host CDI spec survives"
+log "k8s teardown: uninstall every chart; resources withdrawn, host CDI specs survive"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
-    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop.yaml' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          > "$ART/teardown-fail.log" 2>&1 || true; fail "k8s teardown check failed"; }
 
 log "collect guest diagnostics"

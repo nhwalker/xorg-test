@@ -15,6 +15,7 @@ GPURES=$(helm template d charts/desktop-container --set gpu.enabled=true \
 NOPROBE=$(helm template d charts/desktop-container --set readinessProbe.enabled=false)
 LIVE=$(helm template d charts/desktop-container --set livenessProbe.enabled=true)
 DP=$(helm template p charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all --set count=10)
+DPA=$(helm template a charts/cdi-device-plugin --set cdiDevice=desktop.local/audio=all --set count=10)
 DPO=$(helm template p charts/cdi-device-plugin --set cdiDevice=nvidia.com/gpu=all \
       --set resourceName=desktop.local/gpu --set priorityClassName=system-node-critical)
 
@@ -57,6 +58,8 @@ ck 'kind: DaemonSet'                         "$DP"  "plugin: daemonset"
 ck 'path: /var/lib/kubelet/device-plugins'   "$DP"  "plugin: kubelet dir hostPath"
 ck 'value: "desktop.local/display=all"'      "$DP"  "plugin: CDI device passed through"
 ck 'value: "desktop.local/display"'          "$DP"  "plugin: resource name defaults to the CDI kind"
+ck 'value: "desktop.local/audio=all"'        "$DPA" "plugin: a second release serves the audio device"
+ck 'value: "desktop.local/audio"'            "$DPA" "plugin: audio resource name defaults to its kind"
 ck 'value: "10"'                             "$DP"  "plugin: count passed through"
 ck 'value: "/etc/cdi,/var/run/cdi"'          "$DP"  "plugin: default spec dirs"
 ck 'readOnly: true'                          "$DP"  "plugin: CDI specs mounted read-only"
@@ -73,24 +76,46 @@ helm template p charts/cdi-device-plugin --set cdiDevice=missing-equals >/dev/nu
     || echo "PASS: plugin: chart rejects an unqualified cdiDevice"
 
 # --- client manifests --------------------------------------------------------
-# The resource name is a contract between the plugin release and every
-# client manifest; nothing at template time would catch them drifting apart.
-RES=$(echo "$DP" | sed -n 's/.*value: "\(desktop\.local\/display\)"$/\1/p' | head -1)
-[ -n "$RES" ] || { echo "FAIL: could not read the advertised resource name from the chart"; exit 1; }
-echo "PASS: plugin advertises $RES"
+# The resource names are a contract between the plugin releases, the CDI
+# generator and every client manifest; nothing at template time would catch
+# them drifting apart, so read them back from the rendered chart.
+DISPLAY_RES=$(echo "$DP" | sed -n 's/.*value: "\(desktop\.local\/display\)"$/\1/p' | head -1)
+AUDIO_RES=$(echo "$DPA" | sed -n 's/.*value: "\(desktop\.local\/audio\)"$/\1/p' | head -1)
+[ -n "$DISPLAY_RES" ] && [ -n "$AUDIO_RES" ] \
+    || { echo "FAIL: could not read the advertised resource names from the chart"; exit 1; }
+echo "PASS: plugin advertises $DISPLAY_RES and $AUDIO_RES"
 
+# The generator is the other end of that contract: the kinds it writes must
+# be exactly the resources the manifests request.
+GEN=deploy/host/usr/local/libexec/desktop-client-cdi
+for kindvar in DISPLAY_KIND AUDIO_KIND; do
+    k=$(sed -n "s/^$kindvar=\"\(.*\)\"\$/\1/p" "$GEN")
+    case "$k" in
+        "$DISPLAY_RES"|"$AUDIO_RES") echo "PASS: generator $kindvar=$k matches an advertised resource" ;;
+        *) echo "FAIL: generator $kindvar=$k is not advertised by any plugin release"; exit 1 ;;
+    esac
+done
+
+# Pods that want the whole desktop request both capabilities...
 for m in examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml; do
     # Comments stripped: these files DESCRIBE what they deliberately omit
     # ("no env, no volumeMounts"), which would otherwise match below.
     M=$(grep -v '^[[:space:]]*#' "$m")
-    ck "$RES: 1"                       "$M" "$m: requests the advertised resource"
-    # Proof-by-construction: these pods must keep declaring NOTHING that
-    # could hand them the display by another route, or they stop proving
-    # that CDI is what wired them up.
+    ck "$DISPLAY_RES: 1"               "$M" "$m: requests the display resource"
+    ck "$AUDIO_RES: 1"                 "$M" "$m: requests the audio resource"
     nk 'volumeMounts'                  "$M" "$m: no volumeMounts of its own"
     nk '^  volumes:'                   "$M" "$m: no volumes of its own"
     nk '^      env:'                   "$M" "$m: no env of its own"
     nk 'cdi\.k8s\.io'                  "$M" "$m: no CDI annotation (it would be silently ignored)"
 done
+
+# ...and the narrow fixtures request exactly ONE, which is what makes the
+# e2e's leak assertions meaningful rather than tautological.
+DO=$(grep -v '^[[:space:]]*#' ci/vm/display-only-pod.yaml)
+ck "$DISPLAY_RES: 1" "$DO" "display-only: requests display"
+nk "$AUDIO_RES"      "$DO" "display-only: does NOT request audio"
+AO=$(grep -v '^[[:space:]]*#' ci/vm/audio-only-pod.yaml)
+ck "$AUDIO_RES: 1"   "$AO" "audio-only: requests audio"
+nk "$DISPLAY_RES"    "$AO" "audio-only: does NOT request display"
 
 echo "== all helm assertions passed"

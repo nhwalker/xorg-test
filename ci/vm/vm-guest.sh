@@ -8,9 +8,9 @@
 #         tree rsync-applied, desktop booted from its quadlet, root-owned
 #         desktop-shell ssh trust exercised under SELinux enforcing, and
 #         desktop-preflight asserted fully green.
-# phase2: k3s + the desktop chart + cdi-device-plugin - client pods
-#         requesting desktop.local/display and reaching the same display,
-#         with CRI-O injecting from /etc/cdi/desktop.yaml.
+# phase2: k3s + the desktop chart + two cdi-device-plugin releases - client
+#         pods requesting desktop.local/display and/or desktop.local/audio,
+#         with CRI-O injecting from the matching /etc/cdi spec.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -48,8 +48,11 @@ fail() {
         echo "" >&2
         echo "---- diagnostics: pod images actually running ----" >&2
         k3s kubectl get pods -A -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGEID:.status.containerStatuses[0].imageID' >&2 2>&1 || true
-        echo "---- diagnostics: client CDI spec ----" >&2
-        cat /etc/cdi/desktop.yaml >&2 2>/dev/null || echo "(no /etc/cdi/desktop.yaml)" >&2
+        echo "---- diagnostics: client CDI specs ----" >&2
+        for f in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml; do
+            echo "-- $f" >&2
+            cat "$f" >&2 2>/dev/null || echo "(missing)" >&2
+        done
         echo "---- diagnostics: cdi-device-plugin logs ----" >&2
         k3s kubectl logs -l app.kubernetes.io/name=cdi-device-plugin --tail=30 >&2 2>&1 || true
         echo "---- diagnostics: kubelet plugin dir ----" >&2
@@ -60,7 +63,7 @@ fail() {
         k3s kubectl exec deploy/desktop -- sh -c \
             'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
             >&2 2>&1 || true
-        k3s kubectl describe pod x11-client-demo cdi-verify >&2 2>/dev/null || true
+        k3s kubectl describe pod x11-client-demo cdi-verify display-only audio-only >&2 2>/dev/null || true
         journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
     fi
     exit 1
@@ -124,10 +127,11 @@ phase1() {
         ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami)
     [ "$who" = "${SUDO_USER:-rocky}" ] || fail "ssh host whoami='$who'"
 
-    log p1 "install.sh wrote the client CDI spec"
-    [ -f /etc/cdi/desktop.yaml ] || fail "install.sh did not write /etc/cdi/desktop.yaml"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
-        || fail "client CDI spec has the wrong kind"
+    log p1 "install.sh wrote both client CDI specs"
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+        || fail "install.sh did not write a usable /etc/cdi/desktop-display.yaml"
+    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+        || fail "install.sh did not write a usable /etc/cdi/desktop-audio.yaml"
 
     # The whole client contract in one command, under podman: a SEPARATE
     # container that passes no -v and no -e reaches the display purely
@@ -146,16 +150,46 @@ phase1() {
         --device desktop.local/display=all \
         localhost/desktop-container:latest sh -c '
             printenv DISPLAY
-            printenv PULSE_SERVER
             test -S /tmp/.X11-unix/X0 && echo SOCKET_OK
-            test -d /run/desktop-audio && echo AUDIO_DIR_OK
-            xdpyinfo >/dev/null && echo XDPYINFO_OK') \
-        || fail "podman CDI client failed (see output above)"
-    for want in ':0' 'unix:/run/desktop-audio/pulse' SOCKET_OK AUDIO_DIR_OK XDPYINFO_OK; do
+            xdpyinfo >/dev/null && echo XDPYINFO_OK
+            printenv PULSE_SERVER || echo NO_PULSE
+            grep -q " /run/desktop-audio " /proc/self/mountinfo || echo NO_AUDIO_MOUNT') \
+        || fail "podman display client failed (see output above)"
+    for want in ':0' SOCKET_OK XDPYINFO_OK NO_PULSE NO_AUDIO_MOUNT; do
         echo "$out" | grep -qx "$want" \
-            || fail "CDI client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
+            || fail "display client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
     done
-    log p1 "podman CDI client reached the display with no -v/-e of its own"
+    log p1 "podman display client opened :0 and got NO audio - the split holds"
+
+    # ...and the mirror image. An audio-only client must not be able to see
+    # the display at all: with xhost +local: an X client can keylog the
+    # whole session, which is precisely what a sound-only workload must not
+    # be handed.
+    log p1 "a podman client resolves desktop.local/audio=all and gets audio only"
+    out=$(podman run --rm --security-opt label=disable \
+        --device desktop.local/audio=all \
+        localhost/desktop-container:latest sh -c '
+            printenv PULSE_SERVER
+            printenv PIPEWIRE_REMOTE
+            test -S /run/desktop-audio/pulse && echo PULSE_SOCKET_OK
+            printenv DISPLAY || echo NO_DISPLAY
+            grep -q " /tmp/.X11-unix " /proc/self/mountinfo || echo NO_X11_MOUNT') \
+        || fail "podman audio client failed (see output above)"
+    for want in 'unix:/run/desktop-audio/pulse' '/run/desktop-audio/pipewire-0' \
+                PULSE_SOCKET_OK NO_DISPLAY NO_X11_MOUNT; do
+        echo "$out" | grep -qx "$want" \
+            || fail "audio client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
+    done
+    log p1 "podman audio client got the audio sockets and NO display"
+
+    # Both together are the union: what a full desktop client asks for.
+    podman run --rm --security-opt label=disable \
+        --device desktop.local/display=all --device desktop.local/audio=all \
+        localhost/desktop-container:latest sh -c '
+            test "$DISPLAY" = :0 && test -S /tmp/.X11-unix/X0 \
+              && test -S /run/desktop-audio/pulse && xdpyinfo >/dev/null' \
+        || fail "requesting both devices did not yield the union of their edits"
+    log p1 "both devices together give display + audio"
 
     # Informational, never fatal: the confined case needs the export dirs
     # labeled container_file_t, which CDI cannot arrange itself (there is no
@@ -203,14 +237,14 @@ phase_deploy() {
 
     log pd "start desktop.service; seat-prep must evict the getty uninstall restarted"
     systemctl start desktop.service
-    for u in desktop-seat-prep desktop-cdi-refresh desktop-display-cdi desktop-host-shell; do
+    for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell; do
         systemctl is-active --quiet "$u.service" || fail "$u.service not active"
     done
     # The tree ships this one pre-enabled (multi-user.target.wants symlink)
     # because a k8s node never starts desktop.service at all - assert the
     # symlink survived the rsync, not just that the unit happens to be up.
-    [ "$(systemctl is-enabled desktop-display-cdi.service)" = enabled ] \
-        || fail "desktop-display-cdi.service is not enabled for multi-user.target"
+    [ "$(systemctl is-enabled desktop-client-cdi.service)" = enabled ] \
+        || fail "desktop-client-cdi.service is not enabled for multi-user.target"
     if systemctl is-active --quiet getty@tty1.service; then
         fail "getty@tty1 survived seat-prep"
     fi
@@ -223,9 +257,11 @@ phase_deploy() {
     podman exec desktop sh -c "tr '\0' '\n' </proc/1/environ | grep -qx NVIDIA_CDI_STUB=1" \
         || fail "stub marker not on container PID 1"
 
-    log pd "the tree's oneshot wrote the client CDI spec"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
-        || fail "desktop-display-cdi did not write a usable /etc/cdi/desktop.yaml"
+    log pd "the tree's oneshot wrote both client CDI specs"
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+        || fail "desktop-client-cdi did not write a usable display spec"
+    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+        || fail "desktop-client-cdi did not write a usable audio spec"
 
     log pd "Xorg serves the virtio display, rootless, under the deploy quadlet"
     wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
@@ -303,11 +339,13 @@ EOF
 
     # Everything downstream depends on this file; assert it before k3s so a
     # missing spec fails here instead of as an opaque pod creation error.
-    # phase-deploy's desktop-display-cdi.service wrote it and the tree is
+    # phase-deploy's desktop-client-cdi.service wrote them and the tree is
     # still applied - only the quadlet unit was removed above.
-    log p2 "client CDI spec is on the node"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
-        || fail "/etc/cdi/desktop.yaml missing or malformed before k3s install"
+    log p2 "both client CDI specs are on the node"
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+        || fail "/etc/cdi/desktop-display.yaml missing or malformed before k3s install"
+    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+        || fail "/etc/cdi/desktop-audio.yaml missing or malformed before k3s install"
 
     # k3s writes its flannel CNI config + plugin binaries under its own tree,
     # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
@@ -356,12 +394,18 @@ EOF
     wait_for 40 5 "desktop deployment ready" \
         sh -c "k3s kubectl get deploy desktop -o jsonpath='{.status.readyReplicas}' | grep -q 1"
 
-    log p2 "deploy the generic CDI device plugin; the resource becomes allocatable"
-    helm install cdi charts/cdi-device-plugin \
-        --set image.repository=localhost/cdi-device-plugin --set image.pullPolicy=Never \
-        --set cdiDevice=desktop.local/display=all --set count=10
-    wait_for 30 4 "desktop.local/display allocatable" \
-        sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}' | grep -q 10"
+    log p2 "deploy one plugin release per capability; both resources become allocatable"
+    # Two releases, not one: kubelet's Register takes a single resource
+    # name. The chart is generic - each release differs only in cdiDevice.
+    for cap in display audio; do
+        helm install "$cap" charts/cdi-device-plugin \
+            --set image.repository=localhost/cdi-device-plugin --set image.pullPolicy=Never \
+            --set "cdiDevice=desktop.local/$cap=all" --set count=10
+    done
+    for cap in display audio; do
+        wait_for 30 4 "desktop.local/$cap allocatable" \
+            sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/$cap}' | grep -q 10"
+    done
 
     log p2 "client pod schedules and opens xterm on the desktop"
     # The example pod declares only the resource request - no volumes, no
@@ -582,6 +626,68 @@ apply_client() { # $1: pod name
         examples/x11-client-pod.yaml | k3s kubectl apply -f -
 }
 
+# verify_split is the test the capability split exists for: each device
+# must grant its own half and NOTHING of the other's. Without it, "we split
+# the device" is a statement about two YAML files rather than an observed
+# property of running pods.
+verify_split() {
+    log vsp "apply the narrow pods: one requests display only, one audio only"
+    k3s kubectl apply -f ci/vm/display-only-pod.yaml
+    k3s kubectl apply -f ci/vm/audio-only-pod.yaml
+    for pod in display-only audio-only; do
+        wait_for 30 4 "$pod running" \
+            sh -c "k3s kubectl get pod $pod -o jsonpath='{.status.phase}' | grep -q Running"
+    done
+
+    log vsp "display-only: has the display"
+    got=$(k3s kubectl exec display-only -- printenv DISPLAY 2>/dev/null || true)
+    [ "$got" = ":0" ] || fail "display-only DISPLAY='$got', want :0"
+    timeout 20 k3s kubectl exec display-only -- sh -c 'xdpyinfo >/dev/null' \
+        || fail "display-only could not open the display"
+
+    log vsp "display-only: has NO audio (env or mount)"
+    for var in PULSE_SERVER PIPEWIRE_REMOTE; do
+        if k3s kubectl exec display-only -- printenv "$var" >/dev/null 2>&1; then
+            fail "display-only leaked $var - the audio device's edits reached a display-only pod"
+        fi
+    done
+    # mountinfo, not `test -e`: the image ships a tmpfiles.d entry for
+    # /run/desktop-audio, so path existence would be the wrong question.
+    # What must be absent is the INJECTED MOUNT.
+    if k3s kubectl exec display-only -- \
+        grep -q ' /run/desktop-audio ' /proc/self/mountinfo 2>/dev/null; then
+        fail "display-only has the audio mount - the audio device's edits leaked"
+    fi
+
+    log vsp "audio-only: has working audio"
+    got=$(k3s kubectl exec audio-only -- printenv PULSE_SERVER 2>/dev/null || true)
+    [ "$got" = "unix:/run/desktop-audio/pulse" ] || fail "audio-only PULSE_SERVER='$got'"
+    got=$(k3s kubectl exec audio-only -- printenv PIPEWIRE_REMOTE 2>/dev/null || true)
+    [ "$got" = "/run/desktop-audio/pipewire-0" ] || fail "audio-only PIPEWIRE_REMOTE='$got'"
+    # Not just present: actually usable, so the narrow device is a real
+    # grant rather than two env vars pointing at nothing.
+    timeout 60 k3s kubectl exec audio-only -- sh -c \
+        'until pactl info >/dev/null 2>&1; do sleep 2; done' \
+        || fail "audio-only could not talk to the pulse socket"
+
+    log vsp "audio-only: has NO display (env or mount)"
+    if k3s kubectl exec audio-only -- printenv DISPLAY >/dev/null 2>&1; then
+        fail "audio-only leaked DISPLAY - a sound-only workload must not reach the X session"
+    fi
+    if k3s kubectl exec audio-only -- \
+        grep -q ' /tmp/.X11-unix ' /proc/self/mountinfo 2>/dev/null; then
+        fail "audio-only has the X11 mount - the display device's edits leaked"
+    fi
+    # The capability it must not have, stated as the capability itself.
+    if timeout 20 k3s kubectl exec audio-only -- sh -c 'xdpyinfo >/dev/null' 2>/dev/null; then
+        fail "audio-only opened the X display - it can keylog the session"
+    fi
+
+    log vsp "each device grants its own half and nothing more"
+    k3s kubectl delete pod display-only audio-only --wait=true >/dev/null 2>&1 || true
+    log vsp "verify-split passed"
+}
+
 verify_concurrency() {
     # The display is shareable and CDI imposes no cap, so the property to
     # prove is that several independent clients hold LIVE connections to the
@@ -618,27 +724,33 @@ verify_concurrency() {
 
 verify_teardown() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    log td "helm uninstall both charts"
-    helm uninstall cdi >/dev/null || fail "helm uninstall cdi failed"
+    log td "helm uninstall every chart (desktop + one plugin release per capability)"
+    for r in display audio; do
+        helm uninstall "$r" >/dev/null || fail "helm uninstall $r failed"
+    done
     helm uninstall desktop >/dev/null || fail "helm uninstall desktop failed"
 
     # Removing the plugin must make the node stop offering the resource.
     # kubelet drops the allocatable COUNT to 0 promptly but often keeps the
     # resource key in node status for a while, so assert the count is 0 (or
     # the key is gone), not that the key vanished.
-    wait_for 30 4 "desktop.local/display no longer allocatable" \
-        sh -c "v=\$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/display}'); [ -z \"\$v\" ] || [ \"\$v\" = 0 ]"
+    for cap in display audio; do
+        wait_for 30 4 "desktop.local/$cap no longer allocatable" \
+            sh -c "v=\$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/$cap}'); [ -z \"\$v\" ] || [ \"\$v\" = 0 ]"
+    done
     # The chart-managed workloads must be gone (get returns non-zero once
     # the objects no longer exist).
-    wait_for 20 3 "desktop deployment + plugin daemonset gone" \
-        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1 && ! k3s kubectl get ds cdi-cdi-device-plugin >/dev/null 2>&1"
+    wait_for 20 3 "desktop deployment + both plugin daemonsets gone" \
+        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1 && ! k3s kubectl get ds display-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds audio-cdi-device-plugin >/dev/null 2>&1"
 
     # The CDI spec is HOST state, not chart state: uninstalling must not
     # remove it (nothing in k8s owns it). This is the seam that makes one
     # spec definition serve podman and kubernetes alike.
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop.yaml \
-        || fail "helm uninstall removed the host CDI spec - it is host state"
-    log td "charts uninstalled; resource withdrawn; host CDI spec untouched"
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+        || fail "helm uninstall removed the host display spec - it is host state"
+    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+        || fail "helm uninstall removed the host audio spec - it is host state"
+    log td "charts uninstalled; resources withdrawn; host CDI specs untouched"
     log td "verify-teardown passed"
 }
 
@@ -676,13 +788,14 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
     phase1) phase1 ;;
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
     play-audio-pod) play_audio_pod "${2:-}" "${3:-}" ;;
     verify-cdi) verify_cdi ;;
+    verify-split) verify_split ;;
     verify-testclient) verify_testclient ;;
     verify-record) verify_record ;;
     verify-concurrency) verify_concurrency ;;
