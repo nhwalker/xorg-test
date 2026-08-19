@@ -61,7 +61,7 @@ if [ -n "${img:-}" ]; then
     fi
 fi
 
-for u in desktop-seat-prep desktop-cdi-refresh desktop-display-cdi desktop-host-shell; do
+for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell; do
     systemctl cat "$u.service" >/dev/null 2>&1 \
         && pass "$u.service installed" \
         || fail "$u.service missing: deploy tree not fully applied"
@@ -148,23 +148,41 @@ if [ -e /dev/nvidiactl ] && ! command -v nvidia-ctk >/dev/null; then
     warn "NVIDIA device present but nvidia-ctk not installed: only a stub spec can be generated"
 fi
 
-# --- client CDI spec (how other containers reach this desktop) ----------------
-# Only a WARN when missing: the desktop itself runs fine without it; what
-# breaks is every client container that asks for desktop.local/display=all.
-if [ -f /etc/cdi/desktop.yaml ]; then
-    dpy=$(sed -n 's/^ *- DISPLAY=\(.*\)$/\1/p' /etc/cdi/desktop.yaml | head -1)
-    if [ -z "$dpy" ]; then
-        warn "/etc/cdi/desktop.yaml has no DISPLAY edit: rewrite it with: systemctl restart desktop-display-cdi"
-    else
-        pass "client CDI spec present (desktop.local/display=all -> DISPLAY=$dpy)"
-        # A spec pointing at a socket dir nobody exports is worse than no
-        # spec: clients start "successfully" and then cannot connect.
-        xdir=$(sed -n 's/^ *- hostPath: \(.*X11.*\)$/\1/p' /etc/cdi/desktop.yaml | head -1)
-        [ -z "$xdir" ] || [ -d "$xdir" ] \
-            || warn "client CDI spec mounts $xdir, which does not exist on this host"
+# --- client CDI specs (how other containers reach this desktop) ---------------
+# Only a WARN when missing: the desktop itself runs fine without them; what
+# breaks is every client container that asks for one of these devices.
+# Checked separately, because a host can legitimately end up with one and
+# not the other (a hand-edited spec dir, a half-finished upgrade).
+for pair in "desktop.local/display:/etc/cdi/desktop-display.yaml" \
+            "desktop.local/audio:/etc/cdi/desktop-audio.yaml"; do
+    kind=${pair%%:*}
+    spec=${pair#*:}
+    if [ ! -f "$spec" ]; then
+        warn "$spec missing: client containers cannot resolve $kind=all; run: systemctl start desktop-client-cdi"
+        continue
     fi
-else
-    warn "/etc/cdi/desktop.yaml missing: client containers cannot resolve desktop.local/display=all; run: systemctl start desktop-display-cdi"
+    if ! grep -q "^kind: $kind\$" "$spec"; then
+        warn "$spec does not declare kind $kind: rewrite it with: systemctl restart desktop-client-cdi"
+        continue
+    fi
+    # A spec pointing at a socket dir nobody exports is worse than no spec:
+    # clients start "successfully" and then cannot connect.
+    missing=""
+    while read -r d; do
+        [ -z "$d" ] || [ -d "$d" ] || missing="$missing $d"
+    done <<< "$(sed -n 's/^ *- hostPath: \(.*\)$/\1/p' "$spec")"
+    if [ -n "$missing" ]; then
+        warn "$kind=all mounts$missing, which do(es) not exist on this host"
+    else
+        pass "client CDI spec present ($kind=all)"
+    fi
+done
+
+# The superseded combined spec granted display AND audio through one
+# device. A leftover copy still resolves, so it would quietly hand the
+# microphone to clients that asked only for the display.
+if [ -f /etc/cdi/desktop.yaml ]; then
+    warn "/etc/cdi/desktop.yaml is superseded by the split display/audio specs and still resolves: remove it (desktop-client-cdi does this automatically)"
 fi
 
 # --- shared dirs + audio client config ----------------------------------------

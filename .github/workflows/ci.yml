@@ -27,15 +27,19 @@ jobs:
           go vet ./...
           go test ./...
       - name: shellcheck (error severity)
+        # No apt install: the runner image ships shellcheck (0.9.0 on
+        # ubuntu-24.04). Installing it anyway cost this job its entire
+        # 20-minute budget twice when an apt mirror stalled, for a binary
+        # that was already on the box. If a future image drops it, the
+        # invocation below fails with command-not-found, which says so.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q shellcheck
+          shellcheck --version
           shellcheck -S error install.sh ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/session-postmortem \
             image/session/host-terminal \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
-            deploy/host/usr/local/libexec/desktop-display-cdi \
+            deploy/host/usr/local/libexec/desktop-client-cdi \
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight
@@ -67,7 +71,8 @@ jobs:
           helm template p charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all \
             | ./kubeconform -strict -summary
           ./kubeconform -strict -summary \
-            examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml
+            examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml \
+            ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml
 
   build-smoke:
     runs-on: ubuntu-latest
@@ -92,11 +97,11 @@ jobs:
         # precisely because pre-5.0 quadlet silently ignores drop-in dirs.
         # Then the stub CDI spec written by desktop-cdi-refresh on this
         # GPU-less runner must actually satisfy AddDevice=nvidia.com/gpu=all
-        # at container creation, the client spec written by
-        # desktop-display-cdi must inject the display + audio into an
-        # unrelated container (with a no-device control), and the host-shell
-        # converger must produce a working sysusers account + root-owned
-        # trust file.
+        # at container creation, the client specs written by
+        # desktop-client-cdi must inject display and audio SEPARATELY into
+        # unrelated containers (each device granting only its own half, with
+        # a no-device control), and the host-shell converger must produce a
+        # working sysusers account + root-owned trust file.
         run: |
           tmp=$(mktemp -d)
           install -m644 deploy/host/etc/containers/systemd/desktop.container "$tmp/"
@@ -118,7 +123,7 @@ jobs:
           echo "$out" | grep -q 'device.*nvidia.com/gpu=all'
           echo "$out" | grep -q 'Wants=desktop-seat-prep.service'
           echo "$out" | grep -q 'Wants=desktop-cdi-refresh.service'
-          echo "$out" | grep -q 'Wants=desktop-display-cdi.service'
+          echo "$out" | grep -q 'Wants=desktop-client-cdi.service'
           echo "$out" | grep -q 'Wants=desktop-host-shell.service'
           # GPU-less runner: the converger must write the stub, and podman
           # must resolve AddDevice against it end-to-end.
@@ -126,33 +131,50 @@ jobs:
           sudo grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml
           sudo podman run --rm --device nvidia.com/gpu=all \
             localhost/desktop-container:latest sh -c 'test "$NVIDIA_CDI_STUB" = 1'
-          # Client CDI spec: the whole display-sharing mechanism, checked
-          # against a real runtime rather than by reading YAML. A container
-          # that passes no -v and no -e must come up with the env set and
-          # both socket dirs mounted, purely from the generated spec.
+          # Client CDI specs: the whole sharing mechanism, checked against a
+          # real runtime rather than by reading YAML. Each device must grant
+          # its own capability and ONLY its own -- the split is a property of
+          # running containers here, not of two YAML files.
           sudo install -d -m1777 /tmp/.X11-unix /run/desktop-audio
-          sudo deploy/host/usr/local/libexec/desktop-display-cdi
+          sudo deploy/host/usr/local/libexec/desktop-client-cdi
+          # display alone: DISPLAY + X socket dir, and NO audio whatsoever.
           sudo podman run --rm --device desktop.local/display=all \
             localhost/desktop-container:latest sh -c '
               test "$DISPLAY" = :0 || { echo "DISPLAY=$DISPLAY"; exit 1; }
+              grep -q " /tmp/.X11-unix " /proc/self/mountinfo || exit 1
+              ! printenv PULSE_SERVER || { echo "leaked PULSE_SERVER"; exit 1; }
+              ! printenv PIPEWIRE_REMOTE || { echo "leaked PIPEWIRE_REMOTE"; exit 1; }
+              ! grep -q " /run/desktop-audio " /proc/self/mountinfo || { echo "leaked audio mount"; exit 1; }'
+          # audio alone: both audio env vars + the audio dir, and NO display.
+          sudo podman run --rm --device desktop.local/audio=all \
+            localhost/desktop-container:latest sh -c '
               test "$PULSE_SERVER" = unix:/run/desktop-audio/pulse || exit 1
               test "$PIPEWIRE_REMOTE" = /run/desktop-audio/pipewire-0 || exit 1
+              grep -q " /run/desktop-audio " /proc/self/mountinfo || exit 1
+              ! printenv DISPLAY || { echo "leaked DISPLAY"; exit 1; }
+              ! grep -q " /tmp/.X11-unix " /proc/self/mountinfo || { echo "leaked X11 mount"; exit 1; }'
+          # both together: the union, which is what a full desktop client asks for.
+          sudo podman run --rm --device desktop.local/display=all --device desktop.local/audio=all \
+            localhost/desktop-container:latest sh -c '
+              test "$DISPLAY" = :0 || exit 1
+              test "$PULSE_SERVER" = unix:/run/desktop-audio/pulse || exit 1
               grep -q " /tmp/.X11-unix " /proc/self/mountinfo || exit 1
               grep -q " /run/desktop-audio " /proc/self/mountinfo || exit 1'
-          # ...and a container WITHOUT the device gets none of it, so the
-          # check above cannot pass on something baked into the image.
+          # ...and a container WITHOUT any device gets none of it, so the
+          # checks above cannot pass on something baked into the image.
           sudo podman run --rm localhost/desktop-container:latest sh -c '
               ! printenv DISPLAY || exit 1
+              ! printenv PULSE_SERVER || exit 1
               ! grep -q " /tmp/.X11-unix " /proc/self/mountinfo || exit 1'
           # The DISPLAY override is the one input clients cannot discover
           # for themselves; a silently ignored conf would be a live break.
           sudo install -d /etc/desktop-container
-          echo 'DISPLAY_VALUE=:7' | sudo tee /etc/desktop-container/display-cdi.conf >/dev/null
-          sudo deploy/host/usr/local/libexec/desktop-display-cdi
+          echo 'DISPLAY_VALUE=:7' | sudo tee /etc/desktop-container/client-cdi.conf >/dev/null
+          sudo deploy/host/usr/local/libexec/desktop-client-cdi
           sudo podman run --rm --device desktop.local/display=all \
             localhost/desktop-container:latest sh -c 'test "$DISPLAY" = :7'
-          sudo rm -f /etc/desktop-container/display-cdi.conf
-          sudo deploy/host/usr/local/libexec/desktop-display-cdi
+          sudo rm -f /etc/desktop-container/client-cdi.conf
+          sudo deploy/host/usr/local/libexec/desktop-client-cdi
           # seat-prep: converges the runner's seat state and must be
           # idempotent (second run silent, exit 0)
           sudo deploy/host/usr/local/libexec/seat-prep.sh

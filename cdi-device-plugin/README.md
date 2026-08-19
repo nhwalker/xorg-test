@@ -14,8 +14,8 @@ RESOURCE_NAME=desktop.local/display
 ```
 
 A pod requesting `desktop.local/display` then receives whatever
-`/etc/cdi/desktop.yaml` says that device injects. Point it at any CDI
-device on the node; install one release per device.
+`/etc/cdi/desktop-display.yaml` says that device injects. Point it at any
+CDI device on the node; install one release per device.
 
 ## Why this exists
 
@@ -129,8 +129,14 @@ deployment is independently debuggable, and the binary stays small.
 
 ```sh
 helm install display charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all --set count=10
+helm install audio   charts/cdi-device-plugin --set cdiDevice=desktop.local/audio=all   --set count=10
 helm install gpu     charts/cdi-device-plugin --set cdiDevice=nvidia.com/gpu=all --set resourceName=desktop.local/gpu
 ```
+
+Separate releases also mean separate counts and independent health, so a
+client can be granted one capability without the other — which is the
+point of splitting the desktop into `display` and `audio` devices rather
+than one combined device.
 
 ## What it deliberately does not do
 
@@ -154,9 +160,10 @@ does, not a stub of it. `Allocate` is asserted to return `CDIDevices` and
 exists to avoid.
 
 The repo's VM e2e exercises the whole path on a live k3s + CRI-O node: the
-resource becoming allocatable, a pod that declares nothing but the
-request reaching an X display and playing audio, and an identical control
-pod that requests nothing and must receive nothing.
+resources becoming allocatable, a pod that declares nothing but its
+requests reaching an X display and playing audio, a control pod that
+requests nothing and must receive nothing, and narrow pods proving each
+device grants its own capability and *not* the other's.
 
 ## A note on upstream
 

@@ -27,9 +27,17 @@ jobs:
           test -e /dev/kvm || { echo "no /dev/kvm on runner"; exit 1; }
           sudo chmod 666 /dev/kvm
       - name: install qemu + tools
+        # These are genuinely not on the runner image, so apt is required.
+        # Retries + a transfer timeout because a stalled mirror otherwise
+        # hangs with no output until the job's 30-minute cap kills it: with
+        # these, apt gives up on the bad mirror in 30s and retries, and a
+        # real outage fails fast with a message instead of a blank timeout.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat imagemagick
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS update -q
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat imagemagick
       - name: cache rocky cloud image
         id: rocky
         uses: actions/cache@v4

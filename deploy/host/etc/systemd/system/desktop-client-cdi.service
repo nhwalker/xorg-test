@@ -1,14 +1,15 @@
 # Part of the desktop-container deploy tree (deploy/README.md).
 [Unit]
-Description=Write the CDI spec that shares the desktop display with client containers
-# Every host runs this, desktop up or not: the spec is the export contract
-# (paths + DISPLAY), not a report on the desktop's state, so there is
-# nothing to converge and no reason to gate it on the desktop starting.
+Description=Write the CDI specs that share this desktop's display and audio with client containers
+# Every host runs this, desktop up or not: the specs are the export
+# contract (paths + DISPLAY), not a report on the desktop's state, so
+# there is nothing to converge and no reason to gate them on the desktop
+# starting.
 #
 # Unlike the other converger oneshots, this one is NOT only for
 # desktop.service: on a kubernetes node the desktop runs as a pod from
 # charts/desktop-container and there is no quadlet at all, yet client pods
-# still resolve this spec (via the device plugin that advertises it).
+# still resolve these specs (via the device plugins that advertise them).
 # Hence the [Install] below (shipped pre-enabled as a
 # multi-user.target.wants symlink in this tree) in addition to
 # desktop.container's Wants=.
@@ -17,7 +18,7 @@ Before=crio.service kubelet.service k3s.service k3s-agent.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/libexec/desktop-display-cdi
+ExecStart=/usr/local/libexec/desktop-client-cdi
 
 [Install]
 WantedBy=multi-user.target

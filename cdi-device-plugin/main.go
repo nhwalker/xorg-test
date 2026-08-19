@@ -18,7 +18,7 @@
 //
 //	RESOURCE_NAME=desktop.local/display  CDI_DEVICE=desktop.local/display=all
 //	  -> pods requesting desktop.local/display get whatever
-//	     /etc/cdi/desktop.yaml says that device injects.
+//	     /etc/cdi/desktop-display.yaml says that device injects.
 //
 // One resource per process: kubelet's Register call takes a single
 // resource name, so serving N devices means running N of these. That
