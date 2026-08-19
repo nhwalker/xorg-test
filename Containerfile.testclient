@@ -32,5 +32,7 @@ RUN dnf -y install \
 # static binary in an image with no X client stack of its own can capture the
 # display using nothing but what desktop.local/display injects.
 COPY --from=localhost/screenshot:latest /screenshot /usr/local/bin/screenshot
+# The pattern painter the screenshot phase captures (ci/vm/testpattern-pod.yaml).
+COPY --from=localhost/screenshot:latest /testpattern /usr/local/bin/testpattern
 
 CMD ["sleep", "infinity"]

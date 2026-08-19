@@ -26,7 +26,13 @@ COPY screenshot/ .
 # CGO_ENABLED=0: the binary is injected into arbitrary client images (ubi9,
 # alpine, distroless), so it must not depend on a libc being present.
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /screenshot .
+# testpattern is a CI FIXTURE, not a product binary: it paints the known
+# pattern the e2e asserts captured pixels against. It rides in this image
+# because the image is a carrier that nothing runs in production, and the only
+# consumer (Containerfile.testclient) already copies from here.
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /testpattern ./testpattern
 
 FROM scratch
 COPY --from=build /screenshot /screenshot
+COPY --from=build /testpattern /testpattern
 ENTRYPOINT ["/screenshot"]

@@ -121,6 +121,32 @@ the binary captures a real Xorg on a real KMS display from inside a client pod
 that has no X client stack of its own and only the injected
 `desktop.local/display`.
 
+That phase checks the **pixels**, not just that a PNG appeared. Image size and a
+"not blank" test are invariant under every interesting way a capture can be
+wrong — flipped, mirrored, rotated, red/blue swapped or shifted images all have
+the same dimensions and the same grayscale standard deviation as a correct one.
+So `screenshot/testpattern` paints a known, deliberately asymmetric pattern
+(a different colour in each corner, a background whose three channels differ,
+1px fiducial lines, a block at un-round coordinates) into an override-redirect
+window covering the display, and `ci/vm/vm-e2e.sh` asserts:
+
+1. **Colour at coordinate** — each corner, either side of a block edge, and the
+   vertical fiducial on both the first and last row (a wrong scanline stride
+   drifts it down the image rather than failing outright).
+2. **Region origin** — each region capture must be byte-identical to the same
+   rectangle cropped out of the full capture. This pins the origin without any
+   pattern at all: under a position-dependent transform, cropping the
+   transformed full image does not equal the transform of the server-side
+   sub-rectangle.
+3. **Orientation against an independent capture** — QEMU's own screendump of
+   the same display, scored by margin against its flipped, mirrored and rotated
+   variants, so the upright match has to win by a wide margin. QEMU composites
+   the pointer cursor and `GetImage` does not, which is why this is a margin
+   test and not an equality one.
+
+Each of those assertions was verified to *fail* against a deliberately mutated
+capture; a check that cannot fail is not a check.
+
 ## Not implemented
 
 Cursor capture, per-output/RandR selection, window-by-title, interactive region

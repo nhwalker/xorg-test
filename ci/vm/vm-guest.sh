@@ -598,7 +598,8 @@ verify_testclient() {
 
 # png_size prints "WxH" from a PNG's IHDR header. Rocky has python3 (see the
 # audio checks below); the testclient image has no imagemagick, so the size is
-# read from the file rather than by asking a tool to decode it.
+# read from the file rather than by asking a tool to decode it. Pixel-level
+# assertions happen on the HOST, where imagemagick already lives (vm-e2e.sh).
 png_size() { # $1: png file
     python3 - "$1" <<'EOF'
 import struct, sys
@@ -620,26 +621,56 @@ shot_to() { # $1: local destination; $2: in-pod path; $3...: extra screenshot fl
     k3s kubectl exec x11-testclient -- cat "$remote" > "$dest" || return 1
 }
 
+# screenshot_pattern_start puts a known, asymmetric pattern on the display and
+# leaves it there. Everything the host asserts about captured PIXELS is
+# asserted against this pattern, so it must be up before anything is captured
+# and before the host's reference screendump is taken.
+#
+# It is a pod, not a backgrounded exec: the pattern has to outlive the command
+# that starts it, and X frees a client's windows the instant it disconnects.
+screenshot_pattern_start() {
+    log ss "paint the known test pattern over the display"
+    k3s kubectl apply -f ci/vm/testpattern-pod.yaml
+    wait_for 30 2 "testpattern pod running" \
+        sh -c "k3s kubectl get pod testpattern -o jsonpath='{.status.phase}' | grep -q Running"
+    # The painter prints this only after a round trip that the server has
+    # already processed, so it is a guarantee the pattern is on screen rather
+    # than a sleep pretending to be one.
+    wait_for 30 2 "test pattern painted" \
+        sh -c "k3s kubectl logs testpattern 2>/dev/null | grep -q painted"
+    k3s kubectl logs testpattern | sed 's/^/== vm-guest(ss): /'
+}
+
+# screenshot_pattern_stop takes the pattern down so later phases see the real
+# desktop again (verify_concurrency screendumps the display after this).
+screenshot_pattern_stop() {
+    log ss "remove the test pattern"
+    k3s kubectl delete pod testpattern --now --ignore-not-found
+}
+
 # verify_screenshot proves the whole point of the binary: an ordinary client
 # image, carrying no X client stack of its own and declaring no env or mounts,
-# captures the real Xorg display using only what desktop.local/display
-# injects. Everything here runs against a live X server on a real KMS display
-# - the fake-server unit tests cover the wire format, this covers reality.
+# captures the real Xorg display using only what desktop.local/display injects.
+#
+# This phase asserts sizes, exit codes and the CLI contract. It does NOT assert
+# pixels - it hands the captured PNGs back and vm-e2e.sh checks their contents
+# with imagemagick, which the runner has and this VM does not.
 verify_screenshot() {
     log ss "capture the live display from the lean client pod"
     wait_for 30 4 "testclient running" \
         sh -c "k3s kubectl get pod x11-testclient -o jsonpath='{.status.phase}' | grep -q Running"
 
-    # The size the real Xorg reports, read from the desktop container itself.
-    # Everything below is checked against this, not against a hardcoded size:
-    # the virtio display geometry is not ours to assume.
+    # The display size as the CLIENT POD sees it, through the very display the
+    # CDI device injected - not via the desktop, which by this phase is a
+    # kubernetes pod and has no podman container to exec into at all.
     local want
-    want=$(podman exec -u desktop -e DISPLAY=:0 desktop \
+    want=$(k3s kubectl exec x11-testclient -- \
         sh -c 'xdpyinfo | awk "/dimensions:/{print \$2; exit}"')
-    [ -n "$want" ] || fail "could not read the display size from xdpyinfo"
-    log ss "xdpyinfo reports $want"
+    [ -n "$want" ] || fail "could not read the display size from the client pod"
+    log ss "the client pod sees a $want display"
 
     rm -rf /tmp/screenshots && mkdir -p /tmp/screenshots
+    echo "$want" > /tmp/screenshots/geometry.txt
 
     # --to-stdout: the PNG must arrive on stdout with nothing else mixed in,
     # which is also how it gets out of the pod here.
@@ -659,13 +690,25 @@ verify_screenshot() {
     [ "$got" = "$want" ] || fail "file-mode captured $got, but the display is $want"
     log ss "file mode captured the full display at $got"
 
-    # A sub-region must come back at exactly the requested size - the region
-    # is a GetImage argument, so this is the protocol path, not a crop.
-    shot_to /tmp/screenshots/region.png /tmp/region.png -x 10 -y 20 -w 200 -h 100 \
-        || fail "region screenshot failed in the client pod"
-    got=$(png_size /tmp/screenshots/region.png) || fail "region output is not a PNG"
-    [ "$got" = 200x100 ] || fail "region screenshot is $got, want 200x100"
-    log ss "region -x 10 -y 20 -w 200 -h 100 captured at $got"
+    # Regions. Each is checked for size here and for CONTENT on the host: the
+    # host crops the same rectangle out of the full capture and requires the
+    # two to be identical, which is what pins the region's origin.
+    #   region   - a plain sub-rectangle
+    #   tl       - exactly the pattern's top-left block, so it must come back
+    #              a single flat colour
+    #   straddle - deliberately across that block's corner, so three of its
+    #              quadrants are background
+    #   odd      - an odd WIDTH, which is the case where a wrongly assumed
+    #              scanline stride starts shearing rows
+    local spec
+    for spec in "region 200 100 10 20" "tl 64 64 0 0" "straddle 8 8 60 60" "odd 199 40 290 0"; do
+        set -- $spec
+        shot_to "/tmp/screenshots/$1.png" "/tmp/$1.png" -x "$4" -y "$5" -w "$2" -h "$3" \
+            || fail "region capture '$1' failed in the client pod"
+        got=$(png_size "/tmp/screenshots/$1.png") || fail "region '$1' output is not a PNG"
+        [ "$got" = "${2}x${3}" ] || fail "region '$1' is $got, want ${2}x${3}"
+        log ss "region '$1' captured at $got"
+    done
 
     # -h is HEIGHT, not help. This is the published CLI contract and the one
     # flag decision a future change is most likely to get backwards, so it is
@@ -694,7 +737,7 @@ verify_screenshot() {
         || fail "the no-DISPLAY error does not name the CDI device that grants one: $out"
     log ss "no DISPLAY: exits 1 pointing at desktop.local/display"
 
-    log ss "screenshot verified from a client pod with only the injected display"
+    log ss "captured from a client pod with only the injected display; pixels checked on the host"
 }
 
 input_sink_start() {
@@ -899,6 +942,8 @@ case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verif
     verify-split) verify_split ;;
     verify-testclient) verify_testclient ;;
     verify-screenshot) verify_screenshot ;;
+    screenshot-pattern-start) screenshot_pattern_start ;;
+    screenshot-pattern-stop) screenshot_pattern_stop ;;
     verify-record) verify_record ;;
     verify-concurrency) verify_concurrency ;;
     verify-teardown) verify_teardown ;;

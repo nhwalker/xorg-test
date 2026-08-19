@@ -82,7 +82,8 @@ jobs:
             | ./kubeconform -strict -summary
           ./kubeconform -strict -summary \
             examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml \
-            ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml
+            ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml \
+            ci/vm/testpattern-pod.yaml
 
   build-smoke:
     runs-on: ubuntu-latest
