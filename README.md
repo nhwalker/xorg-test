@@ -24,6 +24,11 @@ Containerfile               APPLICATION layer: config/services on the base (offl
 Containerfile.plugin[.base] cdi-device-plugin image (same base/app offline split)
 cdi-device-plugin/          generic CDI device plugin: one CDI device -> one k8s
                             resource; reusable on its own, see its README
+Containerfile.screenshot[.base]
+                            screenshot image (same base/app offline split)
+screenshot/                 static X11 screen-capture binary for client
+                            containers; the stable CLI the Wayland move hides
+                            behind, see its README
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
 deploy/                     declarative deployment: the same host end state as

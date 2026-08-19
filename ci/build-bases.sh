@@ -33,3 +33,5 @@ ensure_base() {
 ensure_base desktop-container-base Containerfile.base image/rocky9.repo
 ensure_base cdi-device-plugin-base Containerfile.plugin.base \
     cdi-device-plugin/go.mod cdi-device-plugin/go.sum
+ensure_base screenshot-base Containerfile.screenshot.base \
+    screenshot/go.mod screenshot/go.sum

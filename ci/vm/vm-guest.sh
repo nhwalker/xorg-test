@@ -596,6 +596,107 @@ verify_testclient() {
     log tc "lean client opened the display with only injected env"
 }
 
+# png_size prints "WxH" from a PNG's IHDR header. Rocky has python3 (see the
+# audio checks below); the testclient image has no imagemagick, so the size is
+# read from the file rather than by asking a tool to decode it.
+png_size() { # $1: png file
+    python3 - "$1" <<'EOF'
+import struct, sys
+data = open(sys.argv[1], "rb").read(24)
+if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+    sys.exit("not a PNG (%d bytes read)" % len(data))
+w, h = struct.unpack(">II", data[16:24])
+print("%dx%d" % (w, h))
+EOF
+}
+
+# shot_to runs the screenshot binary in the lean client pod and streams the
+# resulting file back out. `kubectl cp` would need tar in the image; `cat`
+# needs nothing, and exec without -t leaves the bytes alone.
+shot_to() { # $1: local destination; $2: in-pod path; $3...: extra screenshot flags
+    local dest="$1" remote="$2"
+    shift 2
+    k3s kubectl exec x11-testclient -- screenshot "$@" "$remote" || return 1
+    k3s kubectl exec x11-testclient -- cat "$remote" > "$dest" || return 1
+}
+
+# verify_screenshot proves the whole point of the binary: an ordinary client
+# image, carrying no X client stack of its own and declaring no env or mounts,
+# captures the real Xorg display using only what desktop.local/display
+# injects. Everything here runs against a live X server on a real KMS display
+# - the fake-server unit tests cover the wire format, this covers reality.
+verify_screenshot() {
+    log ss "capture the live display from the lean client pod"
+    wait_for 30 4 "testclient running" \
+        sh -c "k3s kubectl get pod x11-testclient -o jsonpath='{.status.phase}' | grep -q Running"
+
+    # The size the real Xorg reports, read from the desktop container itself.
+    # Everything below is checked against this, not against a hardcoded size:
+    # the virtio display geometry is not ours to assume.
+    local want
+    want=$(podman exec -u desktop -e DISPLAY=:0 desktop \
+        sh -c 'xdpyinfo | awk "/dimensions:/{print \$2; exit}"')
+    [ -n "$want" ] || fail "could not read the display size from xdpyinfo"
+    log ss "xdpyinfo reports $want"
+
+    rm -rf /tmp/screenshots && mkdir -p /tmp/screenshots
+
+    # --to-stdout: the PNG must arrive on stdout with nothing else mixed in,
+    # which is also how it gets out of the pod here.
+    k3s kubectl exec x11-testclient -- screenshot --to-stdout \
+        > /tmp/screenshots/full-stdout.png \
+        || fail "screenshot --to-stdout failed in the client pod"
+    local got
+    got=$(png_size /tmp/screenshots/full-stdout.png) \
+        || fail "screenshot --to-stdout did not produce a PNG"
+    [ "$got" = "$want" ] || fail "--to-stdout captured $got, but the display is $want"
+    log ss "--to-stdout captured the full display at $got"
+
+    # File mode must agree with stdout mode.
+    shot_to /tmp/screenshots/full.png /tmp/full.png \
+        || fail "screenshot to a file failed in the client pod"
+    got=$(png_size /tmp/screenshots/full.png) || fail "file-mode output is not a PNG"
+    [ "$got" = "$want" ] || fail "file-mode captured $got, but the display is $want"
+    log ss "file mode captured the full display at $got"
+
+    # A sub-region must come back at exactly the requested size - the region
+    # is a GetImage argument, so this is the protocol path, not a crop.
+    shot_to /tmp/screenshots/region.png /tmp/region.png -x 10 -y 20 -w 200 -h 100 \
+        || fail "region screenshot failed in the client pod"
+    got=$(png_size /tmp/screenshots/region.png) || fail "region output is not a PNG"
+    [ "$got" = 200x100 ] || fail "region screenshot is $got, want 200x100"
+    log ss "region -x 10 -y 20 -w 200 -h 100 captured at $got"
+
+    # -h is HEIGHT, not help. This is the published CLI contract and the one
+    # flag decision a future change is most likely to get backwards, so it is
+    # asserted against the real binary and not only in the Go tests.
+    shot_to /tmp/screenshots/hw.png /tmp/hw.png -w 160 -h 120 \
+        || fail "-w/-h screenshot failed (is -h being parsed as --help?)"
+    got=$(png_size /tmp/screenshots/hw.png) || fail "-w/-h output is not a PNG"
+    [ "$got" = 160x120 ] || fail "-w 160 -h 120 produced $got, want 160x120"
+    log ss "-h is height: -w 160 -h 120 captured at $got"
+
+    # An out-of-bounds region is refused, not clamped, and says what the
+    # screen actually is. Exit 2 is the usage-error contract.
+    local out rc=0
+    out=$(k3s kubectl exec x11-testclient -- screenshot -w 99999 /tmp/bad.png 2>&1) || rc=$?
+    [ "$rc" = 2 ] || fail "an oversized region exited $rc, want 2 (usage error)"
+    grep -q "$want" <<<"$out" \
+        || fail "the oversized-region error does not name the real screen size ($want): $out"
+    log ss "oversized region refused with exit 2 naming $want"
+
+    # No display granted: the binary must fail cleanly and point at the CDI
+    # device, which is the error a mis-specified client pod actually hits.
+    rc=0
+    out=$(k3s kubectl exec x11-testclient -- env -u DISPLAY screenshot /tmp/nodisplay.png 2>&1) || rc=$?
+    [ "$rc" = 1 ] || fail "screenshot without DISPLAY exited $rc, want 1 (runtime failure)"
+    grep -q 'desktop.local/display' <<<"$out" \
+        || fail "the no-DISPLAY error does not name the CDI device that grants one: $out"
+    log ss "no DISPLAY: exits 1 pointing at desktop.local/display"
+
+    log ss "screenshot verified from a client pod with only the injected display"
+}
+
 input_sink_start() {
     # A sink xterm reads one line and records it. Geometry must match the
     # click coordinate the host computes (100x30 at +250+200 -> centre ~550,395).
@@ -797,6 +898,7 @@ case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verif
     verify-cdi) verify_cdi ;;
     verify-split) verify_split ;;
     verify-testclient) verify_testclient ;;
+    verify-screenshot) verify_screenshot ;;
     verify-record) verify_record ;;
     verify-concurrency) verify_concurrency ;;
     verify-teardown) verify_teardown ;;

@@ -223,6 +223,26 @@ for path in pulse pipewire alsa; do
         || fail "lean client $path audio capture is empty or silent"
 done
 
+log "screenshot: the injected binary captures the live display from a client pod"
+# The lean client image carries the screenshot binary and no other X client
+# stack; the display it captures can only come from desktop.local/display.
+# Assertions (sizes, exit codes, the -h-is-height contract) run in the guest;
+# here we pull the captured PNGs out as artifacts and check the full-desktop
+# one for real content with the SAME analysis applied to QEMU's own
+# screendumps - so "the binary produced a PNG" cannot pass for "the binary
+# produced the screen".
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-screenshot' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient; echo ---; sudo cat /etc/cdi/desktop-display.yaml' \
+         > "$ART/screenshot-fail.log" 2>&1 || true; fail "screenshot capture check failed"; }
+vm_ssh 'sudo tar -C /tmp/screenshots -cf - .' | tar -C "$ART" -xf - \
+    || fail "could not retrieve the captured screenshots from the VM"
+for f in full full-stdout region hw; do
+    [ -s "$ART/$f.png" ] || fail "screenshot artifact $f.png was not retrieved"
+    mv "$ART/$f.png" "$ART/screenshot-$f.png"
+done
+assert_nonblank screenshot-full
+assert_nonblank screenshot-full-stdout
+
 log "cdi: concurrent clients share one display"
 # Three requesting pods open the display, and two of them re-open it while
 # the third holds a connection. Proves the shareable-device concurrency the
