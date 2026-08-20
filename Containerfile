@@ -10,15 +10,20 @@
 # published to clients at boot. Build Containerfile.screenshot first.
 # Run via quadlet/desktop.container or charts/ (see install.sh / README.md).
 
+# BOTH args must sit here, above the FIRST FROM. An ARG declared before any
+# FROM is global and usable in every FROM line; one declared after a FROM
+# belongs to that stage alone. Putting BASE_IMAGE between the two FROMs below
+# scopes it to the tools stage, leaving `FROM ${BASE_IMAGE}` empty and the
+# build dying with "no FROM statement found".
+ARG BASE_IMAGE=localhost/desktop-container-base:latest
 # Image carrying the client tools staged into this one; see "client tools".
-# A named stage, not `COPY --from=${TOOLS_IMAGE}` directly: an ARG declared
-# before the first FROM is in scope for FROM instructions only, and is empty
-# inside a build stage unless re-declared. Naming the stage sidesteps that
-# entirely.
 ARG TOOLS_IMAGE=localhost/screenshot:latest
+
+# A named stage rather than `COPY --from=${TOOLS_IMAGE}` further down: global
+# ARGs are in scope for FROM instructions but NOT inside a build stage, so the
+# variable would be empty there. Referring to the stage by name sidesteps it.
 FROM ${TOOLS_IMAGE} AS tools
 
-ARG BASE_IMAGE=localhost/desktop-container-base:latest
 FROM ${BASE_IMAGE}
 
 # --- Xorg -------------------------------------------------------------------
