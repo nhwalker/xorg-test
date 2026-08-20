@@ -48,37 +48,15 @@ if grep -q DISPLAY= /etc/cdi/desktop-audio.yaml; then
     fail "audio spec carries DISPLAY: the split leaks"
 fi
 
-log "the tools device is NOT advertised on a host that never ran the desktop"
-# The whole point of gating desktop-tools-cdi on a populated toolkit: this
-# runner installs the host side but never starts the desktop, so nothing has
-# published any binaries. Advertising desktop.local/tools here would hand
-# clients an empty directory and a "command not found" deep inside whatever
-# they were trying to run; withholding it makes them fail to schedule (k8s) or
-# fail to create (podman) with the reason right there.
-if [ -e /etc/cdi/desktop-tools.yaml ]; then
-    fail "desktop-tools.yaml exists although the desktop never published a toolkit"
-fi
-if podman run --rm --device desktop.local/tools=all localhost/desktop-container:latest true 2>/dev/null; then
-    fail "podman resolved desktop.local/tools although the device was never advertised"
-fi
-log "unprovisioned host: desktop.local/tools correctly unresolvable"
+log "install.sh created the toolkit dir the quadlet bind-mounts"
+# desktop.service cannot even be created without this: podman refuses a mount
+# whose source is missing. install.sh writes its own tmpfiles list, separate
+# from the deploy tree's, so this is exactly where the two flows drift.
+[ -d /var/lib/desktop-container/bin ] \
+    || fail "install.sh did not create /var/lib/desktop-container/bin (tmpfiles drift vs the deploy tree)"
+mode=$(stat -c %a /var/lib/desktop-container/bin)
+[ "$mode" = 755 ] || fail "toolkit dir is mode $mode, want 755 (never 1777 - it holds executables)"
 
-log "the watcher unit is installed and armed"
-systemctl is-enabled --quiet desktop-tools-cdi.path \
-    || fail "desktop-tools-cdi.path not enabled by install.sh"
-# Simulate what the desktop container does at startup, and confirm the .path
-# unit converts that into an advertised device without anything else running.
-install -d -m0755 /var/lib/desktop-container/bin
-install -m0755 /bin/true /var/lib/desktop-container/bin/screenshot
-for _ in $(seq 20); do
-    [ -e /etc/cdi/desktop-tools.yaml ] && break
-    sleep 0.5
-done
-grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
-    || fail "publishing a tool did not make desktop-tools-cdi.path write the spec"
-grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' /etc/cdi/desktop-tools.yaml \
-    || fail "the tools spec does not inject DESKTOP_TOOLS_BIN"
-log "publishing a tool advertised desktop.local/tools via the .path unit"
 
 log "wait for the container to answer"
 for _ in $(seq 20); do
@@ -110,6 +88,42 @@ case "$failed" in
     ""|"desktop-session.service ") ;;
     *) fail "unexpected failed units: $failed" ;;
 esac
+
+log "the desktop published its toolkit and the .path unit advertised it"
+# The container is up, so desktop-tools-publish.service has run (a failure
+# would already have been caught by the failed-units check above - it is
+# deliberately not "-" prefixed). That fills the host directory, which
+# desktop-tools-cdi.path watches, which writes the spec. Nothing here is
+# simulated: this is the real chain on a real container.
+#
+# Note the negative case - an unprovisioned host must NOT advertise the
+# device - cannot be tested in this flow, because install.sh starts the
+# desktop. ci/smoke-deploy.sh asserts it before starting the service.
+[ "$(systemctl is-enabled desktop-tools-cdi.path)" = enabled ] \
+    || fail "desktop-tools-cdi.path not enabled by install.sh"
+for _ in $(seq 30); do
+    [ -e /etc/cdi/desktop-tools.yaml ] && break
+    sleep 1
+done
+[ -s /var/lib/desktop-container/bin/screenshot ] \
+    || fail "the desktop did not publish screenshot into /var/lib/desktop-container/bin"
+[ "$(stat -c %a /var/lib/desktop-container/bin/screenshot)" = 755 ] \
+    || fail "published screenshot is not mode 755"
+grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
+    || fail "desktop-tools-cdi.path did not write the spec after the desktop published"
+grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' /etc/cdi/desktop-tools.yaml \
+    || fail "the tools spec does not inject DESKTOP_TOOLS_BIN"
+
+# A client resolves the device and runs the injected binary. No `| head`
+# inside the container: under pipefail an early-exiting consumer SIGPIPEs the
+# producer, which this repo has been bitten by before.
+out=$(podman run --rm --device desktop.local/tools=all \
+    localhost/desktop-container:latest \
+    sh -c 'printenv DESKTOP_TOOLS_BIN; "$DESKTOP_TOOLS_BIN"/screenshot --help' 2>&1) \
+    || fail "a client requesting desktop.local/tools could not run the injected binary: $out"
+grep -q '/opt/desktop-tools/bin' <<<"$out" || fail "client did not receive DESKTOP_TOOLS_BIN: $out"
+grep -qi 'usage' <<<"$out" || fail "the injected screenshot binary did not run: $out"
+log "a client resolved desktop.local/tools and ran the injected binary"
 
 log "session plumbing: X serves, or the postmortem explains why not"
 plumbing=""

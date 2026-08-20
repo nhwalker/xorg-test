@@ -257,10 +257,21 @@ EOF
 systemctl try-restart systemd-logind || warn "could not restart systemd-logind; changes apply after reboot"
 
 # --- 4. Shared dirs (audio sockets, X socket) --------------------------------
+# Keep in sync with deploy/host/etc/tmpfiles.d/desktop-container.conf, which
+# is the same set minus the deploy-only Host Terminal entries (those reference
+# the sysusers-created desktop-shell account, which this flow does not make).
+# The toolkit dir must exist before desktop.service starts: the quadlet
+# bind-mounts it, and podman refuses to create a container whose mount source
+# is missing ("statfs ...: no such file or directory").
 cat > "$TMPFILES_CONF" <<'EOF'
 # Installed by desktop-container install.sh.
 d /run/desktop-audio 1777 root root -
 d /tmp/.X11-unix 1777 root root -
+# 0755, NOT 1777 like the socket dirs above: this one holds executables that
+# get mounted into every client, so world-writable would let anything on the
+# host control code running in all of them. See the deploy tree's copy.
+d /var/lib/desktop-container 0755 root root -
+d /var/lib/desktop-container/bin 0755 root root -
 EOF
 systemd-tmpfiles --create "$TMPFILES_CONF"
 
