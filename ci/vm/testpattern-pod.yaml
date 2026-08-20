@@ -1,0 +1,25 @@
+# Test-only fixture: paints a known, asymmetric pattern over the whole display
+# and holds it there while the screenshot phase captures it.
+#
+# It runs as its own pod rather than a backgrounded `kubectl exec` so its
+# lifetime is managed (the pattern must outlive the command that starts it, and
+# X frees a client's windows the moment it disconnects). Requesting
+# desktop.local/display is how it reaches the display at all - it declares no
+# env and no mounts of its own, exactly like every other client here.
+#
+# The pattern's geometry and colours are defined in screenshot/testpattern and
+# asserted in ci/vm/vm-e2e.sh; see those for what the pixels mean.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: testpattern
+spec:
+  restartPolicy: Never
+  containers:
+    - name: painter
+      image: localhost/desktop-testclient:latest
+      imagePullPolicy: Never
+      command: ["testpattern", "--hold", "600s"]
+      resources:
+        limits:
+          desktop.local/display: 1

@@ -19,9 +19,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: cdi-device-plugin/go.mod
-          cache-dependency-path: cdi-device-plugin/go.sum
-      - name: go fmt/vet/test
+          cache-dependency-path: |
+            cdi-device-plugin/go.sum
+            screenshot/go.sum
+      # Both modules pin the same go/toolchain directives, so one setup-go
+      # serves them; if they ever diverge this needs a second setup step.
+      - name: go fmt/vet/test (cdi-device-plugin)
         working-directory: cdi-device-plugin
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: go fmt/vet/test (screenshot)
+        working-directory: screenshot
         run: |
           test -z "$(gofmt -l .)"
           go vet ./...
@@ -72,7 +82,8 @@ jobs:
             | ./kubeconform -strict -summary
           ./kubeconform -strict -summary \
             examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml \
-            ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml
+            ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml \
+            ci/vm/testpattern-pod.yaml
 
   build-smoke:
     runs-on: ubuntu-latest
@@ -90,6 +101,7 @@ jobs:
         run: |
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
       - name: deploy tree quadlet dry-run + CDI spec checks
         # Validate the declarative deploy/ tree: the quadlet generator must
         # accept the unit, and everything must land in the generated service

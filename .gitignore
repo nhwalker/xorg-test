@@ -1,4 +1,5 @@
 cdi-device-plugin/cdi-device-plugin
+screenshot/screenshot
 ci/vm/images-*.tar
 ci/vm/*.qcow2
 __pycache__/

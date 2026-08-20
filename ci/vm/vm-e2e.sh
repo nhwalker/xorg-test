@@ -54,6 +54,138 @@ assert_nonblank() { # $1: screendump basename (as passed to screendump)
         || fail "screendump $1 is blank/near-uniform (grayscale stddev=$sd); X is up but rendering nothing"
     log "render: $1 is non-blank (grayscale stddev=$sd)"
 }
+# --- screenshot pixel assertions ------------------------------------------
+# The screenshot phase paints a known pattern (screenshot/testpattern) and then
+# checks what the binary captured against it. Size and "not blank" are NOT
+# enough on their own: a vertically flipped, horizontally mirrored, rotated,
+# channel-swapped or offset capture has exactly the same dimensions and the
+# same grayscale standard deviation as a correct one. These assertions name a
+# colour at a coordinate, so each of those defects fails a specific line.
+#
+# The pattern's geometry, repeated from screenshot/testpattern/main.go - keep
+# the two in sync.
+PAT_BLOCK=64
+PAT_FIDX=300
+PAT_FIDY=200
+PAT_ODDX=37
+PAT_ODDY=91
+
+# px prints "r,g,b" for one pixel. The %[pixel:] format is NOT usable here: it
+# returns colour names for some values ("gray(0)" for black), so comparisons
+# against it silently depend on which colour you picked.
+px() { # $1: image; $2: x; $3: y
+    convert "$1" -crop "1x1+$2+$3" +repage -depth 8 \
+        -format '%[fx:int(255*r+0.5)],%[fx:int(255*g+0.5)],%[fx:int(255*b+0.5)]' info:
+}
+assert_px() { # $1: image; $2: x; $3: y; $4: expected "r,g,b"; $5: what this proves
+    local got
+    got=$(px "$1" "$2" "$3") || fail "could not read pixel ($2,$3) of $1"
+    [ "$got" = "$4" ] || fail "$5: pixel ($2,$3) of $(basename "$1") is $got, want $4"
+}
+
+# assert_pattern checks a full-screen capture against the painted pattern.
+assert_pattern() { # $1: image; $2: width; $3: height
+    local f="$1" w="$2" h="$3" right=$(( $2 - 3 )) bottom=$(( $3 - 3 ))
+    # Orientation: a different colour in each corner, so a flip, a mirror or a
+    # 180-degree rotation each permutes them in its own recognisable way.
+    assert_px "$f" 2 2 255,0,0 "top-left corner (vertical flip / mirror / rotation)"
+    assert_px "$f" "$right" 2 0,255,0 "top-right corner (horizontal mirror)"
+    assert_px "$f" 2 "$bottom" 0,0,255 "bottom-left corner (vertical flip)"
+    assert_px "$f" "$right" "$bottom" 255,255,255 "bottom-right corner (180-degree rotation)"
+    # Channel order: the background's three channels differ, so a red/blue
+    # swap reads back as 96,64,32.
+    assert_px "$f" $((w/2)) $((h/2)) 32,64,96 "background colour (red/blue channel swap)"
+    # Off-by-one: the two pixels either side of a block edge.
+    assert_px "$f" $((PAT_BLOCK-1)) 2 255,0,0 "last column inside the top-left block (off-by-one)"
+    assert_px "$f" "$PAT_BLOCK" 2 32,64,96 "first column outside the top-left block (off-by-one)"
+    # Shear: the 1px vertical fiducial must sit at the same x on the first row
+    # and the last row. A wrongly assumed scanline stride drifts it down the
+    # image instead of failing outright.
+    assert_px "$f" "$PAT_FIDX" 0 255,255,0 "vertical fiducial on the first row"
+    assert_px "$f" "$PAT_FIDX" $((h-1)) 255,255,0 "vertical fiducial on the last row (shear)"
+    assert_px "$f" $((PAT_FIDX-1)) 0 32,64,96 "left of the vertical fiducial"
+    assert_px "$f" $((PAT_FIDX+1)) $((h-1)) 32,64,96 "right of the vertical fiducial"
+    # The horizontal fiducial, and a block at deliberately un-round coordinates.
+    assert_px "$f" $((w/2)) "$PAT_FIDY" 255,0,255 "horizontal fiducial"
+    assert_px "$f" $((PAT_ODDX+2)) $((PAT_ODDY+2)) 0,255,255 "block at un-round coordinates"
+    assert_px "$f" $((PAT_ODDX-1)) $((PAT_ODDY+2)) 32,64,96 "left of the un-round block"
+    log "pixels: $(basename "$f") matches the painted pattern in colour and position"
+}
+
+# assert_same crops the region out of the full capture and requires the region
+# capture to be identical to it.
+#
+# This pins the region's ORIGIN without needing any pattern at all: if the
+# decoder applied any position-dependent transform, cropping the transformed
+# full image would not equal the transform of the server-side sub-rectangle.
+# (It says nothing about channel swaps, which are position-independent.)
+assert_same() { # $1: full capture; $2: region capture; $3: WxH+X+Y
+    local diff
+    convert "$1" -crop "$3" +repage "$ART/.crop.png" \
+        || fail "could not crop $3 out of $(basename "$1")"
+    diff=$(compare -metric AE "$ART/.crop.png" "$2" null: 2>&1) \
+        || true   # compare exits non-zero whenever the images differ at all
+    [ "$diff" = 0 ] \
+        || fail "region $(basename "$2") differs from the same crop of the full capture in $diff pixel(s): the region origin is wrong"
+    rm -f "$ART/.crop.png"
+    log "region: $(basename "$2") is exactly $3 of the full capture"
+}
+
+# assert_orientation_vs_reference cross-checks the capture against QEMU's own
+# screendump of the same display - a completely independent capture path (the
+# emulator reading its framebuffer vs. our X11 GetImage).
+#
+# Scored by margin, not by an absolute threshold: QEMU composites the pointer
+# cursor, which GetImage never returns, so the identity comparison is close to
+# but not exactly zero. What must hold is that it beats every flipped, mirrored
+# and rotated variant by a wide margin.
+assert_orientation_vs_reference() { # $1: capture; $2: reference screendump basename
+    local ref="$ART/$2.png"
+    [ -s "$ref" ] || ref="$ART/$2.ppm"
+    [ -s "$ref" ] || { log "WARNING: no reference screendump $2; skipping the cross-check"; return 0; }
+    local cap_geom ref_geom
+    cap_geom=$(identify -format '%wx%h' "$1") || fail "could not read the size of $1"
+    ref_geom=$(identify -format '%wx%h' "$ref") || fail "could not read the size of $ref"
+    if [ "$cap_geom" != "$ref_geom" ]; then
+        log "WARNING: capture is $cap_geom but the reference screendump is $ref_geom; skipping the cross-check"
+        return 0
+    fi
+    local s0 s1 s2 s3
+    s0=$(rmse "$1" "$ref" "")           || fail "could not score the capture against the reference screendump"
+    s1=$(rmse "$1" "$ref" "-flip")      || fail "could not score the capture against the flipped screendump"
+    s2=$(rmse "$1" "$ref" "-flop")      || fail "could not score the capture against the mirrored screendump"
+    s3=$(rmse "$1" "$ref" "-rotate 180") || fail "could not score the capture against the rotated screendump"
+    rm -f "$ART/.ref.png"
+    awk -v s0="$s0" -v s1="$s1" -v s2="$s2" -v s3="$s3" '
+        BEGIN {
+            worst = s1; if (s2 < worst) worst = s2; if (s3 < worst) worst = s3;
+            printf "identity=%.6f flipped=%.6f mirrored=%.6f rotated=%.6f\n", s0, s1, s2, s3;
+            exit !(s0 < 0.25 * worst);
+        }' \
+        || fail "the capture matches a flipped/mirrored/rotated QEMU screendump about as well as the upright one: it is not oriented like the real screen"
+    log "orientation: the capture matches QEMU's own screendump far better than any flipped variant"
+}
+
+# rmse scores two images, optionally transforming the second first, and prints
+# the normalised 0..1 distance.
+#
+# `compare` exits NON-ZERO whenever the images differ at all, which is the
+# normal case here - the cursor alone guarantees it - so its status must be
+# discarded explicitly. Under this script's `set -e`, letting it escape makes
+# `s=$(rmse ...)` abort the whole run with no message at all.
+rmse() { # $1: image; $2: reference; $3: imagemagick transform for the reference
+    local ref="$2" out score
+    if [ -n "$3" ]; then
+        # shellcheck disable=SC2086
+        convert "$2" $3 "$ART/.ref.png" || { echo "rmse: could not transform the reference" >&2; return 1; }
+        ref="$ART/.ref.png"
+    fi
+    out=$(compare -metric RMSE "$1" "$ref" null: 2>&1 || true)
+    score=$(sed -n 's/.*(\([0-9.]*\)).*/\1/p' <<<"$out")
+    [ -n "$score" ] || { echo "rmse: could not read a score from: $out" >&2; return 1; }
+    printf '%s\n' "$score"
+}
+
 # Audio analogue of screendump: wavcapture taps the guest's HDA output
 # into a WAV in the artifacts dir. Each start/stop cycle occupies capture
 # index 0 (verified: the index is a list position, freed by stopcapture).
@@ -222,6 +354,60 @@ for path in pulse pipewire alsa; do
     python3 check-audio.py "$ART/audio-testclient-$path.wav" 1 0.05 "$(freq_for "$path")" \
         || fail "lean client $path audio capture is empty or silent"
 done
+
+log "screenshot: the injected binary captures the live display from a client pod"
+# The lean client image carries the screenshot binary and no other X client
+# stack, so the display it captures can only come from desktop.local/display.
+#
+# A known pattern goes up first and everything below is checked against it.
+# Size and "not blank" alone would pass a capture that is upside down,
+# mirrored, red/blue swapped or shifted; the pattern is what turns this from
+# "it produced a PNG" into "it produced THE SCREEN".
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh screenshot-pattern-start' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod testpattern; echo ---; sudo /usr/local/bin/k3s kubectl logs testpattern' \
+         > "$ART/screenshot-pattern-fail.log" 2>&1 || true; fail "could not paint the test pattern"; }
+# QEMU's own view of the same display, taken while the pattern is up: an
+# independent capture path to cross-check orientation against.
+screendump screenshot-reference
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-screenshot' \
+    || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient; echo ---; sudo cat /etc/cdi/desktop-display.yaml' \
+         > "$ART/screenshot-fail.log" 2>&1 || true; fail "screenshot capture check failed"; }
+vm_ssh 'sudo tar -C /tmp/screenshots -cf - .' | tar -C "$ART" -xf - \
+    || fail "could not retrieve the captured screenshots from the VM"
+# Down again before the concurrency phase screendumps the display.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh screenshot-pattern-stop' || true
+
+for f in full full-stdout region tl straddle odd hw; do
+    [ -s "$ART/$f.png" ] || fail "screenshot artifact $f.png was not retrieved"
+    mv "$ART/$f.png" "$ART/screenshot-$f.png"
+done
+SS_GEOM=$(cat "$ART/geometry.txt")
+rm -f "$ART/geometry.txt"
+SS_W=${SS_GEOM%x*}
+SS_H=${SS_GEOM#*x}
+[ "$(identify -format '%wx%h' "$ART/screenshot-full.png")" = "$SS_GEOM" ] \
+    || fail "the full capture is not the $SS_GEOM the client pod reported"
+
+# 1. the capture shows the pattern, in the right colours at the right places
+assert_pattern "$ART/screenshot-full.png" "$SS_W" "$SS_H"
+# 2. stdout mode and file mode are the same bytes for the same static screen
+[ "$(compare -metric AE "$ART/screenshot-full.png" "$ART/screenshot-full-stdout.png" null: 2>&1 || true)" = 0 ] \
+    || fail "--to-stdout and file mode produced different images of the same static screen"
+# 3. every region is exactly the corresponding crop of the full capture
+assert_same "$ART/screenshot-full.png" "$ART/screenshot-region.png"   200x100+10+20
+assert_same "$ART/screenshot-full.png" "$ART/screenshot-tl.png"       64x64+0+0
+assert_same "$ART/screenshot-full.png" "$ART/screenshot-straddle.png" 8x8+60+60
+assert_same "$ART/screenshot-full.png" "$ART/screenshot-odd.png"      199x40+290+0
+assert_same "$ART/screenshot-full.png" "$ART/screenshot-hw.png"       160x120+0+0
+# 4. the top-left region lands exactly on the pattern's flat red block, so a
+#    region origin off by even one pixel shows up as a second colour
+[ "$(identify -format '%k' "$ART/screenshot-tl.png")" = 1 ] \
+    || fail "the 64x64+0+0 region is not a single flat colour: its origin is off"
+assert_px "$ART/screenshot-tl.png" 0 0 255,0,0 "top-left region origin"
+assert_px "$ART/screenshot-tl.png" 63 63 255,0,0 "top-left region far corner"
+# 5. cross-check orientation against QEMU's own framebuffer dump
+assert_orientation_vs_reference "$ART/screenshot-full.png" screenshot-reference
+assert_nonblank screenshot-full
 
 log "cdi: concurrent clients share one display"
 # Three requesting pods open the display, and two of them re-open it while

@@ -24,4 +24,15 @@ RUN dnf -y install \
         alsa-utils \
     && dnf clean all
 
+# The screenshot binary, baked in from its own scratch image.
+#
+# This is a CI FIXTURE, not the shipped delivery path: how the binary reaches
+# a host path for the CDI specs to mount is a separate, still-open decision.
+# Baking it in lets the e2e prove the part that matters either way - that a
+# static binary in an image with no X client stack of its own can capture the
+# display using nothing but what desktop.local/display injects.
+COPY --from=localhost/screenshot:latest /screenshot /usr/local/bin/screenshot
+# The pattern painter the screenshot phase captures (ci/vm/testpattern-pod.yaml).
+COPY --from=localhost/screenshot:latest /testpattern /usr/local/bin/testpattern
+
 CMD ["sleep", "infinity"]

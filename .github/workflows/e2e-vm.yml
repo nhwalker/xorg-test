@@ -59,8 +59,11 @@ jobs:
           sudo -E ci/build-bases.sh
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
           # Lean non-desktop client fixture (networked build; CI-only, not a
-          # product artifact, so the offline rule does not apply to it).
+          # product artifact, so the offline rule does not apply to it). Must
+          # come AFTER the screenshot build: it pulls the binary out of that
+          # image with COPY --from.
           sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
           # One archive per image: podman-save's docker-archive format
           # silently collapses multiple images into the FIRST one with all
