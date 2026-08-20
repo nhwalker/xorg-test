@@ -48,6 +48,38 @@ if grep -q DISPLAY= /etc/cdi/desktop-audio.yaml; then
     fail "audio spec carries DISPLAY: the split leaks"
 fi
 
+log "the tools device is NOT advertised on a host that never ran the desktop"
+# The whole point of gating desktop-tools-cdi on a populated toolkit: this
+# runner installs the host side but never starts the desktop, so nothing has
+# published any binaries. Advertising desktop.local/tools here would hand
+# clients an empty directory and a "command not found" deep inside whatever
+# they were trying to run; withholding it makes them fail to schedule (k8s) or
+# fail to create (podman) with the reason right there.
+if [ -e /etc/cdi/desktop-tools.yaml ]; then
+    fail "desktop-tools.yaml exists although the desktop never published a toolkit"
+fi
+if podman run --rm --device desktop.local/tools=all localhost/desktop-container:latest true 2>/dev/null; then
+    fail "podman resolved desktop.local/tools although the device was never advertised"
+fi
+log "unprovisioned host: desktop.local/tools correctly unresolvable"
+
+log "the watcher unit is installed and armed"
+systemctl is-enabled --quiet desktop-tools-cdi.path \
+    || fail "desktop-tools-cdi.path not enabled by install.sh"
+# Simulate what the desktop container does at startup, and confirm the .path
+# unit converts that into an advertised device without anything else running.
+install -d -m0755 /var/lib/desktop-container/bin
+install -m0755 /bin/true /var/lib/desktop-container/bin/screenshot
+for _ in $(seq 20); do
+    [ -e /etc/cdi/desktop-tools.yaml ] && break
+    sleep 0.5
+done
+grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
+    || fail "publishing a tool did not make desktop-tools-cdi.path write the spec"
+grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' /etc/cdi/desktop-tools.yaml \
+    || fail "the tools spec does not inject DESKTOP_TOOLS_BIN"
+log "publishing a tool advertised desktop.local/tools via the .path unit"
+
 log "wait for the container to answer"
 for _ in $(seq 20); do
     podman exec desktop true 2>/dev/null && break
@@ -181,9 +213,14 @@ fi
 if grep -q desktop-container-host-shell "/home/$SMOKE_USER/.ssh/authorized_keys" 2>/dev/null; then
     fail "authorized_keys entry not removed"
 fi
+# The published toolkit lives on disk, not in /run, so nothing clears it at
+# reboot: uninstall has to, or binaries outlive the image that produced them.
+if [ -e /var/lib/desktop-container/bin ]; then
+    fail "published toolkit not removed by --uninstall"
+fi
 # The client specs are generated, never hand-written, so uninstall owns
 # them outright (unlike /etc/cdi/nvidia.yaml, which the toolkit may also own).
-for spec in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml; do
+for spec in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml /etc/cdi/desktop-tools.yaml; do
     if [ -e "$spec" ]; then
         fail "client CDI spec $spec not removed by --uninstall"
     fi

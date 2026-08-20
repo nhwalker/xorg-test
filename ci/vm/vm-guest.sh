@@ -394,15 +394,21 @@ EOF
     wait_for 40 5 "desktop deployment ready" \
         sh -c "k3s kubectl get deploy desktop -o jsonpath='{.status.readyReplicas}' | grep -q 1"
 
-    log p2 "deploy one plugin release per capability; both resources become allocatable"
-    # Two releases, not one: kubelet's Register takes a single resource
+    log p2 "deploy one plugin release per device; all three resources become allocatable"
+    # Three releases, not one: kubelet's Register takes a single resource
     # name. The chart is generic - each release differs only in cdiDevice.
-    for cap in display audio; do
+    #
+    # tools is the odd one out. display and audio are capabilities (they carry
+    # the sockets); tools only distributes binaries, and its spec exists only
+    # because the desktop has already published a toolkit - see
+    # desktop-tools-cdi. Its plugin is Healthy for the same reason the others
+    # are: the spec file is present.
+    for cap in display audio tools; do
         helm install "$cap" charts/cdi-device-plugin \
             --set image.repository=localhost/cdi-device-plugin --set image.pullPolicy=Never \
             --set "cdiDevice=desktop.local/$cap=all" --set count=10
     done
-    for cap in display audio; do
+    for cap in display audio tools; do
         wait_for 30 4 "desktop.local/$cap allocatable" \
             sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/$cap}' | grep -q 10"
     done
@@ -614,10 +620,17 @@ EOF
 # shot_to runs the screenshot binary in the lean client pod and streams the
 # resulting file back out. `kubectl cp` would need tar in the image; `cat`
 # needs nothing, and exec without -t leaves the bytes alone.
+# TOOL is how a client actually invokes the toolkit: an absolute path under the
+# directory the tools CDI device mounted, named by the env var it injected.
+# Nothing is on PATH and nothing is baked into the image - if this resolves,
+# the whole delivery chain (desktop publishes -> host dir -> CDI -> client)
+# worked.
+TOOL='"$DESKTOP_TOOLS_BIN"/screenshot'
+
 shot_to() { # $1: local destination; $2: in-pod path; $3...: extra screenshot flags
     local dest="$1" remote="$2"
     shift 2
-    k3s kubectl exec x11-testclient -- screenshot "$@" "$remote" || return 1
+    k3s kubectl exec x11-testclient -- sh -c "$TOOL \"\$@\" \"$remote\"" _ "$@" || return 1
     k3s kubectl exec x11-testclient -- cat "$remote" > "$dest" || return 1
 }
 
@@ -660,6 +673,27 @@ verify_screenshot() {
     wait_for 30 4 "testclient running" \
         sh -c "k3s kubectl get pod x11-testclient -o jsonpath='{.status.phase}' | grep -q Running"
 
+    # The toolkit arrived by the real delivery path, not baked into the image.
+    # Assert each link before trusting the binary: the desktop published to the
+    # host directory, desktop-tools-cdi.path noticed and wrote the spec, and
+    # CDI injected the mount and env into this pod.
+    [ -s /etc/cdi/desktop-tools.yaml ] \
+        || fail "no /etc/cdi/desktop-tools.yaml: the .path unit never fired after the desktop published"
+    local toolkit
+    toolkit=$(k3s kubectl exec x11-testclient -- printenv DESKTOP_TOOLS_BIN 2>/dev/null || true)
+    [ -n "$toolkit" ] \
+        || fail "the client pod has no DESKTOP_TOOLS_BIN: the tools device injected nothing"
+    k3s kubectl exec x11-testclient -- test -x "$toolkit/screenshot" \
+        || fail "no executable screenshot in the injected toolkit at $toolkit"
+    log ss "toolkit delivered to the client at $toolkit (published by the desktop, mounted by CDI)"
+
+    # Read-only, as the spec declares: a client must not be able to replace a
+    # binary that every other client executes.
+    if k3s kubectl exec x11-testclient -- sh -c "touch $toolkit/.probe" 2>/dev/null; then
+        fail "the injected toolkit is WRITABLE from the client; it must be mounted read-only"
+    fi
+    log ss "injected toolkit is read-only from the client"
+
     # The display size as the CLIENT POD sees it, through the very display the
     # CDI device injected - not via the desktop, which by this phase is a
     # kubernetes pod and has no podman container to exec into at all.
@@ -674,7 +708,7 @@ verify_screenshot() {
 
     # --to-stdout: the PNG must arrive on stdout with nothing else mixed in,
     # which is also how it gets out of the pod here.
-    k3s kubectl exec x11-testclient -- screenshot --to-stdout \
+    k3s kubectl exec x11-testclient -- sh -c "$TOOL --to-stdout" \
         > /tmp/screenshots/full-stdout.png \
         || fail "screenshot --to-stdout failed in the client pod"
     local got
@@ -722,7 +756,7 @@ verify_screenshot() {
     # An out-of-bounds region is refused, not clamped, and says what the
     # screen actually is. Exit 2 is the usage-error contract.
     local out rc=0
-    out=$(k3s kubectl exec x11-testclient -- screenshot -w 99999 /tmp/bad.png 2>&1) || rc=$?
+    out=$(k3s kubectl exec x11-testclient -- sh -c "$TOOL -w 99999 /tmp/bad.png" 2>&1) || rc=$?
     [ "$rc" = 2 ] || fail "an oversized region exited $rc, want 2 (usage error)"
     grep -q "$want" <<<"$out" \
         || fail "the oversized-region error does not name the real screen size ($want): $out"
@@ -731,7 +765,7 @@ verify_screenshot() {
     # No display granted: the binary must fail cleanly and point at the CDI
     # device, which is the error a mis-specified client pod actually hits.
     rc=0
-    out=$(k3s kubectl exec x11-testclient -- env -u DISPLAY screenshot /tmp/nodisplay.png 2>&1) || rc=$?
+    out=$(k3s kubectl exec x11-testclient -- sh -c "env -u DISPLAY $TOOL /tmp/nodisplay.png" 2>&1) || rc=$?
     [ "$rc" = 1 ] || fail "screenshot without DISPLAY exited $rc, want 1 (runtime failure)"
     grep -q 'desktop.local/display' <<<"$out" \
         || fail "the no-DISPLAY error does not name the CDI device that grants one: $out"
@@ -788,6 +822,19 @@ verify_split() {
     [ "$got" = ":0" ] || fail "display-only DISPLAY='$got', want :0"
     timeout 20 k3s kubectl exec display-only -- sh -c 'xdpyinfo >/dev/null' \
         || fail "display-only could not open the display"
+
+    log vsp "display-only: has NO toolkit (it never requested desktop.local/tools)"
+    # Binaries are not a capability - a client with the display can already
+    # screenshot for itself under X11 - but the toolkit must still arrive only
+    # where it was asked for, or "one device, one thing" is just a claim about
+    # yaml files. display-only requests display alone, so the mount must be
+    # absent and the env var unset.
+    if k3s kubectl exec display-only -- printenv DESKTOP_TOOLS_BIN >/dev/null 2>&1; then
+        fail "display-only leaked DESKTOP_TOOLS_BIN - the tools device's edits reached a pod that never requested it"
+    fi
+    if k3s kubectl exec display-only -- sh -c 'grep -q " /opt/desktop-tools/bin " /proc/self/mountinfo' 2>/dev/null; then
+        fail "display-only has the toolkit mounted without requesting desktop.local/tools"
+    fi
 
     log vsp "display-only: has NO audio (env or mount)"
     for var in PULSE_SERVER PIPEWIRE_REMOTE; do

@@ -28,6 +28,23 @@
 # the desktop is down is correct - a client that starts early simply finds
 # no socket to connect to, exactly as with any other bind mount.
 #
+# That reasoning covers THESE TWO SPECS ONLY. The third client device,
+# desktop.local/tools, is written by desktop-tools-cdi and is deliberately
+# CONDITIONAL - it appears only once the desktop has published its toolkit.
+# The difference is what kind of fact each one states:
+#
+#   - A socket is LIVE state, coupled to the desktop's process lifecycle. It
+#     comes and goes on every restart, so gating a spec on it would flap, and
+#     its absence is already a clean connect-time error in the client.
+#   - The toolkit directory is PROVISIONING state. It is empty only between
+#     host provisioning and the desktop's first start, and populated from
+#     then on. Gating on it turns "this node was never set up" into a
+#     scheduling failure an operator can see, rather than a "command not
+#     found" buried in an application log.
+#
+# Do not "make it consistent" by writing the tools spec here unconditionally;
+# desktop-tools-cdi's header has the full reasoning.
+#
 # Defaults match the quadlet/chart exports. Override per host by dropping
 # assignments into /etc/desktop-container/client-cdi.conf, e.g.
 #   DISPLAY_VALUE=:1

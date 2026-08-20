@@ -35,6 +35,11 @@ spec:
         - name: init-perms
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Only the two SOCKET dirs. The toolkit hostPath is deliberately
+          # absent: DirectoryOrCreate already makes it 0755 root, which is what
+          # it must stay. It holds executables mounted into every client, so
+          # 1777 would let anything on the node control code running in all of
+          # them. Do not add it here "for consistency".
           command: ["sh", "-c", "chmod 1777 /export/x11 /export/audio"]
           securityContext:
             privileged: true
@@ -114,6 +119,10 @@ spec:
               mountPath: /run/desktop-audio
             - name: x11-socket
               mountPath: /tmp/.X11-unix
+            # Writable: this is where the desktop publishes its client tools.
+            # Clients get the same directory read-only, via CDI.
+            - name: tools-bin
+              mountPath: /var/lib/desktop-container/bin
             # Host-shell material for the 'Host Terminal' menu entry
             # (created by install.sh --shell-user; harmless when empty).
             - name: host-shell
@@ -138,6 +147,14 @@ spec:
         - name: audio-socket
           hostPath:
             path: {{ .Values.hostPaths.audioSocket }}
+            type: DirectoryOrCreate
+        # Client toolkit the desktop publishes at startup; the
+        # desktop.local/tools CDI device mounts it read-only into clients.
+        # DirectoryOrCreate gives 0755 root, which is correct here - see the
+        # init-perms note above.
+        - name: tools-bin
+          hostPath:
+            path: {{ .Values.hostPaths.toolsBin }}
             type: DirectoryOrCreate
         - name: host-shell
           hostPath:

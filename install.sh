@@ -50,6 +50,8 @@ set -euo pipefail
 
 IMAGE="localhost/desktop-container:latest"
 BASE_IMAGE="localhost/desktop-container-base:latest"
+TOOLS_BASE_IMAGE="localhost/screenshot-base:latest"
+TOOLS_IMAGE="localhost/screenshot:latest"
 STATE_DIR="/var/lib/desktop-container"
 QUADLET_DIR="/etc/containers/systemd"
 DROPIN_DIR="$QUADLET_DIR/desktop.container.d"
@@ -60,6 +62,8 @@ PULSE_CLIENT_CONF="/etc/pulse/client.conf.d/50-desktop-container.conf"
 ASOUND_CONF="/etc/asound.conf"
 DISPLAY_CDI_SPEC="/etc/cdi/desktop-display.yaml"
 AUDIO_CDI_SPEC="/etc/cdi/desktop-audio.yaml"
+TOOLS_CDI_SPEC="/etc/cdi/desktop-tools.yaml"
+TOOLS_BIN_DIR="/var/lib/desktop-container/bin"
 HOST_SHELL_DIR="/etc/desktop-container"
 SHELL_USER="${SUDO_USER:-}"
 VT="tty1"
@@ -154,8 +158,15 @@ uninstall() {
     rm -f "$TMPFILES_CONF"
     # Ours entirely (generated, never hand-written), unlike nvidia.yaml
     # below which the toolkit may also own - so these just go.
-    rm -f "$DISPLAY_CDI_SPEC" "$AUDIO_CDI_SPEC" /etc/cdi/desktop.yaml
+    rm -f "$DISPLAY_CDI_SPEC" "$AUDIO_CDI_SPEC" "$TOOLS_CDI_SPEC" /etc/cdi/desktop.yaml
+    systemctl disable --now desktop-tools-cdi.path >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/desktop-tools-cdi.path \
+          /etc/systemd/system/desktop-tools-cdi.service \
+          /usr/local/libexec/desktop-tools-cdi
 
+    # This also takes $TOOLS_BIN_DIR with it, which matters: unlike the socket
+    # dirs in /run, the published toolkit survives reboots, so leaving it would
+    # strand binaries that outlive the image that produced them.
     rm -rf "$STATE_DIR"
     log "uninstalled. The container image ($IMAGE) was kept; remove with: podman rmi $IMAGE"
     if [ -f /etc/cdi/nvidia.yaml ]; then
@@ -176,10 +187,24 @@ if [ "$DO_BUILD" = 1 ]; then
     else
         log "reusing existing base image $BASE_IMAGE (--no-base)"
     fi
+    # The desktop app layer stages the client tools out of the screenshot
+    # image (Containerfile's COPY --from), so that image has to exist first.
+    # Its own base is the network half, gated by --no-base like the desktop's.
+    if [ "$DO_BASE" = 1 ] || ! podman image exists "$TOOLS_BASE_IMAGE"; then
+        log "building tools base image $TOOLS_BASE_IMAGE (network build: go modules)"
+        podman build -t "$TOOLS_BASE_IMAGE" -f "$REPO_DIR/Containerfile.screenshot.base" "$REPO_DIR"
+    else
+        log "reusing existing tools base image $TOOLS_BASE_IMAGE (--no-base)"
+    fi
+    log "building tools image $TOOLS_IMAGE (offline)"
+    podman build --network=none --build-arg "BASE_IMAGE=$TOOLS_BASE_IMAGE" \
+        -t "$TOOLS_IMAGE" -f "$REPO_DIR/Containerfile.screenshot" "$REPO_DIR"
+
     # The application layer is config-only by design; --network=none both
     # proves and enforces that no build step phones home.
     log "building $IMAGE (offline application layer)"
     podman build --network=none --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+        --build-arg "TOOLS_IMAGE=$TOOLS_IMAGE" \
         -t "$IMAGE" -f "$REPO_DIR/Containerfile" "$REPO_DIR"
 else
     log "skipping build; using image $IMAGE"
@@ -252,6 +277,21 @@ systemd-tmpfiles --create "$TMPFILES_CONF"
 # cannot drift.
 log "writing client CDI specs ($DISPLAY_CDI_SPEC, $AUDIO_CDI_SPEC)"
 "$REPO_DIR/deploy/host/usr/local/libexec/desktop-client-cdi"
+
+# The third client device, desktop.local/tools, is NOT written here. Its spec
+# may only exist once the desktop has published its toolkit into
+# $TOOLS_BIN_DIR, so a .path unit watches that directory and writes the spec
+# when it becomes non-empty. Installing the units is all host prep can do; on a
+# fresh host the device appears the first time the desktop starts.
+log "installing the client toolkit CDI watcher (desktop.local/tools)"
+install -m0755 "$REPO_DIR/deploy/host/usr/local/libexec/desktop-tools-cdi" \
+    /usr/local/libexec/desktop-tools-cdi
+install -m0644 "$REPO_DIR/deploy/host/etc/systemd/system/desktop-tools-cdi.service" \
+    /etc/systemd/system/desktop-tools-cdi.service
+install -m0644 "$REPO_DIR/deploy/host/etc/systemd/system/desktop-tools-cdi.path" \
+    /etc/systemd/system/desktop-tools-cdi.path
+systemctl daemon-reload
+systemctl enable --now desktop-tools-cdi.path
 
 # --- 5. Host audio client configuration --------------------------------------
 log "writing Pulse client config ($PULSE_CLIENT_CONF)"
@@ -413,6 +453,8 @@ else
     log "host prep done (no service installed). GPU CDI spec: $([ "$gpu_enabled" = 1 ] && echo /etc/cdi/nvidia.yaml || echo none)"
     log "client CDI specs: $DISPLAY_CDI_SPEC (desktop.local/display=all)"
     log "                  $AUDIO_CDI_SPEC (desktop.local/audio=all)"
+    log "                  $TOOLS_CDI_SPEC (desktop.local/tools=all) - written"
+    log "                  once the desktop first publishes to $TOOLS_BIN_DIR"
     log "deploy with the Helm chart: helm install desktop charts/desktop-container \\"
     log "    --set image.repository=<registry>/desktop-container$([ "$gpu_enabled" = 1 ] && echo ' --set gpu.enabled=true')"
     log "client pods: install charts/cdi-device-plugin once per device, then"

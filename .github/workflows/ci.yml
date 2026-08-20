@@ -99,9 +99,11 @@ jobs:
         run: sudo -E ci/build-bases.sh
       - name: application layers (offline gate)
         run: |
+          # Before the desktop image: that layer stages the client tools out of
+          # this one (Containerfile's `tools` build stage).
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
-          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
       - name: deploy tree quadlet dry-run + CDI spec checks
         # Validate the declarative deploy/ tree: the quadlet generator must
         # accept the unit, and everything must land in the generated service

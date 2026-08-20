@@ -36,6 +36,10 @@ hostPaths:
   x11Socket: /tmp/.X11-unix
   # Exported audio sockets (PipeWire native + Pulse).
   audioSocket: /run/desktop-audio
+  # Client toolkit the desktop publishes for client containers; the
+  # desktop.local/tools CDI device mounts it into them read-only. Disk-backed
+  # rather than /run because the toolkit grows and tmpfs costs RAM per tool.
+  toolsBin: /var/lib/desktop-container/bin
   # Host-shell material (ssh key + username) for the 'Host Terminal' menu
   # entry; created by install.sh --shell-user, harmless when empty.
   hostShellDir: /etc/desktop-container

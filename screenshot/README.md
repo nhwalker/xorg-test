@@ -15,6 +15,46 @@ There is no `libX11`, no `xwd`, no ImageMagick and no libc: a static
 of which ship an X client stack. That is the whole point — it is meant to be
 injected into arbitrary client containers.
 
+## How it reaches a client
+
+It ships **inside the desktop image**. At startup the desktop publishes it to
+`/var/lib/desktop-container/bin` on the host (`image/tools/publish-tools.sh`,
+run by `desktop-tools-publish.service`), and the `desktop.local/tools` CDI
+device mounts that directory read-only into clients as
+`/opt/desktop-tools/bin`, injecting `DESKTOP_TOOLS_BIN` to point at it:
+
+```sh
+podman run --rm --device desktop.local/display=all --device desktop.local/tools=all \
+    <image> sh -c '"$DESKTOP_TOOLS_BIN"/screenshot /tmp/out.png'
+```
+
+Living in the desktop image is the point: the binary's version becomes an
+attribute of the desktop, so the display server and the tool that talks to it
+update together and cannot disagree about the protocol. That is what makes the
+Wayland move a single-artifact change.
+
+Three details of the delivery are load-bearing:
+
+- **Published by rename, never `cp`.** Writing over a binary a client is
+  currently executing fails `ETXTBSY`; rename swaps in a new inode and leaves
+  the old one alive for anything still running it.
+- **`0755`, not `1777`** like the exported socket dirs next to it. That
+  directory holds executables mounted into every client, so anything able to
+  write it would control code running in all of them.
+- **The device is advertised only once the directory is populated**, so a node
+  where the desktop never started fails at scheduling rather than handing a
+  client an empty toolkit. See `deploy/host/usr/local/libexec/desktop-tools-cdi`.
+
+Holding `desktop.local/tools` grants no capability by itself — the binary is
+inert without the X socket, which comes from `desktop.local/display`.
+
+**Known coverage gap:** nothing yet proves a *confined* (SELinux-enforcing)
+container may execute from the injected directory. Executing a host-labelled
+file inside a container is a harder case than opening a socket, and every
+client path in CI is exempt — the desktop is `--privileged`, the k8s phase runs
+permissive, and the podman probes run on non-SELinux runners. The mount and the
+exec are covered; the confined case is not.
+
 ## Why a binary, and not just documentation
 
 X11 lets any client on the display read the framebuffer, so a client container
@@ -105,7 +145,10 @@ podman build --network=none -t localhost/screenshot:latest -f Containerfile.scre
 ```
 
 The resulting `scratch` image exists to *carry* the binary, not to run it —
-nothing about this tool is containerized in production.
+nothing about this tool is containerized in production. The desktop image
+stages the binary out of it (a named `tools` build stage), so this image must
+be built **before** `Containerfile`; `install.sh` and the CI workflows order
+them that way.
 
 ## Testing
 
@@ -118,8 +161,9 @@ production helper would let a wrong stride lay out and read back identically.)
 
 Reality is covered in the VM e2e (`ci/vm/vm-guest.sh verify-screenshot`), where
 the binary captures a real Xorg on a real KMS display from inside a client pod
-that has no X client stack of its own and only the injected
-`desktop.local/display`.
+that has no X client stack of its own. The pod does not bake the binary in — it
+arrives by the real delivery path, so the phase also proves the desktop
+published it, the `.path` unit advertised it, and CDI injected it read-only.
 
 That phase checks the **pixels**, not just that a PNG appeared. Image size and a
 "not blank" test are invariant under every interesting way a capture can be

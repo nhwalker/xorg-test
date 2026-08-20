@@ -1,0 +1,13 @@
+# Part of the desktop-container deploy tree (deploy/README.md).
+[Unit]
+Description=Write the CDI spec that shares this desktop's client tools with client containers
+# Ordered like its sibling so a spec that already exists from a previous boot
+# is refreshed before anything can consume it. Unlike desktop-client-cdi this
+# unit is NOT enabled on its own - desktop-tools-cdi.path starts it, because
+# the spec must not be written until the toolkit directory is populated.
+Before=crio.service kubelet.service k3s.service k3s-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/desktop-tools-cdi

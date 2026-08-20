@@ -1,0 +1,26 @@
+# Part of the desktop-container deploy tree (deploy/README.md).
+[Unit]
+Description=Watch for the desktop's client toolkit and advertise it when it appears
+# Why a .path unit and not a boot-time oneshot like desktop-client-cdi:
+#
+# The toolkit directory is populated by the DESKTOP CONTAINER at its startup,
+# which is necessarily after the host's boot-time convergers have run. A
+# oneshot ordered before crio/kubelet (which is where it would have to sit to
+# beat any client) would look at an empty directory, write nothing, and never
+# run again - the device would never be advertised on any host.
+#
+# A .path unit re-evaluates its condition when it is started, so a reboot with
+# an already-populated directory re-writes the spec immediately, and a freshly
+# provisioned host gets it the moment the desktop first publishes.
+#
+# Note this only ever fires the spec INTO existence. Nothing removes it if the
+# directory is later emptied, so the resource means "this node has been
+# provisioned with the toolkit", not "the toolkit is current" - see the header
+# of usr/local/libexec/desktop-tools-cdi.
+
+[Path]
+DirectoryNotEmpty=/var/lib/desktop-container/bin
+Unit=desktop-tools-cdi.service
+
+[Install]
+WantedBy=multi-user.target

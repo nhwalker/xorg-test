@@ -1,0 +1,23 @@
+[Unit]
+Description=Publish the desktop's client tools to the host toolkit directory
+# Deliberately NOT ordered against desktop-session.service. Clients should get
+# the toolkit whether or not Xorg comes up: a tool that runs and reports "no
+# display to capture" is a far better failure than a missing binary, and tying
+# publication to the session would withhold the tools exactly when someone is
+# trying to debug why the session is down.
+#
+# The directory this writes into is what makes the host advertise
+# desktop.local/tools - see usr/local/libexec/publish-tools.sh in this image and
+# desktop-tools-cdi.path on the host.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No "-" prefix, unlike most of xorg-conf.service's lines: those are
+# best-effort diagnostics, but a failed publish means client containers get a
+# toolkit that is missing or stale, and that must be visible in the journal
+# rather than silently tolerated.
+ExecStart=/usr/local/bin/publish-tools.sh
+
+[Install]
+WantedBy=multi-user.target

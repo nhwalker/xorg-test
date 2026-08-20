@@ -27,9 +27,10 @@ jobs:
           sudo podman build --pull --no-cache -t localhost/screenshot-base:latest -f Containerfile.screenshot.base .
       - name: offline app layers still build on the fresh bases
         run: |
+          # Before the desktop image, which stages its tools out of this one.
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
-          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
       - name: push refreshed bases (content tag + latest)
         env:
           PUSH_BASES: "1"

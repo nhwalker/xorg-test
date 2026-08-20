@@ -28,7 +28,9 @@ Containerfile.screenshot[.base]
                             screenshot image (same base/app offline split)
 screenshot/                 static X11 screen-capture binary for client
                             containers; the stable CLI the Wayland move hides
-                            behind, see its README
+                            behind, see its README. Ships inside the desktop
+                            image, published to the host at boot, and mounted
+                            into clients by desktop.local/tools
 install.sh                  host setup / teardown (run as root)
 quadlet/desktop.container   podman quadlet unit -> desktop.service
 deploy/                     declarative deployment: the same host end state as
@@ -387,8 +389,9 @@ and nothing more:
 |---|---|
 | `desktop.local/display=all` | `DISPLAY`, the `/tmp/.X11-unix` socket dir |
 | `desktop.local/audio=all` | `PULSE_SERVER`, `PIPEWIRE_REMOTE`, the `/run/desktop-audio` socket dir |
+| `desktop.local/tools=all` | `DESKTOP_TOOLS_BIN`, the client toolkit at `/opt/desktop-tools/bin` (read-only) |
 
-The split is about privilege, not tidiness. Neither half is harmless:
+The first two are about privilege, not tidiness. Neither half is harmless:
 
 - X11 here runs with `xhost +local:`, so **any** client on the display can
   read every keystroke, screenshot other windows and inject events. A
@@ -396,8 +399,36 @@ The split is about privilege, not tidiness. Neither half is harmless:
 - The audio socket allows **recording**, not just playback — the
   microphone included. A GUI app that makes no sound should not get it.
 
-`desktop-client-cdi` writes both specs (`/etc/cdi/desktop-display.yaml`
-and `/etc/cdi/desktop-audio.yaml`). The `deploy/` tree ships it as a
+**`tools` is not a third capability.** A binary grants nothing on its own — a
+socket does. `screenshot` in a container that holds no display is an inert
+file; what makes it work is `desktop.local/display`. So the toolkit is
+distributed freely and capability stays enforced by the other two devices,
+which is why one device covers the whole toolkit rather than one per tool.
+
+The toolkit ships **inside the desktop image** and the desktop publishes it to
+`/var/lib/desktop-container/bin` at startup, so a tool's version is an
+attribute of the desktop: the display server and the tools that speak to it
+update together and cannot disagree about the protocol. That is what makes the
+eventual move to Wayland a single-artifact change rather than a coordinated
+re-pull of every client.
+
+Its spec is written **only once that directory is populated** (by
+`desktop-tools-cdi`, triggered by a `.path` unit watching the directory) —
+unlike display and audio, which are written unconditionally at boot. Sockets
+are live state that comes and goes with the desktop process; the toolkit is
+provisioning state. Gating on it means a node where the desktop has never
+started fails at *scheduling* (`Insufficient desktop.local/tools`) instead of
+running a container that dies on `command not found`. The resource therefore
+means "this node has been provisioned with the toolkit", not "the toolkit is
+current".
+
+```sh
+podman run --rm --device desktop.local/display=all --device desktop.local/tools=all \
+    <image> sh -c '"$DESKTOP_TOOLS_BIN"/screenshot /tmp/out.png'
+```
+
+`desktop-client-cdi` writes the display and audio specs
+(`/etc/cdi/desktop-display.yaml` and `/etc/cdi/desktop-audio.yaml`). The `deploy/` tree ships it as a
 boot-time oneshot; `install.sh` runs it during host prep, including
 `--host-prep-only`. Mounts are **rw** — unix `connect(2)` needs write
 access to the socket inode — and they mount the *directories*, because
@@ -432,6 +463,9 @@ helm install display charts/cdi-device-plugin \
 helm install audio charts/cdi-device-plugin \
     --set image.repository=<registry>/cdi-device-plugin \
     --set cdiDevice=desktop.local/audio=all --set count=10
+helm install tools charts/cdi-device-plugin \
+    --set image.repository=<registry>/cdi-device-plugin \
+    --set cdiDevice=desktop.local/tools=all --set count=10
 ```
 
 A client pod then requests what it needs — both for a full desktop client,

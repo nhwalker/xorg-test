@@ -24,6 +24,11 @@ Volume=/run/udev:/run/udev:ro
 Volume=/tmp/.X11-unix:/tmp/.X11-unix
 # Exported audio sockets (PipeWire native + Pulse), see README.
 Volume=/run/desktop-audio:/run/desktop-audio
+# Client toolkit: the desktop publishes its client tools here at boot, and the
+# desktop.local/tools CDI device mounts them (read-only) into client
+# containers. Writing into it is what makes the host advertise that device -
+# see desktop-tools-cdi.path.
+Volume=/var/lib/desktop-container/bin:/var/lib/desktop-container/bin
 # Host-shell material for the 'Host Terminal' menu entry (key + username;
 # created by install.sh --shell-user; harmless when absent/empty).
 Volume=/etc/desktop-container:/etc/desktop-container:ro

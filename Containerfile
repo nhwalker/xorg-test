@@ -5,7 +5,18 @@
 #   podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
 #
 # Override the base with --build-arg BASE_IMAGE=<ref> (e.g. a registry copy).
+# Requires localhost/screenshot:latest to exist (override with
+# --build-arg TOOLS_IMAGE=<ref>): its binaries are staged into this image and
+# published to clients at boot. Build Containerfile.screenshot first.
 # Run via quadlet/desktop.container or charts/ (see install.sh / README.md).
+
+# Image carrying the client tools staged into this one; see "client tools".
+# A named stage, not `COPY --from=${TOOLS_IMAGE}` directly: an ARG declared
+# before the first FROM is in scope for FROM instructions only, and is empty
+# inside a build stage unless re-declared. Naming the stage sidesteps that
+# entirely.
+ARG TOOLS_IMAGE=localhost/screenshot:latest
+FROM ${TOOLS_IMAGE} AS tools
 
 ARG BASE_IMAGE=localhost/desktop-container-base:latest
 FROM ${BASE_IMAGE}
@@ -61,7 +72,23 @@ RUN mkdir -p /etc/systemd/user/default.target.wants \
     && ln -sf /usr/lib/systemd/user/wireplumber.service \
         /etc/systemd/user/default.target.wants/wireplumber.service
 
+# --- client tools -----------------------------------------------------------
+# The tools client containers run against this desktop (currently just
+# screenshot). They ship here, not on the host, so their version is an
+# attribute of the desktop image: the display server and the tools that speak
+# to it update together and cannot disagree about the protocol. At boot
+# publish-tools.sh copies them into the host directory the desktop.local/tools
+# CDI device mounts into clients.
+#
+# Copied from the `tools` stage above, so this stays an offline build - nothing
+# is fetched, the screenshot image just has to exist locally first (install.sh
+# and the CI workflows build it before this layer).
+COPY --from=tools /screenshot /usr/libexec/desktop-tools/screenshot
+COPY image/tools/publish-tools.sh /usr/local/bin/publish-tools.sh
+RUN chmod 0755 /usr/local/bin/publish-tools.sh /usr/libexec/desktop-tools/*
+
 # --- systemd ----------------------------------------------------------------
+COPY image/systemd/desktop-tools-publish.service /etc/systemd/system/desktop-tools-publish.service
 COPY image/systemd/xorg-conf.service /etc/systemd/system/xorg-conf.service
 COPY image/systemd/desktop-session.service /etc/systemd/system/desktop-session.service
 COPY image/systemd/journal-console.service /etc/systemd/system/journal-console.service
@@ -72,7 +99,7 @@ RUN systemctl unmask systemd-logind.service dbus-org.freedesktop.login1.service 
     # keep /run/desktop-audio working even if the host mount is absent
     && echo 'd /run/desktop-audio 1777 root root -' > /etc/tmpfiles.d/desktop-audio.conf \
     && systemctl enable xorg-conf.service desktop-session.service \
-        journal-console.service \
+        journal-console.service desktop-tools-publish.service \
     # host udev owns the devices; /run/udev is mounted read-only from the host
     && systemctl mask systemd-udevd.service systemd-udevd-kernel.socket \
         systemd-udevd-control.socket systemd-udev-trigger.service \
