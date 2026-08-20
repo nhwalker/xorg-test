@@ -9,5 +9,17 @@ Before=crio.service kubelet.service k3s.service k3s-agent.service
 
 [Service]
 Type=oneshot
+# RemainAfterExit is LOAD-BEARING here, not the usual oneshot bookkeeping.
+# DirectoryNotEmpty= is a LEVEL condition: systemd re-evaluates it every time
+# the triggered unit goes inactive. A unit that exits and stays exited would
+# therefore be retriggered immediately - the directory is still non-empty -
+# and would spin until systemd hit the start-limit and failed the .path unit.
+# Staying active is what parks the watcher.
+#
+# The price is that this runs AT MOST ONCE PER BOOT. That is fine for what it
+# writes (the spec is static - see the generator), but it means anything that
+# removes the spec must also stop this unit, or the host can never re-advertise
+# without a reboot. install.sh --uninstall does exactly that; if you add
+# another teardown path, it has to as well.
 RemainAfterExit=yes
 ExecStart=/usr/local/libexec/desktop-tools-cdi

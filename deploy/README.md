@@ -98,6 +98,15 @@ a scheduling failure an operator can see. The resource means "this node has
 been provisioned with the toolkit", not "the toolkit is current" — nothing
 removes the spec if the directory is later emptied.
 
+The unit the watcher triggers is `RemainAfterExit=yes`, and it has to be:
+`DirectoryNotEmpty=` is a level condition, so a unit that exited would be
+retriggered immediately, over and over, until systemd failed the `.path` unit
+on its start limit. Staying active parks the watcher — at the cost that the
+generator runs **at most once per boot**. Anything that tears the spec down
+must therefore also `systemctl stop desktop-tools-cdi.service`, or the host
+cannot advertise the device again until it reboots (`install.sh --uninstall`
+does this).
+
 Mounts are rw (unix `connect(2)` needs write access to the socket inode)
 and are of the **directories**, not the socket files: Xorg and PipeWire
 unlink and recreate their sockets on restart, and a file bind mount would

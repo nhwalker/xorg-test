@@ -22,6 +22,19 @@ TOOLS_SPEC=/etc/cdi/desktop-tools.yaml
 TOOLS_BIN=/var/lib/desktop-container/bin
 log()  { echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# The toolkit chain has three places to die (watcher never started, watcher
+# started but never triggered, generator ran and declined) and they look
+# identical from the outside: a published binary and no spec. Print enough to
+# tell them apart, so a red run does not cost a whole cycle just to diagnose.
+tools_diag() {
+    echo "--- desktop-tools-cdi.path" >&2
+    systemctl status desktop-tools-cdi.path --no-pager -l 2>&1 | head -20 >&2 || true
+    echo "--- desktop-tools-cdi.service" >&2
+    systemctl status desktop-tools-cdi.service --no-pager -l 2>&1 | head -20 >&2 || true
+    journalctl -u desktop-tools-cdi.service --no-pager -o cat 2>&1 | tail -20 >&2 || true
+    echo "--- $TOOLS_BIN" >&2
+    ls -la "$TOOLS_BIN" >&2 || true
+}
 
 [ "$(id -u)" = 0 ] || fail "must run as root (sudo)"
 
@@ -199,7 +212,7 @@ done
 [ "$(stat -c %a "$TOOLS_BIN/screenshot")" = 755 ] \
     || fail "published screenshot is not mode 755"
 grep -q 'kind: desktop.local/tools' "$TOOLS_SPEC" \
-    || fail "tools CDI spec missing after the desktop published its toolkit"
+    || { tools_diag; fail "tools CDI spec missing after the desktop published its toolkit"; }
 grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' "$TOOLS_SPEC" \
     || fail "tools spec does not inject DESKTOP_TOOLS_BIN"
 log "toolkit published and desktop.local/tools advertised by the .path unit"

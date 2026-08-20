@@ -232,6 +232,16 @@ fi
 if [ -e /var/lib/desktop-container/bin ]; then
     fail "published toolkit not removed by --uninstall"
 fi
+# The watcher's triggered unit must be STOPPED, not merely disabled along with
+# its .path. It is RemainAfterExit=yes, so an active leftover latches "already
+# run" for the rest of the boot: the next install arms the watcher, the desktop
+# publishes, and the trigger no-ops against an already-active unit - the host
+# never advertises desktop.local/tools again until it reboots. A removed unit
+# file does not clear this; systemd keeps it loaded and active.
+if systemctl is-active --quiet desktop-tools-cdi.service; then
+    fail "desktop-tools-cdi.service left active by --uninstall (latches the watcher for this boot)"
+fi
+
 # The client specs are generated, never hand-written, so uninstall owns
 # them outright (unlike /etc/cdi/nvidia.yaml, which the toolkit may also own).
 for spec in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml /etc/cdi/desktop-tools.yaml; do

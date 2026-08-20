@@ -221,6 +221,15 @@ phase_deploy() {
     if systemctl is-active --quiet desktop.service; then
         fail "desktop.service still active after uninstall"
     fi
+    # The toolkit watcher's triggered unit is RemainAfterExit=yes, so an active
+    # leftover would latch "already run" for the rest of this boot: the deploy
+    # tree below would arm the watcher, the desktop would publish, and the
+    # trigger would no-op against an already-active unit. Everything downstream
+    # (the spec, the device plugin's health, the client pod's toolkit) would
+    # then be missing with nothing in this phase to say why.
+    if systemctl is-active --quiet desktop-tools-cdi.service; then
+        fail "desktop-tools-cdi.service left active by uninstall (latches the watcher for this boot)"
+    fi
 
     log pd "install the deploy tree's host prerequisites (HOST-REQUIRES.md)"
     dnf -y -q install rsync psmisc >/dev/null
@@ -262,6 +271,18 @@ phase_deploy() {
         || fail "desktop-client-cdi did not write a usable display spec"
     grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "desktop-client-cdi did not write a usable audio spec"
+
+    log pd "the desktop published its toolkit and the watcher advertised it"
+    # Unlike the two specs above, this one is not written at boot: the .path
+    # unit fires only once the desktop has published. Asserting it HERE rather
+    # than leaving it to phase2 keeps the whole chain (image -> publish-tools.sh
+    # -> host dir -> .path -> generator) attributable to the phase that runs it;
+    # a failure downstream in k8s otherwise looks like a device-plugin problem.
+    wait_for 30 1 "tools CDI spec" test -s /etc/cdi/desktop-tools.yaml
+    [ -s /var/lib/desktop-container/bin/screenshot ] \
+        || fail "the desktop did not publish screenshot into /var/lib/desktop-container/bin"
+    grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
+        || fail "desktop-tools-cdi.path did not advertise the toolkit after the desktop published"
 
     log pd "Xorg serves the virtio display, rootless, under the deploy quadlet"
     wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0

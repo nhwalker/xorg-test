@@ -160,6 +160,13 @@ uninstall() {
     # below which the toolkit may also own - so these just go.
     rm -f "$DISPLAY_CDI_SPEC" "$AUDIO_CDI_SPEC" "$TOOLS_CDI_SPEC" /etc/cdi/desktop.yaml
     systemctl disable --now desktop-tools-cdi.path >/dev/null 2>&1 || true
+    # ...and the unit it triggers, which `disable --now` on the .path does NOT
+    # stop. It is RemainAfterExit=yes (it has to be - see that unit's header),
+    # so leaving it active latches it "already run" for the rest of the boot:
+    # a later install would arm the watcher, the desktop would publish, and the
+    # trigger would be a no-op against an already-active unit. The host would
+    # then never advertise desktop.local/tools until it rebooted.
+    systemctl stop desktop-tools-cdi.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/desktop-tools-cdi.path \
           /etc/systemd/system/desktop-tools-cdi.service \
           /usr/local/libexec/desktop-tools-cdi
