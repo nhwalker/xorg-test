@@ -47,12 +47,39 @@ jobs:
           shellcheck -S error install.sh ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/session-postmortem \
-            image/session/host-terminal \
+            image/session/host-terminal image/tools/publish-tools.sh \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
             deploy/host/usr/local/libexec/desktop-client-cdi \
+            deploy/host/usr/local/libexec/desktop-tools-cdi \
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight
+      - name: build args stay global (multi-stage ARG scoping)
+        # An ARG declared before the first FROM is global and usable in every
+        # FROM line; one declared AFTER a FROM belongs to that stage alone and
+        # expands to nothing later. Containerfile has two stages and two args,
+        # and getting this wrong fails with "no FROM statement found" - which
+        # names neither the arg nor the line. hadolint does not catch it, so
+        # the rule is enforced here rather than trusted to review.
+        run: |
+          python3 - <<'PY'
+          import glob, sys
+          bad = []
+          for f in sorted(glob.glob('Containerfile*')):
+              lines = [l.strip() for l in open(f)
+                       if l.strip() and not l.lstrip().startswith('#')]
+              froms = [i for i, l in enumerate(lines) if l.upper().startswith('FROM')]
+              if not froms:
+                  continue
+              for i, l in enumerate(lines):
+                  if l.upper().startswith('ARG') and i > froms[0]:
+                      bad.append(f"{f}: {l!r} is declared after the first FROM, "
+                                 "so it is scoped to that stage and will be empty "
+                                 "in later FROM lines")
+          if bad:
+              print("\n".join(bad)); sys.exit(1)
+          print("all Containerfile ARGs precede the first FROM")
+          PY
       - name: quadlet variants stay in sync
         # quadlet/desktop.container (install.sh flow) and the deploy tree's
         # unit must keep identical [Container] sections except the deploy
@@ -99,9 +126,11 @@ jobs:
         run: sudo -E ci/build-bases.sh
       - name: application layers (offline gate)
         run: |
+          # Before the desktop image: that layer stages the client tools out of
+          # this one (Containerfile's `tools` build stage).
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
-          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
       - name: deploy tree quadlet dry-run + CDI spec checks
         # Validate the declarative deploy/ tree: the quadlet generator must
         # accept the unit, and everything must land in the generated service

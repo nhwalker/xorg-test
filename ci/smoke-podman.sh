@@ -48,6 +48,16 @@ if grep -q DISPLAY= /etc/cdi/desktop-audio.yaml; then
     fail "audio spec carries DISPLAY: the split leaks"
 fi
 
+log "install.sh created the toolkit dir the quadlet bind-mounts"
+# desktop.service cannot even be created without this: podman refuses a mount
+# whose source is missing. install.sh writes its own tmpfiles list, separate
+# from the deploy tree's, so this is exactly where the two flows drift.
+[ -d /var/lib/desktop-container/bin ] \
+    || fail "install.sh did not create /var/lib/desktop-container/bin (tmpfiles drift vs the deploy tree)"
+mode=$(stat -c %a /var/lib/desktop-container/bin)
+[ "$mode" = 755 ] || fail "toolkit dir is mode $mode, want 755 (never 1777 - it holds executables)"
+
+
 log "wait for the container to answer"
 for _ in $(seq 20); do
     podman exec desktop true 2>/dev/null && break
@@ -78,6 +88,42 @@ case "$failed" in
     ""|"desktop-session.service ") ;;
     *) fail "unexpected failed units: $failed" ;;
 esac
+
+log "the desktop published its toolkit and the .path unit advertised it"
+# The container is up, so desktop-tools-publish.service has run (a failure
+# would already have been caught by the failed-units check above - it is
+# deliberately not "-" prefixed). That fills the host directory, which
+# desktop-tools-cdi.path watches, which writes the spec. Nothing here is
+# simulated: this is the real chain on a real container.
+#
+# Note the negative case - an unprovisioned host must NOT advertise the
+# device - cannot be tested in this flow, because install.sh starts the
+# desktop. ci/smoke-deploy.sh asserts it before starting the service.
+[ "$(systemctl is-enabled desktop-tools-cdi.path)" = enabled ] \
+    || fail "desktop-tools-cdi.path not enabled by install.sh"
+for _ in $(seq 30); do
+    [ -e /etc/cdi/desktop-tools.yaml ] && break
+    sleep 1
+done
+[ -s /var/lib/desktop-container/bin/screenshot ] \
+    || fail "the desktop did not publish screenshot into /var/lib/desktop-container/bin"
+[ "$(stat -c %a /var/lib/desktop-container/bin/screenshot)" = 755 ] \
+    || fail "published screenshot is not mode 755"
+grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
+    || fail "desktop-tools-cdi.path did not write the spec after the desktop published"
+grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' /etc/cdi/desktop-tools.yaml \
+    || fail "the tools spec does not inject DESKTOP_TOOLS_BIN"
+
+# A client resolves the device and runs the injected binary. No `| head`
+# inside the container: under pipefail an early-exiting consumer SIGPIPEs the
+# producer, which this repo has been bitten by before.
+out=$(podman run --rm --device desktop.local/tools=all \
+    localhost/desktop-container:latest \
+    sh -c 'printenv DESKTOP_TOOLS_BIN; "$DESKTOP_TOOLS_BIN"/screenshot --help' 2>&1) \
+    || fail "a client requesting desktop.local/tools could not run the injected binary: $out"
+grep -q '/opt/desktop-tools/bin' <<<"$out" || fail "client did not receive DESKTOP_TOOLS_BIN: $out"
+grep -qi 'usage' <<<"$out" || fail "the injected screenshot binary did not run: $out"
+log "a client resolved desktop.local/tools and ran the injected binary"
 
 log "session plumbing: X serves, or the postmortem explains why not"
 plumbing=""
@@ -181,9 +227,24 @@ fi
 if grep -q desktop-container-host-shell "/home/$SMOKE_USER/.ssh/authorized_keys" 2>/dev/null; then
     fail "authorized_keys entry not removed"
 fi
+# The published toolkit lives on disk, not in /run, so nothing clears it at
+# reboot: uninstall has to, or binaries outlive the image that produced them.
+if [ -e /var/lib/desktop-container/bin ]; then
+    fail "published toolkit not removed by --uninstall"
+fi
+# The watcher's triggered unit must be STOPPED, not merely disabled along with
+# its .path. It is RemainAfterExit=yes, so an active leftover latches "already
+# run" for the rest of the boot: the next install arms the watcher, the desktop
+# publishes, and the trigger no-ops against an already-active unit - the host
+# never advertises desktop.local/tools again until it reboots. A removed unit
+# file does not clear this; systemd keeps it loaded and active.
+if systemctl is-active --quiet desktop-tools-cdi.service; then
+    fail "desktop-tools-cdi.service left active by --uninstall (latches the watcher for this boot)"
+fi
+
 # The client specs are generated, never hand-written, so uninstall owns
 # them outright (unlike /etc/cdi/nvidia.yaml, which the toolkit may also own).
-for spec in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml; do
+for spec in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml /etc/cdi/desktop-tools.yaml; do
     if [ -e "$spec" ]; then
         fail "client CDI spec $spec not removed by --uninstall"
     fi

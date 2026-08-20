@@ -18,3 +18,7 @@ spec:
         limits:
           desktop.local/display: 1
           desktop.local/audio: 1
+          # The toolkit. Without this the pod has no screenshot binary at all -
+          # the image no longer bakes one, which is the point: this proves the
+          # real delivery path (desktop publishes -> host -> CDI -> client).
+          desktop.local/tools: 1

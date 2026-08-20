@@ -43,6 +43,18 @@ After=desktop-cdi-refresh.service
 # desktop as a pod and never starts this unit.
 Wants=desktop-client-cdi.service
 After=desktop-client-cdi.service
+# Client toolkit CDI spec (desktop.local/tools). A .path unit rather than a
+# oneshot, because the spec may only be written once the desktop has published
+# its tools - see usr/local/libexec/desktop-tools-cdi in this tree.
+#
+# Pulled in here for the same reason the units above are, and for one more:
+# the tree ships this .path pre-enabled, but a multi-user.target.wants symlink
+# only takes effect at BOOT. Applying the tree to a running host and doing
+# `systemctl daemon-reload` enables the watcher without ever starting it, so
+# the desktop would publish its toolkit into a directory nothing was watching
+# and the device would never be advertised until the next reboot.
+Wants=desktop-tools-cdi.path
+After=desktop-tools-cdi.path
 # Host Terminal, always on: a fresh loopback-ssh keypair is generated every
 # boot for the dedicated 'desktop-shell' account (see deploy/README.md
 # "Host Terminal"). To ship hosts WITHOUT it, comment out the next two
@@ -64,6 +76,11 @@ Volume=/run/udev:/run/udev:ro
 Volume=/tmp/.X11-unix:/tmp/.X11-unix
 # Exported audio sockets (PipeWire native + Pulse), see README.
 Volume=/run/desktop-audio:/run/desktop-audio
+# Client toolkit: the desktop publishes its client tools here at boot, and the
+# desktop.local/tools CDI device mounts them (read-only) into client
+# containers. Writing into it is what makes the host advertise that device -
+# see desktop-tools-cdi.path.
+Volume=/var/lib/desktop-container/bin:/var/lib/desktop-container/bin
 # Host-shell material for the 'Host Terminal' menu entry: the static
 # shell-user file from this tree plus the boot-fresh keypair written by
 # desktop-host-shell.service (harmless when absent/empty).

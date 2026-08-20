@@ -57,9 +57,11 @@ jobs:
           PUSH_BASES: "0"
         run: |
           sudo -E ci/build-bases.sh
+          # Before the desktop image: that layer stages the client tools out of
+          # this one (Containerfile's `tools` build stage).
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
-          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
           # Lean non-desktop client fixture (networked build; CI-only, not a
           # product artifact, so the offline rule does not apply to it). Must
           # come AFTER the screenshot build: it pulls the binary out of that

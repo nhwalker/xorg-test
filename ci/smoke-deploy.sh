@@ -18,8 +18,23 @@ SEATPREP=deploy/host/usr/local/libexec/seat-prep.sh
 SPEC=/etc/cdi/nvidia.yaml
 DISPLAY_SPEC=/etc/cdi/desktop-display.yaml
 AUDIO_SPEC=/etc/cdi/desktop-audio.yaml
+TOOLS_SPEC=/etc/cdi/desktop-tools.yaml
+TOOLS_BIN=/var/lib/desktop-container/bin
 log()  { echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# The toolkit chain has three places to die (watcher never started, watcher
+# started but never triggered, generator ran and declined) and they look
+# identical from the outside: a published binary and no spec. Print enough to
+# tell them apart, so a red run does not cost a whole cycle just to diagnose.
+tools_diag() {
+    echo "--- desktop-tools-cdi.path" >&2
+    systemctl status desktop-tools-cdi.path --no-pager -l 2>&1 | head -20 >&2 || true
+    echo "--- desktop-tools-cdi.service" >&2
+    systemctl status desktop-tools-cdi.service --no-pager -l 2>&1 | head -20 >&2 || true
+    journalctl -u desktop-tools-cdi.service --no-pager -o cat 2>&1 | tail -20 >&2 || true
+    echo "--- $TOOLS_BIN" >&2
+    ls -la "$TOOLS_BIN" >&2 || true
+}
 
 [ "$(id -u)" = 0 ] || fail "must run as root (sudo)"
 
@@ -151,6 +166,16 @@ systemctl daemon-reload
 systemd-sysusers
 systemd-tmpfiles --create || true   # unrelated runner entries may fail; ours asserted below
 [ -d /run/desktop-audio ] && [ -d /tmp/.X11-unix ] || fail "tmpfiles dirs missing"
+[ -d "$TOOLS_BIN" ] || fail "toolkit dir $TOOLS_BIN not created by tmpfiles"
+# 0755, not the 1777 the two socket dirs use. This directory holds executables
+# that get mounted into every client, so world-writable would let anything on
+# the host control code running in all of them.
+mode=$(stat -c %a "$TOOLS_BIN")
+[ "$mode" = 755 ] || fail "toolkit dir is mode $mode, want 755 (never 1777 - it holds executables)"
+# It must be EMPTY before the desktop runs, and therefore not yet advertised.
+if [ -e "$TOOLS_SPEC" ]; then
+    fail "$TOOLS_SPEC exists before the desktop ever published a toolkit"
+fi
 # the sshd_config.d drop-in is read at sshd start; this runner's sshd predates it
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
@@ -171,6 +196,48 @@ grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" \
     || fail "display CDI spec missing after the tree boot"
 grep -q 'kind: desktop.local/audio' "$AUDIO_SPEC" \
     || fail "audio CDI spec missing after the tree boot"
+
+# The toolkit delivery chain, end to end on this runner: the desktop container
+# published its tools into the host directory, and desktop-tools-cdi.path
+# noticed and advertised the device. Unlike the two specs above this one did
+# NOT exist a moment ago - it appears only because the desktop ran.
+[ "$(systemctl is-enabled desktop-tools-cdi.path)" = enabled ] \
+    || fail "desktop-tools-cdi.path not enabled for multi-user.target after rsync"
+for _ in $(seq 30); do
+    [ -e "$TOOLS_SPEC" ] && break
+    sleep 1
+done
+[ -s "$TOOLS_BIN/screenshot" ] \
+    || fail "the desktop did not publish screenshot into $TOOLS_BIN"
+[ "$(stat -c %a "$TOOLS_BIN/screenshot")" = 755 ] \
+    || fail "published screenshot is not mode 755"
+grep -q 'kind: desktop.local/tools' "$TOOLS_SPEC" \
+    || { tools_diag; fail "tools CDI spec missing after the desktop published its toolkit"; }
+grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' "$TOOLS_SPEC" \
+    || fail "tools spec does not inject DESKTOP_TOOLS_BIN"
+log "toolkit published and desktop.local/tools advertised by the .path unit"
+
+# And a real client gets it, read-only, without baking anything in.
+#
+# NOTE: this runner is not SELinux-enforcing, so this proves the mount and the
+# exec, NOT that a CONFINED container may execute from the injected directory.
+# That case is still uncovered - see the delivery notes in screenshot/README.md.
+#
+# No `| head` inside the container: under pipefail an early-exiting consumer
+# SIGPIPEs the producer, which this repo has been bitten by before.
+out=$(podman run --rm --device desktop.local/tools=all \
+    localhost/desktop-container:latest \
+    sh -c 'printenv DESKTOP_TOOLS_BIN; "$DESKTOP_TOOLS_BIN"/screenshot --help' 2>&1) \
+    || fail "a client requesting desktop.local/tools could not run the injected binary: $out"
+grep -q '/opt/desktop-tools/bin' <<<"$out" \
+    || fail "client did not receive DESKTOP_TOOLS_BIN: $out"
+grep -qi 'usage' <<<"$out" \
+    || fail "the injected screenshot binary did not run: $out"
+if podman run --rm --device desktop.local/tools=all localhost/desktop-container:latest \
+        sh -c 'touch "$DESKTOP_TOOLS_BIN"/.probe' 2>/dev/null; then
+    fail "the injected toolkit is writable from a client; it must be read-only"
+fi
+log "a client resolved desktop.local/tools and ran the injected binary (read-only)"
 
 log "wait for the container to answer"
 up=0

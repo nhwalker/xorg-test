@@ -66,18 +66,46 @@ marker plus visible NVIDIA hardware — as `preflight: FAIL` in
 ## Client containers: the other CDI specs
 
 `desktop-cdi-refresh` writes the spec this desktop *consumes* (the GPU).
-`desktop-client-cdi` writes the specs other containers consume to reach
-*this desktop* — **two of them, one capability each**:
+Two generators write the specs other containers consume to reach *this
+desktop* — `desktop-client-cdi` for the two capabilities, and
+`desktop-tools-cdi` for the toolkit:
 
 | spec | device | grants |
 |---|---|---|
 | `/etc/cdi/desktop-display.yaml` | `desktop.local/display=all` | `DISPLAY` + `/tmp/.X11-unix` |
 | `/etc/cdi/desktop-audio.yaml` | `desktop.local/audio=all` | `PULSE_SERVER`, `PIPEWIRE_REMOTE` + `/run/desktop-audio` |
+| `/etc/cdi/desktop-tools.yaml` | `desktop.local/tools=all` | `DESKTOP_TOOLS_BIN` + `/opt/desktop-tools/bin` (ro) |
 
-Split for privilege, not tidiness. X11 here runs with `xhost +local:`, so
-any client on the display can keylog the session, screenshot other windows
-and inject events; and the audio socket permits **recording**, microphone
-included. Few clients need both, so they are granted separately.
+Display and audio are split for privilege, not tidiness. X11 here runs with
+`xhost +local:`, so any client on the display can keylog the session,
+screenshot other windows and inject events; and the audio socket permits
+**recording**, microphone included. Few clients need both, so they are granted
+separately.
+
+`tools` is not a third capability — a binary grants nothing without the socket
+it talks to. It carries the client tools the desktop publishes to
+`/var/lib/desktop-container/bin` at startup (see `publish-tools.sh` inside the
+image), so tool versions track the desktop image rather than the host.
+
+**Its spec is conditional, and that is deliberate.** `desktop-tools-cdi` runs
+from `desktop-tools-cdi.path`, which watches that directory and fires when it
+becomes non-empty; a boot-time oneshot could not work, since it would run
+before the desktop had published anything and never run again. Display and
+audio specs describe an export contract and are written unconditionally;
+sockets are live state whose absence is a clean connect error. The toolkit is
+*provisioning* state, so gating on it turns "this node was never set up" into
+a scheduling failure an operator can see. The resource means "this node has
+been provisioned with the toolkit", not "the toolkit is current" — nothing
+removes the spec if the directory is later emptied.
+
+The unit the watcher triggers is `RemainAfterExit=yes`, and it has to be:
+`DirectoryNotEmpty=` is a level condition, so a unit that exited would be
+retriggered immediately, over and over, until systemd failed the `.path` unit
+on its start limit. Staying active parks the watcher — at the cost that the
+generator runs **at most once per boot**. Anything that tears the spec down
+must therefore also `systemctl stop desktop-tools-cdi.service`, or the host
+cannot advertise the device again until it reboots (`install.sh --uninstall`
+does this).
 
 Mounts are rw (unix `connect(2)` needs write access to the socket inode)
 and are of the **directories**, not the socket files: Xorg and PipeWire
