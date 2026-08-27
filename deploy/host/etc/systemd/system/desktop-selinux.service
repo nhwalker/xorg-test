@@ -1,0 +1,25 @@
+# Part of the desktop-container deploy tree (deploy/README.md).
+[Unit]
+Description=Label the desktop's client-facing directories for confined containers
+# Every host runs this, GPU or not, SELinux or not (the script no-ops where
+# SELinux is absent). It labels the three directories the CDI specs mount
+# into CLIENT containers container_file_t, without which a confined client
+# on an enforcing host is denied the moment it connects - see the script.
+#
+# Pre-enabled for multi-user.target (as a wants symlink in this tree) for the
+# same reason desktop-client-cdi is: the specs and the labels are two halves
+# of one export contract, and on a kubernetes node a client pod can be
+# admitted on a boot where desktop.service has not come up yet. Both must be
+# true before the first client starts, not before the desktop does.
+Before=desktop.service crio.service kubelet.service k3s.service k3s-agent.service
+# The directories are tmpfiles.d's to create; this only labels them.
+After=systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/desktop-selinux
+
+[Install]
+WantedBy=multi-user.target

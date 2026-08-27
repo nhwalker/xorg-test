@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.."
 
 CDI=deploy/host/usr/local/libexec/desktop-cdi-refresh
 CLIENT_CDI=deploy/host/usr/local/libexec/desktop-client-cdi
+SELINUX_LABEL=deploy/host/usr/local/libexec/desktop-selinux
 SEATPREP=deploy/host/usr/local/libexec/seat-prep.sh
 SPEC=/etc/cdi/nvidia.yaml
 DISPLAY_SPEC=/etc/cdi/desktop-display.yaml
@@ -125,6 +126,23 @@ rm -f /etc/desktop-container/client-cdi.conf
 "$CLIENT_CDI" >/dev/null
 grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "defaults not restored after removing the override"
 
+# --- SELinux labeling: the no-SELinux path -----------------------------------
+# GitHub's runners are Ubuntu with AppArmor and no SELinux, so this asserts the
+# branch that matters here: the labeler must no-op CLEANLY, never fail a boot on
+# a host that has no SELinux at all. The enforcing path is the VM e2e's job
+# (phase-deploy asserts the resulting labels; phase2 runs confined pods against
+# them), because it needs a real policy to be meaningful.
+log "selinux labeler: clean no-op where SELinux is absent"
+if [ -d /sys/fs/selinux ]; then
+    log "  (skipped: this runner HAS SELinux, so the no-op branch is untestable here)"
+else
+    out=$("$SELINUX_LABEL" 2>&1)         || fail "labeler exited non-zero on a host without SELinux: $out"
+    echo "$out" | grep -qi 'no selinux\|selinux disabled'         || fail "labeler did not report the no-op it took (got: $out)"
+    # The no-op must be reached before anything touches the filesystem: the
+    # directories do not exist yet on this runner at this point in the script.
+    log "  $out"
+fi
+
 # --- seat-prep on a deliberately dirty seat ----------------------------------
 log "seat-prep: converges seat rules + a running display manager"
 touch /etc/udev/rules.d/72-seat-ci-test.rules
@@ -182,15 +200,18 @@ log "start desktop.service (generated from the tree's quadlet)"
 systemctl start desktop.service
 
 log "converger oneshots all pulled in and succeeded"
-for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell; do
+for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell desktop-selinux; do
     systemctl is-active --quiet "$u.service" \
         || { systemctl status "$u.service" --no-pager || true; fail "$u.service not active"; }
 done
-# desktop-client-cdi is the one oneshot that must ALSO run where there is
-# no desktop.service (a k8s node): the tree ships it pre-enabled, and that
-# only holds if the rsync preserved the .wants symlink.
-[ "$(systemctl is-enabled desktop-client-cdi.service)" = enabled ] \
-    || fail "desktop-client-cdi.service not enabled for multi-user.target after rsync"
+# Two oneshots must ALSO run before a client starts on a boot where
+# desktop.service has not: the CDI specs and the labels those specs' mounts
+# depend on. The tree ships both pre-enabled, which only holds if the rsync
+# preserved their .wants symlinks.
+for u in desktop-client-cdi desktop-selinux; do
+    [ "$(systemctl is-enabled "$u.service")" = enabled ] \
+        || fail "$u.service not enabled for multi-user.target after rsync"
+done
 grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" \
     || fail "display CDI spec missing after the tree boot"
 grep -q 'kind: desktop.local/audio' "$AUDIO_SPEC" \

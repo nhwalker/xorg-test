@@ -1,0 +1,128 @@
+#!/bin/bash
+# Label the host directories client containers reach through CDI, before
+# every desktop start (run by desktop-selinux.service; see deploy/README.md
+# "SELinux").
+#
+# Three host paths are bind-mounted into CLIENT containers by the CDI specs
+# desktop-client-cdi and desktop-tools-cdi write:
+#
+#   $X11_DIR     the X socket        (rw - unix connect(2) needs write)
+#   $AUDIO_DIR   the audio sockets   (rw, same reason)
+#   $TOOLS_DIR   the client toolkit  (ro, and EXECUTED by the client)
+#
+# tmpfiles.d creates all three as ordinary host directories, so they carry
+# ordinary host types. A confined container runs as container_t, which has no
+# rule permitting it to connect to or execute those types: on an enforcing
+# host the client resolves its device, receives the mounts and the env, and
+# is then denied - with everything looking correct from the outside. CDI
+# cannot fix this itself; containerEdits has no equivalent of podman's -v
+# src:dst:z, so the relabel has to happen host-side. That is this script.
+#
+# container_file_t is the type confined containers may use, and semanage
+# applies it at level s0 with NO MCS categories. That matters for kubernetes:
+# CRI-O gives each pod its own category pair, and a file's categories must be
+# a subset of the process's - the empty set is a subset of every set, so one
+# label serves every client without any pod needing seLinuxOptions or
+# privileged. It is the same mechanism `-v src:dst:z` uses.
+#
+# Sockets and binaries INSIDE the directories inherit the directory's type
+# (absent a type_transition rule, a new file takes its parent's), so labeling
+# the three directories is enough - the sockets Xorg and PipeWire create in
+# them, and the binaries the desktop publishes, come out container_file_t too.
+#
+# Runs every boot because $AUDIO_DIR is on tmpfs: it is destroyed and
+# recreated by systemd-tmpfiles at each boot, so a one-off relabel would not
+# survive. Two mechanisms, in order of durability:
+#
+#   1. semanage fcontext + restorecon - the label becomes POLICY, so it also
+#      survives a full filesystem relabel and applies to the directories at
+#      creation on later boots. Needs policycoreutils-python-utils.
+#   2. chcon - direct, no extra package, but not policy: undone by any
+#      restorecon and by a relabel. Converging every boot is what makes it
+#      hold anyway. This is the fallback.
+#
+# Takes an optional list of paths to label instead of all three. That is how
+# desktop-tools-cdi re-runs it for the toolkit directory: the desktop
+# publishes its binaries AFTER this unit has run, and while a new file
+# normally inherits its parent directory's type, relabeling the directory
+# once its contents exist does not depend on that.
+#
+# No-ops silently on a host without SELinux.
+set -euo pipefail
+
+CONF=/etc/desktop-container/client-cdi.conf
+
+# Defaults match the quadlet's exports and the two CDI generators; the same
+# override file steers all three, so a host that moves a directory does not
+# have to remember to move it here too.
+X11_DIR="/tmp/.X11-unix"
+AUDIO_DIR="/run/desktop-audio"
+TOOLS_DIR="/var/lib/desktop-container/bin"
+
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+
+if [ "$#" -gt 0 ]; then
+    DIRS=("$@")
+else
+    DIRS=("$X11_DIR" "$AUDIO_DIR" "$TOOLS_DIR")
+fi
+TYPE=container_file_t
+
+# selinuxenabled (libselinux-utils) is the authoritative check and is pulled
+# in by podman's dependency chain; the /sys test is the fallback for a host
+# that somehow lacks it. Disabled or absent SELinux means nothing to do.
+#
+# The fallback tests /sys/fs/selinux/enforce, NOT the directory: the selinuxfs
+# MOUNT POINT exists on plenty of kernels with SELinux inactive (an empty
+# directory), so testing the directory reports SELinux on hosts that have
+# none. The enforce file appears only once selinuxfs is actually mounted, and
+# it exists whether the mode is enforcing or permissive - which is what we
+# want, since a permissive host should still be labeled correctly.
+if command -v selinuxenabled >/dev/null; then
+    selinuxenabled || { echo "SELinux disabled: nothing to label"; exit 0; }
+elif [ ! -e /sys/fs/selinux/enforce ]; then
+    echo "no SELinux on this host: nothing to label"
+    exit 0
+fi
+
+# The directories are tmpfiles.d's to create (this unit is ordered after it).
+# A missing one here means tmpfiles did not run or the override points
+# somewhere nothing creates - either way, labeling is not the real problem
+# and inventing the directory would only hide it.
+missing=()
+for d in "${DIRS[@]}"; do
+    [ -d "$d" ] || missing+=("$d")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+    echo "WARNING: not created by tmpfiles.d, skipping: ${missing[*]}" >&2
+fi
+
+present=()
+for d in "${DIRS[@]}"; do
+    [ -d "$d" ] && present+=("$d")
+done
+[ ${#present[@]} -gt 0 ] || { echo "none of the client directories exist yet" >&2; exit 1; }
+
+if command -v semanage >/dev/null && command -v restorecon >/dev/null; then
+    for d in "${present[@]}"; do
+        # Escape the path into a file_contexts regex: dots are wildcards
+        # there, and /tmp/.X11-unix contains one.
+        pattern="$(printf '%s' "$d" | sed 's/\./\\./g')(/.*)?"
+        # -a fails when the rule already exists (every boot after the first),
+        # so fall back to -m to converge a rule an admin may have edited.
+        if ! semanage fcontext -a -t "$TYPE" "$pattern" 2>/dev/null; then
+            semanage fcontext -m -t "$TYPE" "$pattern" 2>/dev/null \
+                || echo "WARNING: could not set the fcontext rule for $d" >&2
+        fi
+    done
+    restorecon -R "${present[@]}"
+    echo "labeled $TYPE via policy (semanage + restorecon): ${present[*]}"
+    exit 0
+fi
+
+# No semanage: label directly. chcon is coreutils, so this path always works,
+# but the label is not policy - it is re-applied here on every boot.
+echo "policycoreutils-python-utils absent: labeling with chcon (not policy; see deploy/README.md)" >&2
+chcon -R -t "$TYPE" "${present[@]}"
+echo "labeled $TYPE via chcon: ${present[*]}"

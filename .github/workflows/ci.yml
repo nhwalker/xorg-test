@@ -52,6 +52,7 @@ jobs:
             deploy/host/usr/local/libexec/desktop-client-cdi \
             deploy/host/usr/local/libexec/desktop-tools-cdi \
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
+            deploy/host/usr/local/libexec/desktop-selinux \
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight
       - name: build args stay global (multi-stage ARG scoping)
