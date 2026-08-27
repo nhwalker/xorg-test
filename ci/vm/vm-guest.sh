@@ -941,13 +941,21 @@ verify_log_bounds() {
     drv=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Type}}' 2>/dev/null || echo unknown)
     [ "$drv" = k8s-file ] \
         || fail "container log driver is '$drv', want k8s-file: the quadlet's LogDriver= did not reach podman, so the bound below is on a sink that may not be the one in use"
-    # podman reports the option under a couple of spellings across versions, so
-    # match the VALUE rather than a particular key path.
-    size=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}' 2>/dev/null || echo '{}')
-    case "$size" in
-        *64m*|*67108864*) log lb "  driver=k8s-file, max-size applied ($size)" ;;
-        *) fail "no max-size on the container log ($size): --log-opt did not reach podman, so journal-console.service is streaming into an unbounded file" ;;
-    esac
+    # Read the size back off the RUNNING container rather than off the unit
+    # file: that proves podman ACCEPTED the option, which is the failure mode
+    # worth catching (an unsupported spelling on an older podman is silently
+    # dropped, and the .container file would still look correct).
+    #
+    # podman normalises the value - "64m" goes in, "64MB" comes back - so match
+    # case-insensitively on the number rather than on the string we passed.
+    # Getting that wrong is what made this assertion fail on its first run
+    # while the bound itself was working perfectly.
+    size=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Size}}' 2>/dev/null || true)
+    # Older podman may not expose .Size; fall back to the whole LogConfig blob.
+    [ -n "$size" ] || size=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}' 2>/dev/null || echo '')
+    echo "$size" | grep -qiE '64 ?mb|67108864' \
+        || fail "no 64M max-size on the container log (got '$size'): --log-opt did not reach podman, so journal-console.service is streaming into an unbounded sink"
+    log lb "  driver=k8s-file, max-size=$size"
 
     # 2. The CONTAINER-side sink: journald's own volatile store, which is RAM.
     log lb "the container's journal is volatile and capped"

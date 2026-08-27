@@ -334,11 +334,13 @@ log "logging: the container log is bounded, not inherited from the host default"
 # disk-filling bug that nothing else in the suite would notice.
 drv=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Type}}')
 [ "$drv" = k8s-file ] || fail "container log driver is '$drv', want k8s-file (LogDriver= did not reach podman)"
-lc=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}')
-case "$lc" in
-    *64m*|*67108864*) log "  driver=k8s-file with max-size applied" ;;
-    *) fail "no max-size on the container log ($lc): --log-opt did not reach podman" ;;
-esac
+# podman normalises the value: "64m" goes in, "64MB" comes back - match the
+# number case-insensitively, not the string we passed in.
+lc=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Size}}' 2>/dev/null || true)
+[ -n "$lc" ] || lc=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}')
+echo "$lc" | grep -qiE '64 ?mb|67108864' \
+    || fail "no 64M max-size on the container log (got '$lc'): --log-opt did not reach podman"
+log "  driver=k8s-file, max-size=$lc"
 
 log "desktop-preflight: fully green (no-KMS FAIL tolerated on KMS-less runners)"
 # Azure runners expose a Hyper-V DRM device, so preflight is normally 0

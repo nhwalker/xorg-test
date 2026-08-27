@@ -810,11 +810,14 @@ than left to whatever the host defaults to.
 | Host: podman's container log | `LogDriver=k8s-file` + `--log-opt max-size=64m` | the quadlet |
 | Container: journald's own store | `Storage=volatile` + `RuntimeMaxUse=64M` | `image/systemd/journald-bounds.conf` |
 
-Neither was stated before, and the defaults are worse than they look. podman's
-built-in default is `k8s-file` with **no size limit** — an ever-growing file
-under `/var/lib/containers` — while a distro whose `containers.conf` sets
-`journald` instead pipes the container's entire journal into the *host* journal,
-where it is capped but evicts everything else. Inside the container, journald
+Neither was stated before, and what you got depended on the host. **Measured on
+the Rocky 9 target, podman's default log driver is `journald`** — so before this
+change the desktop's entire journal was being piped into the *host* journal,
+where it is capped by `SystemMaxUse` but evicts everything else the machine
+logs. On a host whose `containers.conf` leaves podman's built-in default in
+place the answer is worse: `k8s-file` with **no size limit**, an ever-growing
+file under `/var/lib/containers`. Naming the driver here means the deployment
+gets the same answer either way. Inside the container, journald
 has no `/var/log/journal` so it uses volatile storage, which defaults to **10%
 of the `/run` tmpfs** — and that tmpfs is sized from host RAM, so on a large
 workstation the desktop can quietly hold hundreds of megabytes of memory it
