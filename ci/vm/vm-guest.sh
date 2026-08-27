@@ -413,14 +413,38 @@ EOF
     log p2 "crio configured to scan /etc/cdi for device specs"
 
     log p2 "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
-    # The installer detects enforcing SELinux and pulls the k3s-selinux policy
-    # module from rpm.rancher.io on its own; INSTALL_K3S_SKIP_SELINUX_RPM is
-    # deliberately NOT set. k3s's own tree (/var/lib/rancher) needs that policy
-    # - CRI-O and the client pods rely on stock container-selinux instead.
-    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
+    # On an enforcing EL host k3s needs its own policy module: its tree under
+    # /var/lib/rancher and its agent processes are not covered by stock
+    # container-selinux (which is what CRI-O and the client pods rely on).
+    # The installer is supposed to detect enforcing SELinux and pull
+    # k3s-selinux from rpm.rancher.io itself, so INSTALL_K3S_SKIP_SELINUX_RPM
+    # is deliberately NOT set - but that is the INSTALLER's behaviour, not
+    # ours, and it is exactly the kind of thing that changes upstream without
+    # us noticing. Assert the result below rather than trusting it.
+    #
+    # Output goes to a file rather than /dev/null: a policy install that failed
+    # or was skipped explains itself there, and discarding it is why this was
+    # unverifiable in the first place.
+    if ! curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
         --container-runtime-endpoint=unix:///run/crio/crio.sock \
         --kubelet-arg=cgroup-driver=systemd \
-        --disable traefik --disable metrics-server" sh - >/dev/null
+        --disable traefik --disable metrics-server" sh - >/tmp/k3s-install.log 2>&1
+    then
+        tail -40 /tmp/k3s-install.log >&2 || true
+        fail "k3s install failed (see output above)"
+    fi
+
+    log p2 "k3s brought its own SELinux policy module (required on an enforcing EL host)"
+    if semodule -l 2>/dev/null | grep -qi '^k3s'; then
+        log p2 "  policy module loaded: $(semodule -l | grep -i '^k3s' | tr '\n' ' ')"
+        rpm -q k3s-selinux >/dev/null 2>&1 && log p2 "  from $(rpm -q k3s-selinux)"
+    else
+        echo "---- selinux lines from the k3s installer ----" >&2
+        grep -i selinux /tmp/k3s-install.log >&2 || echo "(none)" >&2
+        echo "---- loaded policy modules ----" >&2
+        semodule -l 2>/dev/null | tail -20 >&2 || true
+        fail "no k3s SELinux policy module loaded - the installer skipped it, and k3s is unconfined-by-omission on an enforcing host"
+    fi
     wait_for 60 5 "k3s node ready" \
         sh -c "k3s kubectl get nodes | grep -q ' Ready'"
     # Prove the node really runs CRI-O, not the bundled containerd.
