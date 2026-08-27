@@ -364,8 +364,14 @@ wait_xorg_conf() {
 log "fixed monitor layout: the shipped default is a genuine no-op"
 [ -f /etc/desktop-container/monitors.conf ] || fail "the tree did not ship monitors.conf"
 wait_xorg_conf
-podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null \
-    | grep -q 'xorg-monitor-conf' || fail "the layout generator never ran"
+# Captured, not piped into grep -q: this script runs under `set -o pipefail`,
+# and a grep that stops at the first match leaves podman writing into a closed
+# pipe - SIGPIPE, exit 141, and a passing check reported as a failure.
+gen_log=$(podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null || true)
+case "$gen_log" in
+    *xorg-monitor-conf*) ;;
+    *) fail "the layout generator never ran" ;;
+esac
 if podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf; then
     fail "a config with no output lines still generated a layout"
 fi

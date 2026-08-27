@@ -425,16 +425,31 @@ xr() {
     podman exec -u desktop -e DISPLAY=:0 desktop xrandr --query
 }
 
-# One output's line from xrandr --query, asserted by CONTENT rather than by
-# field position: "primary" sits between the connection state and the geometry
-# only on the primary output, and matching positionally silently expects one
-# shape of line and fails on the other. Same containment test the watcher
-# itself uses.
+# One output's line from xrandr --query.
+#
+# NEVER `xr | grep -q` or `xr | grep -m1` here. This script runs under
+# `set -o pipefail`, and those greps stop reading at the first match: the
+# writer - a podman exec with the rest of the query still to send - takes
+# SIGPIPE and exits 141, which pipefail reports as the whole pipeline
+# failing. The match succeeded and the check says it failed. Worse, it is
+# timing-dependent on WHERE the match is: it fires on the first output in the
+# list, where most of the output is still unread, and usually not on the last.
+# So capture the query whole and match against the variable.
+xr_line() {
+    local all
+    all=$(xr) || return 1
+    grep -m1 "^$1 " <<<"$all"
+}
+
+# Asserted by CONTENT rather than by field position: "primary" sits between
+# the connection state and the geometry on the primary output only, and
+# matching positionally silently expects one shape of line and fails on the
+# other. Same containment test the watcher itself uses.
 #   xr_is <output> <connected|disconnected> [geometry]
 # With no geometry, asserts the output carries none - i.e. it is not enabled.
 xr_is() {
     local want_out=$1 want_state=$2 want_geom=${3:-} line
-    line=$(xr | grep -m1 "^$want_out ") || return 1
+    line=$(xr_line "$want_out") || return 1
     case "$line" in
         "$want_out $want_state "*) ;;
         *) return 1 ;;
@@ -529,14 +544,16 @@ EOF
 
     log pd "fixed monitor layout: the DISCONNECTED output is enabled, where it was declared"
     xr_is Virtual-1 connected 1024x768+0+0 \
-        || fail "Virtual-1 not where it was declared: $(xr | grep '^Virtual-1')"
-    xr | grep -q '^Virtual-1 connected primary ' \
-        || fail "Virtual-1 was declared primary but is not: $(xr | grep '^Virtual-1')"
+        || fail "Virtual-1 not where it was declared: $(xr_line Virtual-1)"
+    case "$(xr_line Virtual-1)" in
+        "Virtual-1 connected primary "*) ;;
+        *) fail "Virtual-1 was declared primary but is not: $(xr_line Virtual-1)" ;;
+    esac
     # One line, and it is the whole point: xrandr says "disconnected" and
     # prints a geometry anyway, because Option "Enable" plus a derived Modeline
     # gave the server a mode it never had to ask a monitor for.
     xr_is Virtual-2 disconnected 1024x768+1024+0 \
-        || fail "Virtual-2 is not enabled on a disconnected connector: $(xr | grep '^Virtual-2')"
+        || fail "Virtual-2 is not enabled on a disconnected connector: $(xr_line Virtual-2)"
     log pd "  Virtual-2 scans out 1024x768+1024+0 with nothing plugged into it"
 
     log pd "fixed monitor layout: the session's re-assert loop is running"
@@ -562,7 +579,7 @@ EOF
         sleep 1
     done
     [ -n "$restored" ] \
-        || fail "monitor-layout-watch did not restore Virtual-2 within 15s: $(xr | grep '^Virtual-2')"
+        || fail "monitor-layout-watch did not restore Virtual-2 within 15s: $(xr_line Virtual-2)"
     [ "$(dpy_dims)" = 2048x768 ] || fail "screen size moved while the layout was being restored"
     log pd "  the loop re-applied the declared layout on its own"
 
@@ -575,11 +592,12 @@ EOF
     [ "$(cat "$conn/status")" = disconnected ] \
         || fail "forcing $conn off did not take (kernel without connector force?)"
     sleep 3
-    if xr | grep -q '^Virtual-1 disconnected'; then
-        log pd "  X noticed on its own - a uevent reached it"
-    else
-        log pd "  X has not re-probed yet; the query below forces one, as any client would"
-    fi
+    case "$(xr_line Virtual-1)" in
+        "Virtual-1 disconnected "*)
+            log pd "  X noticed on its own - a uevent reached it" ;;
+        *)
+            log pd "  X has not re-probed yet; the query below forces one, as any client would" ;;
+    esac
     # RRGetInfo -> xf86ProbeOutputModes: X re-reads the connector and sees it
     # disconnected. Nothing about the CRTC configuration may change.
     xr >/dev/null
@@ -587,7 +605,7 @@ EOF
     [ "$dims" = 2048x768 ] \
         || fail "screen collapsed to $dims when Virtual-1 went down - the layout did not hold"
     xr_is Virtual-1 disconnected 1024x768+0+0 \
-        || fail "Virtual-1 lost its geometry on disconnect: $(xr | grep '^Virtual-1')"
+        || fail "Virtual-1 lost its geometry on disconnect: $(xr_line Virtual-1)"
     log pd "  both outputs now disconnected, both still scanning out where they were declared"
 
     log pd "fixed monitor layout: restore the connector and the shipped (empty) config"
@@ -605,7 +623,7 @@ EOF
         fail "the shipped monitors.conf still generated a layout - it is not a no-op"
     fi
     xr_is Virtual-2 disconnected \
-        || fail "Virtual-2 is still enabled after the layout was withdrawn: $(xr | grep '^Virtual-2')"
+        || fail "Virtual-2 is still enabled after the layout was withdrawn: $(xr_line Virtual-2)"
     dims=$(dpy_dims)
     # Not an equality against $before: setting a scanout can leave QEMU
     # reporting the new size as that display's geometry, so autodetection may
