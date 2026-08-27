@@ -425,6 +425,32 @@ xr() {
     podman exec -u desktop -e DISPLAY=:0 desktop xrandr --query
 }
 
+# One output's line from xrandr --query, asserted by CONTENT rather than by
+# field position: "primary" sits between the connection state and the geometry
+# only on the primary output, and matching positionally silently expects one
+# shape of line and fails on the other. Same containment test the watcher
+# itself uses.
+#   xr_is <output> <connected|disconnected> [geometry]
+# With no geometry, asserts the output carries none - i.e. it is not enabled.
+xr_is() {
+    local want_out=$1 want_state=$2 want_geom=${3:-} line
+    line=$(xr | grep -m1 "^$want_out ") || return 1
+    case "$line" in
+        "$want_out $want_state "*) ;;
+        *) return 1 ;;
+    esac
+    if [ -z "$want_geom" ]; then
+        case "$line" in
+            *\ [0-9]*x[0-9]*+[0-9]*+[0-9]*\ *) return 1 ;;
+            *) return 0 ;;
+        esac
+    fi
+    case " $line " in
+        *" $want_geom "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # After a restart: container running AND X actually answering. Waiting on the
 # socket FILE would not do - /tmp/.X11-unix is a host bind mount that survives
 # the container, so a stale node from the instance just stopped can satisfy a
@@ -502,14 +528,15 @@ EOF
         || fail "screen is $dims, want 2048x768 - the declared layout did not take"
 
     log pd "fixed monitor layout: the DISCONNECTED output is enabled, where it was declared"
-    out=$(xr)
-    echo "$out" | grep -q '^Virtual-1 connected primary 1024x768+0+0' \
-        || fail "Virtual-1 not where it was declared: $(echo "$out" | grep '^Virtual-1')"
+    xr_is Virtual-1 connected 1024x768+0+0 \
+        || fail "Virtual-1 not where it was declared: $(xr | grep '^Virtual-1')"
+    xr | grep -q '^Virtual-1 connected primary ' \
+        || fail "Virtual-1 was declared primary but is not: $(xr | grep '^Virtual-1')"
     # One line, and it is the whole point: xrandr says "disconnected" and
     # prints a geometry anyway, because Option "Enable" plus a derived Modeline
     # gave the server a mode it never had to ask a monitor for.
-    echo "$out" | grep -q '^Virtual-2 disconnected 1024x768+1024+0' \
-        || fail "Virtual-2 is not enabled on a disconnected connector: $(echo "$out" | grep '^Virtual-2')"
+    xr_is Virtual-2 disconnected 1024x768+1024+0 \
+        || fail "Virtual-2 is not enabled on a disconnected connector: $(xr | grep '^Virtual-2')"
     log pd "  Virtual-2 scans out 1024x768+1024+0 with nothing plugged into it"
 
     log pd "fixed monitor layout: the session's re-assert loop is running"
@@ -527,11 +554,11 @@ EOF
     out=$(podman exec -u desktop -e DISPLAY=:0 desktop \
         sh -c 'xrandr --output Virtual-2 --off && xrandr --query') \
         || fail "could not turn Virtual-2 off to test the re-assert loop"
-    if echo "$out" | grep -q '^Virtual-2 disconnected 1024x768+1024+0'; then
-        fail "Virtual-2 never went off, so its return would prove nothing"
-    fi
+    case " $(echo "$out" | grep '^Virtual-2 ') " in
+        *" 1024x768+1024+0 "*) fail "Virtual-2 never went off, so its return would prove nothing" ;;
+    esac
     for _ in $(seq 15); do
-        if xr | grep -q '^Virtual-2 disconnected 1024x768+1024+0'; then restored=yes; break; fi
+        if xr_is Virtual-2 disconnected 1024x768+1024+0; then restored=yes; break; fi
         sleep 1
     done
     [ -n "$restored" ] \
@@ -559,9 +586,8 @@ EOF
     dims=$(dpy_dims)
     [ "$dims" = 2048x768 ] \
         || fail "screen collapsed to $dims when Virtual-1 went down - the layout did not hold"
-    out=$(xr)
-    echo "$out" | grep -q '^Virtual-1 disconnected 1024x768+0+0' \
-        || fail "Virtual-1 lost its geometry on disconnect: $(echo "$out" | grep '^Virtual-1')"
+    xr_is Virtual-1 disconnected 1024x768+0+0 \
+        || fail "Virtual-1 lost its geometry on disconnect: $(xr | grep '^Virtual-1')"
     log pd "  both outputs now disconnected, both still scanning out where they were declared"
 
     log pd "fixed monitor layout: restore the connector and the shipped (empty) config"
@@ -578,10 +604,8 @@ EOF
     if podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf; then
         fail "the shipped monitors.conf still generated a layout - it is not a no-op"
     fi
-    out=$(xr)
-    if echo "$out" | grep -qE '^Virtual-2 disconnected [0-9]+x[0-9]+\+'; then
-        fail "Virtual-2 is still enabled after the layout was withdrawn: $(echo "$out" | grep '^Virtual-2')"
-    fi
+    xr_is Virtual-2 disconnected \
+        || fail "Virtual-2 is still enabled after the layout was withdrawn: $(xr | grep '^Virtual-2')"
     dims=$(dpy_dims)
     # Not an equality against $before: setting a scanout can leave QEMU
     # reporting the new size as that display's geometry, so autodetection may
