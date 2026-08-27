@@ -303,6 +303,14 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-privileges' \
     || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop grep -E "^(Cap|Seccomp)" /proc/1/status' \
          2>&1 | tee "$ART/privileges-fail.log" || true; fail "privilege assertions failed"; }
 
+log "logging: both log sinks are bounded, on the running container"
+# Reports the host's DEFAULT log driver alongside the assertion: that default
+# is what this unit would have inherited without LogDriver=, and it is the
+# thing that made the old behaviour unpredictable per distro.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-log-bounds' \
+    || { vm_ssh 'echo "-- host podman default log driver (what we would have inherited):"; sudo podman info --format "{{.Host.LogDriver}}"; echo "-- this container:"; sudo podman inspect desktop --format "{{json .HostConfig.LogConfig}}"; echo "-- journald config in the container:"; sudo podman exec desktop systemd-analyze cat-config systemd/journald.conf' \
+         2>&1 | tee "$ART/log-bounds-fail.log" || true; fail "log bound assertions failed"; }
+
 log "audio: record each client path (pulse, pipewire, ALSA) individually"
 # One capture cycle per player so every path is acoustically verified on
 # its own - an aggregate capture would let one silent path hide behind

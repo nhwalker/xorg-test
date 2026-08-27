@@ -327,6 +327,19 @@ seccomp=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/1/status
 [ "$seccomp" = 2 ] || fail "PID 1 Seccomp=$seccomp, want 2 (filter active)"
 log "  Privileged=false, Seccomp=2"
 
+log "logging: the container log is bounded, not inherited from the host default"
+# The cheap half of verify-log-bounds in the VM e2e. Worth repeating here for
+# the same reason the privilege checks are: journal-console.service streams the
+# journal into this sink continuously, so an unbounded one is a slow
+# disk-filling bug that nothing else in the suite would notice.
+drv=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Type}}')
+[ "$drv" = k8s-file ] || fail "container log driver is '$drv', want k8s-file (LogDriver= did not reach podman)"
+lc=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}')
+case "$lc" in
+    *64m*|*67108864*) log "  driver=k8s-file with max-size applied" ;;
+    *) fail "no max-size on the container log ($lc): --log-opt did not reach podman" ;;
+esac
+
 log "desktop-preflight: fully green (no-KMS FAIL tolerated on KMS-less runners)"
 # Azure runners expose a Hyper-V DRM device, so preflight is normally 0
 # FAILs here and X genuinely runs; a runner image without /dev/dri may

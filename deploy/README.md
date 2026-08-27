@@ -437,6 +437,17 @@ halves are needed; see README.md "Container privileges".
 reduces attack surface without changing the trust boundary. See README.md
 "Container privileges" for the full table and reasoning.
 
+## Log growth
+
+`journal-console.service` streams the container's journal into `/dev/console`
+continuously, which is what `podman logs desktop` reads. The quadlet bounds that
+sink explicitly — `LogDriver=k8s-file` plus `--log-opt max-size=64m` — rather
+than inheriting whatever the host's `containers.conf` sets, because podman's own
+default is an unbounded file and some distros default to `journald`, which would
+push the desktop's entire journal into the host journal. The container's own
+volatile journal is capped separately inside the image. See "Log growth" in
+README.md for the full reasoning and the numbers.
+
 ## Deliberately out of scope
 
 - **Building or pulling images.** Provisioning supplies the image; CI

@@ -926,6 +926,53 @@ verify_screenshot() {
     log ss "captured from a client pod with only the injected display; pixels checked on the host"
 }
 
+verify_log_bounds() {
+    # Both sinks the container's logging lands in must be BOUNDED, and both
+    # are asserted on the running container rather than on the config that was
+    # meant to produce them - a log option that silently did not apply looks
+    # exactly like one that did, right up until a disk or the RAM fills.
+    #
+    # Why this needs asserting at all: journal-console.service runs
+    # `journalctl -b -f` into /dev/console forever, so this is a continuous
+    # stream on a machine meant to run for months, not a boot-time burst.
+
+    # 1. The HOST-side sink: podman's own log for the container.
+    log lb "the container log has an explicit driver and a size bound"
+    drv=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Type}}' 2>/dev/null || echo unknown)
+    [ "$drv" = k8s-file ] \
+        || fail "container log driver is '$drv', want k8s-file: the quadlet's LogDriver= did not reach podman, so the bound below is on a sink that may not be the one in use"
+    # podman reports the option under a couple of spellings across versions, so
+    # match the VALUE rather than a particular key path.
+    size=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}' 2>/dev/null || echo '{}')
+    case "$size" in
+        *64m*|*67108864*) log lb "  driver=k8s-file, max-size applied ($size)" ;;
+        *) fail "no max-size on the container log ($size): --log-opt did not reach podman, so journal-console.service is streaming into an unbounded file" ;;
+    esac
+
+    # 2. The CONTAINER-side sink: journald's own volatile store, which is RAM.
+    log lb "the container's journal is volatile and capped"
+    st=$(podman exec desktop sh -c \
+        'systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -iE "^[[:space:]]*(Storage|RuntimeMaxUse)=" | tr -d " "' \
+        2>/dev/null || true)
+    echo "$st" | grep -qix 'storage=volatile' \
+        || fail "journald Storage is not volatile (got: $(echo "$st" | tr '\n' ' ')): the journal may be landing on the container's writable layer"
+    echo "$st" | grep -qix 'runtimemaxuse=64m' \
+        || fail "journald RuntimeMaxUse is not 64M (got: $(echo "$st" | tr '\n' ' ')): the volatile journal falls back to 10% of the /run tmpfs, which is RAM sized from the host"
+
+    # And the outcome, not just the setting: journald is actually using the
+    # volatile path. If /var/log/journal ever appears, Storage=volatile is the
+    # only thing keeping the journal off the writable layer - assert the store
+    # it really opened.
+    podman exec desktop test -d /run/log/journal \
+        || fail "no /run/log/journal in the container: journald is not using the volatile store the cap applies to"
+    used=$(podman exec desktop sh -c 'du -sk /run/log/journal 2>/dev/null | cut -f1' || echo 0)
+    [ "${used:-0}" -lt 65536 ] \
+        || fail "the volatile journal is already ${used}K, past the 64M cap - RuntimeMaxUse is not being honoured"
+    log lb "  volatile journal at ${used:-?}K of a 64M cap"
+
+    log lb "verify-log-bounds passed"
+}
+
 verify_privileges() {
     # The container must be running with LESS than --privileged, and stay that
     # way. Without this, restoring --privileged would be invisible: everything
@@ -1339,6 +1386,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|hotplug-probe|play-audio|play-a
     verify-concurrency) verify_concurrency ;;
     verify-teardown) verify_teardown ;;
     verify-privileges) verify_privileges ;;
+    verify-log-bounds) verify_log_bounds ;;
     hotplug-probe) hotplug_probe ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
