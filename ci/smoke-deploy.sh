@@ -309,6 +309,16 @@ for _ in $(seq 10); do
 done
 [ "$cwho" = desktop-shell ] || fail "container ssh host returned '$cwho', want desktop-shell"
 
+log "privileges: not --privileged, and a seccomp filter is applied"
+# The full set of assertions lives in the VM e2e (verify-privileges); these two
+# are the ones that catch a restored --privileged, and this job is a third of
+# the e2e's runtime, so the regression surfaces sooner.
+priv=$(podman inspect desktop --format '{{.HostConfig.Privileged}}')
+[ "$priv" = false ] || fail "podman reports Privileged=$priv, want false"
+seccomp=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/1/status")
+[ "$seccomp" = 2 ] || fail "PID 1 Seccomp=$seccomp, want 2 (filter active)"
+log "  Privileged=false, Seccomp=2"
+
 log "desktop-preflight: fully green (no-KMS FAIL tolerated on KMS-less runners)"
 # Azure runners expose a Hyper-V DRM device, so preflight is normally 0
 # FAILs here and X genuinely runs; a runner image without /dev/dri may

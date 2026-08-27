@@ -253,9 +253,10 @@ container content). So `charts/cdi-device-plugin` gives the plugin pod
 still declare no `securityContext` at all, and `ci/helm-assertions.sh` asserts
 both halves so the two never blur together.
 
-**Not covered.** The desktop container itself is `--privileged`, so label
-separation is already off for it — none of this applies there. If you tighten
-that, expect to write policy for the device and VT access it does.
+**Not covered.** The desktop container runs with `SecurityLabelDisable=true`,
+so label separation is off for it — none of this applies there. Confining it
+would need a policy module of its own for DRM, evdev and VT access; see
+"Container privileges".
 
 To check a running host:
 
@@ -370,7 +371,7 @@ boot-time baseline; the script is what makes them true again after drift.
 The desktop's "Host Terminal" menu entry lands in **`desktop-shell`**, a
 deliberately boring unprivileged account created declaratively by
 sysusers.d (no groups, no sudo, locked password — the container is
-`--privileged` anyway, so this path is convenience + audit trail, not a
+holding `CAP_SYS_ADMIN` anyway, so this path is convenience + audit trail, not a
 boundary). Three properties are worth calling out:
 
 - **Fresh key every boot.** `desktop-host-shell.service` regenerates the
@@ -390,6 +391,51 @@ boundary). Three properties are worth calling out:
 sshd itself: the unit `Wants=sshd.service` (started each boot while the
 desktop is deployed), but whether sshd is *enabled* on the host stays the
 admin's/provisioning's call.
+
+## Input hotplug and KVM switches
+
+`Volume=/dev/input:/dev/input` gives the container a live view of the host's
+input devices. Without it podman's own `/dev` is a snapshot taken at creation,
+so devices added later never appear inside and libinput has nothing to open.
+
+The case that makes this load-bearing rather than cosmetic is a **USB KVM
+switch without HID emulation**: it disconnects and re-enumerates the keyboard
+and mouse on every switch, so a snapshot `/dev` leaves input dead from the
+first switch back until `desktop.service` restarts.
+
+Only `/dev/input`, not all of `/dev` — podman's `/dev/console`, `/dev/pts` and
+`/dev/shm` are what `--systemd=always` and `--tty` rely on, and a blanket
+`/dev:/dev` would shadow them.
+
+The device cgroup allows major 13 (input) explicitly for this reason — a bind
+mount is not a device as far as the cgroup is concerned, so without that rule
+it would resolve to nodes the container may not open. See README.md for the
+video-switching caveat, which this does not address.
+
+## Container privileges
+
+The quadlet does not use `--privileged`. Devices are granted explicitly
+(`AddDevice=-/dev/dri` and `-/dev/snd` — the `-` makes them optional, so a host
+without a GPU or a sound card still starts and lets `desktop-preflight` name
+what is missing — the `/dev/input` bind mount, and device cgroup rules for
+majors 13/4/5/226/116), capabilities are dropped to a named set, and podman's
+default seccomp filter stays in place. `SecurityLabelDisable=true` remains,
+because confining this container needs a policy module of its own; AppArmor is
+disabled alongside it (`--security-opt apparmor=unconfined`) for the same
+reason, so a Debian-family host does not silently get a different answer than
+a RHEL one.
+
+`rtkit-daemon` is masked in the image — it cannot work without
+`SYS_PTRACE`/`DAC_READ_SEARCH`/`NET_ADMIN`, and a *failed* unit would leave
+`systemctl is-system-running` reporting `degraded`. PipeWire gets its realtime
+priorities from the quadlet's `--ulimit rtprio=95` instead — together with a
+systemd drop-in *inside* the image, because `--ulimit` reaches PID 1 and no
+further (systemd applies its own `DefaultLimitRTPRIO=`, which is 0). Both
+halves are needed; see README.md "Container privileges".
+
+`CAP_SYS_ADMIN` is still required by systemd and logind as PID 1, so this
+reduces attack surface without changing the trust boundary. See README.md
+"Container privileges" for the full table and reasoning.
 
 ## Deliberately out of scope
 

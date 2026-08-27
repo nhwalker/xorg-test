@@ -66,8 +66,50 @@ RUN sed -i 's|#sockets = \[ { name = "pipewire-0" }, { name = "pipewire-0-manage
         /usr/share/pipewire/pipewire.conf \
     && grep -q 'desktop-audio' /usr/share/pipewire/pipewire.conf
 COPY image/pipewire/pipewire-pulse-export.conf /etc/pipewire/pipewire-pulse.conf.d/10-desktop-audio-export.conf
+# Realtime without RTKit, for the daemon and for RT clients (pipewire-pulse).
+#
+# rtkit-daemon is masked in this container (it wants SYS_PTRACE,
+# DAC_READ_SEARCH and NET_ADMIN - three of the capabilities the quadlet
+# deliberately withholds), and module-rt PREFERS RTKit when PipeWire is built
+# with D-Bus support rather than falling back to it only when direct
+# scheduling fails. Left alone it queries RTKit, finds it masked, and settles
+# for SCHED_FIFO at priority 1. Raising RLIMIT_RTPRIO does not change that on
+# its own, because nothing was asking for the rlimit path.
+#
+# This edits the STOCK module-rt args rather than adding a conf.d drop-in. A
+# drop-in was tried first and did NOT reach module-rt - the run with it in
+# place still logged "mod.rt: RTKit does not give us MaxRealtimePriority",
+# which module-rt cannot do once rtkit.enabled=false has been applied to it.
+# Whether PipeWire merges context.modules entries by name is evidently not
+# something to rely on, so the entry that definitely loads is edited directly:
+# the same conclusion the protocol-native socket patch above reached, for the
+# same reason.
+#
+# Only the three settings that decide WHERE realtime comes from. rt.prio is
+# deliberately not set here: the stock conf carries an uncommented rt.prio = 60
+# below the insertion point, which wins anyway, and a shadowed duplicate reads
+# as a contradiction to the next person. 60 is under the 95 the rlimit grants,
+# which is all that matters.
+#
+# Targeted by range (the `args = {` inside the module-rt block) rather than by
+# matching a specific setting, so it does not depend on which lines the distro
+# leaves commented out. If it does not apply exactly once, the BUILD fails and
+# prints the block it could not patch - a five-minute signal instead of a
+# thirteen-minute one, and it says what the file actually contains.
+RUN for f in /usr/share/pipewire/pipewire.conf /usr/share/pipewire/client-rt.conf; do \
+        [ -f "$f" ] || continue; \
+        sed -i '/name = libpipewire-module-rt/,/flags/ s/^\([[:space:]]*\)args = {/\1args = {\n\1    rlimits.enabled  = true\n\1    rtportal.enabled = false\n\1    rtkit.enabled    = false/' "$f" \
+        && [ "$(grep -c 'rtkit.enabled' "$f")" = 1 ] \
+        || { echo "module-rt patch did not apply exactly once to $f; the block reads:"; \
+             grep -n -A 12 'libpipewire-module-rt' "$f"; exit 1; }; \
+    done
 COPY image/systemd/pipewire-umask.conf /etc/systemd/user/pipewire.service.d/10-umask.conf
 COPY image/systemd/pipewire-umask.conf /etc/systemd/user/pipewire-pulse.service.d/10-umask.conf
+# Realtime limits, the other half of masking rtkit - see the file's header.
+# systemd does not pass its own rlimits to the units it starts, so the
+# quadlet's --ulimit stops at PID 1 without these.
+COPY image/systemd/realtime-limits.conf /etc/systemd/system.conf.d/10-realtime.conf
+COPY image/systemd/realtime-limits.conf /etc/systemd/user.conf.d/10-realtime.conf
 # The exported sockets are served by the daemons themselves (not socket
 # activation), so start the audio stack with every user manager.
 RUN mkdir -p /etc/systemd/user/default.target.wants \
@@ -110,7 +152,24 @@ RUN systemctl unmask systemd-logind.service dbus-org.freedesktop.login1.service 
     && systemctl mask systemd-udevd.service systemd-udevd-kernel.socket \
         systemd-udevd-control.socket systemd-udev-trigger.service \
     # the session service owns tty1
-    && systemctl mask getty@tty1.service console-getty.service
+    && systemctl mask getty@tty1.service console-getty.service \
+    # rtkit cannot work in this container and must not be left failing.
+    #
+    # It hands PipeWire its realtime thread priorities, and to do that it wants
+    # CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH (to verify the calling process)
+    # plus CAP_NET_ADMIN (its own PrivateNetwork= sandbox needs to configure
+    # loopback). The quadlet deliberately grants none of those - they are three
+    # of the most powerful capabilities there are, and not granting them is
+    # most of the point of not being --privileged. Without them rtkit's
+    # cap_set_proc() returns EPERM and the unit hits its start limit.
+    #
+    # A failed unit is not cosmetic here: systemctl is-system-running then
+    # reports "degraded" rather than "running", which is what the deploy checks
+    # wait for. Masking is the honest resolution - the service genuinely cannot
+    # run, so say so - and PipeWire gets its realtime priorities from
+    # RLIMIT_RTPRIO instead, which the quadlet sets and which needs no
+    # capability at all. See "Container privileges" in README.md.
+    && systemctl mask rtkit-daemon.service
 
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

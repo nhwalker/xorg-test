@@ -20,13 +20,42 @@ log()  { echo "== vm-e2e: $*"; }
 freq_for() { case "$1" in pulse) echo 440;; pipewire) echo 880;; alsa) echo 1320;; *) echo 0;; esac; }
 fail() { echo "FAIL: vm-e2e: $*" >&2; exit 1; }
 
+# ConnectTimeout only bounds the handshake, so a guest that accepts the
+# connection and then wedges would hang here indefinitely - and inside a
+# 20-iteration poll loop that silently eats the job's whole 30-minute budget
+# instead of failing. The outer timeout bounds the command itself; ServerAlive
+# turns a dead-but-open connection into an error.
+#
+# The default is deliberately LARGE. A single flat bound cannot serve both
+# kinds of call this script makes, and choosing one that fit the probes broke
+# the phases: at 60s, `vm-guest.sh phase-deploy` - which installs packages,
+# loads images and brings up the desktop - was killed mid-package-install
+# every run, and reported itself as whatever step it happened to be on when
+# the axe fell. Two runs were diagnosed as an rtkit failure and a dnf mirror
+# problem on that evidence; both were this timeout. So the default bounds a
+# wedged guest without bounding legitimate work, and the poll loops use
+# vm_ssh_quick, which is where a hang actually needs catching fast.
 vm_ssh() {
-    ssh -q -p "$SSHPORT" -i id_ed25519 \
+    timeout "${VM_SSH_TIMEOUT:-900}" ssh -q -p "$SSHPORT" -i id_ed25519 \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 rocky@127.0.0.1 "$@"
+        -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+        rocky@127.0.0.1 "$@"
 }
+# For probes inside poll loops: a command that should answer in under a second,
+# so twenty iterations of it cannot consume the job.
+vm_ssh_quick() { VM_SSH_TIMEOUT=20 vm_ssh "$@"; }
+
 mon_cmd() {
     echo "$1" | socat - "UNIX-CONNECT:$MON" >/dev/null
+}
+# hotplug_probe echoes "<container input nodes> <Xorg input adds>", always as
+# two integers. Defaults to "0 0" rather than letting an ssh hiccup produce an
+# empty string that the arithmetic comparisons below would choke on.
+hotplug_probe() {
+    local out nodes adds
+    out=$(vm_ssh_quick 'sudo repo/ci/vm/vm-guest.sh hotplug-probe' 2>/dev/null || true)
+    read -r nodes adds <<<"$out"
+    echo "${nodes:-0} ${adds:-0}"
 }
 screendump() {
     # -f png needs QEMU >= 7.1. Monitor errors are invisible (socat output
@@ -207,6 +236,22 @@ EOF
 printf 'instance-id: e2e\nlocal-hostname: e2e\n' > meta-data
 cloud-localds seed.img user-data meta-data
 
+# Two keyboards, on purpose.
+#
+# virtio-keyboard-pci is the session's keyboard and stays put. kvmkbd is a USB
+# keyboard on an xHCI controller, and it is the one the KVM-switch simulation
+# unplugs and replugs.
+#
+# USB rather than PCI because that is what a KVM switch actually is, and
+# because PCI hot-unplug is the wrong tool: device_del on a PCI device asks the
+# guest to release it over ACPI and WAITS for the acknowledgement, which a
+# device X currently holds open may never send. USB device removal is immediate
+# and needs no guest cooperation - exactly like yanking the cable a KVM
+# switches.
+#
+# Keeping the virtio keyboard also means the guest is never left with no
+# keyboard, which is why the typing check after the cycle is a session-health
+# check rather than proof about which device carried the keystrokes.
 log "boot VM (KVM, virtio-vga, virtio input, intel-hda)"
 qemu-system-x86_64 \
     -enable-kvm -cpu host -m 6144 -smp 3 \
@@ -214,6 +259,7 @@ qemu-system-x86_64 \
     -drive "file=seed.img,if=virtio,format=raw" \
     -device virtio-vga -display none \
     -device virtio-keyboard-pci -device virtio-tablet-pci \
+    -device qemu-xhci,id=xhci -device usb-kbd,id=kvmkbd,bus=xhci.0 \
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$SSHPORT-:22" -device virtio-net-pci,netdev=n0 \
     -monitor "unix:$MON,server,nowait" \
@@ -223,10 +269,10 @@ qemu-system-x86_64 \
 
 log "wait for ssh"
 for _ in $(seq 60); do
-    vm_ssh true 2>/dev/null && break
+    vm_ssh_quick true 2>/dev/null && break
     sleep 5
 done
-vm_ssh true || fail "VM never became reachable"
+vm_ssh_quick true || fail "VM never became reachable"
 
 log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
@@ -235,6 +281,11 @@ scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
     images-desktop.tar images-plugin.tar images-testclient.tar \
     rocky@127.0.0.1:/tmp/
 
+# Every failure handler below tees its diagnostic rather than redirecting it.
+# Redirecting put the journal, the AVC denials and the pod descriptions in an
+# artifact zip and NOWHERE else, so a red run showed only "guest phase-deploy
+# failed" and finding out why meant downloading it. The artifact is still
+# written; the job log just stops being useless.
 log "phase deploy: the declarative tree on a stock host (SELinux enforcing)"
 # The one host-setup path there is: the deploy tree applied over a stock
 # Rocky host - the boot getty seat-prep must evict, the root-owned
@@ -243,9 +294,14 @@ log "phase deploy: the declarative tree on a stock host (SELinux enforcing)"
 # desktop-preflight fully green.
 vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-guest.sh phase-deploy' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
-         > "$ART/guest-deploy-fail.log" 2>&1 || true; fail "guest phase-deploy failed"; }
+         2>&1 | tee "$ART/guest-deploy-fail.log" || true; fail "guest phase-deploy failed"; }
 screendump desktop-deploy
 assert_nonblank desktop-deploy
+
+log "privileges: the desktop container runs with less than --privileged"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-privileges' \
+    || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop grep -E "^(Cap|Seccomp)" /proc/1/status' \
+         2>&1 | tee "$ART/privileges-fail.log" || true; fail "privilege assertions failed"; }
 
 log "audio: record each client path (pulse, pipewire, ALSA) individually"
 # One capture cycle per player so every path is acoustically verified on
@@ -279,20 +335,112 @@ sleep 2
 screendump input-typed
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check inputok' \
     || { vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null' \
-         > "$ART/input-proof.txt" 2>&1 || true; fail "typed text did not reach the app"; }
+         2>&1 | tee "$ART/input-proof.txt" || true; fail "typed text did not reach the app"; }
 
 log "input hotplug: add a virtio keyboard while X runs"
-before=$(vm_ssh 'ls /dev/input/event* | wc -l')
+# Three layers, measured separately, because they fail for different reasons:
+#   host   the VM sees the new evdev node       (QEMU + kernel)
+#   nodes  it reaches the CONTAINER's /dev      (the /dev/input bind mount)
+#   adds   Xorg logs an "Adding input device"   (the uevent; Network=host)
+#
+# The middle layer used to be broken and unmeasured: podman gives the container
+# its own /dev, a tmpfs populated at creation, so nodes the host gained later
+# never appeared inside. The quadlet now bind-mounts /dev/input; this is what
+# holds that in place.
+before_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+read -r before_nodes before_adds <<<"$(hotplug_probe)"
+log "  before: host=$before_host container-nodes=$before_nodes xorg-adds=$before_adds"
+
 mon_cmd "device_add virtio-keyboard-pci,id=hotkbd"
-sleep 5
-after=$(vm_ssh 'ls /dev/input/event* | wc -l')
-[ "$after" -gt "$before" ] || fail "hotplugged keyboard did not appear ($before -> $after)"
-vm_ssh 'sudo podman exec desktop sh -c "grep -c \"Adding input device\" /home/desktop/.local/share/xorg/Xorg.0.log"' \
-    > "$ART/xorg-input-count.txt" || true
+
+after_host=$before_host after_nodes=$before_nodes after_adds=$before_adds
+for _ in $(seq 20); do
+    after_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+    read -r after_nodes after_adds <<<"$(hotplug_probe)"
+    [ "$after_host" -gt "$before_host" ] && [ "$after_nodes" -gt "$before_nodes" ] && break
+    sleep 1
+done
+log "  after:  host=$after_host container-nodes=$after_nodes xorg-adds=$after_adds"
+
+[ "$after_host" -gt "$before_host" ] \
+    || fail "hotplugged keyboard never appeared on the VM host ($before_host -> $after_host)"
+[ "$after_nodes" -gt "$before_nodes" ] \
+    || fail "the new input node never reached the container ($before_nodes -> $after_nodes): the /dev/input bind mount is missing or not live"
+# Recorded, not asserted: "Adding input device" is logged when Xorg BEGINS
+# handling a device, including ones it then ignores, so an increment is
+# suggestive rather than proof that the device works.
+log "  note: xorg-adds $before_adds -> $after_adds (log lines, not proof of a working device)"
+
+log "KVM switch simulation: remove the keyboard and bring it back"
+# What a USB KVM without HID emulation does on every switch: the devices are
+# electrically disconnected from this host and re-enumerated on the way back,
+# often at a different eventN. The failure this guards against is not "the new
+# device does not work" but "input is dead until desktop.service restarts",
+# which is far worse and only shows up on the FIRST switch back.
+#
+# Asserted on the node counts, in both directions. The removal half matters as
+# much as the addition: a stale node that never disappears is exactly what a
+# snapshot /dev looks like, and it would let the re-add half pass for the wrong
+# reason.
+kvm_base_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+read -r kvm_base_nodes _ <<<"$(hotplug_probe)"
+log "  base:    host=$kvm_base_host container-nodes=$kvm_base_nodes"
+
+mon_cmd "device_del kvmkbd"
+kvm_off_host=$kvm_base_host kvm_off_nodes=$kvm_base_nodes
+for _ in $(seq 20); do
+    kvm_off_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+    read -r kvm_off_nodes _ <<<"$(hotplug_probe)"
+    [ "$kvm_off_host" -lt "$kvm_base_host" ] && [ "$kvm_off_nodes" -lt "$kvm_base_nodes" ] && break
+    sleep 1
+done
+log "  switched away: host=$kvm_off_host container-nodes=$kvm_off_nodes"
+[ "$kvm_off_host" -lt "$kvm_base_host" ] \
+    || fail "device_del kvmkbd did not remove the node on the VM host ($kvm_base_host -> $kvm_off_host)"
+[ "$kvm_off_nodes" -lt "$kvm_base_nodes" ] \
+    || fail "the container still sees the removed keyboard ($kvm_base_nodes -> $kvm_off_nodes): its /dev/input is a stale snapshot, so a KVM switch would leave a dead node behind"
+
+# Safe to re-add immediately: USB removal completes without waiting on the
+# guest, so the id is free by the time the removal shows up in /dev.
+mon_cmd "device_add usb-kbd,id=kvmkbd,bus=xhci.0"
+kvm_on_host=$kvm_off_host kvm_on_nodes=$kvm_off_nodes
+for _ in $(seq 20); do
+    kvm_on_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+    read -r kvm_on_nodes _ <<<"$(hotplug_probe)"
+    [ "$kvm_on_host" -ge "$kvm_base_host" ] && [ "$kvm_on_nodes" -ge "$kvm_base_nodes" ] && break
+    sleep 1
+done
+log "  switched back: host=$kvm_on_host container-nodes=$kvm_on_nodes"
+[ "$kvm_on_host" -ge "$kvm_base_host" ] \
+    || fail "the keyboard never came back on the VM host ($kvm_off_host -> $kvm_on_host)"
+[ "$kvm_on_nodes" -ge "$kvm_base_nodes" ] \
+    || fail "the re-added keyboard never reached the container ($kvm_off_nodes -> $kvm_on_nodes): a KVM switch would leave input dead until desktop.service restarts"
+
+# Session health after the cycle. NOT proof that the re-added virtio keyboard
+# is carrying these keystrokes - QEMU always provides a PS/2 keyboard too, and
+# input-send-event goes to whatever the input core has. What it does prove is
+# that a remove/re-add cycle did not wedge the X session or its input stack,
+# which is the other way a KVM switch could ruin the desktop.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
+sleep 2
+python3 qmp-type.py "$QMP" "$res" 550 395 kvmok
+sleep 2
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check kvmok' \
+    || { vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null' \
+         2>&1 | tee "$ART/input-proof-kvm.txt" || true
+         fail "the session stopped accepting input after a remove/re-add cycle"; }
+log "  the session still accepts input after a full switch cycle"
+
+printf 'hotplug-add     host %s -> %s / container-nodes %s -> %s / xorg-adds %s -> %s\n' \
+    "$before_host" "$after_host" "$before_nodes" "$after_nodes" "$before_adds" "$after_adds" \
+    > "$ART/xorg-input-count.txt"
+printf 'kvm-cycle       host %s -> %s -> %s / container-nodes %s -> %s -> %s\n' \
+    "$kvm_base_host" "$kvm_off_host" "$kvm_on_host" \
+    "$kvm_base_nodes" "$kvm_off_nodes" "$kvm_on_nodes" >> "$ART/xorg-input-count.txt"
 
 log "phase 2: k3s + a cdi-device-plugin release per capability, desktop still on the quadlet"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
-    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
+    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' 2>&1 | tee "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
 assert_nonblank desktop-k3s-client
 
@@ -302,7 +450,7 @@ log "cdi: a requesting pod gets DISPLAY + sockets injected by the runtime"
 # assertions prove the plugin -> CRI-O CDI path end to end in a live pod.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-cdi' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod cdi-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
-         > "$ART/cdi-verify-fail.log" 2>&1 || true; fail "CDI injection verification failed"; }
+         2>&1 | tee "$ART/cdi-verify-fail.log" || true; fail "CDI injection verification failed"; }
 screendump cdi-verify-window
 assert_nonblank cdi-verify-window
 
@@ -312,7 +460,7 @@ log "cdi: each device grants ONLY its own capability"
 # to open the display (X11 here would let it keylog the whole session).
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-split' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod display-only audio-only; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
-         > "$ART/verify-split-fail.log" 2>&1 || true; fail "capability split verification failed"; }
+         2>&1 | tee "$ART/verify-split-fail.log" || true; fail "capability split verification failed"; }
 
 log "cdi: each audio path works from the requesting pod (injected env only)"
 # One capture per path, played from the verifier pod using only injected
@@ -332,14 +480,14 @@ log "cdi: a client can RECORD from the desktop audio (loopback via monitor)"
 # plays and confirm the recording carries it. Checked inside the VM.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-record' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl exec cdi-verify -- sh -c "pactl info; pactl list short sources"' \
-         > "$ART/record-fail.log" 2>&1 || true; fail "audio record-direction check failed"; }
+         2>&1 | tee "$ART/record-fail.log" || true; fail "audio record-direction check failed"; }
 
 log "cdi: a LEAN non-desktop image works with only the injected env/mounts"
 # Proves the CDI contract holds for an ordinary app container (no Xorg
 # server, pipewire daemon, session or WM), not just the desktop image.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-testclient' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient' \
-         > "$ART/testclient-fail.log" 2>&1 || true; fail "lean client display check failed"; }
+         2>&1 | tee "$ART/testclient-fail.log" || true; fail "lean client display check failed"; }
 for path in pulse pipewire alsa; do
     audio_capture_start "audio-testclient-$path"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path x11-testclient" \
@@ -359,13 +507,13 @@ log "screenshot: the injected binary captures the live display from a client pod
 # "it produced a PNG" into "it produced THE SCREEN".
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh screenshot-pattern-start' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod testpattern; echo ---; sudo /usr/local/bin/k3s kubectl logs testpattern' \
-         > "$ART/screenshot-pattern-fail.log" 2>&1 || true; fail "could not paint the test pattern"; }
+         2>&1 | tee "$ART/screenshot-pattern-fail.log" || true; fail "could not paint the test pattern"; }
 # QEMU's own view of the same display, taken while the pattern is up: an
 # independent capture path to cross-check orientation against.
 screendump screenshot-reference
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-screenshot' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient; echo ---; sudo cat /etc/cdi/desktop-display.yaml' \
-         > "$ART/screenshot-fail.log" 2>&1 || true; fail "screenshot capture check failed"; }
+         2>&1 | tee "$ART/screenshot-fail.log" || true; fail "screenshot capture check failed"; }
 vm_ssh 'sudo tar -C /tmp/screenshots -cf - .' | tar -C "$ART" -xf - \
     || fail "could not retrieve the captured screenshots from the VM"
 # Down again before the concurrency phase screendumps the display.
@@ -409,13 +557,13 @@ log "cdi: concurrent clients share one display"
 # advertised count is there to permit.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-concurrency' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo /usr/local/bin/k3s kubectl describe pod x11-client-c' \
-         > "$ART/verify-concurrency-fail.log" 2>&1 || true; fail "concurrency check failed"; }
+         2>&1 | tee "$ART/verify-concurrency-fail.log" || true; fail "concurrency check failed"; }
 screendump concurrent-clients
 
 log "k8s teardown: uninstall the plugin releases; resources withdrawn, host CDI specs and the desktop survive"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
-         > "$ART/teardown-fail.log" 2>&1 || true; fail "k8s teardown check failed"; }
+         2>&1 | tee "$ART/teardown-fail.log" || true; fail "k8s teardown check failed"; }
 
 log "collect guest diagnostics"
 vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide' \
