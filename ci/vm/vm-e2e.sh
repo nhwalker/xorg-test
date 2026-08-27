@@ -2,7 +2,8 @@
 # Host-side orchestration for the Rocky 9 VM e2e test. Boots a KVM guest
 # with virtio graphics/input/sound, drives ci/vm/vm-guest.sh over ssh, hot-
 # adds an input device mid-test, and captures screendumps of the virtual
-# display as artifacts.
+# display as artifacts. The GPU carries two connectors, only one of which
+# QEMU ever enables - see the boot command below.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -252,12 +253,32 @@ cloud-localds seed.img user-data meta-data
 # Keeping the virtio keyboard also means the guest is never left with no
 # keyboard, which is why the typing check after the cycle is a session-health
 # check rather than proof about which device carried the keystrokes.
-log "boot VM (KVM, virtio-vga, virtio input, intel-hda)"
+#
+# Two display connectors, on purpose - max_outputs=2 on the virtio-vga.
+#
+# virtio-gpu derives connector status straight from whether QEMU has that
+# scanout enabled, and QEMU enables scanout 0 at realize and only ever adds
+# more when a UI frontend reports geometry for them. Under `-display none`
+# nothing ever does. So the guest boots with Virtual-1 connected and
+# Virtual-2 PERMANENTLY DISCONNECTED - a monitor-shaped hole, free, with no
+# DDC emulation involved.
+#
+# That hole is what makes the fixed monitor layout testable here. Its
+# load-bearing claim is that a declared output comes up at the declared
+# geometry on a connector the driver says is not connected, which is the hard
+# half of surviving a KVM switch; phase-deploy declares a two-monitor layout
+# across these two connectors and asserts exactly that. See "fixed monitor
+# layout" in vm-guest.sh for what this does and does not prove.
+#
+# Everything else on the display is unaffected: with no layout declared, X
+# autodetects and never enables a disconnected output, so the second
+# connector is inert for the rest of the suite.
+log "boot VM (KVM, virtio-vga with 2 connectors, virtio input, intel-hda)"
 qemu-system-x86_64 \
     -enable-kvm -cpu host -m 6144 -smp 3 \
     -drive "file=$DISK,if=virtio" \
     -drive "file=seed.img,if=virtio,format=raw" \
-    -device virtio-vga -display none \
+    -device virtio-vga,max_outputs=2 -display none \
     -device virtio-keyboard-pci -device virtio-tablet-pci \
     -device qemu-xhci,id=xhci -device usb-kbd,id=kvmkbd,bus=xhci.0 \
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \

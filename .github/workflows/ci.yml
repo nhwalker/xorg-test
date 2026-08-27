@@ -54,7 +54,15 @@ jobs:
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
             deploy/host/usr/local/libexec/desktop-selinux \
             deploy/host/usr/local/libexec/seat-prep.sh \
-            deploy/host/usr/local/bin/desktop-preflight
+            deploy/host/usr/local/bin/desktop-preflight \
+            deploy/host/usr/local/bin/desktop-monitors-capture
+      - name: fixed monitor layout branch tests
+        # Pure logic (no root, no X, no container): the boot-time generator's
+        # driver paths and rejections, and the derived CVT timings against the
+        # values cvt(1) prints. A wrong Modeline is a black screen on the host
+        # that opted in, and nothing downstream would catch it - the config it
+        # lands in is syntactically perfect either way.
+        run: ci/monitor-layout-tests.sh
       - name: build args stay global (multi-stage ARG scoping)
         # An ARG declared before the first FROM is global and usable in every
         # FROM line; one declared AFTER a FROM belongs to that stage alone and

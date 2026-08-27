@@ -4,8 +4,9 @@
 #         rsync-applied over the boot getty seat-prep must evict, desktop
 #         booted from its quadlet with real Xorg on the virtio display,
 #         audio, root-owned desktop-shell ssh trust under SELinux enforcing,
-#         the CONFINED podman client CDI contract, and desktop-preflight
-#         fully green.
+#         the CONFINED podman client CDI contract, a fixed monitor layout
+#         brought up across a connector QEMU never connects, and
+#         desktop-preflight fully green.
 # phase2: k3s + CRI-O + one cdi-device-plugin release per capability, with
 #         the quadlet desktop STILL RUNNING and SELinux STILL ENFORCING -
 #         confined client pods requesting desktop.local/display and/or
@@ -374,11 +375,239 @@ phase_deploy() {
         || fail "requesting both devices did not yield the union of their edits"
     log pd "both devices together give display + audio"
 
+    verify_fixed_layout
+
     log pd "spawn an xterm so the screendump shows a window"
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
         xterm -T deploy-proof -geometry 80x24+80+80
     sleep 3
     log pd "phase-deploy passed"
+}
+
+# --- fixed monitor layout ------------------------------------------------------
+# The KVM video case, as far as a VM can honestly carry it.
+#
+# What this DOES prove, and it is the load-bearing claim: an output declared in
+# monitors.conf comes up at its declared mode and position on a connector the
+# driver reports as NOT CONNECTED, with the framebuffer pinned to the full
+# declared size. The VM gets that connector for free - QEMU enables virtio
+# scanout 0 only, and virtio-gpu reports connector status straight from the
+# scanout's enabled bit, so Virtual-2 is disconnected from boot to shutdown
+# (see the -device line in vm-e2e.sh). "Monitor was never there" is a strict
+# superset of the hard part of "monitor went away".
+#
+# It also proves the live behaviour: a connector going down under a running X
+# does not move the geometry.
+#
+# What it does NOT prove, and what "try it on real hardware early" in README.md
+# is still there for:
+#   - the physical layer. No EDID re-read, no link retraining, no sink that
+#     takes a moment to come back. virtio has no DDC to model.
+#   - a switch-away that is not a connector event at all. Some KVMs drop the
+#     link without the sink ever going down, so nothing here is notified and
+#     nothing reprobes; the static config is what covers that, and it is the
+#     half this VM cannot stage.
+#
+# One thing this DOES reach, contrary to what the comment here first claimed:
+# the sysfs connector force below is delivered to Xorg as an event. The run
+# logs "X noticed on its own" - X had re-probed within three seconds, before
+# anything asked it to. So the notification path is exercised, not stubbed.
+# The explicit query afterwards stays anyway: it costs nothing and it makes
+# the assertion independent of that timing rather than resting on it. Whether
+# X noticed is logged as evidence, never asserted.
+#
+# Restores the shipped (empty) monitors.conf and the connector's forced status
+# before returning, so nothing downstream - the screendumps, the testpattern
+# comparison, phase2's client pods - sees a display this function set up.
+dpy_dims() {
+    podman exec -u desktop -e DISPLAY=:0 desktop \
+        sh -c "xdpyinfo | awk '/dimensions:/{print \$2; exit}'"
+}
+
+xr() {
+    podman exec -u desktop -e DISPLAY=:0 desktop xrandr --query
+}
+
+# One output's line from xrandr --query.
+#
+# NEVER `xr | grep -q` or `xr | grep -m1` here. This script runs under
+# `set -o pipefail`, and those greps stop reading at the first match: the
+# writer - a podman exec with the rest of the query still to send - takes
+# SIGPIPE and exits 141, which pipefail reports as the whole pipeline
+# failing. The match succeeded and the check says it failed. Worse, it is
+# timing-dependent on WHERE the match is: it fires on the first output in the
+# list, where most of the output is still unread, and usually not on the last.
+# So capture the query whole and match against the variable.
+xr_line() {
+    local all
+    all=$(xr) || return 1
+    grep -m1 "^$1 " <<<"$all"
+}
+
+# Asserted by CONTENT rather than by field position: "primary" sits between
+# the connection state and the geometry on the primary output only, and
+# matching positionally silently expects one shape of line and fails on the
+# other. Same containment test the watcher itself uses.
+#   xr_is <output> <connected|disconnected> [geometry]
+# With no geometry, asserts the output carries none - i.e. it is not enabled.
+xr_is() {
+    local want_out=$1 want_state=$2 want_geom=${3:-} line
+    line=$(xr_line "$want_out") || return 1
+    case "$line" in
+        "$want_out $want_state "*) ;;
+        *) return 1 ;;
+    esac
+    if [ -z "$want_geom" ]; then
+        case "$line" in
+            *\ [0-9]*x[0-9]*+[0-9]*+[0-9]*\ *) return 1 ;;
+            *) return 0 ;;
+        esac
+    fi
+    case " $line " in
+        *" $want_geom "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# After a restart: container running AND X actually answering. Waiting on the
+# socket FILE would not do - /tmp/.X11-unix is a host bind mount that survives
+# the container, so a stale node from the instance just stopped can satisfy a
+# test -S immediately and hand the next check a dead socket.
+desktop_up() {
+    wait_for 40 3 "systemd running in container" container_running
+    wait_for 60 4 "X answering on :0" \
+        podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo
+}
+
+conn_connected() { [ "$(cat "$1/status")" = connected ]; }
+
+verify_fixed_layout() {
+    local conn conn2 dims out before
+
+    log pd "fixed monitor layout: the VM has a second connector, and it is disconnected"
+    conn=$(ls -d /sys/class/drm/card*-Virtual-1 2>/dev/null | head -n1)
+    conn2=$(ls -d /sys/class/drm/card*-Virtual-2 2>/dev/null | head -n1)
+    [ -n "$conn" ] || fail "no Virtual-1 DRM connector: the virtio GPU is not what this expects"
+    [ -n "$conn2" ] || fail "no Virtual-2 connector: vm-e2e.sh must boot virtio-vga with max_outputs=2"
+    [ "$(cat "$conn/status")" = connected ] \
+        || fail "Virtual-1 is not connected; nothing below would mean anything"
+    [ "$(cat "$conn2/status")" = disconnected ] \
+        || fail "Virtual-2 is connected - QEMU enabled a second scanout, so the hole this test needs is gone"
+
+    # 1024x768 for both, and the reason is a virtio quirk rather than anything
+    # about this feature. A mode Xorg marks preferred - which Option
+    # "PreferredMode" does, and M_T_PREFERRED is bit-identical to
+    # DRM_MODE_TYPE_PREFERRED - has to survive virtio_gpu_conn_mode_valid:
+    #
+    #     if (!(mode->type & DRM_MODE_TYPE_PREFERRED))       return MODE_OK;
+    #     if (mode->hdisplay == XRES_DEF &&
+    #         mode->vdisplay == YRES_DEF)                    return MODE_OK;
+    #     if (mode->hdisplay <= width  && mode->hdisplay >= width  - 16 &&
+    #         mode->vdisplay <= height && mode->vdisplay >= height - 16)
+    #                                                        return MODE_OK;
+    #     return MODE_BAD;
+    #
+    # XRES_DEF x YRES_DEF is 1024x768, and that second line is unconditional -
+    # it does not consult the scanout's size at all. Which is what this test
+    # needs, because Virtual-2's scanout was never enabled and so HAS no size:
+    # the width/height check could never pass for it. Any other resolution
+    # would fail here on the quirk and say nothing about the feature.
+    #
+    # Note what is deliberately NOT assumed: the size QEMU boots this display
+    # at. That is a device property (xres/yres, 1280x800 on current QEMU), it
+    # has no bearing on the rule above, and the restore check at the end
+    # compares against whatever it actually is.
+    before=$(dpy_dims)
+    log pd "fixed monitor layout: declare both connectors side by side (display is $before)"
+    cat > /etc/desktop-container/monitors.conf <<'EOF'
+Virtual-1  1024x768@60  +0+0      primary
+Virtual-2  1024x768@60  +1024+0
+EOF
+    systemctl restart desktop.service
+    desktop_up
+
+    log pd "fixed monitor layout: the generator wrote the modesetting config"
+    out=$(podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf 2>/dev/null || true)
+    if [ -z "$out" ]; then
+        podman logs desktop 2>&1 | grep xorg-monitor-conf >&2 || true
+        fail "the declared layout generated no /etc/X11/xorg.conf.d/30-monitors.conf"
+    fi
+    echo "$out" | grep -q 'Option      "Enable" "true"' \
+        || fail "outputs were not forced enabled"
+    echo "$out" | grep -q 'Modeline "1024x768_60.00"' \
+        || fail "no derived timing for the declared mode"
+    echo "$out" | grep -q 'Virtual 2048 768' \
+        || fail "framebuffer not pinned to the declared extents"
+
+    # THE ASSERTION THIS WHOLE ARRANGEMENT EXISTS FOR.
+    log pd "fixed monitor layout: X came up at the full declared size"
+    dims=$(dpy_dims)
+    [ "$dims" = 2048x768 ] \
+        || fail "screen is $dims, want 2048x768 - the declared layout did not take"
+
+    log pd "fixed monitor layout: the DISCONNECTED output is enabled, where it was declared"
+    xr_is Virtual-1 connected 1024x768+0+0 \
+        || fail "Virtual-1 not where it was declared: $(xr_line Virtual-1)"
+    case "$(xr_line Virtual-1)" in
+        "Virtual-1 connected primary "*) ;;
+        *) fail "Virtual-1 was declared primary but is not: $(xr_line Virtual-1)" ;;
+    esac
+    # One line, and it is the whole point: xrandr says "disconnected" and
+    # prints a geometry anyway, because Option "Enable" plus a derived Modeline
+    # gave the server a mode it never had to ask a monitor for.
+    xr_is Virtual-2 disconnected 1024x768+1024+0 \
+        || fail "Virtual-2 is not enabled on a disconnected connector: $(xr_line Virtual-2)"
+    log pd "  Virtual-2 scans out 1024x768+1024+0 with nothing plugged into it"
+
+    # A connector going down UNDER a running X. The force is real: the kernel
+    # reports this connector disconnected to every probe from here on. It
+    # arrives without the uevent a physical unplug would carry, which is why
+    # the probe is driven rather than waited for - see this section's header.
+    log pd "fixed monitor layout: a live disconnect does not move the geometry"
+    echo off > "$conn/status"
+    [ "$(cat "$conn/status")" = disconnected ] \
+        || fail "forcing $conn off did not take (kernel without connector force?)"
+    sleep 3
+    case "$(xr_line Virtual-1)" in
+        "Virtual-1 disconnected "*)
+            log pd "  X noticed on its own - a uevent reached it" ;;
+        *)
+            log pd "  X has not re-probed yet; the query below forces one, as any client would" ;;
+    esac
+    # RRGetInfo -> xf86ProbeOutputModes: X re-reads the connector and sees it
+    # disconnected. Nothing about the CRTC configuration may change.
+    xr >/dev/null
+    dims=$(dpy_dims)
+    [ "$dims" = 2048x768 ] \
+        || fail "screen collapsed to $dims when Virtual-1 went down - the layout did not hold"
+    xr_is Virtual-1 disconnected 1024x768+0+0 \
+        || fail "Virtual-1 lost its geometry on disconnect: $(xr_line Virtual-1)"
+    log pd "  both outputs now disconnected, both still scanning out where they were declared"
+
+    log pd "fixed monitor layout: restore the connector and the shipped (empty) config"
+    echo detect > "$conn/status"
+    wait_for 10 1 "Virtual-1 connected again" conn_connected "$conn"
+    install -m644 deploy/host/etc/desktop-container/monitors.conf \
+        /etc/desktop-container/monitors.conf
+    systemctl restart desktop.service
+    desktop_up
+    # The shipped file is pure comments, so the feature must be OFF again: no
+    # generated config, and a screen sized by autodetection alone. That is what
+    # every other test in this suite - and every host that never opts in - gets,
+    # so assert it rather than assume the restore worked.
+    if podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf; then
+        fail "the shipped monitors.conf still generated a layout - it is not a no-op"
+    fi
+    xr_is Virtual-2 disconnected \
+        || fail "Virtual-2 is still enabled after the layout was withdrawn: $(xr_line Virtual-2)"
+    dims=$(dpy_dims)
+    # Not an equality against $before: setting a scanout can leave QEMU
+    # reporting the new size as that display's geometry, so autodetection may
+    # legitimately settle somewhere other than where it started. What must be
+    # true is that the declared layout is gone - one output, not two.
+    [ "$dims" != 2048x768 ] \
+        || fail "the screen is still the declared two-monitor size after the layout was withdrawn"
+    log pd "fixed monitor layout: back to autodetection at $dims (was $before on entry)"
 }
 
 phase2() {

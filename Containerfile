@@ -36,6 +36,9 @@ COPY image/xorg/xorg-gpu-conf.sh /usr/local/bin/xorg-gpu-conf.sh
 COPY image/xorg/ensure-vt-devices.sh /usr/local/bin/ensure-vt-devices.sh
 COPY image/xorg/align-device-groups.sh /usr/local/bin/align-device-groups.sh
 COPY image/xorg/preflight-check.sh /usr/local/bin/preflight-check.sh
+# Fixed monitor layout (KVM video). Opt-in per host: without the config file
+# this generator writes nothing and Xorg autodetects as before. See README.md.
+COPY image/xorg/xorg-monitor-conf.sh /usr/local/bin/xorg-monitor-conf.sh
 
 # --- Session ----------------------------------------------------------------
 COPY image/session/start-session /usr/local/bin/start-session
@@ -51,6 +54,7 @@ RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/ensure-vt-devices.
         /usr/local/bin/start-session \
         /usr/local/bin/session-postmortem /usr/local/bin/align-device-groups.sh \
         /usr/local/bin/preflight-check.sh /usr/local/bin/host-shell-setup.sh \
+        /usr/local/bin/xorg-monitor-conf.sh \
         /usr/local/bin/host-terminal /etc/X11/xinit/xinitrc.desktop
 
 RUN for g in input render video audio tty; do \

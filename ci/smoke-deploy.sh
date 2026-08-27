@@ -355,6 +355,48 @@ if [ "$nfail" != 0 ]; then
     fi
 fi
 
+# --- fixed monitor layout: the host file reaches the container ---------------
+# ci/monitor-layout-tests.sh covers the generator's own branches; what only a
+# real deploy can show is the wiring - that a file dropped in the tree's
+# /etc/desktop-container is visible inside through the quadlet's existing
+# read-only mount, and is acted on at container start. No quadlet change was
+# needed for this feature, and that claim is exactly what would rot silently.
+#
+# Both halves wait on xorg-conf.service, never on the container merely being
+# reachable: the generator runs from that oneshot, which finishes seconds
+# AFTER `podman exec` starts working. Reading its output early is not just a
+# flaky failure - it would let the no-op assertion pass vacuously, on a
+# container that had not yet had the chance to write anything.
+wait_xorg_conf() {
+    for _ in $(seq 30); do
+        podman exec desktop systemctl is-active --quiet xorg-conf.service && return 0
+        sleep 2
+    done
+    podman exec desktop systemctl status xorg-conf.service --no-pager -l >&2 2>&1 || true
+    fail "xorg-conf.service never completed in the container"
+}
+
+log "fixed monitor layout: the shipped default is a genuine no-op"
+[ -f /etc/desktop-container/monitors.conf ] || fail "the tree did not ship monitors.conf"
+wait_xorg_conf
+# Captured, not piped into grep -q: this script runs under `set -o pipefail`,
+# and a grep that stops at the first match leaves podman writing into a closed
+# pipe - SIGPIPE, exit 141, and a passing check reported as a failure.
+gen_log=$(podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null || true)
+case "$gen_log" in
+    *xorg-monitor-conf*) ;;
+    *) fail "the layout generator never ran" ;;
+esac
+if podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf; then
+    fail "a config with no output lines still generated a layout"
+fi
+
+log "fixed monitor layout: a declared layout is applied at the next start"
+cat > /etc/desktop-container/monitors.conf <<'EOF'
+DP-1  1920x1080@60  +0+0     primary
+DP-2  1920x1080@60  +1920+0
+EOF
+
 log "desktop.service survives a restart"
 systemctl restart desktop.service
 up=0
@@ -363,5 +405,23 @@ for _ in $(seq 20); do
     sleep 2
 done
 [ "$up" = 1 ] || fail "container did not come back after restart"
+
+# The restart above is what re-runs xorg-conf.service, so the assertions on
+# the declared layout land here rather than beside the config that set it up.
+wait_xorg_conf
+mon=$(podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf 2>/dev/null || true)
+if [ -z "$mon" ]; then
+    podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null | grep xorg-monitor-conf >&2 || true
+    fail "the declared layout produced no /etc/X11/xorg.conf.d/30-monitors.conf"
+fi
+echo "$mon" | grep -q 'Identifier  "DP-2"' || fail "generated config does not name the declared outputs"
+# A runner with no KMS falls through to the modesetting branch, which is the
+# one that has to invent a timing; on a runner with a DRM device it is the
+# same branch, because no runner has an NVIDIA GPU.
+echo "$mon" | grep -q 'Option      "Enable" "true"' || fail "outputs not forced enabled"
+echo "$mon" | grep -q 'Modeline "1920x1080_60.00"' || fail "no derived timing for the declared mode"
+# Put the shipped default back, so nothing after this point sees a layout the
+# tree does not actually ship.
+install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf
 
 log "deploy smoke passed"

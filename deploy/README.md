@@ -336,6 +336,8 @@ point of the declarative form — the file list above *is* the state).
 | `etc/sysusers.d/desktop-container.conf` | the dedicated `desktop-shell` account (see "Host Terminal" below) |
 | `etc/ssh/sshd_config.d/40-desktop-container.conf` | root-owned `authorized_keys` location for `desktop-shell` |
 | `etc/desktop-container/shell-user` | account name the container's `ssh host` targets (static: `desktop-shell`) |
+| `etc/desktop-container/monitors.conf` | the fixed monitor layout, read by the container at every start (see "Fixed monitor layout" below). Ships as pure comments = feature off |
+| `usr/local/bin/desktop-monitors-capture` | read-only debug tool: prints the desktop's current arrangement as a `monitors.conf` block; not wired into boot |
 | `etc/systemd/system/desktop-host-shell.service` | oneshot before `desktop.service`: fresh keypair every boot + root-owned trust entry |
 | `usr/local/libexec/desktop-host-shell-setup` | the script that unit runs (boot-time convergence agent, not an installer) |
 
@@ -409,8 +411,53 @@ Only `/dev/input`, not all of `/dev` — podman's `/dev/console`, `/dev/pts` and
 
 The device cgroup allows major 13 (input) explicitly for this reason — a bind
 mount is not a device as far as the cgroup is concerned, so without that rule
-it would resolve to nodes the container may not open. See README.md for the
-video-switching caveat, which this does not address.
+it would resolve to nodes the container may not open.
+
+Video is the other half of the same switch, and it is handled by declaring the
+layout rather than by a mount — see the next section.
+
+## Fixed monitor layout
+
+A KVM takes the video link with it too: on switch-away the EDID disappears and
+the connector goes down, and nothing in this session re-establishes the outputs
+on the way back (mwm predates RandR; no desktop environment is running). The
+tree's answer is to state the arrangement instead of detecting it, in
+
+```
+/etc/desktop-container/monitors.conf
+```
+
+which is already mounted read-only into the container by the quadlet's
+`Volume=/etc/desktop-container:/etc/desktop-container:ro` — the same mount the
+Host Terminal material rides on, so **nothing about the quadlet changes to turn
+this on**. The container reads it at every start of `desktop.service` and
+generates the driver-appropriate Xorg config; the mechanics are in README.md
+("Fixed monitor layout"), and the file's own comments document every field.
+
+It ships as pure comments, which is the off state: no output lines, no
+generated config, Xorg autodetects from EDID exactly as before. That is the
+same shape as everything else here — one tree for every host class, with the
+per-class behaviour a runtime no-op rather than a different file set.
+
+Getting the output names right is the whole difficulty, and they are the
+driver's to spell, so read them off the running server instead of guessing:
+
+```sh
+desktop-monitors-capture            # root; prints a ready-to-paste block
+                                    # for the monitors attached RIGHT NOW
+```
+
+Run it with the KVM pointed at this host — that arrangement is the one being
+frozen. Paste, then `systemctl restart desktop.service`.
+
+Two knobs exist only for NVIDIA, because that driver has no equivalent of the
+per-output "stay enabled" flag the modesetting path uses:
+`nvidia-connected` (its `ConnectedMonitor`, in the driver's own *display
+device* names — `DFP-0`, not the RandR name `DP-0`) and `nvidia-edid` (a saved
+EDID, captured from `/sys/class/drm/card*-*/edid` while the monitor is
+attached and dropped next to `monitors.conf`, where the container can read
+it). Reach for them if the layout survives a switch on a modesetting host but
+not on the NVIDIA one.
 
 ## Container privileges
 
@@ -498,11 +545,18 @@ systemctl status desktop-host-shell         # fresh key generated this boot
 ls -l /etc/ssh/authorized_keys.d/           # root-owned desktop-shell entry
 podman logs desktop | grep preflight:       # container-side assumptions;
                                             # FAILs on stub spec + visible GPU
+desktop-monitors-capture                    # current arrangement, as config
+podman logs desktop | grep xorg-monitor-conf  # what layout was applied, if any
 ```
 
 ## How CI validates this tree
 
-- `ci.yml` static job: shellcheck on every script in this tree.
+- `ci.yml` static job: shellcheck on every script in this tree, and
+  `ci/monitor-layout-tests.sh` for the fixed-layout generator this tree feeds
+  (both driver paths, the derived CVT timings against `cvt(1)`, and the
+  rejections). `e2e-vm.yml` then declares a
+  layout through this tree's `monitors.conf` on a GPU whose second connector
+  QEMU never connects, and asserts the declared output comes up on it anyway.
 - `ci.yml` build-smoke also asserts the SELinux labeler's no-op branch: the
   runner is Ubuntu with no SELinux, and a deploy there must not fail because
   of it.

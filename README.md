@@ -190,13 +190,114 @@ the container*, in both directions. The removal half matters as much as the addi
 that never disappears is what a snapshot `/dev` looks like, and it would let the
 re-add half pass for the wrong reason.
 
-> **Video is a separate question.** A KVM switches the display too, and on
-> switch-away the monitor's EDID disappears and the GPU sees a connector
-> disconnect. That is not a `/dev` problem — `/dev/dri/card*` does not go away —
-> but whether Xorg restores the mode cleanly on switch-back is a distinct and
-> well-known pain point. Nothing here addresses it, and QEMU's virtio-vga does
-> not model DDC disconnect well enough to test it honestly. Try it on real
-> hardware early.
+> **Video is a separate question**, with a separate answer — the next
+> section. A KVM switches the display too, but that is not a `/dev` problem:
+> `/dev/dri/card*` never goes away, only the EDID on it does.
+
+### Fixed monitor layout (KVM video)
+
+On switch-away a KVM takes the video link with it: the monitor's EDID
+disappears and the GPU sees the connector go down. Nothing re-establishes the
+outputs on the way back, because this session has no component that would —
+mwm predates RandR, and there is no desktop environment running to react to a
+hotplug event. The screen collapses onto whatever output survived, every
+window is reflowed into it, and it stays that way until `desktop.service`
+restarts.
+
+The fix is not to detect the switch better. It is to stop detecting: **declare
+the layout, and Xorg never asks a connector what the geometry is.** A host
+that knows its arrangement at provisioning time — which, for a KVM'd desk, it
+does — writes it into `/etc/desktop-container/monitors.conf`:
+
+```
+# <output>  <WxH[@Hz]>  <+X+Y>  [primary] [rotate=left|right|inverted]
+DP-1        1920x1080@60   +0+0      primary
+DP-2        1920x1080@60   +1920+0
+```
+
+`desktop-monitors-capture` on the host prints that block for the monitors
+attached right now, so the output names come from the running server instead
+of from guesswork. The file ships with the deploy tree as pure comments, and
+that is the off state: with no output lines nothing is generated and Xorg
+autodetects exactly as before. Its comments document every field and the
+global `watch` / `virtual` / `nvidia-*` lines.
+
+One thing holds the geometry:
+
+**`xorg-monitor-conf.sh`** turns the file into
+   `/etc/X11/xorg.conf.d/30-monitors.conf` at every container boot, after
+   `xorg-gpu-conf.sh` has picked the driver — the two drivers have no
+   mechanism in common:
+   - **modesetting**: one `Section "Monitor"` per output, identified by the
+     RandR output name, carrying `Option "Enable" "true"` (forces the output
+     on *even where the driver reports it disconnected* — this is the line
+     that survives the switch), `PreferredMode`, `Position`, and a
+     **generated CVT `Modeline`**. The modeline is what makes forcing it on
+     mean anything: no monitor means no EDID, no EDID means no modes, and an
+     output with no modes cannot be enabled however hard you try. The timing
+     is derived from the declared resolution in integer shell arithmetic —
+     the same computation as `cvt(1)`, whose output CI pins it against — so
+     the mode list is identical whether the KVM points here or not.
+   - **NVIDIA**: the driver implements RandR 1.2 itself and ignores all of
+     the above, so the layout is one `Option "MetaModes"` in the `Screen`
+     section plus `ModeValidation "AllowNonEdidModes"`. A MetaMode is a
+     statement about the X screen rather than about what is plugged in, so it
+     holds across connector events by construction. The driver's counterpart
+     of `Enable` is `ConnectedMonitor`, which needs its *display device*
+     names (`DFP-0`, not the RandR name `DP-0`) and so is opt-in via
+     `nvidia-connected`; `nvidia-edid` feeds it a saved EDID the same way.
+   - Both paths pin the framebuffer with `Virtual` at the layout's extents.
+     That changes nothing at startup — the enabled outputs already sum to it
+     — and everything if an output fails to come up: restoring it later is
+     then a mode set rather than a screen resize, and a resize is what moves
+     every window on a desktop whose window manager has never heard of RandR.
+That config is authoritative at server **start**, and nothing re-asserts it
+afterwards. Nothing in this session watches RandR at all — mwm predates it and
+no desktop environment runs here — so a layout that something else moves stays
+moved until `desktop.service` restarts. A session-side re-assert loop was
+written and then removed before merge: what the e2e actually showed is that
+the static config held on its own through a connector going down, so the loop
+had nothing to do, and it could not have helped with the case that most often
+bites (X's state correct but the panel dark, because the link never
+retrained). If a real switch turns out to move the layout, that loop is the
+thing to build — see the history of this file.
+
+A bad config never costs a boot: the generator logs what was wrong, writes
+nothing, and the desktop comes up autodetecting. `podman logs desktop | grep
+xorg-monitor-conf` is the whole story of what it decided, and the container's
+preflight flags an output name with no matching DRM connector before that.
+
+**What CI proves.** The static job pins the pieces that have no hardware in
+them: the derived timings against `cvt(1)`, both driver paths, and the config
+rejections (`ci/monitor-layout-tests.sh`). The VM e2e proves the load-bearing claim
+itself. QEMU's virtio-vga is booted with `max_outputs=2`, and virtio-gpu
+reports connector status straight from whether QEMU has that scanout enabled —
+under `-display none` it never enables the second one, so the guest has a
+permanently **disconnected** `Virtual-2`: a monitor-shaped hole, with no DDC
+emulation involved. The e2e declares a two-monitor layout across both
+connectors and asserts that `xrandr` reports
+
+```
+Virtual-2 disconnected 1024x768+1024+0
+```
+
+— an output scanning out at its declared position with nothing plugged into
+it, on a screen pinned to the full 2048x768. It then forces `Virtual-1`'s
+connector down under the running server and asserts the geometry does not
+move. "Monitor was never there" is a strict superset of the hard part
+of "monitor went away".
+
+The notification path is exercised too, which was not expected: forcing the
+connector down through sysfs reaches Xorg as an event — the run logs `X
+noticed on its own`, having re-probed within three seconds before anything
+asked it to. The e2e still drives a client query afterwards, so the assertion
+rests on the geometry rather than on that timing.
+
+**What it does not prove**, and what to try on real hardware early: the
+physical layer — EDID re-read, link retraining, a sink that takes a moment to
+come back — and the KVMs that drop the link without the sink ever going down,
+where nothing is notified and nothing reprobes. That last case is exactly what
+the static config covers and exactly what a VM cannot stage.
 
 ### Changing the VT
 
@@ -215,7 +316,9 @@ all of them (a systemd drop-in works for the unit) to move the session.
 - At container boot, `xorg-gpu-conf.sh` writes
   `/etc/X11/xorg.conf.d/20-gpu.conf`: `nvidia` if device nodes **and** an
   injected `nvidia_drv.so` are present, else `modesetting` on the first
-  connected `/dev/dri/card*`.
+  connected `/dev/dri/card*`. `xorg-monitor-conf.sh` runs next and reads that
+  decision back, because the fixed monitor layout is spelled differently for
+  each driver — see "Fixed monitor layout" above.
 - **nvidia_drv.so missing:** older toolkits don't include the Xorg driver
   module in the CDI spec, and preflight then warns
   `nvidia_drv.so NOT injected`. Pin a toolkit that includes it, or bind-mount
@@ -652,8 +755,11 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   get its capability and no other, input is typed in over the real virtual
   keyboard, hotplug is asserted through to the container's `/dev` and a full
   KVM-style remove/re-add cycle is exercised via QEMU (see "Input hotplug and
-  KVM switches"), the container's privileges are asserted to be less than
-  `--privileged` (see "Container privileges"), and
+  KVM switches"), a fixed monitor layout is declared across the GPU's two
+  connectors — one of which QEMU never connects — and asserted to come up
+  whole and to hold when a connector is forced down under the running server
+  (see "Fixed monitor layout"), the container's privileges are asserted to be less
+  than `--privileged` (see "Container privileges"), and
   `desktop-preflight` is asserted fully green. The podman clients run
   **confined** — no `label=disable` anywhere in the suite — against the
   `container_file_t` labels `desktop-selinux.service` applied, which are
@@ -684,6 +790,7 @@ systemctl status desktop.service
 podman exec desktop systemctl status desktop-session xorg-conf
 podman exec desktop loginctl                   # session for "desktop" on seat0
 podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf   # nvidia vs modesetting
+podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf  # fixed layout, if declared
 DISPLAY=:0 xrandr                              # display up, modes listed
 DISPLAY=:0 glxinfo -B                          # GPU mode: "NVIDIA"; else llvmpipe
 fgconsole                                      # VT 1 active
@@ -698,6 +805,11 @@ aplay        /usr/share/sounds/alsa/Front_Center.wav   # via the ALSA drop-in
 
 Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 (uevents arrive because the container shares the host network namespace).
+
+Video, on a host that declared a layout ("Fixed monitor layout" above): switch
+the KVM away and back. `DISPLAY=:0 xrandr` must report the same geometry
+throughout, and no window may have moved. `podman logs desktop | grep xorg-monitor-conf` says what was configured at
+boot.
 
 ## Container privileges
 
