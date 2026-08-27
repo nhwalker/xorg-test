@@ -19,7 +19,13 @@ device nodes -- comes from the CDI spec, not from this chart:
       limits:
         {{ include "cdi-device-plugin.resourceName" . }}: 1
 
-Install one release per CDI device, e.g. alongside this one:
+{{ if .Values.seLinuxOptions }}This release runs the plugin as {{ .Values.seLinuxOptions.type }}, because registering means
+connecting to kubelet's own socket, which a confined container may not do on an
+SELinux-enforcing host. A runtime on a host without SELinux has no label to
+apply; if yours objects, reinstall with --set seLinuxOptions=null. Client pods
+need nothing here either way -- they stay fully confined.
+
+{{ end }}Install one release per CDI device, e.g. alongside this one:
 
     helm install <name> charts/cdi-device-plugin \
         --set cdiDevice=<vendor/class=device> --set count=<n>

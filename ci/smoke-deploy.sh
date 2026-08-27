@@ -133,7 +133,11 @@ grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "defaults not restored after removi
 # (phase-deploy asserts the resulting labels; phase2 runs confined pods against
 # them), because it needs a real policy to be meaningful.
 log "selinux labeler: clean no-op where SELinux is absent"
-if [ -d /sys/fs/selinux ]; then
+# /sys/fs/selinux/enforce, not the DIRECTORY: the selinuxfs mount point exists
+# empty on plenty of kernels with SELinux inactive, so guarding on the
+# directory would skip this test on exactly the hosts it is meant to cover.
+# Same trap the labeler itself had - see deploy/README.md "SELinux".
+if [ -e /sys/fs/selinux/enforce ]; then
     log "  (skipped: this runner HAS SELinux, so the no-op branch is untestable here)"
 else
     out=$("$SELINUX_LABEL" 2>&1)         || fail "labeler exited non-zero on a host without SELinux: $out"
