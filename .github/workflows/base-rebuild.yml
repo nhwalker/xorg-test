@@ -19,14 +19,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ghcr login
+        # --password-stdin, never -p: an argument would put the token in the
+        # process list and in podman's own error output on a failed login.
         run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: rebuild bases from scratch
         run: |
+          # --pull re-resolves the upstream FROM image even when a local copy
+          # exists, and --no-cache discards every layer cache entry. Together
+          # they are what makes this workflow mean anything: its whole job is
+          # to prove the bases still build from current upstream and to pick up
+          # security updates. Without them it could "succeed" against a stale
+          # cache and report a green that tested nothing.
           sudo podman build --pull --no-cache -t localhost/desktop-container-base:latest -f Containerfile.base .
           sudo podman build --pull --no-cache -t localhost/cdi-device-plugin-base:latest -f Containerfile.plugin.base .
           sudo podman build --pull --no-cache -t localhost/screenshot-base:latest -f Containerfile.screenshot.base .
       - name: offline app layers still build on the fresh bases
         run: |
+          # --network=none is the offline gate, not a speed-up: these layers
+          # must build with no network at all, so a dependency can never be
+          # added without also changing a Containerfile.*.base and forcing a
+          # base rebuild. A build that needs the network fails here loudly
+          # instead of drifting.
+          #
           # Before the desktop image, which stages its tools out of this one.
           sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .

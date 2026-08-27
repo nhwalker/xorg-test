@@ -164,9 +164,6 @@ AddDevice=-/dev/snd
 # lines are optional ('-' prefix) and so may grant nothing: this keeps the
 # cgroup policy a property of the unit rather than of what the host happens to
 # have.
-#
-# The rule values are QUOTED: quadlet splits PodmanArgs on whitespace, and
-# "c 13:* rwm" is one argument containing two spaces.
 
 # Realtime scheduling for the audio stack, WITHOUT rtkit. PipeWire runs as the
 # unprivileged 'desktop' user, so it cannot use the container's CAP_SYS_NICE -
@@ -177,7 +174,48 @@ AddDevice=-/dev/snd
 # to SCHED_FIFO for an unprivileged process and needs no capability at all, so
 # PipeWire gets its RT threads and the dangerous capabilities stay dropped.
 # memlock likewise replaces the CAP_IPC_LOCK that PipeWire would otherwise want
-# for its buffers.
+# for its buffers. The image also needs a systemd drop-in for these to reach
+# PipeWire at all - see image/systemd/realtime-limits.conf.
+#
+# --- every flag on the PodmanArgs line, and why ------------------------------
+# These are the options quadlet has no key of its own for. Comments cannot be
+# interleaved into a line continuation, so they are indexed here instead; keep
+# this list in step with the line below.
+#
+#   --systemd=always        Run the image's /sbin/init as a real systemd PID 1:
+#                           podman then mounts /sys/fs/cgroup, puts tmpfs on
+#                           /run and /tmp, and stops the container with
+#                           SIGRTMIN+3. "always" rather than the default
+#                           "true" because "true" only switches systemd mode on
+#                           when podman recognises the entrypoint (/sbin/init
+#                           and friends); "always" does not depend on that
+#                           sniffing continuing to match. A silently
+#                           non-systemd PID 1 would take logind, the seat and
+#                           the whole session with it.
+#
+#   --tty                   Allocate a pty so the runtime creates
+#                           /dev/console, which is what `podman logs` reads and
+#                           what journal-console.service redirects the journal
+#                           into. Without it there is no /dev/console at all,
+#                           the container's boot is invisible from the host,
+#                           and that unit refuses to start rather than create a
+#                           regular file that grows forever on the /dev tmpfs.
+#                           See image/systemd/journal-console.service.
+#
+#   --security-opt          AppArmor off - the Debian-family counterpart of
+#     apparmor=unconfined   SecurityLabelDisable= below, and inert on the
+#                           RHEL/Rocky targets this tree is written for. The
+#                           full reasoning is with that directive.
+#
+#   --ulimit rtprio=95      RLIMIT_RTPRIO / RLIMIT_MEMLOCK for the audio stack,
+#   --ulimit memlock=...    replacing rtkit and CAP_IPC_LOCK respectively - see
+#                           the paragraph directly above.
+#
+#   --device-cgroup-rule    The device allowlist; the majors and the reason
+#     (five of them)        each one is here are listed above. The values are
+#                           QUOTED because quadlet splits PodmanArgs on
+#                           whitespace and "c 13:* rwm" is ONE argument
+#                           containing two spaces - unquoted it becomes three.
 PodmanArgs=--systemd=always --tty \
     --security-opt apparmor=unconfined \
     --ulimit rtprio=95 \

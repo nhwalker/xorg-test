@@ -1,10 +1,18 @@
 #!/bin/bash
-# Container runtimes disagree about VT device nodes in privileged
-# containers: docker exposes the host's /dev/tty0..N, rootful podman does
+# Container runtimes disagree about whether VT device nodes appear inside a
+# container: docker exposes the host's /dev/tty0..N, rootful podman does
 # NOT (verified on real hosts - the session then fails at step STDIN and
-# the desktop black-screens). The container's /dev is a tmpfs and the
-# container has CAP_MKNOD with an open device cgroup, so create the nodes
-# ourselves when the runtime didn't. Runs first from xorg-conf.service.
+# the desktop black-screens). The container's /dev is a tmpfs, so create the
+# nodes ourselves when the runtime didn't.
+#
+# The quadlet grants exactly what that needs and nothing more: CAP_MKNOD, and
+# device-cgroup-rule "c 4:* rwm" for the VT major. Creating them here on the
+# container's OWN /dev is deliberate rather than a workaround - systemd chowns
+# TTYPath= to the session user, and doing that to an AddDevice-d host node
+# would change the HOST's /dev/tty1. See the MKNOD entry in
+# deploy/host/etc/containers/systemd/desktop.container.
+#
+# Runs first from xorg-conf.service.
 set -u
 
 log() { echo "ensure-vt-devices: $*"; }

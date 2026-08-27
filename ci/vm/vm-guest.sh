@@ -17,6 +17,33 @@
 # setenforce: a client that only works permissive is a client that does not
 # work, and that is the whole point of the desktop-selinux labeling the
 # deploy tree ships.
+#
+# podman flag conventions used throughout, stated once here rather than at
+# each of the two dozen call sites:
+#
+#   podman exec -u desktop     Enter as the SESSION user, not root. Checks
+#                              about the desktop (can it open the display, can
+#                              it reach the audio socket, does ssh work) are
+#                              only meaningful as the user that actually runs
+#                              it; root would pass some of them for the wrong
+#                              reason.
+#   podman exec -e DISPLAY=... `podman exec` inherits the environment of the
+#              -e HOME=...     container's PID 1, NOT of the logind session -
+#              -e XDG_RUNTIME_DIR   so DISPLAY, HOME and XDG_RUNTIME_DIR are
+#                              absent and have to be supplied. Getting this
+#                              wrong looks like a broken desktop rather than a
+#                              broken test.
+#   podman exec -d             Detach, for the xterms that must stay up while
+#                              the screendump is taken. Without it the exec
+#                              blocks until the window is closed, which never
+#                              happens.
+#   podman run --rm            Every `podman run` here is a one-shot probe;
+#                              leftovers would pollute the container list the
+#                              later checks read.
+#
+# The flags NOT passed matter as much: no --security-opt label=disable and no
+# --privileged on any client, because the point is that a CONFINED client
+# works. See the block above the podman client probes in phase-deploy.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -276,12 +303,31 @@ phase_deploy() {
     # because the runtime applied the spec's containerEdits. Same mechanism
     # k8s uses via the device plugin, minus kubernetes.
     #
-    # These run CONFINED - no --security-opt label=disable anywhere in this
-    # phase. desktop-selinux.service labeled the export dirs container_file_t,
-    # and a confined client reaching the display is exactly what that buys;
-    # without it each of these fails on connect(2) with the device resolved
-    # and the mounts in place. The desktop container itself is still exempt
-    # (--privileged), but nothing downstream of it is.
+    # Every podman flag on the three commands below, and why - including the
+    # one that is deliberately NOT there:
+    #
+    #   --device desktop.local/<cap>=all   the point of the test: the ONLY
+    #                                      thing granting access. No -v, no -e,
+    #                                      so anything the client sees came
+    #                                      from the CDI spec's containerEdits.
+    #   --rm                               these are one-shot probes; leaving
+    #                                      them behind would make the next
+    #                                      phase's `podman ps` output lie.
+    #   (no --security-opt label=disable)  LOAD-BEARING BY ITS ABSENCE. These
+    #                                      run CONFINED under enforcing
+    #                                      SELinux, which is what
+    #                                      desktop-selinux.service labeling the
+    #                                      export dirs container_file_t buys:
+    #                                      without those labels each of these
+    #                                      fails on connect(2) with the device
+    #                                      resolved and the mounts in place.
+    #                                      Adding the flag would make the test
+    #                                      pass while proving nothing.
+    #
+    # The desktop container is exempt from SELinux separation
+    # (SecurityLabelDisable=true in the quadlet - it is the trusted component,
+    # and confining it needs a policy module of its own). Nothing downstream of
+    # it is exempt, which is the asymmetry these commands exist to prove.
     log pd "a CONFINED podman client resolves desktop.local/display=all and opens :0"
     out=$(podman run --rm \
         --device desktop.local/display=all \

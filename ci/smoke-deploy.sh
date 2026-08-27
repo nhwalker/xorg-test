@@ -249,6 +249,11 @@ log "toolkit published and desktop.local/tools advertised by the .path unit"
 #
 # No `| head` inside the container: under pipefail an early-exiting consumer
 # SIGPIPEs the producer, which this repo has been bitten by before.
+#
+# Flags: --device desktop.local/tools=all is the whole point - no -v and no -e,
+# so the mount and DESKTOP_TOOLS_BIN can only have come from the CDI spec's
+# containerEdits. --rm because these are one-shot probes and a leftover
+# container would pollute the container list the checks below read.
 out=$(podman run --rm --device desktop.local/tools=all \
     localhost/desktop-container:latest \
     sh -c 'printenv DESKTOP_TOOLS_BIN; "$DESKTOP_TOOLS_BIN"/screenshot --help' 2>&1) \
@@ -300,6 +305,9 @@ who=$(ssh -i /etc/desktop-container/host-shell-key -o BatchMode=yes -o ConnectTi
 [ "$who" = desktop-shell ] || fail "host ssh whoami returned '$who', want desktop-shell"
 
 log "host terminal: same path from inside the container ('ssh host')"
+# -u desktop because the Host Terminal menu entry runs as the session user, and
+# -e HOME because `podman exec` inherits PID 1's environment rather than the
+# logind session's, so ssh would otherwise look for its config under /root.
 cwho=""
 for _ in $(seq 10); do
     cwho=$(podman exec -u desktop -e HOME=/home/desktop desktop \
