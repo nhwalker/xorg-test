@@ -15,11 +15,6 @@ xset -dpms || true
 # Adding an xrdb call would silently shadow that file — see its header.
 xsetroot -solid '#101216' || true
 
-# Hold the fixed monitor layout against KVM switches. Exits immediately
-# unless the host declared one (see xorg-monitor-conf.sh); backgrounded, so
-# it lives as long as the session does.
-/usr/local/bin/monitor-layout-watch &
-
 xterm -geometry 100x30+60+60 &
 
 exec /usr/bin/mwm

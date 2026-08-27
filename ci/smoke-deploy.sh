@@ -405,8 +405,6 @@ echo "$mon" | grep -q 'Identifier  "DP-2"' || fail "generated config does not na
 # same branch, because no runner has an NVIDIA GPU.
 echo "$mon" | grep -q 'Option      "Enable" "true"' || fail "outputs not forced enabled"
 echo "$mon" | grep -q 'Modeline "1920x1080_60.00"' || fail "no derived timing for the declared mode"
-podman exec desktop grep -q '^output DP-1 ' /run/desktop-monitors.layout \
-    || fail "the session-side layout file was not written"
 # Put the shipped default back, so nothing after this point sees a layout the
 # tree does not actually ship.
 install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf

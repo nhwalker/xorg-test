@@ -396,9 +396,8 @@ phase_deploy() {
 # (see the -device line in vm-e2e.sh). "Monitor was never there" is a strict
 # superset of the hard part of "monitor went away".
 #
-# It also proves the two live behaviours: the session's re-assert loop puts the
-# layout back after something else moves it, and a connector going down under a
-# running X does not move the geometry.
+# It also proves the live behaviour: a connector going down under a running X
+# does not move the geometry.
 #
 # What it does NOT prove, and what "try it on real hardware early" in README.md
 # is still there for:
@@ -483,7 +482,7 @@ desktop_up() {
 conn_connected() { [ "$(cat "$1/status")" = connected ]; }
 
 verify_fixed_layout() {
-    local conn conn2 dims out before restored=""
+    local conn conn2 dims out before
 
     log pd "fixed monitor layout: the VM has a second connector, and it is disconnected"
     conn=$(ls -d /sys/class/drm/card*-Virtual-1 2>/dev/null | head -n1)
@@ -559,33 +558,6 @@ EOF
     xr_is Virtual-2 disconnected 1024x768+1024+0 \
         || fail "Virtual-2 is not enabled on a disconnected connector: $(xr_line Virtual-2)"
     log pd "  Virtual-2 scans out 1024x768+1024+0 with nothing plugged into it"
-
-    log pd "fixed monitor layout: the session's re-assert loop is running"
-    podman exec desktop pgrep -f monitor-layout-watch >/dev/null \
-        || fail "monitor-layout-watch is not running in the session"
-
-    # Break the layout the way a driver would, and let the loop find it. This
-    # is the part of the watcher that ci/monitor-layout-tests.sh cannot reach
-    # with a fake xrandr: a real server, a real mode set, a real recovery.
-    #
-    # The --off and the check that it took are ONE exec: the loop re-applies
-    # within its two-second interval, and a second round trip could lose the
-    # race and report a working loop as a failed mode set.
-    log pd "fixed monitor layout: something turns an output off; the loop puts it back"
-    out=$(podman exec -u desktop -e DISPLAY=:0 desktop \
-        sh -c 'xrandr --output Virtual-2 --off && xrandr --query') \
-        || fail "could not turn Virtual-2 off to test the re-assert loop"
-    case " $(echo "$out" | grep '^Virtual-2 ') " in
-        *" 1024x768+1024+0 "*) fail "Virtual-2 never went off, so its return would prove nothing" ;;
-    esac
-    for _ in $(seq 15); do
-        if xr_is Virtual-2 disconnected 1024x768+1024+0; then restored=yes; break; fi
-        sleep 1
-    done
-    [ -n "$restored" ] \
-        || fail "monitor-layout-watch did not restore Virtual-2 within 15s: $(xr_line Virtual-2)"
-    [ "$(dpy_dims)" = 2048x768 ] || fail "screen size moved while the layout was being restored"
-    log pd "  the loop re-applied the declared layout on its own"
 
     # A connector going down UNDER a running X. The force is real: the kernel
     # reports this connector disconnected to every probe from here on. It

@@ -24,7 +24,6 @@
 # Config (host-provided, mounted read-only at /etc/desktop-container):
 #
 #     # global, all optional
-#     watch 2                       # re-assert poll interval, or "off"
 #     virtual 3840x1080             # override the computed framebuffer size
 #     nvidia-connected DFP-0,DFP-1  # NVIDIA ConnectedMonitor (see below)
 #     nvidia-edid DFP-0=/etc/desktop-container/edid-dfp0.bin
@@ -44,10 +43,6 @@ set -u
 
 CONF=${MONITORS_CONF:-/etc/desktop-container/monitors.conf}
 OUT=${MONITORS_OUT:-/etc/X11/xorg.conf.d/30-monitors.conf}
-# Machine-readable echo of the same layout for the session-side re-assert
-# loop (monitor-layout-watch). Written rather than re-parsed there, so the
-# config is interpreted exactly once, here, as root.
-LAYOUT=${MONITORS_LAYOUT:-/run/desktop-monitors.layout}
 # Written by xorg-gpu-conf.sh; read here for the Device identifier and driver.
 GPU_CONF=${XORG_GPU_CONF:-/etc/X11/xorg.conf.d/20-gpu.conf}
 DEVICE_ID=gpu0
@@ -61,7 +56,7 @@ log() { echo "xorg-monitor-conf: $*"; }
 give_up() {
     log "ERROR: $*"
     log "no fixed layout applied; Xorg will autodetect (previous behaviour)"
-    rm -f "$OUT" "$LAYOUT"
+    rm -f "$OUT"
     exit 0
 }
 
@@ -130,12 +125,12 @@ cvt_mode() {
 # --- read the config ---------------------------------------------------------
 if [ ! -f "$CONF" ]; then
     log "no $CONF: no fixed monitor layout configured, Xorg will autodetect"
-    rm -f "$OUT" "$LAYOUT"
+    rm -f "$OUT"
     exit 0
 fi
 
 names=() widths=() heights=() rates=() xs=() ys=() rots=() prims=()
-watch=2 virt_w=0 virt_h=0 nv_connected="" nv_edids=()
+virt_w=0 virt_h=0 nv_connected="" nv_edids=()
 primary_seen=""
 lineno=0
 
@@ -144,13 +139,6 @@ while read -r f1 f2 f3 rest || [ -n "$f1" ]; do
     case "$f1" in ''|'#'*) continue ;; esac
 
     case "$f1" in
-    watch)
-        case "$f2" in
-            off|0)        watch=off ;;
-            ''|*[!0-9]*)  give_up "$CONF:$lineno: watch wants seconds or 'off', got '$f2'" ;;
-            *)            watch=$f2 ;;
-        esac
-        continue ;;
     virtual)
         case "$f2" in
             *x*) virt_w=${f2%%x*}; virt_h=${f2##*x} ;;
@@ -245,7 +233,7 @@ done < "$CONF"
 
 if [ ${#names[@]} -eq 0 ]; then
     log "$CONF declares no outputs: no fixed layout, Xorg will autodetect"
-    rm -f "$OUT" "$LAYOUT"
+    rm -f "$OUT"
     exit 0
 fi
 
@@ -395,23 +383,7 @@ if [ "$have_device" = yes ]; then
 fi
 } > "$OUT"
 
-# --- the session-side copy ---------------------------------------------------
-{
-printf '# Generated at boot by xorg-monitor-conf.sh from %s. Do not edit.\n' "$CONF"
-printf 'watch %s\n' "$watch"
-for i in "${!names[@]}"; do
-    # Last field is the geometry xrandr(1) reports for a correctly placed
-    # output - post-rotation, which is why the extents are carried here and
-    # not the panel dimensions.
-    printf 'output %s %s %sx%s %s %s %sx%s+%s+%s\n' \
-        "${names[$i]}" "${mode_names[$i]}" "${xs[$i]}" "${ys[$i]}" \
-        "${rots[$i]}" "${prims[$i]}" \
-        "${ext_w[$i]}" "${ext_h[$i]}" "${xs[$i]}" "${ys[$i]}"
-done
-} > "$LAYOUT"
-chmod 0644 "$LAYOUT"
-
 log "wrote $OUT:"
 sed 's/^/xorg-monitor-conf:     /' "$OUT"
-log "fixed layout ${virt_w}x${virt_h}: ${names[*]} (driver $driver, re-assert $watch)"
+log "fixed layout ${virt_w}x${virt_h}: ${names[*]} (driver $driver)"
 exit 0

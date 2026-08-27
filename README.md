@@ -222,9 +222,9 @@ that is the off state: with no output lines nothing is generated and Xorg
 autodetects exactly as before. Its comments document every field and the
 global `watch` / `virtual` / `nvidia-*` lines.
 
-Two things then hold the geometry, and it takes both:
+One thing holds the geometry:
 
-1. **`xorg-monitor-conf.sh`** turns the file into
+**`xorg-monitor-conf.sh`** turns the file into
    `/etc/X11/xorg.conf.d/30-monitors.conf` at every container boot, after
    `xorg-gpu-conf.sh` has picked the driver — the two drivers have no
    mechanism in common:
@@ -251,15 +251,16 @@ Two things then hold the geometry, and it takes both:
      — and everything if an output fails to come up: restoring it later is
      then a mode set rather than a screen resize, and a resize is what moves
      every window on a desktop whose window manager has never heard of RandR.
-2. **`monitor-layout-watch`**, started by `xinitrc.desktop`, re-applies the
-   declared layout when the live one drifts from it. The static config is
-   authoritative at server *start*; this is the backstop for what can move it
-   afterwards — a driver that drops a CRTC when the connector goes, a link
-   that does not retrain coming back. It polls (`xrandr(1)` has no event
-   mode) and acts only on drift, so the steady state is one cheap query every
-   two seconds and no mode sets at all. It is deliberately authoritative: it
-   will also undo a manual `xrandr`, within one interval. Set `watch off` on
-   hosts where something in the session is meant to drive RandR itself.
+That config is authoritative at server **start**, and nothing re-asserts it
+afterwards. Nothing in this session watches RandR at all — mwm predates it and
+no desktop environment runs here — so a layout that something else moves stays
+moved until `desktop.service` restarts. A session-side re-assert loop was
+written and then removed before merge: what the e2e actually showed is that
+the static config held on its own through a connector going down, so the loop
+had nothing to do, and it could not have helped with the case that most often
+bites (X's state correct but the panel dark, because the link never
+retrained). If a real switch turns out to move the layout, that loop is the
+thing to build — see the history of this file.
 
 A bad config never costs a boot: the generator logs what was wrong, writes
 nothing, and the desktop comes up autodetecting. `podman logs desktop | grep
@@ -267,9 +268,8 @@ xorg-monitor-conf` is the whole story of what it decided, and the container's
 preflight flags an output name with no matching DRM connector before that.
 
 **What CI proves.** The static job pins the pieces that have no hardware in
-them: the derived timings against `cvt(1)`, both driver paths, the config
-rejections, and the re-assert loop against a fake `xrandr`
-(`ci/monitor-layout-tests.sh`). The VM e2e proves the load-bearing claim
+them: the derived timings against `cvt(1)`, both driver paths, and the config
+rejections (`ci/monitor-layout-tests.sh`). The VM e2e proves the load-bearing claim
 itself. QEMU's virtio-vga is booted with `max_outputs=2`, and virtio-gpu
 reports connector status straight from whether QEMU has that scanout enabled —
 under `-display none` it never enables the second one, so the guest has a
@@ -282,10 +282,9 @@ Virtual-2 disconnected 1024x768+1024+0
 ```
 
 — an output scanning out at its declared position with nothing plugged into
-it, on a screen pinned to the full 2048x768. It then turns that output off
-behind the session's back and asserts the loop restores it, and forces
-`Virtual-1`'s connector down under the running server and asserts the geometry
-does not move. "Monitor was never there" is a strict superset of the hard part
+it, on a screen pinned to the full 2048x768. It then forces `Virtual-1`'s
+connector down under the running server and asserts the geometry does not
+move. "Monitor was never there" is a strict superset of the hard part
 of "monitor went away".
 
 The notification path is exercised too, which was not expected: forcing the
@@ -758,9 +757,8 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   KVM-style remove/re-add cycle is exercised via QEMU (see "Input hotplug and
   KVM switches"), a fixed monitor layout is declared across the GPU's two
   connectors — one of which QEMU never connects — and asserted to come up
-  whole, hold when an output is switched off behind the session's back, and
-  hold again when a connector is forced down under the running server (see
-  "Fixed monitor layout"), the container's privileges are asserted to be less
+  whole and to hold when a connector is forced down under the running server
+  (see "Fixed monitor layout"), the container's privileges are asserted to be less
   than `--privileged` (see "Container privileges"), and
   `desktop-preflight` is asserted fully green. The podman clients run
   **confined** — no `label=disable` anywhere in the suite — against the
@@ -810,9 +808,8 @@ Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 
 Video, on a host that declared a layout ("Fixed monitor layout" above): switch
 the KVM away and back. `DISPLAY=:0 xrandr` must report the same geometry
-throughout, and no window may have moved. `podman logs desktop | grep -E
-'xorg-monitor-conf|monitor-layout-watch'` says what was configured at boot and
-whether the session had to put anything back.
+throughout, and no window may have moved. `podman logs desktop | grep xorg-monitor-conf` says what was configured at
+boot.
 
 ## Container privileges
 

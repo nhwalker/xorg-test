@@ -542,8 +542,8 @@ podman logs desktop | grep xorg-monitor-conf  # what layout was applied, if any
 
 - `ci.yml` static job: shellcheck on every script in this tree, and
   `ci/monitor-layout-tests.sh` for the fixed-layout generator this tree feeds
-  (both driver paths, the derived CVT timings against `cvt(1)`, the
-  rejections, and the session's re-assert loop). `e2e-vm.yml` then declares a
+  (both driver paths, the derived CVT timings against `cvt(1)`, and the
+  rejections). `e2e-vm.yml` then declares a
   layout through this tree's `monitors.conf` on a GPU whose second connector
   QEMU never connects, and asserts the declared output comes up on it anyway.
 - `ci.yml` build-smoke also asserts the SELinux labeler's no-op branch: the
