@@ -288,12 +288,17 @@ behind the session's back and asserts the loop restores it, and forces
 does not move. "Monitor was never there" is a strict superset of the hard part
 of "monitor went away".
 
-**What it still does not prove**, and what to try on real hardware early: the
+The notification path is exercised too, which was not expected: forcing the
+connector down through sysfs reaches Xorg as an event — the run logs `X
+noticed on its own`, having re-probed within three seconds before anything
+asked it to. The e2e still drives a client query afterwards, so the assertion
+rests on the geometry rather than on that timing.
+
+**What it does not prove**, and what to try on real hardware early: the
 physical layer — EDID re-read, link retraining, a sink that takes a moment to
-come back — and the asynchronous notification path, since forcing a connector
-down through sysfs reprobes it without emitting the hotplug uevent a real
-unplug carries. The e2e therefore drives X's probe with a client query rather
-than waiting for a notification the VM cannot deliver faithfully.
+come back — and the KVMs that drop the link without the sink ever going down,
+where nothing is notified and nothing reprobes. That last case is exactly what
+the static config covers and exactly what a VM cannot stage.
 
 ### Changing the VT
 

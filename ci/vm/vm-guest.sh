@@ -404,14 +404,18 @@ phase_deploy() {
 # is still there for:
 #   - the physical layer. No EDID re-read, no link retraining, no sink that
 #     takes a moment to come back. virtio has no DDC to model.
-#   - the asynchronous notification path. A real unplug reaches Xorg as a
-#     kernel hotplug uevent; the sysfs connector force used below changes what
-#     the kernel REPORTS without generating one (status_store reprobes the
-#     connector, it does not call drm_kms_helper_hotplug_event), and udevadm's
-#     synthetic change event is not the same thing. So the disconnect check
-#     drives X's probe path explicitly with a client query rather than waiting
-#     for a notification this VM cannot deliver faithfully. Whether X noticed
-#     on its own is logged as evidence, never asserted.
+#   - a switch-away that is not a connector event at all. Some KVMs drop the
+#     link without the sink ever going down, so nothing here is notified and
+#     nothing reprobes; the static config is what covers that, and it is the
+#     half this VM cannot stage.
+#
+# One thing this DOES reach, contrary to what the comment here first claimed:
+# the sysfs connector force below is delivered to Xorg as an event. The run
+# logs "X noticed on its own" - X had re-probed within three seconds, before
+# anything asked it to. So the notification path is exercised, not stubbed.
+# The explicit query afterwards stays anyway: it costs nothing and it makes
+# the assertion independent of that timing rather than resting on it. Whether
+# X noticed is logged as evidence, never asserted.
 #
 # Restores the shipped (empty) monitors.conf and the connector's forced status
 # before returning, so nothing downstream - the screendumps, the testpattern
