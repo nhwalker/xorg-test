@@ -1,0 +1,73 @@
+#!/bin/bash
+# Print the desktop's CURRENT monitor arrangement as a monitors.conf block,
+# ready to paste into /etc/desktop-container/monitors.conf.
+#
+# The hard part of declaring a fixed layout is not the geometry - the
+# operator can see that - it is spelling the RandR output names the way this
+# particular driver spells them (DP-1 vs DP-0 vs DVI-D-1), and getting them
+# wrong means an output that is silently never configured. So read them off
+# the running server rather than asking anyone to guess.
+#
+# Run it with every monitor switched TO this host, which is the arrangement
+# you want frozen. Read-only debug utility: prints, never writes.
+set -u
+
+CONTAINER=${DESKTOP_CONTAINER:-desktop}
+DPY=${DESKTOP_DISPLAY:-:0}
+
+[ "$(id -u)" = 0 ] || { echo "desktop-monitors-capture: run as root (podman storage is root-only)" >&2; exit 2; }
+command -v podman >/dev/null || { echo "desktop-monitors-capture: podman not installed" >&2; exit 2; }
+
+if ! q=$(podman exec -u desktop -e "DISPLAY=$DPY" "$CONTAINER" xrandr --query 2>&1); then
+    echo "desktop-monitors-capture: cannot query the desktop's display:" >&2
+    echo "$q" >&2
+    echo "desktop-monitors-capture: is desktop.service running? (systemctl status desktop.service)" >&2
+    exit 1
+fi
+
+# xrandr --query, for an enabled output:
+#   DP-1 connected primary 1920x1080+0+0 (normal left inverted ...) 520mm x 290mm
+# The refresh is on the mode lines that follow, marked '*' for current.
+out=$(printf '%s\n' "$q" | awk '
+    /^[A-Za-z][A-Za-z0-9._-]* (connected|disconnected)/ {
+        name = $1; geom = ""; primary = ""; rot = ""
+        for (i = 2; i <= NF; i++) {
+            if ($i == "primary") primary = " primary"
+            else if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) geom = $i
+            else if ($i == "(normal" && $(i-1) ~ /^(left|right|inverted)$/) rot = $(i-1)
+        }
+        if (geom == "") { name = ""; next }        # output is off; not in the layout
+        split(geom, g, /[x+]/)
+        w = g[1]; h = g[2]; x = g[3]; y = g[4]
+        # A rotated output reports its transposed size; monitors.conf takes
+        # the PANEL size plus rotate=, so undo the transposition here.
+        rotate = ""
+        if (rot == "left" || rot == "right") { t = w; w = h; h = t; rotate = " rotate=" rot }
+        else if (rot == "inverted") rotate = " rotate=inverted"
+        pending = 1
+        next
+    }
+    # First mode line after the output line carries the active refresh ("*").
+    pending && /^ / {
+        for (i = 2; i <= NF; i++)
+            if ($i ~ /\*/) { rate = $i; sub(/[*+]+$/, "", rate); break }
+        if (rate == "") next
+        printf "%-8s %sx%s@%s   +%s+%s%s%s\n", name, w, h, rate, x, y, primary, rotate
+        pending = 0; rate = ""
+        next
+    }
+')
+
+if [ -z "$out" ]; then
+    echo "desktop-monitors-capture: the server reports no enabled outputs" >&2
+    printf '%s\n' "$q" >&2
+    exit 1
+fi
+
+cat <<EOF
+# Captured from the running desktop $(date -u '+%Y-%m-%dT%H:%M:%SZ') by
+# desktop-monitors-capture. Paste into /etc/desktop-container/monitors.conf
+# (read its comments first - the global lines are documented there), then:
+#     systemctl restart desktop.service
+$out
+EOF

@@ -1,0 +1,113 @@
+#!/bin/bash
+# Re-assert the fixed monitor layout whenever the live one drifts from it.
+#
+# The static config xorg-monitor-conf.sh writes is authoritative at server
+# START: Xorg comes up with exactly the declared geometry whether or not any
+# monitor is attached. This is the backstop for everything that can move it
+# afterwards - a driver that drops a CRTC when the connector goes away, a KMS
+# link that does not retrain on the way back, an X client that ran xrandr.
+# None of those are hypothetical on a KVM, and the session has no other
+# RandR-aware component: mwm predates RandR entirely, so with nothing here a
+# layout that breaks stays broken until desktop.service is restarted.
+#
+# Polling, not events: xrandr(1) has no event mode, and pulling in an X event
+# tool for this would be a package dependency for a query that takes a couple
+# of milliseconds. The loop re-applies ONLY on drift, so the steady state is
+# one cheap query every few seconds and nothing else - in particular it is not
+# a periodic mode set, which would blink the monitors forever.
+#
+# Deliberately authoritative: it will also undo a manual xrandr call, within
+# one interval. That is what "fixed layout" means; hosts that want a movable
+# layout set "watch off" in monitors.conf, which stops this before it starts.
+#
+# Started in the background from xinitrc.desktop, as the desktop user. Exits
+# immediately when no layout is configured, so it costs nothing on hosts that
+# have not opted in. The session's tty hangup kills it when Xorg exits.
+set -u
+
+LAYOUT=${MONITORS_LAYOUT:-/run/desktop-monitors.layout}
+# Set by the test harness to make exactly one pass and exit.
+ONCE=${MONITOR_WATCH_ONCE:-}
+
+log() { echo "monitor-layout-watch: $*"; }
+
+[ -r "$LAYOUT" ] || exit 0
+
+interval=2
+outs=() geoms=()
+args=()
+while read -r kw a b c d e f; do
+    case "$kw" in
+    watch)  interval=$a ;;
+    output)
+        # output <name> <mode> <XxY> <rotation> <primary|-> <expected geometry>
+        outs+=("$a"); geoms+=("$f")
+        args+=(--output "$a" --mode "$b" --pos "$c" --rotate "$d")
+        [ "$e" = primary ] && args+=(--primary)
+        ;;
+    esac
+done < "$LAYOUT"
+
+if [ "$interval" = off ]; then
+    log "re-assert disabled in monitors.conf (watch off); the boot-time layout stands on its own"
+    exit 0
+fi
+if [ ${#outs[@]} -eq 0 ]; then
+    log "no outputs in $LAYOUT; nothing to hold"
+    exit 0
+fi
+
+log "holding ${#outs[@]} output(s) every ${interval}s: ${outs[*]}"
+
+# State machine over one variable, so a monitor that is unplugged for a week
+# does not write a line to the journal every interval: log on entering drift,
+# on recovering from it, and once per distinct failure - never on the
+# steady state.
+state=ok
+query_err="" apply_err=""
+
+while :; do
+    if ! q=$(xrandr --query 2>&1); then
+        [ -n "$query_err" ] || log "xrandr --query failed: $q"
+        query_err=$q
+    else
+        query_err=""
+        drift=""
+        for i in "${!outs[@]}"; do
+            line=$(printf '%s\n' "$q" | grep -m1 "^${outs[$i]} ") || line=""
+            if [ -z "$line" ]; then
+                # The output is gone from the server's own list, which a
+                # connector event cannot cause - only a driver reload or a
+                # config that never mentioned it. Re-applying cannot fix it.
+                drift="$drift ${outs[$i]}(absent)"
+                continue
+            fi
+            case " $line " in
+                *" ${geoms[$i]} "*) ;;
+                *) drift="$drift ${outs[$i]}" ;;
+            esac
+        done
+
+        if [ -n "$drift" ]; then
+            [ "$state" = drift ] || log "layout drifted (${drift# }); re-applying"
+            state=drift
+            if out=$(xrandr "${args[@]}" 2>&1); then
+                apply_err=""
+                [ -n "$out" ] && log "xrandr: $out"
+            else
+                # An output whose modes the driver dropped entirely cannot be
+                # re-established from here; say so once rather than every
+                # interval for as long as the KVM stays pointed elsewhere.
+                [ "$apply_err" = "$out" ] || log "re-apply failed: $out"
+                apply_err=$out
+            fi
+        elif [ "$state" = drift ]; then
+            log "layout restored"
+            state=ok
+        fi
+    fi
+
+    [ -z "$ONCE" ] || break
+    sleep "$interval"
+done
+exit 0

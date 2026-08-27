@@ -100,6 +100,37 @@ else
     warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: the desktop-host-shell lines in the deploy tree's quadlet (deploy/README.md)"
 fi
 
+# --- fixed monitor layout ------------------------------------------------------
+# Only the shallow check that has to happen BEFORE the generator runs: are the
+# output names real? Everything else about the file (syntax, geometry, driver
+# specifics) is xorg-monitor-conf's to validate and to log, later in this same
+# unit. A name that matches nothing is the one mistake that costs an output
+# silently - X simply never configures a Monitor section nobody claims.
+MONCONF=${MONITORS_CONF:-/etc/desktop-container/monitors.conf}
+if [ ! -f "$MONCONF" ]; then
+    pass "no fixed monitor layout configured: Xorg will autodetect from EDID"
+else
+    declared=$(grep -vE '^[[:space:]]*(#|$)' "$MONCONF" \
+        | grep -vE '^[[:space:]]*(watch|virtual|nvidia-connected|nvidia-edid)[[:space:]]' \
+        | awk '{print $1}')
+    if [ -z "$declared" ]; then
+        pass "fixed monitor layout file present but declares no outputs: Xorg will autodetect"
+    else
+        unknown=""
+        for o in $declared; do
+            ls -d /sys/class/drm/card*-"$o" >/dev/null 2>&1 || unknown="$unknown $o"
+        done
+        if [ -z "$unknown" ]; then
+            pass "fixed monitor layout declares$(printf ' %s' $declared), all present as DRM connectors"
+        else
+            # WARN, not FAIL: the NVIDIA driver's RandR output names are its
+            # own (DP-0 where the kernel says DP-1), so a name with no matching
+            # connector is expected there and wrong everywhere else.
+            warn "fixed monitor layout names output(s)$unknown with no matching DRM connector ($(ls -d /sys/class/drm/card*-* 2>/dev/null | sed 's|.*/card[0-9]*-||' | tr '\n' ' ')). Expected on NVIDIA (its output names differ from the kernel's); a typo anywhere else - that output would never be configured"
+        fi
+    fi
+fi
+
 # --- NVIDIA coherence ----------------------------------------------------------
 # NVIDIA_CDI_STUB=1 is injected by the deploy tree's stub CDI spec, written
 # when the host has no working GPU stack. Hardware visible anyway (via the
