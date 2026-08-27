@@ -22,6 +22,21 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
+      {{- with .Values.seLinuxOptions }}
+      # SELinux: the plugin registers by connecting to KUBELET'S socket under
+      # the kubelet plugin dir. On an enforcing host a confined container
+      # (container_t) is denied there - the plugin creates its own socket
+      # fine and then loops on "connect: permission denied" registering,
+      # so the resource never becomes allocatable and pods stay Pending.
+      #
+      # This grants the PLUGIN a host-management type. It says nothing about
+      # client pods: those reach the desktop through CDI mounts on directories
+      # the node labels container_file_t, and stay fully confined with no
+      # securityContext of their own. Do not copy this into a client manifest.
+      securityContext:
+        seLinuxOptions:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
       containers:
         - name: cdi-device-plugin
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

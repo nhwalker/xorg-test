@@ -80,6 +80,16 @@ if ! find "$TOOLS_DIR" -mindepth 1 -maxdepth 1 -type f ! -name '.*' \
     exit 0
 fi
 
+# The toolkit is populated by the desktop, AFTER desktop-selinux.service has
+# run - so relabel it now that its contents exist, before advertising it.
+# Clients EXECUTE these binaries; a confined one on an enforcing host cannot
+# execute a file that is not container_file_t, and it would fail with the
+# device resolved and the mount in place. No-ops without SELinux.
+if [ -x /usr/local/libexec/desktop-selinux ]; then
+    /usr/local/libexec/desktop-selinux "$TOOLS_DIR" \
+        || echo "WARNING: could not relabel $TOOLS_DIR for confined clients" >&2
+fi
+
 mkdir -p "$CDI_DIR"
 
 # Same atomic write as desktop-client-cdi: CDI consumers rescan the spec dirs

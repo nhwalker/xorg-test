@@ -162,15 +162,108 @@ Override per host with assignments in
 Validation runs before any write, so a rejected config leaves both
 existing specs untouched.
 
-**SELinux caveat.** This tree does not label the exported socket dirs, so
-on an enforcing host a *confined* client resolves its device, receives the
-mounts and env, and is then denied on `connect(2)`. CDI cannot express a
-relabel (no `:z` equivalent in `containerEdits`), so fixing it properly
-means labeling `/tmp/.X11-unix` and `/run/desktop-audio`
-`container_file_t` on the host. Until then, clients need label separation
-off (`--security-opt label=disable`, or a privileged pod). The desktop
-container is unaffected — it is `--privileged`. See README.md "Client
-containers via CDI".
+**SELinux is handled** — `desktop-selinux.service` labels the three
+directories the specs mount into clients (`/tmp/.X11-unix`,
+`/run/desktop-audio`, `/var/lib/desktop-container/bin`) `container_file_t`
+before the desktop starts. Confined clients need no `label=disable` and no
+privileged pod spec. See "SELinux" below for how and why.
+
+## SELinux
+
+The tree ships enforcing-ready. There is one thing an enforcing host needs
+that CDI cannot express, and `desktop-selinux.service` does it at every boot.
+
+**The problem.** Three host directories are bind-mounted into *client*
+containers by the CDI specs:
+
+| Directory | Mounted | Client does |
+|---|---|---|
+| `/tmp/.X11-unix` | rw | `connect(2)` to the X socket |
+| `/run/desktop-audio` | rw | `connect(2)` to the audio sockets |
+| `/var/lib/desktop-container/bin` | ro | **executes** the toolkit binaries |
+
+tmpfiles.d creates them as ordinary host directories, so they carry ordinary
+host types. A confined container runs as `container_t`, which has no rule
+letting it connect to or execute those types. On an enforcing host the client
+resolves its device, receives the mounts and the env, and is then denied —
+with everything looking correct from the outside. Podman's `-v src:dst:z`
+would relabel a mount, but `containerEdits` has no equivalent, so CDI cannot
+fix this from the spec. It has to happen host-side.
+
+**The fix.** `usr/local/libexec/desktop-selinux` labels all three
+`container_file_t` — the type confined containers may use — at level `s0`
+with no MCS categories. That last detail is what makes it work under
+kubernetes: CRI-O gives each pod its own category pair, and a file's
+categories must be a subset of the process's; the empty set is a subset of
+every set, so one label serves every client and **no pod needs
+`seLinuxOptions` or `privileged`**. It is the same mechanism `:z` uses.
+
+Sockets and binaries *inside* the directories inherit the directory's type,
+so labeling the directories covers the sockets Xorg and PipeWire create in
+them. The toolkit is the exception — the desktop publishes it *after* this
+unit has run — so `desktop-tools-cdi` re-runs the labeler for that directory
+once its contents exist, before advertising the device.
+
+It runs every boot because `/run/desktop-audio` is on tmpfs: destroyed and
+recreated by tmpfiles at each boot, so a one-off relabel would not survive.
+Two mechanisms, preferred in order:
+
+1. **`semanage fcontext` + `restorecon`** — best effort, so the label becomes
+   *policy* and survives a full filesystem relabel. Needs
+   `policycoreutils-python-utils` (see `HOST-REQUIRES.md`).
+2. **`chcon`** for anything policy did not cover — no extra package needed,
+   but not policy: undone by any `restorecon` and by a relabel. Converging
+   every boot is what makes it hold.
+3. **Verification**, and the unit fails if any directory is still wrong.
+   Running the commands is not the same as the labels landing, and that
+   distinction is not hypothetical — see below.
+
+> **`/run` needs the equivalency workaround.** The distribution ships a
+> file-context equivalency between `/var/run` and `/run`, and `semanage`
+> *refuses* an fcontext rule written against one side of it, naming the other
+> spelling in the error. The first version of this script swallowed that
+> error, so `/run/desktop-audio` silently kept `var_run_t` while
+> `/tmp/.X11-unix` relabeled fine — and it reported success. The script now
+> retries as `/var/run/...` (a rule stored there still governs `/run`), and
+> then verifies the result regardless.
+
+On a host without SELinux the script exits 0 having done nothing.
+
+**The host keeps full access.** Relabeling is for the benefit of confined
+containers, and it must not cost the host the desktop it is hosting. A host
+process is `unconfined_t`, which may use `container_file_t`, and the label
+goes on at `s0` with no categories, which `unconfined_t`'s range dominates —
+so rendering to the display, playing audio and running the published toolkit
+from a host shell all keep working. The e2e asserts each of those from the VM
+host under enforcing (`pactl` over the exported socket; the published
+`screenshot` binary executed, then run against `:0`), separately from the
+container tests, because a relabel is exactly the kind of change that could
+fix containers by breaking the host.
+
+Confined *host services* are the one case this does not serve — a daemon
+running in its own domain would need its own policy. Nothing in the tree runs
+that way.
+
+**Kubernetes device plugins are the other asymmetry.** Labeling gets *client*
+pods to the desktop, but a device plugin also has to register with **kubelet**,
+by connecting to kubelet's own socket — which a confined container may not do,
+and which is not something this tree should relabel (it is kubelet's state, not
+container content). So `charts/cdi-device-plugin` gives the plugin pod
+`seLinuxOptions.type: spc_t`. That grant is the plugin's alone: client pods
+still declare no `securityContext` at all, and `ci/helm-assertions.sh` asserts
+both halves so the two never blur together.
+
+**Not covered.** The desktop container itself is `--privileged`, so label
+separation is already off for it — none of this applies there. If you tighten
+that, expect to write policy for the device and VT access it does.
+
+To check a running host:
+
+```sh
+systemctl status desktop-selinux
+ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin
+ausearch -m avc -ts boot          # expect nothing
+```
 
 ## Apply
 
@@ -181,6 +274,19 @@ rsync -a --chown=root:root deploy/host/ /
 systemctl daemon-reload
 reboot
 ```
+
+On an SELinux host, `rsync -a` does not carry labels (that would need `-X`),
+so the copied files are labeled by the kernel's transition rules rather than
+by `restorecon`'s. Those usually agree, but it is cheap insurance not to
+depend on it:
+
+```sh
+restorecon -R /etc/systemd /etc/ssh /etc/desktop-container \
+              /usr/local/bin /usr/local/libexec /var/lib/desktop-container
+```
+
+(RPM-based provisioning sets labels correctly on its own; this is an
+rsync-specific step.)
 
 `--chown=root:root` matters: `rsync -a` would otherwise preserve the repo
 checkout's owner on files under `/etc`. `-a` also copies the two symlinks
@@ -220,6 +326,9 @@ point of the declarative form — the file list above *is* the state).
 | `usr/local/libexec/seat-prep.sh` | the script that unit runs (boot-time convergence agent, not an installer) |
 | `etc/systemd/system/desktop-cdi-refresh.service` | oneshot before `desktop.service`: converge `/etc/cdi/nvidia.yaml` (real spec or no-op stub, see "GPU" above) |
 | `usr/local/libexec/desktop-cdi-refresh` | the script that unit runs (boot-time convergence agent, not an installer) |
+| `etc/systemd/system/desktop-selinux.service` | oneshot before `desktop.service` and before any CRI: label the three client-facing directories `container_file_t` so confined containers can use them (see "SELinux" above); pre-enabled for `multi-user.target` for the same reason `desktop-client-cdi` is |
+| `usr/local/libexec/desktop-selinux` | the script that unit runs (no-ops without SELinux; also re-run by `desktop-tools-cdi` for the toolkit dir) |
+| `etc/systemd/system/multi-user.target.wants/desktop-selinux.service` → `../desktop-selinux.service` | that enablement, as a symlink |
 | `etc/systemd/system/desktop-client-cdi.service` | oneshot writing the two specs **client** containers resolve to reach this desktop, one per capability (see "Client containers" below); the only oneshot shipped enabled for `multi-user.target`, because kubelet must find the specs before it admits a client pod that requests one, which can happen on a boot where `desktop.service` has not come up yet |
 | `etc/systemd/system/multi-user.target.wants/desktop-client-cdi.service` → `../desktop-client-cdi.service` | that enablement, as a symlink, so the tree stays a pure `rsync` with no `systemctl enable` step |
 | `usr/local/libexec/desktop-client-cdi` | the script that unit runs (pure config → specs; overridable via `/etc/desktop-container/client-cdi.conf`) |
@@ -337,6 +446,9 @@ podman logs desktop | grep preflight:       # container-side assumptions;
 ## How CI validates this tree
 
 - `ci.yml` static job: shellcheck on every script in this tree.
+- `ci.yml` build-smoke also asserts the SELinux labeler's no-op branch: the
+  runner is Ubuntu with no SELinux, and a deploy there must not fail because
+  of it.
 - `ci.yml` build-smoke: a quadlet `-dryrun` fast-fail, then
   `ci/smoke-deploy.sh` — CDI converger branch tests (stub / generate /
   transient-failure / no-downgrade), seat-prep against a staged dirty seat,
@@ -348,7 +460,10 @@ podman logs desktop | grep preflight:       # container-side assumptions;
   enforcing** and a real KMS display — seat-prep evicting the genuinely
   running boot getty, rootless Xorg + mwm + seat0 under this quadlet, real
   audio over all three client paths, the root-owned `desktop-shell` trust
-  path through a real sshd under enforcing, podman clients resolving each
-  client CDI device, `desktop-preflight` at 0 FAILs, and a non-blank
-  screendump artifact. The desktop then stays up for the k3s phase, which
-  runs client pods against it.
+  path through a real sshd under enforcing, **confined** podman clients
+  resolving each client CDI device with no `label=disable` anywhere,
+  `desktop-preflight` at 0 FAILs, and a non-blank screendump artifact. It
+  asserts the resulting labels directly (all three directories and a
+  published toolkit binary) before the clients that depend on them run. The
+  desktop then stays up for the k3s phase, which runs confined client pods
+  against it **still enforcing** — nothing in the suite calls `setenforce`.

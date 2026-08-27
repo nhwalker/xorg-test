@@ -35,10 +35,20 @@ After=desktop-cdi-refresh.service
 # Client-side CDI specs (desktop.local/display and desktop.local/audio):
 # what OTHER containers resolve to get this desktop's X socket or audio,
 # one capability each. Independent of the desktop itself - they ship
-# enabled for multi-user.target too, because a kubernetes node runs the
-# desktop as a pod and never starts this unit.
+# enabled for multi-user.target too, because kubelet must find the specs
+# before it admits a client pod that requests one, which can happen on a
+# boot where this unit has not started yet.
 Wants=desktop-client-cdi.service
 After=desktop-client-cdi.service
+# SELinux labels for the same three directories the specs above and the
+# toolkit spec below mount into clients. Without container_file_t on them, a
+# CONFINED client on an enforcing host resolves its device, gets the mounts
+# and env, and is then denied on connect(2)/exec - see
+# usr/local/libexec/desktop-selinux in this tree. Shipped pre-enabled for
+# multi-user.target alongside desktop-client-cdi, for the same reason: specs
+# and labels are two halves of one export contract.
+Wants=desktop-selinux.service
+After=desktop-selinux.service
 # Client toolkit CDI spec (desktop.local/tools). A .path unit rather than a
 # oneshot, because the spec may only be written once the desktop has published
 # its tools - see usr/local/libexec/desktop-tools-cdi in this tree.

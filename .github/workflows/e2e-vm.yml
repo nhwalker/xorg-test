@@ -2,8 +2,9 @@
 # graphics/input/sound and SELinux enforcing - the declarative deploy/ tree
 # applied to a stock host (real Xorg, audio, input hotplug, root-owned
 # desktop-shell trust under enforcing, preflight green), then k3s + a
-# cdi-device-plugin release per capability with client pods wired up by
-# CDI, all while the quadlet desktop keeps serving the display.
+# cdi-device-plugin release per capability with confined client pods wired
+# up by CDI, all while the quadlet desktop keeps serving the display.
+# SELinux stays enforcing for BOTH phases - nothing here calls setenforce.
 name: e2e-vm
 on:
   pull_request:

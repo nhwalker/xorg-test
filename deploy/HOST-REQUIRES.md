@@ -8,7 +8,8 @@ podman, the `openssh` client tools behind openssh-server, and so on).
 ## Every host
 
 ```sh
-dnf install podman openssh-server psmisc alsa-plugins-pulseaudio
+dnf install podman openssh-server psmisc alsa-plugins-pulseaudio \
+            policycoreutils-python-utils
 ```
 
 | Package | Why | If you skip it |
@@ -17,6 +18,7 @@ dnf install podman openssh-server psmisc alsa-plugins-pulseaudio
 | `openssh-server` | sshd for the Host Terminal's loopback ssh; also pulls the `ssh-keygen` used by the per-boot key oneshot | only Host Terminal breaks — skippable on hosts that comment out its two `Wants=`/`After=` lines in the quadlet |
 | `psmisc` | `fuser`, used by `seat-prep.sh`'s DRM/VT verification gate and by `desktop-preflight` | everything runs; the holder checks degrade to a logged warning |
 | `alsa-plugins-pulseaudio` | the pulse route for **host-side** ALSA clients to reach the container's audio | desktop + container audio unaffected; only host ALSA clients lose sound |
+| `policycoreutils-python-utils` | `semanage`, used by `desktop-selinux` to make the client-directory labels part of POLICY (see deploy/README.md "SELinux") | on an SELinux host the labeler falls back to `chcon`: still correct every boot, but the labels are not policy, so a `restorecon` or a filesystem relabel undoes them until the next boot. No effect on a host without SELinux |
 
 ## GPU hosts, additionally
 

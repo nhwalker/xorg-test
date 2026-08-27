@@ -347,7 +347,11 @@ Prerequisites on the node:
 - a device plugin advertising each CDI device as a resource —
   `charts/cdi-device-plugin`, one release per device (display, audio,
   tools). Kubernetes has no pod field that names a CDI device, so nothing
-  reaches CDI injection without one; see "Client containers via CDI"
+  reaches CDI injection without one; see "Client containers via CDI".
+  On an enforcing host the plugin pod needs `seLinuxOptions.type: spc_t`
+  (the chart's default) because *registering* means connecting to kubelet's
+  own socket. That applies to the plugin only — client pods stay confined
+  and declare no `securityContext`
 
 > **Changed:** client pods used to be documented as carrying the annotation
 > `cdi.k8s.io/gpu: nvidia.com/gpu=all`, which never worked — kubelet does
@@ -515,16 +519,21 @@ Other semantics worth knowing:
   pre-enabled for `multi-user.target`, so the display and audio specs are
   written at boot whether or not `desktop.service` has come up yet —
   kubelet has to find them before it will admit a pod that requests one.
-- **SELinux: confined clients need the export dirs labeled.** On an
-  enforcing host the exported socket dirs carry host labels, so a confined
-  container is denied when it connects — it gets its env and mounts, then
-  fails. CDI cannot fix this from the spec: `containerEdits` has no
-  equivalent of `-v src:dst:z`, so the labeling is host-side. Until the
-  dirs are labeled `container_file_t` (`semanage fcontext` +
-  `restorecon`), clients need label separation turned off —
-  `--security-opt label=disable` for podman, an `seLinuxOptions`/privileged
-  pod spec for kubernetes. The desktop container itself is unaffected:
-  `--privileged` already disables label separation.
+- **SELinux: handled, and clients need nothing special.** A confined
+  container is `container_t`, which may not connect to or execute ordinary
+  host types — so without help, a client on an enforcing host resolves its
+  device, gets the mounts and env, and is then denied. CDI cannot fix this
+  from the spec (`containerEdits` has no `-v src:dst:z` equivalent), so the
+  deploy tree does it host-side: `desktop-selinux.service` labels all three
+  client-facing directories `container_file_t` at level `s0` with no MCS
+  categories, before the desktop or any CRI starts. Confined pods therefore
+  need **no** `seLinuxOptions` and **no** `privileged`, and podman clients
+  need no `--security-opt label=disable`. **The host keeps full access** —
+  `unconfined_t` may use `container_file_t`, so rendering, audio and the
+  published toolkit all keep working from a host shell, and the e2e asserts
+  each from the host under enforcing. See `deploy/README.md` "SELinux".
+  The desktop container itself is unaffected either way: `--privileged`
+  already disables label separation.
 - **Audio clients**: pulse and PipeWire-native work via the injected env
   alone. ALSA-only apps additionally need `alsa-plugins-pulseaudio` in
   their image plus the two-stanza ALSA config shown in the Audio
@@ -603,10 +612,15 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   directions under enforcing, podman clients resolve each CDI device and
   get its capability and no other, input is typed in over the real virtual
   keyboard and hotplug is exercised via QEMU `device_add`, and
-  `desktop-preflight` is asserted fully green. Then k3s + CRI-O join the
-  same machine **with the desktop still running on its quadlet**, and one
-  `cdi-device-plugin` release per capability makes each resource
-  allocatable — client pods then draw on the display and play/record audio
+  `desktop-preflight` is asserted fully green. The podman clients run
+  **confined** — no `label=disable` anywhere in the suite — against the
+  `container_file_t` labels `desktop-selinux.service` applied, which are
+  themselves asserted directly beforehand. Then k3s + CRI-O join the
+  same machine **with the desktop still running on its quadlet and SELinux
+  still enforcing**, and one `cdi-device-plugin` release per capability makes
+  each resource allocatable — confined client pods (asserted to be
+  `container_t`, declaring no `securityContext`) then draw on the display and
+  play/record audio
   purely through CDI injection, checked against a control pod that
   requests nothing and must get nothing, and against narrow pods proving a
   display-only client gets no audio and an audio-only client cannot open
@@ -704,6 +718,14 @@ under `journalctl -t session-postmortem`, not under the unit).
   for another seat: `systemctl restart desktop-seat-prep.service` (removes
   `72-seat-*.rules` and re-triggers udev), or check
   `udevadm info /dev/input/event0 | grep -i seat`.
-- **SELinux denials** — `--privileged` disables label separation; if you
-  tightened the unit, host clients may need extra policy for the shared
-  sockets.
+- **SELinux denials from a client container** (device resolved, mounts
+  present, `connect(2)` or exec denied) — the client-facing directories lost
+  their `container_file_t` labels. Check
+  `systemctl status desktop-selinux` and
+  `ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin`;
+  `systemctl restart desktop-selinux` re-converges them. `ausearch -m avc -ts
+  recent | audit2why` names the denial. Do not reach for `audit2allow` here —
+  the label is wrong, not the policy.
+- **SELinux denials from the desktop itself** — `--privileged` disables label
+  separation, so there should be none; if you tightened the unit, expect to
+  write policy for its device and VT access.

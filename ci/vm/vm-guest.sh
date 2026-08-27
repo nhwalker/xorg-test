@@ -4,12 +4,19 @@
 #         rsync-applied over the boot getty seat-prep must evict, desktop
 #         booted from its quadlet with real Xorg on the virtio display,
 #         audio, root-owned desktop-shell ssh trust under SELinux enforcing,
-#         the podman client CDI contract, and desktop-preflight fully green.
+#         the CONFINED podman client CDI contract, and desktop-preflight
+#         fully green.
 # phase2: k3s + CRI-O + one cdi-device-plugin release per capability, with
-#         the quadlet desktop STILL RUNNING - client pods requesting
-#         desktop.local/display and/or desktop.local/audio, with CRI-O
-#         injecting from the matching /etc/cdi spec. Kubernetes carries
-#         application containers here; it never carries the desktop.
+#         the quadlet desktop STILL RUNNING and SELinux STILL ENFORCING -
+#         confined client pods requesting desktop.local/display and/or
+#         desktop.local/audio, with CRI-O injecting from the matching
+#         /etc/cdi spec. Kubernetes carries application containers here; it
+#         never carries the desktop.
+#
+# Both phases run enforcing end to end. Nothing in this suite calls
+# setenforce: a client that only works permissive is a client that does not
+# work, and that is the whole point of the desktop-selinux labeling the
+# deploy tree ships.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -41,6 +48,10 @@ fail() {
         >&2 2>&1 || true
     # phase-deploy runs enforcing, where a denial is often the whole story
     # and is invisible in every other log here.
+    echo "---- diagnostics: SELinux mode + client-facing labels ----" >&2
+    getenforce >&2 2>/dev/null || true
+    ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin >&2 2>/dev/null || true
+    systemctl status desktop-selinux.service --no-pager -l >&2 2>/dev/null | head -20 || true
     echo "---- diagnostics: recent SELinux denials ----" >&2
     ausearch -m avc -ts recent 2>/dev/null | tail -20 >&2 || echo "(none / ausearch unavailable)" >&2
     if command -v k3s >/dev/null; then
@@ -86,12 +97,20 @@ phase_deploy() {
     log pd "SELinux must be enforcing for this phase to mean anything"
     [ "$(getenforce)" = Enforcing ] || fail "SELinux is not enforcing"
 
-    # podman and psmisc are deploy-tree prerequisites (HOST-REQUIRES.md); the
-    # cloud image already carries openssh-server. rsync applies the tree and
-    # pulseaudio-utils (pactl) is this test's own probe - neither is a
-    # prerequisite of the deployment itself.
+    # podman, psmisc and policycoreutils-python-utils are deploy-tree
+    # prerequisites (HOST-REQUIRES.md); the cloud image already carries
+    # openssh-server. rsync applies the tree and pulseaudio-utils (pactl) is
+    # this test's own probe - neither is a prerequisite of the deployment.
+    #
+    # policycoreutils-python-utils matters here: it is what makes
+    # desktop-selinux take its semanage path rather than the chcon fallback,
+    # and the semanage path is the one hosts are meant to run.
+    # `audit` is purely for diagnostics, and it earns its place: without
+    # ausearch, fail() prints "(none / ausearch unavailable)" and an SELinux
+    # failure costs a whole CI round just to find out what was denied.
     log pd "install the deploy tree's prerequisites plus this phase's probes"
-    dnf -y -q install podman psmisc rsync pulseaudio-utils >/dev/null
+    dnf -y -q install podman psmisc policycoreutils-python-utils \
+        rsync pulseaudio-utils audit >/dev/null
 
     log pd "load prebuilt images"
     podman load -q -i /tmp/images-desktop.tar >/dev/null
@@ -115,7 +134,7 @@ phase_deploy() {
 
     log pd "start desktop.service; seat-prep must evict the boot getty"
     systemctl start desktop.service
-    for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell; do
+    for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell desktop-selinux; do
         systemctl is-active --quiet "$u.service" || fail "$u.service not active"
     done
     # The tree ships this one pre-enabled (multi-user.target.wants symlink):
@@ -179,26 +198,80 @@ phase_deploy() {
     echo "$out"
     echo "$out" | grep -q 'done: 0 FAIL' || fail "preflight did not report 0 FAILs"
 
-    log pd "audio: HDA device visible, pulse socket reachable from VM host"
+    log pd "HOST audio: HDA device visible, pulse socket reachable from the host"
     podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
         sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
     PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
         || fail "pulse socket unreachable from VM host"
+
+    # Assert the labels BEFORE the confined clients below depend on them, so a
+    # regression names its cause here instead of surfacing as an unexplained
+    # connect(2) failure inside a client three tests later.
+    log pd "desktop-selinux labeled every client-facing directory container_file_t"
+    systemctl is-active --quiet desktop-selinux.service \
+        || fail "desktop-selinux.service did not run"
+    for d in /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin; do
+        ctx=$(ls -Zd "$d" | awk '{print $1}')
+        case "$ctx" in
+            *:container_file_t:*) log pd "  $d -> $ctx" ;;
+            *) fail "$d is $ctx, want container_file_t (confined clients cannot reach it)" ;;
+        esac
+    done
+    # The published binaries too, not just the directory that holds them:
+    # clients EXECUTE these, and desktop-tools-cdi relabels after the desktop
+    # publishes precisely so this holds.
+    ctx=$(ls -Z /var/lib/desktop-container/bin/screenshot | awk '{print $1}')
+    case "$ctx" in
+        *:container_file_t:*) log pd "  published screenshot binary -> $ctx" ;;
+        *) fail "published toolkit binary is $ctx, want container_file_t" ;;
+    esac
+
+
+    # THE HOST IS A FIRST-CLASS CLIENT TOO. Everything below this comment
+    # tests containers; the host must render to the display, play audio and
+    # run the published tools just as well, and the container_file_t relabel
+    # is the thing most likely to take that away: a host process is
+    # unconfined_t, and it now has to execute a file and connect to a socket
+    # that both carry a CONTAINER type. Host audio is asserted above (pactl
+    # over the exported socket); these two cover the other two capabilities.
+    #
+    # Split deliberately into exec and connect. Run as one command, a denial
+    # on either would look identical, and they have different fixes: exec is
+    # about the toolkit dir's label, connect is about the socket dir's.
+    #
+    # The screenshot binary is the right probe because it is static
+    # (CGO_ENABLED=0) - the host needs no X client stack installed to run it,
+    # which is also why this VM has none.
+    log pd "HOST tools: the published binary is executable by an unconfined host process"
+    TOOLKIT=/var/lib/desktop-container/bin
+    "$TOOLKIT/screenshot" --help >/dev/null \
+        || fail "host cannot EXECUTE $TOOLKIT/screenshot - container_file_t not executable by unconfined_t?"
+
+    log pd "HOST display: that binary captures the live desktop from the host"
+    hostshot=/tmp/host-toolkit-shot.png
+    rm -f "$hostshot"
+    DISPLAY=:0 "$TOOLKIT/screenshot" "$hostshot" \
+        || fail "host could not capture :0 with the published binary - denied on the X socket?"
+    [ -s "$hostshot" ] || fail "host screenshot produced an empty file"
+    # PNG magic, so a truncated or half-written file cannot pass as success.
+    head -c8 "$hostshot" | od -An -tx1 | tr -d ' \n' | grep -qi '^89504e470d0a1a0a' \
+        || fail "host screenshot is not a PNG"
+    log pd "  host captured $(stat -c%s "$hostshot") bytes with no X client stack installed"
+    rm -f "$hostshot"
 
     # The whole client contract in one command, under podman: a SEPARATE
     # container that passes no -v and no -e reaches the display purely
     # because the runtime applied the spec's containerEdits. Same mechanism
     # k8s uses via the device plugin, minus kubernetes.
     #
-    # label=disable is required here, and is NOT papering over a broken
-    # spec: the exported socket dirs carry host labels, so a CONFINED
-    # container is denied by SELinux however it obtained the mounts. Every
-    # other client in this suite is exempt the same way - the desktop
-    # container via --privileged, the k8s client pods via phase2 running
-    # permissive. The probe below records the confined case instead of
-    # asserting it; see "Client containers via CDI" in README.md.
-    log pd "a podman client resolves desktop.local/display=all and opens :0"
-    out=$(podman run --rm --security-opt label=disable \
+    # These run CONFINED - no --security-opt label=disable anywhere in this
+    # phase. desktop-selinux.service labeled the export dirs container_file_t,
+    # and a confined client reaching the display is exactly what that buys;
+    # without it each of these fails on connect(2) with the device resolved
+    # and the mounts in place. The desktop container itself is still exempt
+    # (--privileged), but nothing downstream of it is.
+    log pd "a CONFINED podman client resolves desktop.local/display=all and opens :0"
+    out=$(podman run --rm \
         --device desktop.local/display=all \
         localhost/desktop-container:latest sh -c '
             printenv DISPLAY
@@ -217,8 +290,8 @@ phase_deploy() {
     # the display at all: with xhost +local: an X client can keylog the
     # whole session, which is precisely what a sound-only workload must not
     # be handed.
-    log pd "a podman client resolves desktop.local/audio=all and gets audio only"
-    out=$(podman run --rm --security-opt label=disable \
+    log pd "a CONFINED podman client resolves desktop.local/audio=all and gets audio only"
+    out=$(podman run --rm \
         --device desktop.local/audio=all \
         localhost/desktop-container:latest sh -c '
             printenv PULSE_SERVER
@@ -235,27 +308,13 @@ phase_deploy() {
     log pd "podman audio client got the audio sockets and NO display"
 
     # Both together are the union: what a full desktop client asks for.
-    podman run --rm --security-opt label=disable \
+    podman run --rm \
         --device desktop.local/display=all --device desktop.local/audio=all \
         localhost/desktop-container:latest sh -c '
             test "$DISPLAY" = :0 && test -S /tmp/.X11-unix/X0 \
               && test -S /run/desktop-audio/pulse && xdpyinfo >/dev/null' \
         || fail "requesting both devices did not yield the union of their edits"
     log pd "both devices together give display + audio"
-
-    # Informational, never fatal: the confined case needs the export dirs
-    # labeled container_file_t, which CDI cannot arrange itself (there is no
-    # equivalent of -v src:dst:z in containerEdits). Logged so the day the
-    # host grows those labels this flips visibly, and so the AVC behind the
-    # current behavior is captured rather than assumed.
-    if podman run --rm --device desktop.local/display=all \
-        localhost/desktop-container:latest sh -c 'xdpyinfo >/dev/null' 2>/dev/null
-    then
-        log pd "NOTE: a CONFINED client reached the display too (host is labeled for it)"
-    else
-        log pd "NOTE: a CONFINED client cannot reach the display under enforcing SELinux (expected; see README)"
-        ausearch -m avc -ts recent 2>/dev/null | tail -5 || true
-    fi
 
     log pd "spawn an xterm so the screendump shows a window"
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
@@ -272,12 +331,22 @@ phase2() {
     systemctl is-active --quiet desktop.service \
         || fail "desktop.service is not running - phase2 tests clients against the quadlet desktop"
 
+    # This phase runs ENFORCING, like phase-deploy. It used to drop the host to
+    # permissive, which meant the entire kubernetes client path - the half of
+    # this design kubernetes actually carries - was never exercised the way it
+    # ships. The client pods below declare no securityContext at all, so they
+    # are confined container_t: they reach this desktop only because
+    # desktop-selinux labeled the export dirs container_file_t, at level s0
+    # with no MCS categories (CRI-O gives each pod its own category pair, and
+    # the empty set is a subset of every set). If that labeling regresses,
+    # these pods fail here rather than on someone's server.
+    log p2 "SELinux must stay enforcing: the k8s client path ships this way"
+    [ "$(getenforce)" = Enforcing ] || fail "SELinux is not enforcing"
+
     # Client pods reach the display through CDI, which only the CRI
     # resolves - so this phase runs k3s on an EXTERNAL CRI-O instead of the
     # bundled containerd. CRI-O scans /etc/cdi, which is where the specs live.
-    # (SELinux policy interplay is out of scope here: permissive.)
     log p2 "install CRI-O ${CRIO_VERSION} (the documented runtime for CDI clients)"
-    setenforce 0
     cat > /etc/yum.repos.d/cri-o.repo <<EOF
 [cri-o]
 name=CRI-O ${CRIO_VERSION}
@@ -344,10 +413,38 @@ EOF
     log p2 "crio configured to scan /etc/cdi for device specs"
 
     log p2 "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
-    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
+    # On an enforcing EL host k3s needs its own policy module: its tree under
+    # /var/lib/rancher and its agent processes are not covered by stock
+    # container-selinux (which is what CRI-O and the client pods rely on).
+    # The installer is supposed to detect enforcing SELinux and pull
+    # k3s-selinux from rpm.rancher.io itself, so INSTALL_K3S_SKIP_SELINUX_RPM
+    # is deliberately NOT set - but that is the INSTALLER's behaviour, not
+    # ours, and it is exactly the kind of thing that changes upstream without
+    # us noticing. Assert the result below rather than trusting it.
+    #
+    # Output goes to a file rather than /dev/null: a policy install that failed
+    # or was skipped explains itself there, and discarding it is why this was
+    # unverifiable in the first place.
+    if ! curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
         --container-runtime-endpoint=unix:///run/crio/crio.sock \
         --kubelet-arg=cgroup-driver=systemd \
-        --disable traefik --disable metrics-server" sh - >/dev/null
+        --disable traefik --disable metrics-server" sh - >/tmp/k3s-install.log 2>&1
+    then
+        tail -40 /tmp/k3s-install.log >&2 || true
+        fail "k3s install failed (see output above)"
+    fi
+
+    log p2 "k3s brought its own SELinux policy module (required on an enforcing EL host)"
+    if semodule -l 2>/dev/null | grep -qi '^k3s'; then
+        log p2 "  policy module loaded: $(semodule -l | grep -i '^k3s' | tr '\n' ' ')"
+        rpm -q k3s-selinux >/dev/null 2>&1 && log p2 "  from $(rpm -q k3s-selinux)"
+    else
+        echo "---- selinux lines from the k3s installer ----" >&2
+        grep -i selinux /tmp/k3s-install.log >&2 || echo "(none)" >&2
+        echo "---- loaded policy modules ----" >&2
+        semodule -l 2>/dev/null | tail -20 >&2 || true
+        fail "no k3s SELinux policy module loaded - the installer skipped it, and k3s is unconfined-by-omission on an enforcing host"
+    fi
     wait_for 60 5 "k3s node ready" \
         sh -c "k3s kubectl get nodes | grep -q ' Ready'"
     # Prove the node really runs CRI-O, not the bundled containerd.
@@ -382,10 +479,21 @@ EOF
             --set image.repository=localhost/cdi-device-plugin --set image.pullPolicy=Never \
             --set "cdiDevice=desktop.local/$cap=all" --set count=10
     done
+    # Registration is where enforcing SELinux bites the PLUGIN (as opposed to
+    # its clients): it means connecting to kubelet's socket, which a confined
+    # container may not do. The chart's seLinuxOptions.type=spc_t is what makes
+    # this pass; without it the plugin serves its own socket fine and loops on
+    # "connect: permission denied", so the only symptom is that the resource
+    # never appears. fail() dumps the plugin logs, where that loop is plain to
+    # see; the description here says where to look.
     for cap in display audio tools; do
-        wait_for 30 4 "desktop.local/$cap allocatable" \
+        wait_for 30 4 "desktop.local/$cap allocatable (plugin registered with kubelet?)" \
             sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/$cap}' | grep -q 10"
     done
+
+    log p2 "the node really is enforcing and k3s did not relax it"
+    [ "$(getenforce)" = Enforcing ] \
+        || fail "something set SELinux permissive during the k3s/CRI-O install"
 
     log p2 "client pod schedules and opens xterm on the desktop"
     # The example pod declares only the resource request - no volumes, no
@@ -396,6 +504,18 @@ EOF
     wait_for 30 4 "client pod running" \
         sh -c "k3s kubectl get pod x11-client-demo -o jsonpath='{.status.phase}' | grep -q Running"
     sleep 5
+
+    # The pod must be CONFINED for any of this to have meant anything. If
+    # CRI-O had handed it spc_t (privileged) the display would work no matter
+    # how the host directories were labeled, and this phase would pass while
+    # proving nothing. Read the type the kernel actually gave it.
+    log p2 "the client pod runs confined, and reached the display anyway"
+    pctx=$(k3s kubectl exec x11-client-demo -- cat /proc/self/attr/current 2>/dev/null | tr -d '\0')
+    case "$pctx" in
+        *:container_t:*) log p2 "  client pod context: $pctx" ;;
+        "") fail "could not read the client pod's SELinux context" ;;
+        *) fail "client pod runs as '$pctx', not container_t - the confined path is untested" ;;
+    esac
     log p2 "phase2 passed"
 }
 
