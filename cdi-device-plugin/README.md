@@ -147,6 +147,16 @@ than one combined device.
   `-v src:dst:z`, so on an enforcing host a *confined* container may
   receive its mounts and still be denied on use. Labeling the underlying
   paths is host-side work.
+
+  Note the asymmetry: labeling covers the CLIENTS, but the plugin itself
+  needs an SELinux type of its own, because registering means connecting to
+  **kubelet's** socket under the plugin dir — which a confined container may
+  not do. The chart sets `seLinuxOptions.type: spc_t` for that (narrower
+  than `privileged`: no extra capabilities or device access). Without it the
+  plugin serves its own socket happily and then loops on
+  `connect: permission denied`, so the resource never becomes allocatable and
+  client pods stay Pending with no obvious cause. Set `seLinuxOptions=null`
+  on a host without SELinux or where policy already permits registration.
 - **Scheduling policy.** Beyond `count` and health, allocation is
   kubelet's business.
 

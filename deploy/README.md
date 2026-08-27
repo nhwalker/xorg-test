@@ -244,6 +244,15 @@ Confined *host services* are the one case this does not serve — a daemon
 running in its own domain would need its own policy. Nothing in the tree runs
 that way.
 
+**Kubernetes device plugins are the other asymmetry.** Labeling gets *client*
+pods to the desktop, but a device plugin also has to register with **kubelet**,
+by connecting to kubelet's own socket — which a confined container may not do,
+and which is not something this tree should relabel (it is kubelet's state, not
+container content). So `charts/cdi-device-plugin` gives the plugin pod
+`seLinuxOptions.type: spc_t`. That grant is the plugin's alone: client pods
+still declare no `securityContext` at all, and `ci/helm-assertions.sh` asserts
+both halves so the two never blur together.
+
 **Not covered.** The desktop container itself is `--privileged`, so label
 separation is already off for it — none of this applies there. If you tighten
 that, expect to write policy for the device and VT access it does.

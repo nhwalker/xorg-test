@@ -44,3 +44,15 @@ priorityClassName: ""
 resources: {}
 nodeSelector: {}
 tolerations: []
+
+# SELinux type for the plugin pod. Device plugins talk to kubelet's own
+# socket, which a confined container may not do on an enforcing host, so the
+# plugin needs a host-management type; spc_t ("super privileged container")
+# is the narrow tool for exactly that, and unlike `privileged: true` it grants
+# no extra capabilities or device access.
+#
+# Set to null on a host without SELinux, or where local policy already allows
+# the plugin to register. Client pods need nothing here - see the comment in
+# templates/daemonset.yaml.
+seLinuxOptions:
+  type: spc_t

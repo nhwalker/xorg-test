@@ -455,8 +455,15 @@ EOF
             --set image.repository=localhost/cdi-device-plugin --set image.pullPolicy=Never \
             --set "cdiDevice=desktop.local/$cap=all" --set count=10
     done
+    # Registration is where enforcing SELinux bites the PLUGIN (as opposed to
+    # its clients): it means connecting to kubelet's socket, which a confined
+    # container may not do. The chart's seLinuxOptions.type=spc_t is what makes
+    # this pass; without it the plugin serves its own socket fine and loops on
+    # "connect: permission denied", so the only symptom is that the resource
+    # never appears. fail() dumps the plugin logs, where that loop is plain to
+    # see; the description here says where to look.
     for cap in display audio tools; do
-        wait_for 30 4 "desktop.local/$cap allocatable" \
+        wait_for 30 4 "desktop.local/$cap allocatable (plugin registered with kubelet?)" \
             sh -c "k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/$cap}' | grep -q 10"
     done
 

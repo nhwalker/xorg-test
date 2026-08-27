@@ -347,7 +347,11 @@ Prerequisites on the node:
 - a device plugin advertising each CDI device as a resource —
   `charts/cdi-device-plugin`, one release per device (display, audio,
   tools). Kubernetes has no pod field that names a CDI device, so nothing
-  reaches CDI injection without one; see "Client containers via CDI"
+  reaches CDI injection without one; see "Client containers via CDI".
+  On an enforcing host the plugin pod needs `seLinuxOptions.type: spc_t`
+  (the chart's default) because *registering* means connecting to kubelet's
+  own socket. That applies to the plugin only — client pods stay confined
+  and declare no `securityContext`
 
 > **Changed:** client pods used to be documented as carrying the annotation
 > `cdi.k8s.io/gpu: nvidia.com/gpu=all`, which never worked — kubelet does
