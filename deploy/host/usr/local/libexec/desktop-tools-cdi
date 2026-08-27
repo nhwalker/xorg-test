@@ -33,7 +33,7 @@
 # somewhere inside the application. It also means the mount below can never
 # reference a missing hostPath, which would fail container creation outright.
 #
-# Defaults match the quadlet/chart exports. Override per host by dropping
+# Defaults match the quadlet's exports. Override per host by dropping
 # assignments into /etc/desktop-container/client-cdi.conf, e.g.
 #   TOOLS_DIR=/opt/desktop-container/bin
 set -euo pipefail

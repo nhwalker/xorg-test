@@ -45,7 +45,7 @@
 # Do not "make it consistent" by writing the tools spec here unconditionally;
 # desktop-tools-cdi's header has the full reasoning.
 #
-# Defaults match the quadlet/chart exports. Override per host by dropping
+# Defaults match the quadlet's exports. Override per host by dropping
 # assignments into /etc/desktop-container/client-cdi.conf, e.g.
 #   DISPLAY_VALUE=:1
 set -euo pipefail

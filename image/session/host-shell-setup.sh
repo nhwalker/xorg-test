@@ -1,8 +1,9 @@
 #!/bin/bash
 # Boot-time setup for the "Host Terminal" menu entry: installs the ssh key
 # and client config for the desktop user from the host-provided material in
-# /etc/desktop-container (mounted read-only; created by install.sh when run
-# with a --shell-user, see README "Host terminal from the desktop").
+# /etc/desktop-container (mounted read-only; the deploy tree's shell-user file
+# plus the boot-fresh keypair desktop-host-shell.service writes, see README
+# "Host terminal from the desktop").
 #
 # Runs as root from xorg-conf.service. Degrades gracefully: without the
 # mount the menu entry fails visibly and everything else is unaffected.
@@ -15,7 +16,7 @@ log() { echo "host-shell-setup: $*"; }
 
 if [ ! -f "$SRC/host-shell-key" ]; then
     log "no host shell key at $SRC/host-shell-key; the 'Host Terminal' menu entry will not work"
-    log "enable it on the host: ./install.sh [--host-prep-only] --shell-user <user>"
+    log "enable it on the host: start desktop-host-shell.service (see deploy/README.md)"
     exit 0
 fi
 

@@ -7,12 +7,12 @@ Description=Write the CDI specs that share this desktop's display and audio with
 # starting.
 #
 # Unlike the other converger oneshots, this one is NOT only for
-# desktop.service: on a kubernetes node the desktop runs as a pod from
-# charts/desktop-container and there is no quadlet at all, yet client pods
-# still resolve these specs (via the device plugins that advertise them).
-# Hence the [Install] below (shipped pre-enabled as a
-# multi-user.target.wants symlink in this tree) in addition to
-# desktop.container's Wants=.
+# desktop.service: on a kubernetes node the client PODS resolve these specs
+# (via the device plugins that advertise them), and kubelet must find them
+# before it admits a pod that requests one - which can happen on a boot
+# where desktop.service has not started yet. Hence the [Install] below
+# (shipped pre-enabled as a multi-user.target.wants symlink in this tree)
+# in addition to desktop.container's Wants=.
 Before=crio.service kubelet.service k3s.service k3s-agent.service
 
 [Service]

@@ -235,11 +235,17 @@ scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
     images-desktop.tar images-plugin.tar images-testclient.tar \
     rocky@127.0.0.1:/tmp/
 
-log "phase 1: quadlet flow (real install.sh, real Xorg, SELinux enforcing)"
-vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-guest.sh phase1' \
-    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase1 failed"; }
-screendump desktop-quadlet
-assert_nonblank desktop-quadlet
+log "phase deploy: the declarative tree on a stock host (SELinux enforcing)"
+# The one host-setup path there is: the deploy tree applied over a stock
+# Rocky host - the boot getty seat-prep must evict, the root-owned
+# desktop-shell ssh trust under enforcing SELinux, the stub CDI path next
+# to a REAL KMS display, the podman client CDI contract, and
+# desktop-preflight fully green.
+vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-guest.sh phase-deploy' \
+    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
+         > "$ART/guest-deploy-fail.log" 2>&1 || true; fail "guest phase-deploy failed"; }
+screendump desktop-deploy
+assert_nonblank desktop-deploy
 
 log "audio: record each client path (pulse, pipewire, ALSA) individually"
 # One capture cycle per player so every path is acoustically verified on
@@ -248,11 +254,11 @@ log "audio: record each client path (pulse, pipewire, ALSA) individually"
 # the capture window brackets it. On failure still stop the capture: the
 # partial WAV is a debugging artifact and stopping finalizes its header.
 for path in pulse pipewire alsa; do
-    audio_capture_start "audio-quadlet-$path"
+    audio_capture_start "audio-deploy-$path"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio $path" \
         || { audio_capture_stop; fail "guest play-audio $path failed"; }
     audio_capture_stop
-    python3 check-audio.py "$ART/audio-quadlet-$path.wav" 1 0.05 "$(freq_for "$path")" \
+    python3 check-audio.py "$ART/audio-deploy-$path.wav" 1 0.05 "$(freq_for "$path")" \
         || fail "$path audio capture is empty or silent"
 done
 
@@ -284,19 +290,7 @@ after=$(vm_ssh 'ls /dev/input/event* | wc -l')
 vm_ssh 'sudo podman exec desktop sh -c "grep -c \"Adding input device\" /home/desktop/.local/share/xorg/Xorg.0.log"' \
     > "$ART/xorg-input-count.txt" || true
 
-log "phase deploy: declarative tree replaces the install.sh flow (SELinux enforcing)"
-# Audio/input plumbing is identical under either flow (already proven in
-# phase 1); this phase proves what only it can: the deploy tree converting
-# a just-uninstalled (getty-restored) host, the root-owned desktop-shell
-# ssh trust under enforcing SELinux, the stub CDI path next to a REAL
-# KMS display, and desktop-preflight fully green.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase-deploy' \
-    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
-         > "$ART/guest-deploy-fail.log" 2>&1 || true; fail "guest phase-deploy failed"; }
-screendump desktop-deploy
-assert_nonblank desktop-deploy
-
-log "phase 2: k3s + desktop chart + a cdi-device-plugin release per capability"
+log "phase 2: k3s + a cdi-device-plugin release per capability, desktop still on the quadlet"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' > "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
@@ -418,7 +412,7 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-concurrency' \
          > "$ART/verify-concurrency-fail.log" 2>&1 || true; fail "concurrency check failed"; }
 screendump concurrent-clients
 
-log "k8s teardown: uninstall every chart; resources withdrawn, host CDI specs survive"
+log "k8s teardown: uninstall the plugin releases; resources withdrawn, host CDI specs and the desktop survive"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          > "$ART/teardown-fail.log" 2>&1 || true; fail "k8s teardown check failed"; }

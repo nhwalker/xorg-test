@@ -31,11 +31,11 @@ screenshot/                 static X11 screen-capture binary for client
                             behind, see its README. Ships inside the desktop
                             image, published to the host at boot, and mounted
                             into clients by desktop.local/tools
-install.sh                  host setup / teardown (run as root)
-quadlet/desktop.container   podman quadlet unit -> desktop.service
-deploy/                     declarative deployment: the same host end state as
-                            plain files (quadlet + systemd drop-ins/masks), no
-                            install script, image assumed prebuilt
+charts/cdi-device-plugin    helm chart for the plugin: one release per CDI
+                            device, so application pods can request one
+deploy/                     the deployment: host end state as plain files
+                            (podman quadlet + systemd drop-ins/masks/oneshots),
+                            no install script, image assumed prebuilt
 image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
@@ -63,10 +63,11 @@ podman build -t localhost/desktop-container-base:latest -f Containerfile.base .
 podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
 ```
 
-`install.sh` runs both stages (the app layer always with `--network=none`);
-`--no-base` reuses an existing base so day-to-day config changes never
-touch the network. `--base-image REF` points the app build at a base from
-a registry instead.
+Nothing in the `deploy/` tree builds or pulls images — provisioning puts a
+prebuilt image in podman's storage. `ci/build-bases.sh` is the reference for
+building the bases; day-to-day config iteration reuses an existing base and
+so never touches the network. `--build-arg BASE_IMAGE=REF` points the app
+build at a base from a registry instead.
 
 > **Point-release drift:** the Rocky repos pin major version `9` while
 > UBI tracks the current 9.x point release. Around release boundaries the
@@ -85,46 +86,52 @@ Hat and Rocky only fills the gaps.
 
 ## Install
 
-On the target host (RHEL/Rocky 9 or similar, podman ≥ 4.4):
+The desktop is deployed by applying the `deploy/` tree to the host: the whole
+host end state as plain files (a podman quadlet unit, systemd drop-ins and
+masks, and converge-at-boot oneshots), applied with rsync/RPM/Ansible. There
+is no install script and nothing autodetects: hosts are *provisioned*, not
+converted, and one tree serves GPU and GPU-less hosts alike.
 
 ```sh
-sudo ./install.sh            # build image, reconfigure host, start desktop.service
-sudo ./install.sh --no-gpu   # force modesetting even if an NVIDIA GPU exists
-sudo ./install.sh --no-build --image <ref>   # use a prebuilt image
-sudo ./install.sh --uninstall                # restore the host
+# image already built and in podman's storage (podman load / podman pull)
+sudo rsync -a --chown=root:root deploy/host/ /
+sudo systemctl daemon-reload
+sudo systemd-sysusers
+sudo systemd-tmpfiles --create
+sudo systemctl start desktop.service
 ```
 
-### Declarative install (production)
+See `deploy/README.md` for the full contents, the host prerequisites
+(`deploy/HOST-REQUIRES.md`), the per-host drop-in overrides, and the
+`desktop-preflight` debug tool.
 
-`install.sh` converts an existing host and can undo itself. For hosts that
-are *provisioned* rather than converted — the planned production shape —
-use the `deploy/` tree instead: the same end state as plain files (quadlet,
-getty mask, logind/tmpfiles/audio drop-ins, sysusers) plus four
-converge-at-boot oneshots (seat state, GPU CDI spec, the client CDI specs,
-host-shell key material)
-and a read-only `desktop-preflight` debug tool — applied with
-rsync/RPM/Ansible, no install script, image assumed already built. One
-tree serves GPU and GPU-less hosts alike. See `deploy/README.md`.
-
-### What install.sh does to the host (all reverted by `--uninstall`)
+### What the tree does to the host
 
 Seat handover — the host must stop claiming the devices the container needs:
 
-1. Disables `display-manager.service` (gdm/sddm/…) and sets the default boot
-   target to `multi-user.target`.
-2. Deletes `/etc/udev/rules.d/72-seat-*.rules` (created by `loginctl attach`)
-   and re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems,
-   so all devices fall back to default `seat0` tagging. Custom multi-seat
-   splits would otherwise hide devices from the container's logind.
-3. Masks `getty@tty1.service` and sets `NAutoVTs=0`, `ReserveVT=0` for host
-   logind — nothing on the host touches the VT the container's Xorg runs on.
-   Host logind itself keeps running (ssh logins etc. still work); with no
-   graphical session it holds no DRM master and no input devices.
+1. Ships the static baseline as symlinks: `default.target` →
+   `multi-user.target`, and `getty@tty1.service` → `/dev/null` (masked), so
+   nothing on the host touches the VT the container's Xorg runs on. A logind
+   drop-in sets `NAutoVTs=0`, `ReserveVT=0`. Host logind itself keeps running
+   (ssh logins etc. still work); with no graphical session it holds no DRM
+   master and no input devices.
+2. `desktop-seat-prep.service` makes that baseline true again at every boot,
+   whatever the host has drifted to: it deletes
+   `/etc/udev/rules.d/72-seat-*.rules` (created by `loginctl attach`) and
+   re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems so all
+   devices fall back to default `seat0` tagging (custom multi-seat splits
+   would otherwise hide devices from the container's logind); disables and
+   stops whatever `display-manager.service` resolves to; re-asserts the
+   default target and the getty mask; then verifies nothing still holds the
+   VT or DRM master before `desktop.service` starts.
+3. The quadlet unit carries a runtime backstop —
+   `Conflicts=getty@tty1.service display-manager.service` — so even a unit
+   that slipped past step 2 cannot run alongside the desktop.
 
 Plus: a tmpfiles.d entry for `/run/desktop-audio` and `/tmp/.X11-unix`, host
-audio client configs (see below), optional GPU CDI spec + quadlet drop-in,
-and the quadlet unit itself. Prior state (display manager, default target,
-replaced files) is saved in `/var/lib/desktop-container/`.
+audio client configs (see below), the GPU CDI spec (real on NVIDIA hosts, a
+stub elsewhere), the client CDI specs, host-shell key material, and the
+quadlet unit itself.
 
 ## Seat model inside the container
 
@@ -154,27 +161,30 @@ container-internal `seat0`:
 
 ### Changing the VT
 
-tty1 is assumed in three places: `getty@tty1` masking in `install.sh`, and
+tty1 is assumed in three places: the `getty@tty1` mask in the deploy tree, and
 `TTYPath=`/`DESKTOP_VT=` in `image/systemd/desktop-session.service`. Change
 all of them (a systemd drop-in works for the unit) to move the session.
 
 ## GPU notes
 
-- The image contains **no** NVIDIA bits. `install.sh` runs
-  `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` and adds a quadlet
-  drop-in with `AddDevice=nvidia.com/gpu=all` when a GPU + toolkit are found.
-  Beware: quadlet only merges drop-ins with podman >= 5.0 (RHEL/Rocky 9.5+);
-  older podman ignores the GPU drop-in **silently** and the desktop comes up
-  unaccelerated. `systemctl cat desktop.service` shows what actually landed.
+- The image contains **no** NVIDIA bits. The quadlet unit carries
+  `AddDevice=nvidia.com/gpu=all` unconditionally, and
+  `desktop-cdi-refresh.service` converges `/etc/cdi/nvidia.yaml` at every
+  boot: `nvidia-ctk cdi generate` on a host with a GPU + toolkit, a stub spec
+  (injecting only the `NVIDIA_CDI_STUB=1` marker) everywhere else. The same
+  unit therefore serves both, and the device reference always resolves.
 - At container boot, `xorg-gpu-conf.sh` writes
   `/etc/X11/xorg.conf.d/20-gpu.conf`: `nvidia` if device nodes **and** an
   injected `nvidia_drv.so` are present, else `modesetting` on the first
   connected `/dev/dri/card*`.
 - **nvidia_drv.so missing:** older toolkits don't include the Xorg driver
-  module in the CDI spec. `install.sh` detects this and appends `Volume=`
-  bind-mounts for the host's `nvidia_drv.so` / `libglxserver_nvidia.so` to
-  the GPU drop-in. If your host keeps them elsewhere, add the mounts to
-  `/etc/containers/systemd/desktop.container.d/10-gpu.conf` manually.
+  module in the CDI spec, and preflight then warns
+  `nvidia_drv.so NOT injected`. Pin a toolkit that includes it, or bind-mount
+  the host's copies via a quadlet drop-in — the commented `Volume=` lines in
+  `deploy/host/etc/containers/systemd/desktop.container` are the template.
+  Beware: quadlet only merges drop-ins with podman >= 5.0 (RHEL/Rocky 9.5+);
+  older podman ignores them **silently**. `systemctl cat desktop.service`
+  shows what actually landed.
 - **No-GPU mode on an NVIDIA-driver host:** `/dev/dri/card*` is provided
   by the `nvidia-drm` module, which only registers a KMS node with
   `nvidia_drm.modeset=1` on the kernel command line. Without it, the
@@ -182,8 +192,8 @@ all of them (a systemd drop-in works for the unit) to move the session.
   "no /dev/dri/card* visible".
 - **CDI spec staleness:** `/etc/cdi/nvidia.yaml` pins driver library paths
   and versions. After a host driver update, container creation fails until
-  you rerun `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` (or
-  rerun `install.sh`).
+  the spec is regenerated — `systemctl restart desktop-cdi-refresh.service`,
+  which the next reboot does anyway.
 
 ## Using the display
 
@@ -286,11 +296,11 @@ two extra sockets in `/run/desktop-audio` (bind-mounted from the host):
 |---|---|---|
 | PipeWire native | `/run/desktop-audio/pipewire-0` | `PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0` |
 | PulseAudio | `/run/desktop-audio/pulse` | `PULSE_SERVER=unix:/run/desktop-audio/pulse` |
-| ALSA | (via pulse plugin) | `/etc/asound.conf` routing `pcm.!default` to the pulse socket |
+| ALSA | (via pulse plugin) | an alsa conf drop-in routing `pcm.!default` to the pulse socket |
 
-- **Host**: `install.sh` already writes `/etc/pulse/client.conf.d/…` and
-  `/etc/asound.conf`, so unmodified pulse and ALSA apps just work
-  (host needs `alsa-plugins-pulseaudio`, standard on EL).
+- **Host**: the deploy tree ships `/etc/pulse/client.conf.d/…` and
+  `/etc/alsa/conf.d/60-desktop-container.conf`, so unmodified pulse and ALSA
+  apps just work (host needs `alsa-plugins-pulseaudio`, standard on EL).
 - **Inside this container**: apps use the default per-user sockets;
   ALSA apps go through `pipewire-alsa`.
 - **Other containers**: mount the socket dir and set the env var, e.g.
@@ -300,83 +310,54 @@ podman run -v /run/desktop-audio:/run/desktop-audio \
     -e PULSE_SERVER=unix:/run/desktop-audio/pulse <img> paplay /usr/share/sounds/...
 ```
 
-For ALSA-only apps in other containers, add the same two-stanza
-`/etc/asound.conf` as `install.sh` writes on the host (requires
+For ALSA-only apps in other containers, add the same two-stanza config the
+deploy tree drops at `/etc/alsa/conf.d/60-desktop-container.conf` (requires
 `alsa-plugins-pulseaudio` in that image).
 
 ## Kubernetes (single-node k3s + CRI-O)
 
-`charts/desktop-container` deploys the same image as a Deployment
-(replicas=1, Recreate) instead of the quadlet. Everything podman's
-`--systemd`/`--privileged`/`--tty` provided is reconstructed in the pod
-spec: privileged container with host `/dev`, Memory-backed `emptyDir` on
-`/run` and `/tmp`, `tty: true` (so `journal-console.service` mirrors the
-journal into `kubectl logs`), `hostNetwork`, the same three host mounts,
-and a privileged initContainer that does tmpfiles.d's `chmod 1777` job on
-the exported socket dirs.
+**Kubernetes here carries application containers, not the desktop.** The
+desktop is deployed once per host by the `deploy/` tree's podman quadlet and
+owns the VT, the GPU and the input devices for as long as the host is up.
+k8s workloads on the same node are *clients* of that display: they reach it
+by resolving the CDI devices below, exactly as a plain `podman run` client
+does. Nothing schedules the X server, so nothing can contend for the seat —
+one host, one desktop, by construction.
+
+That split is why there is no chart for the desktop. A Deployment would have
+to reconstruct everything podman's `--systemd`/`--privileged`/`--tty` gives
+it, gain nothing schedulable (it is pinned to one node's hardware anyway),
+and introduce the one failure mode the seat model cannot tolerate: two X
+servers fighting over DRM master.
 
 Prerequisites on the node:
-- privileged pods allowed in the target namespace (k3s default: yes)
-- CRI-O scanning `/etc/cdi` — required for GPU mode and for client
-  containers (see below). This is the default, but the default is not
-  echoed in `crio config` output, so it is worth stating explicitly in a
-  drop-in rather than assuming:
+- the `deploy/` tree applied and `desktop.service` running (that is what
+  writes `/etc/cdi/desktop-*.yaml` and exports the sockets)
+- privileged pods allowed in the target namespace only if your *own*
+  workloads need them; the client pods here do not
+- CRI-O scanning `/etc/cdi` — required for client containers. This is the
+  default, but the default is not echoed in `crio config` output, so it is
+  worth stating explicitly in a drop-in rather than assuming:
 
   ```toml
   # /etc/crio/crio.conf.d/12-cdi.conf
   [crio.runtime]
   cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
   ```
-- the image reachable from the node: pushed to a registry (default), or
-  imported into the runtime locally — then set `image.repository` to the
-  imported name and `image.pullPolicy=Never`
-- host prep run once: `sudo ./install.sh --host-prep-only` (seat undo,
-  audio client configs, `/etc/cdi/nvidia.yaml` and the client specs
-  `/etc/cdi/desktop-{display,audio}.yaml`; no podman service is installed)
-- for client pods (and for GPU mode): a device plugin advertising each CDI
-  device as a resource — `charts/cdi-device-plugin` (one release per
-  device: display, audio), or NVIDIA's own for `nvidia.com/gpu`.
-  Kubernetes has no pod field that names a CDI device, so nothing reaches
-  CDI injection without one; see "Client containers via CDI"
+- a device plugin advertising each CDI device as a resource —
+  `charts/cdi-device-plugin`, one release per device (display, audio,
+  tools). Kubernetes has no pod field that names a CDI device, so nothing
+  reaches CDI injection without one; see "Client containers via CDI"
 
-Install:
-
-```sh
-helm install desktop charts/desktop-container \
-    --set image.repository=<registry>/desktop-container
-# with NVIDIA GPU injection:
-helm install desktop charts/desktop-container \
-    --set image.repository=<registry>/desktop-container --set gpu.enabled=true
-```
-
-GPU mode makes the pod request `gpu.resourceName` (default
-`nvidia.com/gpu`, what NVIDIA's own device plugin advertises); the plugin
-behind that resource names the CDI device and CRI-O injects the devices
-and driver userspace from `/etc/cdi/nvidia.yaml`. On a node without
-NVIDIA's plugin, serve the same spec with `charts/cdi-device-plugin` and
-point `gpu.resourceName` at it. With `gpu.enabled=false` the container
-uses modesetting on `/dev/dri` exactly like the no-GPU podman flow.
-Client pods reach this desktop the same way — see "Client containers via
-CDI".
-
-> **Changed:** this used to be documented as the pod annotation
+> **Changed:** client pods used to be documented as carrying the annotation
 > `cdi.k8s.io/gpu: nvidia.com/gpu=all`, which never worked — kubelet does
 > not pass pod annotations to the runtime's CDI injection, so the pod
-> started with no GPU and no error. The mechanism was never exercised in
-> CI because no runner has a GPU. See the note under "Client containers
-> via CDI".
+> started with nothing injected and no error. Use a device plugin and a
+> resource request. `ci/helm-assertions.sh` asserts the annotation stays
+> out of every manifest, because its reappearance would fail silently.
 
-Verify: `kubectl logs deploy/desktop | grep preflight:` (same
-PASS/WARN/FAIL report), `grep postmortem:` on session failures, and the
-same `kubectl exec` spot-checks as the podman checklist below. The pod
-turns Ready only when a real X connection succeeds (`xdpyinfo`), so a
-stale socket file never reads as Ready.
-
-> **One desktop per host:** never run the quadlet service and the k8s
-> deployment at the same time — two X servers would contend for the VT
-> and DRM master. On a k8s node, use `install.sh --host-prep-only` (it
-> never installs the quadlet); `install.sh` warns if it detects an active
-> kubelet/k3s when installing the podman service.
+Verify the desktop the same way as on any other host — `desktop-preflight`,
+`podman logs desktop | grep preflight:` — not through `kubectl`.
 
 ## Client containers via CDI
 
@@ -428,9 +409,9 @@ podman run --rm --device desktop.local/display=all --device desktop.local/tools=
 ```
 
 `desktop-client-cdi` writes the display and audio specs
-(`/etc/cdi/desktop-display.yaml` and `/etc/cdi/desktop-audio.yaml`). The `deploy/` tree ships it as a
-boot-time oneshot; `install.sh` runs it during host prep, including
-`--host-prep-only`. Mounts are **rw** — unix `connect(2)` needs write
+(`/etc/cdi/desktop-display.yaml` and `/etc/cdi/desktop-audio.yaml`); the
+`deploy/` tree ships it as a boot-time oneshot. Mounts are **rw** — unix
+`connect(2)` needs write
 access to the socket inode — and they mount the *directories*, because
 Xorg and PipeWire unlink and recreate their sockets on restart, which
 would leave a file bind mount pinned to a dead inode.
@@ -530,8 +511,10 @@ Other semantics worth knowing:
   `/etc/desktop-container/client-cdi.conf` and rerunning the generator;
   the values must match what the desktop exports.
 - **Node prep is required.** The specs must exist on every node that runs
-  clients: `sudo ./install.sh --host-prep-only`, or apply the `deploy/`
-  tree.
+  clients: apply the `deploy/` tree. `desktop-client-cdi.service` ships
+  pre-enabled for `multi-user.target`, so the display and audio specs are
+  written at boot whether or not `desktop.service` has come up yet —
+  kubelet has to find them before it will admit a pod that requests one.
 - **SELinux: confined clients need the export dirs labeled.** On an
   enforcing host the exported socket dirs carry host labels, so a confined
   container is denied when it connects — it gets its env and mounts, then
@@ -544,7 +527,7 @@ Other semantics worth knowing:
   `--privileged` already disables label separation.
 - **Audio clients**: pulse and PipeWire-native work via the injected env
   alone. ALSA-only apps additionally need `alsa-plugins-pulseaudio` in
-  their image plus the two-stanza `/etc/asound.conf` shown in the Audio
+  their image plus the two-stanza ALSA config shown in the Audio
   section, pointing at the injected `PULSE_SERVER` path.
 - **GL**: clients get software rendering. Hardware GL would need render
   nodes/driver userspace in the client (deliberately out of scope — the
@@ -557,31 +540,25 @@ container, where the X stack lives — the host deliberately has no GUI
 packages) whose shell is on the **host**, via ssh over loopback (the
 container shares the host network namespace).
 
-Enable it by giving host-prep a target account:
-
-```sh
-sudo ./install.sh --shell-user alice          # podman flow
-sudo ./install.sh --host-prep-only --shell-user alice   # k8s flow
-# --shell-user defaults to $SUDO_USER (whoever ran sudo)
-```
-
-(The declarative `deploy/` tree does this differently: a dedicated
-unprivileged `desktop-shell` account, a fresh key on every boot, and
-root-owned trust under `/etc/ssh/authorized_keys.d` — always on, with a
-commented off-switch. See `deploy/README.md` "Host Terminal".)
+It is **on by default**. The deploy tree ships a dedicated unprivileged
+`desktop-shell` account (sysusers.d), and `desktop-host-shell.service`
+generates a fresh ed25519 keypair on every boot. To ship hosts without it,
+comment out the `Wants=`/`After=desktop-host-shell.service` lines in the
+quadlet unit: with no key generated, nothing can log into the account and the
+menu entry degrades gracefully. See `deploy/README.md` "Host Terminal".
 
 What that sets up:
 
-- a dedicated ed25519 keypair in `/etc/desktop-container/` — **root-only
+- a per-boot ed25519 keypair in `/etc/desktop-container/` — **root-only
   on the host** (no non-root host user can read it) and mounted read-only
   into the container, where a boot script installs a `desktop`-owned copy
   and generates the `ssh host` client config (loopback, fixed user,
   `NoHostAuthenticationForLocalhost`);
-- a restricted `authorized_keys` entry for the target user:
+- a restricted `authorized_keys` entry for `desktop-shell`, root-owned under
+  `/etc/ssh/authorized_keys.d` (not in the account's home):
   `from="127.0.0.1,::1"`, no port/agent/X11 forwarding;
-- sshd enabled if it wasn't running. `--uninstall` removes the key
-  material and the authorized_keys entry but deliberately leaves sshd
-  as-is — whether the host runs sshd is the admin's call.
+- an sshd drop-in pointing sshd at that path. Whether the host runs sshd at
+  all stays the admin's call — the tree enables nothing.
 
 A failed "Host Terminal" click keeps its window open with the reason and
 the enablement command (`/usr/local/bin/host-terminal` wrapper) instead of
@@ -589,18 +566,18 @@ flashing shut.
 
 Security framing: the desktop container is `--privileged`, so container
 root already has host-root-equivalent power; this key adds a *convenient*
-path for the unprivileged `desktop` user to a *specific* host account,
-with the ssh audit trail in the host journal. Without `--shell-user`
-everything degrades gracefully — preflight WARNs and the menu entry
-fails; the rest of the desktop is unaffected.
+path for the unprivileged `desktop` user to a *specific*, unprivileged host
+account, with the ssh audit trail in the host journal. With the service
+switched off everything degrades gracefully — preflight WARNs and the menu
+entry fails; the rest of the desktop is unaffected.
 
 ## CI
 
 Three workflows verify everything short of NVIDIA hardware, on every PR:
 
-- **`ci.yml`** — static checks (go fmt/vet/test for the plugin,
-  shellcheck, helm lint + golden template assertions in
-  `ci/helm-assertions.sh`, kubeconform over both charts and the client
+- **`ci.yml`** — static checks (go fmt/vet/test for the plugin and the
+  screenshot binary, shellcheck, helm lint + golden template assertions in
+  `ci/helm-assertions.sh`, kubeconform over the plugin chart and the client
   manifests) and the builds: base images are pulled from GHCR by content
   hash (`ci/build-bases.sh`, rebuilt only when their inputs change) and
   the application layers build with `--network=none` — the offline
@@ -609,39 +586,34 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   audio alone, both together, each asserted to grant its own capability
   and **not** the other's, with a no-device control proving nothing is
   baked into the image.
-  Then `ci/smoke-podman.sh` runs the **real `install.sh`**
-  on the ephemeral runner (quadlet install, seat undo, sshd/key
-  provisioning) and asserts the boot: seat0 session, audio sockets +
-  cross-uid connects, preflight/postmortem in the logs, the tty-less
-  journal-mirror guard, end-to-end `ssh host`, and clean `--uninstall`.
-  After that, `ci/smoke-deploy.sh` proves the **declarative `deploy/`
-  tree** on the same restored runner: script-level branch tests (CDI
-  converger no-downgrade rules, client-spec disjointness, overrides and
-  atomic write, removal of the superseded combined spec, seat-prep on a
-  staged dirty seat), then
-  the full composition — rsync-apply, boot from the tree's quadlet,
-  converger oneshots, stub-CDI marker on container PID 1, `desktop-shell`
-  ssh in both directions, `desktop-preflight` green, service restart. A
-  static-job guard also keeps the two quadlet variants' `[Container]`
-  sections in sync.
+  Then `ci/smoke-deploy.sh` proves the **`deploy/` tree** on the ephemeral
+  runner: script-level branch tests (CDI converger no-downgrade rules,
+  client-spec disjointness, overrides and atomic write, removal of the
+  superseded combined spec, seat-prep on a staged dirty seat), then the
+  full composition — rsync-apply, boot from the tree's quadlet, converger
+  oneshots, stub-CDI marker on container PID 1, seat0 session, audio
+  sockets, `desktop-shell` ssh in both directions, `desktop-preflight`
+  green, service restart.
 - **`e2e-vm.yml`** — the full stack in a KVM-booted **Rocky 9 VM** with
   virtio display/input/sound and **SELinux enforcing**
-  (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`): real Xorg starts rootless on
-  a real KMS device, mwm runs, audio devices appear, the host-terminal
-  ssh path works under SELinux (validating the restorecon handling),
-  input hotplug is exercised via QEMU device_add; then the **declarative
-  `deploy/` tree** takes over the same machine (install.sh uninstalled,
-  tree rsync-applied, seat-prep evicting the restored getty, the
-  root-owned `desktop-shell` ssh trust proven under enforcing,
-  `desktop-preflight` asserted fully green); then the machine switches to
-  k3s and deploys the desktop chart plus one `cdi-device-plugin` release
-  per capability — real readiness, both resources becoming allocatable,
-  then client pods drawing on the display and playing/recording audio
+  (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`). The `deploy/` tree is applied
+  to the stock host: seat-prep evicts the boot getty, real Xorg starts
+  rootless on a real KMS device, mwm runs, audio plays over all three
+  client paths, the root-owned `desktop-shell` ssh trust is proven in both
+  directions under enforcing, podman clients resolve each CDI device and
+  get its capability and no other, input is typed in over the real virtual
+  keyboard and hotplug is exercised via QEMU `device_add`, and
+  `desktop-preflight` is asserted fully green. Then k3s + CRI-O join the
+  same machine **with the desktop still running on its quadlet**, and one
+  `cdi-device-plugin` release per capability makes each resource
+  allocatable — client pods then draw on the display and play/record audio
   purely through CDI injection, checked against a control pod that
   requests nothing and must get nothing, and against narrow pods proving a
   display-only client gets no audio and an audio-only client cannot open
-  the display at all. Screendumps of the virtual display are uploaded as
-  artifacts.
+  the display at all. Teardown asserts the other half of that seam:
+  `helm uninstall` withdraws the resources and touches neither the host
+  CDI specs nor the desktop. Screendumps of the virtual display are
+  uploaded as artifacts.
 - **`base-rebuild.yml`** — weekly from-scratch base rebuilds pushed to
   GHCR: early warning for Rocky/UBI point-release drift.
 
@@ -665,7 +637,7 @@ podman exec -u desktop desktop wpctl status    # sound devices present
 # audio, one per protocol (repeat from host and from a scratch container):
 pw-play      /usr/share/sounds/alsa/Front_Center.wav   # PIPEWIRE_REMOTE set
 paplay       /usr/share/sounds/alsa/Front_Center.wav   # PULSE_SERVER set
-aplay        /usr/share/sounds/alsa/Front_Center.wav   # via /etc/asound.conf
+aplay        /usr/share/sounds/alsa/Front_Center.wav   # via the ALSA drop-in
 ```
 
 Input hotplug: unplug/replug a keyboard; it should re-appear in the session
@@ -716,7 +688,8 @@ under `journalctl -t session-postmortem`, not under the unit).
   re-enabled, another compositor). DRM master is released automatically
   when its holder's fd closes, so a previously-stopped X server is never
   the cause — a live one is. `fuser -v /dev/dri/card0` on the host shows
-  the culprit; rerun `install.sh` to re-disable the display manager.
+  the culprit; `systemctl restart desktop-seat-prep.service` walks the seat
+  back (display manager, gettys, seat splits) before the desktop starts.
 - **Keyboard/mouse/GPU dead with rootless X (EACCES opening devices)** —
   gid alignment likely failed: check
   `journalctl -u xorg-conf` inside the container for `align-device-groups`
@@ -728,7 +701,8 @@ under `journalctl -t session-postmortem`, not under the unit).
   boot; restart with `systemctl restart desktop.service` after fixing the
   device situation.
 - **No input devices** — `/run/udev` mount missing, or devices still tagged
-  for another seat: rerun `install.sh` (removes `72-seat-*.rules`) or check
+  for another seat: `systemctl restart desktop-seat-prep.service` (removes
+  `72-seat-*.rules` and re-triggers udev), or check
   `udevadm info /dev/input/event0 | grep -i seat`.
 - **SELinux denials** — `--privileged` disables label separation; if you
   tightened the unit, host clients may need extra policy for the shared
