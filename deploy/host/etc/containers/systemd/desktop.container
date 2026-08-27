@@ -12,10 +12,6 @@
 #   /etc/containers/systemd/desktop.container.d/50-image.conf
 #     [Container]
 #     Image=registry.example.com/desktop-container@sha256:...
-#
-# Keep the [Container] section in sync with quadlet/desktop.container (the
-# install.sh flow); the [Unit] seat backstop below is the only intended
-# difference.
 
 [Unit]
 Description=Containerized desktop (Xorg + mwm + PipeWire)

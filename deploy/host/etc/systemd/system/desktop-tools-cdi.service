@@ -19,7 +19,6 @@ Type=oneshot
 # The price is that this runs AT MOST ONCE PER BOOT. That is fine for what it
 # writes (the spec is static - see the generator), but it means anything that
 # removes the spec must also stop this unit, or the host can never re-advertise
-# without a reboot. install.sh --uninstall does exactly that; if you add
-# another teardown path, it has to as well.
+# without a reboot. Any teardown path you add has to do that.
 RemainAfterExit=yes
 ExecStart=/usr/local/libexec/desktop-tools-cdi

@@ -8,7 +8,8 @@
 # Requires localhost/screenshot:latest to exist (override with
 # --build-arg TOOLS_IMAGE=<ref>): its binaries are staged into this image and
 # published to clients at boot. Build Containerfile.screenshot first.
-# Run via quadlet/desktop.container or charts/ (see install.sh / README.md).
+# Run via the deploy tree's quadlet unit
+# (deploy/host/etc/containers/systemd/desktop.container; see README.md).
 
 # BOTH args must sit here, above the FIRST FROM. An ARG declared before any
 # FROM is global and usable in every FROM line; one declared after a FROM
@@ -86,8 +87,8 @@ RUN mkdir -p /etc/systemd/user/default.target.wants \
 # CDI device mounts into clients.
 #
 # Copied from the `tools` stage above, so this stays an offline build - nothing
-# is fetched, the screenshot image just has to exist locally first (install.sh
-# and the CI workflows build it before this layer).
+# is fetched, the screenshot image just has to exist locally first (the CI
+# workflows build it before this layer).
 COPY --from=tools /screenshot /usr/libexec/desktop-tools/screenshot
 COPY image/tools/publish-tools.sh /usr/local/bin/publish-tools.sh
 RUN chmod 0755 /usr/local/bin/publish-tools.sh /usr/libexec/desktop-tools/*

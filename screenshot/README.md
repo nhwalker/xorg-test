@@ -147,7 +147,7 @@ podman build --network=none -t localhost/screenshot:latest -f Containerfile.scre
 The resulting `scratch` image exists to *carry* the binary, not to run it —
 nothing about this tool is containerized in production. The desktop image
 stages the binary out of it (a named `tools` build stage), so this image must
-be built **before** `Containerfile`; `install.sh` and the CI workflows order
+be built **before** `Containerfile`; the CI workflows order
 them that way.
 
 ## Testing

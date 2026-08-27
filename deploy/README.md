@@ -1,10 +1,10 @@
-# Declarative host deployment (no install.sh)
+# Declarative host deployment
 
-`install.sh` mutates a host imperatively, autodetects what it can, and
-records state so it can undo itself — right for a dev box, wrong for
-production. This tree is the **same host end state expressed as plain
-files**: a podman quadlet plus systemd drop-ins, masks, symlinks, and
-tmpfiles.d entries. Lay it onto the filesystem with whatever provisioning
+This tree is the desktop's **host end state expressed as plain files**: a
+podman quadlet plus systemd drop-ins, masks, symlinks, and tmpfiles.d
+entries. It is the only way the desktop is deployed — hosts are
+*provisioned*, not converted, so nothing here autodetects, mutates a host
+imperatively, or records state in order to undo itself. Lay it onto the filesystem with whatever provisioning
 you already use (rsync, RPM/ostree packaging, Ansible `copy`, image build),
 reload systemd, and the desktop comes up on every boot of
 `multi-user.target`. Nothing here is a script that runs once at install
@@ -104,8 +104,7 @@ retriggered immediately, over and over, until systemd failed the `.path` unit
 on its start limit. Staying active parks the watcher — at the cost that the
 generator runs **at most once per boot**. Anything that tears the spec down
 must therefore also `systemctl stop desktop-tools-cdi.service`, or the host
-cannot advertise the device again until it reboots (`install.sh --uninstall`
-does this).
+cannot advertise the device again until it reboots.
 
 Mounts are rw (unix `connect(2)` needs write access to the socket inode)
 and are of the **directories**, not the socket files: Xorg and PipeWire
@@ -207,21 +206,21 @@ point of the declarative form — the file list above *is* the state).
 
 ## What each file does
 
-| File (under `host/`) | Replaces (install.sh step) |
+| File (under `host/`) | What it does |
 |---|---|
-| `etc/containers/systemd/desktop.container` | the quadlet install; `[Install]` is honored by the quadlet generator, so there is no `systemctl enable` |
-| `etc/systemd/system/default.target` → `multi-user.target` | `systemctl set-default multi-user.target` |
-| `etc/systemd/system/getty@tty1.service` → `/dev/null` | `systemctl mask getty@tty1.service` (frees the VT) |
+| `etc/containers/systemd/desktop.container` | the quadlet unit that becomes `desktop.service`; `[Install]` is honored by the quadlet generator, so there is no `systemctl enable` |
+| `etc/systemd/system/default.target` → `multi-user.target` | the default boot target, as a symlink rather than `systemctl set-default` |
+| `etc/systemd/system/getty@tty1.service` → `/dev/null` | masks the getty (frees the VT), as a symlink rather than `systemctl mask` |
 | `etc/systemd/logind.conf.d/50-desktop-container.conf` | logind `NAutoVTs=0` / `ReserveVT=0` drop-in |
 | `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix` |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
-| `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket (install.sh writes `/etc/asound.conf` instead; the drop-in form doesn't clobber host files but is EL/Fedora packaging) |
+| `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket. A drop-in rather than `/etc/asound.conf`, so a host-local `asound.conf` still wins; the `/etc/alsa/conf.d` mechanism is EL/Fedora packaging |
 | `usr/local/bin/desktop-preflight` | read-only debug tool: PASS/WARN/FAIL per host-side assumption; not wired into boot |
 | `etc/systemd/system/desktop-seat-prep.service` | oneshot before `desktop.service`: converge + verify the seat (see "Seat state" below) |
 | `usr/local/libexec/seat-prep.sh` | the script that unit runs (boot-time convergence agent, not an installer) |
 | `etc/systemd/system/desktop-cdi-refresh.service` | oneshot before `desktop.service`: converge `/etc/cdi/nvidia.yaml` (real spec or no-op stub, see "GPU" above) |
 | `usr/local/libexec/desktop-cdi-refresh` | the script that unit runs (boot-time convergence agent, not an installer) |
-| `etc/systemd/system/desktop-client-cdi.service` | oneshot writing the two specs **client** containers resolve to reach this desktop, one per capability (see "Client containers" below); the only oneshot shipped enabled for `multi-user.target`, because k8s nodes never start `desktop.service` |
+| `etc/systemd/system/desktop-client-cdi.service` | oneshot writing the two specs **client** containers resolve to reach this desktop, one per capability (see "Client containers" below); the only oneshot shipped enabled for `multi-user.target`, because kubelet must find the specs before it admits a client pod that requests one, which can happen on a boot where `desktop.service` has not come up yet |
 | `etc/systemd/system/multi-user.target.wants/desktop-client-cdi.service` → `../desktop-client-cdi.service` | that enablement, as a symlink, so the tree stays a pure `rsync` with no `systemctl enable` step |
 | `usr/local/libexec/desktop-client-cdi` | the script that unit runs (pure config → specs; overridable via `/etc/desktop-container/client-cdi.conf`) |
 | `etc/sysusers.d/desktop-container.conf` | the dedicated `desktop-shell` account (see "Host Terminal" below) |
@@ -263,7 +262,7 @@ The desktop's "Host Terminal" menu entry lands in **`desktop-shell`**, a
 deliberately boring unprivileged account created declaratively by
 sysusers.d (no groups, no sudo, locked password — the container is
 `--privileged` anyway, so this path is convenience + audit trail, not a
-boundary). Differences from the install.sh flow:
+boundary). Three properties are worth calling out:
 
 - **Fresh key every boot.** `desktop-host-shell.service` regenerates the
   ed25519 keypair under `/etc/desktop-container` on every boot; key
@@ -281,19 +280,25 @@ boundary). Differences from the install.sh flow:
 
 sshd itself: the unit `Wants=sshd.service` (started each boot while the
 desktop is deployed), but whether sshd is *enabled* on the host stays the
-admin's/provisioning's call, as with install.sh.
+admin's/provisioning's call.
 
-## What install.sh does that this tree deliberately doesn't
+## Deliberately out of scope
 
-- **The `nvidia_drv.so` bind-mount fallback for old toolkits.** Pin your
-  toolkit version instead, or add the `Volume=` lines shown in the quadlet
-  unit's GPU comment. (GPU detection itself IS carried over, as the
-  converging CDI refresh unit — see "GPU" above.)
-- **Building images.** Provisioning supplies the image; CI builds it.
-- **State backup / `--uninstall`.** Reprovision instead.
-- **The kubelet/k3s "two desktops" check.** Same rule applies (never run
-  the quadlet service and the k8s chart on one host — two X servers would
-  fight over the VT and DRM master); enforce it in provisioning.
+- **Building or pulling images.** Provisioning supplies the image; CI
+  builds it. See "Overriding the image reference" below.
+- **Uninstall / state backup.** Reprovision the host instead — that
+  asymmetry is the point of the declarative form: the file list above *is*
+  the state.
+- **An automatic `nvidia_drv.so` bind-mount for old toolkits.** Pin a
+  toolkit version that ships the Xorg driver module in its CDI spec, or add
+  the `Volume=` lines shown in the quadlet unit's GPU comment. (GPU
+  *detection* is in scope, as the converging CDI refresh unit — see "GPU"
+  above.)
+- **Running the desktop under kubernetes.** The desktop is a quadlet
+  service on the host, full stop; k8s on the same node carries application
+  containers, which reach this desktop through the client CDI devices (see
+  "Client containers" below). Nothing schedules an X server, so nothing can
+  contend for the VT or DRM master.
 
 ## Overriding the image reference
 
@@ -331,9 +336,7 @@ podman logs desktop | grep preflight:       # container-side assumptions;
 
 ## How CI validates this tree
 
-- `ci.yml` static job: shellcheck on all four scripts, plus a guard that
-  the `[Container]` sections of this quadlet and `quadlet/desktop.container`
-  (the install.sh flow) only differ by the intended GPU lines.
+- `ci.yml` static job: shellcheck on every script in this tree.
 - `ci.yml` build-smoke: a quadlet `-dryrun` fast-fail, then
   `ci/smoke-deploy.sh` — CDI converger branch tests (stub / generate /
   transient-failure / no-downgrade), seat-prep against a staged dirty seat,
@@ -342,8 +345,10 @@ podman logs desktop | grep preflight:       # container-side assumptions;
   container PID 1, `desktop-shell` ssh from the host and from inside the
   container, `desktop-preflight` green, and a service restart.
 - `e2e-vm.yml` phase-deploy: the same flow on a Rocky 9 VM with **SELinux
-  enforcing** and a real KMS display — seat-prep evicting a genuinely
-  running getty, rootless Xorg + mwm + seat0 under this quadlet, the
-  root-owned `desktop-shell` trust path through a real sshd under
-  enforcing, `desktop-preflight` at 0 FAILs, and a non-blank screendump
-  artifact.
+  enforcing** and a real KMS display — seat-prep evicting the genuinely
+  running boot getty, rootless Xorg + mwm + seat0 under this quadlet, real
+  audio over all three client paths, the root-owned `desktop-shell` trust
+  path through a real sshd under enforcing, podman clients resolving each
+  client CDI device, `desktop-preflight` at 0 FAILs, and a non-blank
+  screendump artifact. The desktop then stays up for the k3s phase, which
+  runs client pods against it.

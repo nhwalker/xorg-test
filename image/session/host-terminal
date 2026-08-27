@@ -8,7 +8,7 @@ echo
 echo "host-terminal: ssh to the host failed (exit $rc)."
 echo
 echo "If this desktop was deployed without a shell user, enable it on the host:"
-echo "    ./install.sh [--host-prep-only] --shell-user <user>"
+echo "    systemctl start desktop-host-shell.service   (see deploy/README.md)"
 echo
 echo "Other common causes: sshd not running on the host; SELinux context on"
 echo "the target user's ~/.ssh (host: restorecon -R ~<user>/.ssh); target"

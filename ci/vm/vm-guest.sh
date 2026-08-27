@@ -1,16 +1,15 @@
 #!/bin/bash
 # Runs INSIDE the Rocky 9 e2e VM (as root via sudo from the rocky user).
-# phase1: podman/quadlet flow with the real install.sh - real Xorg on the
-#         virtio display, audio, host-terminal ssh, all under SELinux
-#         enforcing.
-# phase-deploy: the declarative deploy/ tree on the same VM - install.sh
-#         uninstalled (which restores a live getty for seat-prep to evict),
-#         tree rsync-applied, desktop booted from its quadlet, root-owned
-#         desktop-shell ssh trust exercised under SELinux enforcing, and
-#         desktop-preflight asserted fully green.
-# phase2: k3s + the desktop chart + two cdi-device-plugin releases - client
-#         pods requesting desktop.local/display and/or desktop.local/audio,
-#         with CRI-O injecting from the matching /etc/cdi spec.
+# phase-deploy: the declarative deploy/ tree applied to a stock host - tree
+#         rsync-applied over the boot getty seat-prep must evict, desktop
+#         booted from its quadlet with real Xorg on the virtio display,
+#         audio, root-owned desktop-shell ssh trust under SELinux enforcing,
+#         the podman client CDI contract, and desktop-preflight fully green.
+# phase2: k3s + CRI-O + one cdi-device-plugin release per capability, with
+#         the quadlet desktop STILL RUNNING - client pods requesting
+#         desktop.local/display and/or desktop.local/audio, with CRI-O
+#         injecting from the matching /etc/cdi spec. Kubernetes carries
+#         application containers here; it never carries the desktop.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -21,7 +20,7 @@ cd "$REPO"
 # spins on "command not found".
 export PATH="/usr/local/bin:$PATH"
 
-# CRI-O stream to install for phase 2 (the chart's documented runtime). Kept
+# CRI-O stream to install for phase 2 (the documented runtime for CDI). Kept
 # near k3s's k8s minor; CRI-O interops across a minor or two if it drifts.
 CRIO_VERSION="${CRIO_VERSION:-v1.31}"
 
@@ -36,8 +35,12 @@ fail() {
     podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null | tail -30 >&2 || true
     echo "---- diagnostics: preflight ----" >&2
     podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
-    # phase1 and phase-deploy run enforcing, where a denial is often the
-    # whole story and is invisible in every other log here.
+    echo "---- diagnostics: desktop audio (export sockets + pipewire procs) ----" >&2
+    podman exec desktop sh -c \
+        'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
+        >&2 2>&1 || true
+    # phase-deploy runs enforcing, where a denial is often the whole story
+    # and is invisible in every other log here.
     echo "---- diagnostics: recent SELinux denials ----" >&2
     ausearch -m avc -ts recent 2>/dev/null | tail -20 >&2 || echo "(none / ausearch unavailable)" >&2
     if command -v k3s >/dev/null; then
@@ -59,10 +62,6 @@ fail() {
         ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
         echo "---- diagnostics: crio CDI view ----" >&2
         journalctl -u crio --no-pager -o cat 2>/dev/null | grep -i cdi | tail -20 >&2 || true
-        echo "---- diagnostics: desktop pod audio (export sockets + pipewire procs) ----" >&2
-        k3s kubectl exec deploy/desktop -- sh -c \
-            'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
-            >&2 2>&1 || true
         k3s kubectl describe pod x11-client-demo cdi-verify display-only audio-only >&2 2>/dev/null || true
         journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
     fi
@@ -83,156 +82,26 @@ container_running() {
     [ "$(podman exec desktop systemctl is-system-running 2>/dev/null || true)" = running ]
 }
 
-phase1() {
-    log p1 "SELinux must be enforcing for this test to mean anything"
+phase_deploy() {
+    log pd "SELinux must be enforcing for this phase to mean anything"
     [ "$(getenforce)" = Enforcing ] || fail "SELinux is not enforcing"
 
-    log p1 "install podman + tools"
-    dnf -y -q install podman pulseaudio-utils >/dev/null
+    # podman and psmisc are deploy-tree prerequisites (HOST-REQUIRES.md); the
+    # cloud image already carries openssh-server. rsync applies the tree and
+    # pulseaudio-utils (pactl) is this test's own probe - neither is a
+    # prerequisite of the deployment itself.
+    log pd "install the deploy tree's prerequisites plus this phase's probes"
+    dnf -y -q install podman psmisc rsync pulseaudio-utils >/dev/null
 
-    log p1 "load prebuilt images"
+    log pd "load prebuilt images"
     podman load -q -i /tmp/images-desktop.tar >/dev/null
 
-    log p1 "real install.sh (quadlet, shell user ${SUDO_USER:-rocky})"
-    ./install.sh --no-build --no-gpu
-
-    log p1 "container reaches running"
-    wait_for 40 3 "systemd running in container" container_running
-
-    log p1 "Xorg actually serves the virtio display, rootless"
-    # Generous first-boot window: cold caches, first session start.
-    wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
-    # NOTE: no `| head` / `| grep -q` on pipelines out of podman exec -
-    # under pipefail an early-exiting consumer SIGPIPEs the producer and
-    # set -e kills the script with no message.
-    podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null \
-        || fail "xdpyinfo could not talk to :0"
-    podman exec -u desktop -e DISPLAY=:0 desktop sh -c 'xdpyinfo | sed -n 1,3p' || true
-    owner=$(podman exec desktop sh -c 'ps -o user= -C Xorg | head -1' || true)
-    [ "$owner" = desktop ] || fail "Xorg runs as '${owner:-nobody}', want desktop"
-    podman exec desktop sh -c 'loginctl list-sessions --no-pager | grep -q seat0' \
-        || fail "no seat0 session"
-
-    log p1 "mwm session is up"
-    podman exec desktop ps -C mwm >/dev/null || fail "mwm not running"
-
-    log p1 "audio: HDA device visible, pulse socket reachable from VM host"
-    podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
-        sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
-    PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
-        || fail "pulse socket unreachable from VM host"
-
-    log p1 "host terminal: container -> host ssh as ${SUDO_USER:-rocky} (restorecon path)"
-    who=$(podman exec -u desktop -e HOME=/home/desktop desktop \
-        ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami)
-    [ "$who" = "${SUDO_USER:-rocky}" ] || fail "ssh host whoami='$who'"
-
-    log p1 "install.sh wrote both client CDI specs"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
-        || fail "install.sh did not write a usable /etc/cdi/desktop-display.yaml"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
-        || fail "install.sh did not write a usable /etc/cdi/desktop-audio.yaml"
-
-    # The whole client contract in one command, under podman: a SEPARATE
-    # container that passes no -v and no -e reaches the display purely
-    # because the runtime applied the spec's containerEdits. Same mechanism
-    # k8s uses via the device plugin, minus kubernetes.
-    #
-    # label=disable is required here, and is NOT papering over a broken
-    # spec: the exported socket dirs carry host labels, so a CONFINED
-    # container is denied by SELinux however it obtained the mounts. Every
-    # other client in this suite is exempt the same way - the desktop
-    # container via --privileged, the k8s client pods via phase2 running
-    # permissive. The probe below records the confined case instead of
-    # asserting it; see "Client containers via CDI" in README.md.
-    log p1 "a podman client resolves desktop.local/display=all and opens :0"
-    out=$(podman run --rm --security-opt label=disable \
-        --device desktop.local/display=all \
-        localhost/desktop-container:latest sh -c '
-            printenv DISPLAY
-            test -S /tmp/.X11-unix/X0 && echo SOCKET_OK
-            xdpyinfo >/dev/null && echo XDPYINFO_OK
-            printenv PULSE_SERVER || echo NO_PULSE
-            grep -q " /run/desktop-audio " /proc/self/mountinfo || echo NO_AUDIO_MOUNT') \
-        || fail "podman display client failed (see output above)"
-    for want in ':0' SOCKET_OK XDPYINFO_OK NO_PULSE NO_AUDIO_MOUNT; do
-        echo "$out" | grep -qx "$want" \
-            || fail "display client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
-    done
-    log p1 "podman display client opened :0 and got NO audio - the split holds"
-
-    # ...and the mirror image. An audio-only client must not be able to see
-    # the display at all: with xhost +local: an X client can keylog the
-    # whole session, which is precisely what a sound-only workload must not
-    # be handed.
-    log p1 "a podman client resolves desktop.local/audio=all and gets audio only"
-    out=$(podman run --rm --security-opt label=disable \
-        --device desktop.local/audio=all \
-        localhost/desktop-container:latest sh -c '
-            printenv PULSE_SERVER
-            printenv PIPEWIRE_REMOTE
-            test -S /run/desktop-audio/pulse && echo PULSE_SOCKET_OK
-            printenv DISPLAY || echo NO_DISPLAY
-            grep -q " /tmp/.X11-unix " /proc/self/mountinfo || echo NO_X11_MOUNT') \
-        || fail "podman audio client failed (see output above)"
-    for want in 'unix:/run/desktop-audio/pulse' '/run/desktop-audio/pipewire-0' \
-                PULSE_SOCKET_OK NO_DISPLAY NO_X11_MOUNT; do
-        echo "$out" | grep -qx "$want" \
-            || fail "audio client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
-    done
-    log p1 "podman audio client got the audio sockets and NO display"
-
-    # Both together are the union: what a full desktop client asks for.
-    podman run --rm --security-opt label=disable \
-        --device desktop.local/display=all --device desktop.local/audio=all \
-        localhost/desktop-container:latest sh -c '
-            test "$DISPLAY" = :0 && test -S /tmp/.X11-unix/X0 \
-              && test -S /run/desktop-audio/pulse && xdpyinfo >/dev/null' \
-        || fail "requesting both devices did not yield the union of their edits"
-    log p1 "both devices together give display + audio"
-
-    # Informational, never fatal: the confined case needs the export dirs
-    # labeled container_file_t, which CDI cannot arrange itself (there is no
-    # equivalent of -v src:dst:z in containerEdits). Logged so the day the
-    # host grows those labels this flips visibly, and so the AVC behind the
-    # current behavior is captured rather than assumed.
-    if podman run --rm --device desktop.local/display=all \
-        localhost/desktop-container:latest sh -c 'xdpyinfo >/dev/null' 2>/dev/null
-    then
-        log p1 "NOTE: a CONFINED client reached the display too (host is labeled for it)"
-    else
-        log p1 "NOTE: a CONFINED client cannot reach the display under enforcing SELinux (expected; see README)"
-        ausearch -m avc -ts recent 2>/dev/null | tail -5 || true
+    # The tree is applied to a STOCK host: nothing has prepared the seat, so
+    # the boot getty still owns tty1. That is the production case seat-prep
+    # exists for - assert the dirty seat is real before relying on it below.
+    if ! systemctl is-active --quiet getty@tty1.service; then
+        fail "getty@tty1 is not active - the seat is already clean, so seat-prep would prove nothing"
     fi
-
-    log p1 "spawn an xterm so the screendump shows a window"
-    podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
-        xterm -T e2e-proof -geometry 80x24+80+80
-    sleep 3
-    log p1 "phase1 passed"
-}
-
-phase_deploy() {
-    log pd "SELinux must still be enforcing for this phase to mean anything"
-    [ "$(getenforce)" = Enforcing ] || fail "SELinux is not enforcing"
-
-    log pd "hand over: uninstall the install.sh flow (restores getty@tty1, a live dirty seat)"
-    ./install.sh --uninstall
-    if systemctl is-active --quiet desktop.service; then
-        fail "desktop.service still active after uninstall"
-    fi
-    # The toolkit watcher's triggered unit is RemainAfterExit=yes, so an active
-    # leftover would latch "already run" for the rest of this boot: the deploy
-    # tree below would arm the watcher, the desktop would publish, and the
-    # trigger would no-op against an already-active unit. Everything downstream
-    # (the spec, the device plugin's health, the client pod's toolkit) would
-    # then be missing with nothing in this phase to say why.
-    if systemctl is-active --quiet desktop-tools-cdi.service; then
-        fail "desktop-tools-cdi.service left active by uninstall (latches the watcher for this boot)"
-    fi
-
-    log pd "install the deploy tree's host prerequisites (HOST-REQUIRES.md)"
-    dnf -y -q install rsync psmisc >/dev/null
 
     log pd "apply the deploy tree (verbatim README command)"
     rsync -a --chown=root:root deploy/host/ /
@@ -244,14 +113,15 @@ phase_deploy() {
     # read at sshd start; this VM's sshd predates it
     systemctl reload sshd
 
-    log pd "start desktop.service; seat-prep must evict the getty uninstall restarted"
+    log pd "start desktop.service; seat-prep must evict the boot getty"
     systemctl start desktop.service
     for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell; do
         systemctl is-active --quiet "$u.service" || fail "$u.service not active"
     done
-    # The tree ships this one pre-enabled (multi-user.target.wants symlink)
-    # because a k8s node never starts desktop.service at all - assert the
-    # symlink survived the rsync, not just that the unit happens to be up.
+    # The tree ships this one pre-enabled (multi-user.target.wants symlink):
+    # the client specs are host state that must exist whether or not the
+    # desktop is up, so assert the symlink survived the rsync rather than
+    # just that the unit happens to be active right now.
     [ "$(systemctl is-enabled desktop-client-cdi.service)" = enabled ] \
         || fail "desktop-client-cdi.service is not enabled for multi-user.target"
     if systemctl is-active --quiet getty@tty1.service; then
@@ -309,6 +179,84 @@ phase_deploy() {
     echo "$out"
     echo "$out" | grep -q 'done: 0 FAIL' || fail "preflight did not report 0 FAILs"
 
+    log pd "audio: HDA device visible, pulse socket reachable from VM host"
+    podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
+        sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
+    PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
+        || fail "pulse socket unreachable from VM host"
+
+    # The whole client contract in one command, under podman: a SEPARATE
+    # container that passes no -v and no -e reaches the display purely
+    # because the runtime applied the spec's containerEdits. Same mechanism
+    # k8s uses via the device plugin, minus kubernetes.
+    #
+    # label=disable is required here, and is NOT papering over a broken
+    # spec: the exported socket dirs carry host labels, so a CONFINED
+    # container is denied by SELinux however it obtained the mounts. Every
+    # other client in this suite is exempt the same way - the desktop
+    # container via --privileged, the k8s client pods via phase2 running
+    # permissive. The probe below records the confined case instead of
+    # asserting it; see "Client containers via CDI" in README.md.
+    log pd "a podman client resolves desktop.local/display=all and opens :0"
+    out=$(podman run --rm --security-opt label=disable \
+        --device desktop.local/display=all \
+        localhost/desktop-container:latest sh -c '
+            printenv DISPLAY
+            test -S /tmp/.X11-unix/X0 && echo SOCKET_OK
+            xdpyinfo >/dev/null && echo XDPYINFO_OK
+            printenv PULSE_SERVER || echo NO_PULSE
+            grep -q " /run/desktop-audio " /proc/self/mountinfo || echo NO_AUDIO_MOUNT') \
+        || fail "podman display client failed (see output above)"
+    for want in ':0' SOCKET_OK XDPYINFO_OK NO_PULSE NO_AUDIO_MOUNT; do
+        echo "$out" | grep -qx "$want" \
+            || fail "display client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
+    done
+    log pd "podman display client opened :0 and got NO audio - the split holds"
+
+    # ...and the mirror image. An audio-only client must not be able to see
+    # the display at all: with xhost +local: an X client can keylog the
+    # whole session, which is precisely what a sound-only workload must not
+    # be handed.
+    log pd "a podman client resolves desktop.local/audio=all and gets audio only"
+    out=$(podman run --rm --security-opt label=disable \
+        --device desktop.local/audio=all \
+        localhost/desktop-container:latest sh -c '
+            printenv PULSE_SERVER
+            printenv PIPEWIRE_REMOTE
+            test -S /run/desktop-audio/pulse && echo PULSE_SOCKET_OK
+            printenv DISPLAY || echo NO_DISPLAY
+            grep -q " /tmp/.X11-unix " /proc/self/mountinfo || echo NO_X11_MOUNT') \
+        || fail "podman audio client failed (see output above)"
+    for want in 'unix:/run/desktop-audio/pulse' '/run/desktop-audio/pipewire-0' \
+                PULSE_SOCKET_OK NO_DISPLAY NO_X11_MOUNT; do
+        echo "$out" | grep -qx "$want" \
+            || fail "audio client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
+    done
+    log pd "podman audio client got the audio sockets and NO display"
+
+    # Both together are the union: what a full desktop client asks for.
+    podman run --rm --security-opt label=disable \
+        --device desktop.local/display=all --device desktop.local/audio=all \
+        localhost/desktop-container:latest sh -c '
+            test "$DISPLAY" = :0 && test -S /tmp/.X11-unix/X0 \
+              && test -S /run/desktop-audio/pulse && xdpyinfo >/dev/null' \
+        || fail "requesting both devices did not yield the union of their edits"
+    log pd "both devices together give display + audio"
+
+    # Informational, never fatal: the confined case needs the export dirs
+    # labeled container_file_t, which CDI cannot arrange itself (there is no
+    # equivalent of -v src:dst:z in containerEdits). Logged so the day the
+    # host grows those labels this flips visibly, and so the AVC behind the
+    # current behavior is captured rather than assumed.
+    if podman run --rm --device desktop.local/display=all \
+        localhost/desktop-container:latest sh -c 'xdpyinfo >/dev/null' 2>/dev/null
+    then
+        log pd "NOTE: a CONFINED client reached the display too (host is labeled for it)"
+    else
+        log pd "NOTE: a CONFINED client cannot reach the display under enforcing SELinux (expected; see README)"
+        ausearch -m avc -ts recent 2>/dev/null | tail -5 || true
+    fi
+
     log pd "spawn an xterm so the screendump shows a window"
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
         xterm -T deploy-proof -geometry 80x24+80+80
@@ -317,17 +265,18 @@ phase_deploy() {
 }
 
 phase2() {
-    log p2 "hand the display over: stop quadlet desktop"
-    systemctl stop desktop.service
-    rm -f /etc/containers/systemd/desktop.container
-    systemctl daemon-reload
+    # The quadlet desktop stays UP for the whole of this phase, and that is
+    # the point: kubernetes here carries application containers, never the
+    # desktop. Nothing contends for the VT or DRM master, because only one
+    # thing on this host ever runs an X server.
+    systemctl is-active --quiet desktop.service \
+        || fail "desktop.service is not running - phase2 tests clients against the quadlet desktop"
 
     # Client pods reach the display through CDI, which only the CRI
     # resolves - so this phase runs k3s on an EXTERNAL CRI-O instead of the
-    # bundled containerd (also what the desktop chart targets: container=cri-o
-    # env). CRI-O scans /etc/cdi, which is where both specs live.
+    # bundled containerd. CRI-O scans /etc/cdi, which is where the specs live.
     # (SELinux policy interplay is out of scope here: permissive.)
-    log p2 "install CRI-O ${CRIO_VERSION} (the chart's documented runtime)"
+    log p2 "install CRI-O ${CRIO_VERSION} (the documented runtime for CDI clients)"
     setenforce 0
     cat > /etc/yum.repos.d/cri-o.repo <<EOF
 [cri-o]
@@ -408,12 +357,16 @@ EOF
     curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
         | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
 
-    log p2 "deploy desktop chart and wait for real readiness (xdpyinfo probe)"
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    helm install desktop charts/desktop-container --set fullnameOverride=desktop \
-        --set image.repository=localhost/desktop-container --set image.pullPolicy=Never
-    wait_for 40 5 "desktop deployment ready" \
-        sh -c "k3s kubectl get deploy desktop -o jsonpath='{.status.readyReplicas}' | grep -q 1"
+
+    # The desktop must have survived the CRI-O + k3s install unscathed: a
+    # container runtime arriving on the node is exactly the kind of thing
+    # that could disturb it, and everything below asserts against its display.
+    systemctl is-active --quiet desktop.service \
+        || fail "desktop.service died while k3s/CRI-O were installed"
+    podman exec desktop test -S /tmp/.X11-unix/X0 \
+        || fail "the desktop's X socket vanished during the k3s/CRI-O install"
+    log p2 "quadlet desktop still serving :0 alongside k3s"
 
     log p2 "deploy one plugin release per device; all three resources become allocatable"
     # Three releases, not one: kubelet's Register takes a single resource
@@ -936,11 +889,10 @@ verify_concurrency() {
 
 verify_teardown() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    log td "helm uninstall every chart (desktop + one plugin release per capability)"
+    log td "helm uninstall one plugin release per capability"
     for r in display audio; do
         helm uninstall "$r" >/dev/null || fail "helm uninstall $r failed"
     done
-    helm uninstall desktop >/dev/null || fail "helm uninstall desktop failed"
 
     # Removing the plugin must make the node stop offering the resource.
     # kubelet drops the allocatable COUNT to 0 promptly but often keeps the
@@ -952,8 +904,8 @@ verify_teardown() {
     done
     # The chart-managed workloads must be gone (get returns non-zero once
     # the objects no longer exist).
-    wait_for 20 3 "desktop deployment + both plugin daemonsets gone" \
-        sh -c "! k3s kubectl get deploy desktop >/dev/null 2>&1 && ! k3s kubectl get ds display-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds audio-cdi-device-plugin >/dev/null 2>&1"
+    wait_for 20 3 "both plugin daemonsets gone" \
+        sh -c "! k3s kubectl get ds display-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds audio-cdi-device-plugin >/dev/null 2>&1"
 
     # The CDI spec is HOST state, not chart state: uninstalling must not
     # remove it (nothing in k8s owns it). This is the seam that makes one
@@ -962,7 +914,14 @@ verify_teardown() {
         || fail "helm uninstall removed the host display spec - it is host state"
     grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "helm uninstall removed the host audio spec - it is host state"
-    log td "charts uninstalled; resources withdrawn; host CDI specs untouched"
+
+    # Same seam from the other side: the desktop is quadlet state, so nothing
+    # helm does can touch it. Tearing kubernetes down leaves the display up.
+    systemctl is-active --quiet desktop.service \
+        || fail "the quadlet desktop went down with the helm releases - it is not kubernetes state"
+    podman exec desktop test -S /tmp/.X11-unix/X0 \
+        || fail "the desktop's X socket vanished on helm uninstall"
+    log td "charts uninstalled; resources withdrawn; host CDI specs and the desktop untouched"
     log td "verify-teardown passed"
 }
 
@@ -1000,8 +959,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase1|phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
-    phase1) phase1 ;;
+case "${1:?phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;

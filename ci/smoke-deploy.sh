@@ -1,8 +1,7 @@
 #!/bin/bash
-# Deploy-tree boot smoke for CI (run as root on an EPHEMERAL runner, AFTER
-# ci/smoke-podman.sh: that suite ends with install.sh --uninstall, so this
-# one proves the declarative deploy/ tree converts a just-restored host
-# from scratch - apply, converge, boot, verify - with no install script).
+# Deploy-tree boot smoke for CI (run as root on an EPHEMERAL runner): proves
+# the declarative deploy/ tree brings up a stock host from scratch - apply,
+# converge, boot, verify - with no install script anywhere in the flow.
 # Assumes localhost/desktop-container:latest already built.
 #
 # Also carries the script-level branch tests that need root and a live
@@ -253,7 +252,7 @@ log "stub CDI resolved through the systemd start (marker env on PID 1)"
 podman exec desktop sh -c "tr '\0' '\n' </proc/1/environ | grep -qx NVIDIA_CDI_STUB=1" \
     || fail "NVIDIA_CDI_STUB not injected via AddDevice + stub spec"
 
-log "wait for the container to settle (same envelope as smoke-podman)"
+log "wait for the container to settle"
 st=""
 for _ in $(seq 40); do
     st=$(podman exec desktop systemctl is-system-running 2>/dev/null || true)

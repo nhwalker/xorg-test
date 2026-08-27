@@ -56,13 +56,13 @@ fi
 if [ -d /run/udev/data ] && [ -n "$(ls -A /run/udev/data 2>/dev/null)" ]; then
     pass "host udev database mounted at /run/udev"
 else
-    fail "host udev database missing or empty: libinput/logind cannot enumerate devices. Mount the host's /run/udev read-only into the container (quadlet Volume=/run/udev:/run/udev:ro, or the chart's hostPaths.udev)"
+    fail "host udev database missing or empty: libinput/logind cannot enumerate devices. Mount the host's /run/udev read-only into the container (quadlet Volume=/run/udev:/run/udev:ro)"
 fi
 
 # --- foreign seat tags (host seat attachments not undone) --------------------
 foreign=$(grep -hE '^E:ID_SEAT=' /run/udev/data/* 2>/dev/null | grep -v '=seat0$' | sort -u)
 if [ -n "$foreign" ]; then
-    warn "devices tagged for a non-default seat ($(echo "$foreign" | tr '\n' ' ')): host 72-seat-*.rules not removed? Rerun install.sh"
+    warn "devices tagged for a non-default seat ($(echo "$foreign" | tr '\n' ' ')): host 72-seat-*.rules not removed? desktop-seat-prep.service undoes these"
 else
     pass "no foreign seat tags in the udev database"
 fi
@@ -97,7 +97,7 @@ done
 if [ -f /etc/desktop-container/host-shell-key ]; then
     pass "host shell material mounted (Host Terminal -> ssh as '$(cat /etc/desktop-container/shell-user 2>/dev/null || echo '?')')"
 else
-    warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: install.sh [--host-prep-only] --shell-user <user>, or the desktop-host-shell lines in the deploy tree's quadlet (deploy/README.md)"
+    warn "no host shell material at /etc/desktop-container: the 'Host Terminal' menu entry will fail. Enable: the desktop-host-shell lines in the deploy tree's quadlet (deploy/README.md)"
 fi
 
 # --- NVIDIA coherence ----------------------------------------------------------

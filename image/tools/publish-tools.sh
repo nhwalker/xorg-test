@@ -9,8 +9,8 @@
 # publishes them rather than the host installing them independently - it is
 # what makes the Wayland transition a single-artifact change.
 #
-# $DEST is a host directory bind-mounted in (see the quadlet's Volume= and the
-# chart's toolsBin hostPath). It is DISK-backed, not /run: the toolkit is
+# $DEST is a host directory bind-mounted in (see the quadlet's Volume=). It is
+# DISK-backed, not /run: the toolkit is
 # expected to grow, and every Go binary carries its own ~1.4MB runtime, so on
 # tmpfs each new tool would cost that much RAM again.
 #
