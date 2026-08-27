@@ -32,14 +32,18 @@
 #
 # Runs every boot because $AUDIO_DIR is on tmpfs: it is destroyed and
 # recreated by systemd-tmpfiles at each boot, so a one-off relabel would not
-# survive. Two mechanisms, in order of durability:
+# survive. Three steps, and the third is the one that matters:
 #
-#   1. semanage fcontext + restorecon - the label becomes POLICY, so it also
-#      survives a full filesystem relabel and applies to the directories at
-#      creation on later boots. Needs policycoreutils-python-utils.
-#   2. chcon - direct, no extra package, but not policy: undone by any
-#      restorecon and by a relabel. Converging every boot is what makes it
-#      hold anyway. This is the fallback.
+#   1. semanage fcontext - best effort, so the label becomes POLICY and
+#      survives a full filesystem relabel. Needs policycoreutils-python-utils,
+#      and see add_rule() for why /run needs special handling.
+#   2. restorecon, then chcon for anything policy did not cover. chcon is
+#      coreutils, so it always works; it is not policy, but this unit runs
+#      every boot, which is what makes it hold.
+#   3. VERIFY, and fail the unit if any directory is still wrong. Running the
+#      commands is not the same as the labels landing: this script once
+#      reported success while /run/desktop-audio kept var_run_t, because
+#      semanage had refused the rule and nothing checked.
 #
 # Takes an optional list of paths to label instead of all three. That is how
 # desktop-tools-cdi re-runs it for the toolkit directory: the desktop
@@ -104,25 +108,70 @@ for d in "${DIRS[@]}"; do
 done
 [ ${#present[@]} -gt 0 ] || { echo "none of the client directories exist yet" >&2; exit 1; }
 
-if command -v semanage >/dev/null && command -v restorecon >/dev/null; then
-    for d in "${present[@]}"; do
-        # Escape the path into a file_contexts regex: dots are wildcards
-        # there, and /tmp/.X11-unix contains one.
-        pattern="$(printf '%s' "$d" | sed 's/\./\\./g')(/.*)?"
-        # -a fails when the rule already exists (every boot after the first),
-        # so fall back to -m to converge a rule an admin may have edited.
-        if ! semanage fcontext -a -t "$TYPE" "$pattern" 2>/dev/null; then
-            semanage fcontext -m -t "$TYPE" "$pattern" 2>/dev/null \
-                || echo "WARNING: could not set the fcontext rule for $d" >&2
-        fi
+# Whether a path already carries the type we want.
+labeled() { ls -Zd "$1" 2>/dev/null | awk '{print $1}' | grep -q ":$TYPE:"; }
+
+# 1. Best effort: make the label POLICY, so it survives a relabel.
+#
+# /run is the awkward one. The distribution ships a file-context EQUIVALENCY
+# between /var/run and /run, and semanage refuses an fcontext rule written
+# against one side of an equivalency - it errors and names the path to use
+# instead. Swallowing that error is how /run/desktop-audio silently kept
+# var_run_t while /tmp/.X11-unix relabeled fine, so try both spellings and
+# report what happened rather than assuming it worked.
+try_rule() { # $1: directory. -a first, then -m for a rule that already exists.
+    local pattern err
+    # Escape the path into a file_contexts regex: dots are wildcards there,
+    # and /tmp/.X11-unix contains one.
+    pattern="$(printf '%s' "$1" | sed 's/\./\\./g')(/.*)?"
+    for op in -a -m; do
+        err=$(semanage fcontext "$op" -t "$TYPE" "$pattern" 2>&1) && return 0
     done
-    restorecon -R "${present[@]}"
-    echo "labeled $TYPE via policy (semanage + restorecon): ${present[*]}"
-    exit 0
+    RULE_ERR="$err"
+    return 1
+}
+
+add_rule() { # $1: directory
+    local d="$1"
+    try_rule "$d" && return 0
+    # The equivalency workaround: the same directory spelled the other way.
+    # A rule stored under /var/run still governs /run, which is the point.
+    case "$d" in
+        /run/*) try_rule "/var$d" && return 0 ;;
+    esac
+    echo "note: no policy rule for $d (${RULE_ERR%%$'\n'*}); relying on the direct relabel below" >&2
+    return 1
+}
+
+if command -v semanage >/dev/null; then
+    for d in "${present[@]}"; do
+        add_rule "$d" || true
+    done
+    command -v restorecon >/dev/null && restorecon -R "${present[@]}" || true
+else
+    echo "note: policycoreutils-python-utils absent, so the labels cannot become policy" >&2
 fi
 
-# No semanage: label directly. chcon is coreutils, so this path always works,
-# but the label is not policy - it is re-applied here on every boot.
-echo "policycoreutils-python-utils absent: labeling with chcon (not policy; see deploy/README.md)" >&2
-chcon -R -t "$TYPE" "${present[@]}"
-echo "labeled $TYPE via chcon: ${present[*]}"
+# 2. Apply directly to whatever policy did not cover. chcon is coreutils, so
+#    this always works; it is not policy, but this unit runs every boot.
+for d in "${present[@]}"; do
+    labeled "$d" || chcon -R -t "$TYPE" "$d" 2>/dev/null || true
+done
+
+# 3. VERIFY. Never report success from having run the commands - the whole
+#    reason /run/desktop-audio shipped unlabeled once is that semanage failing
+#    quietly still looked like success. A directory that is still wrong here
+#    means confined clients are about to be denied with no clue why, so fail
+#    the unit and say which one.
+bad=()
+for d in "${present[@]}"; do
+    labeled "$d" || bad+=("$d: $(ls -Zd "$d" 2>/dev/null | awk '{print $1}')")
+done
+if [ ${#bad[@]} -gt 0 ]; then
+    echo "FAILED to label for confined containers:" >&2
+    printf '  %s\n' "${bad[@]}" >&2
+    echo "want type $TYPE; confined clients will be denied on connect/exec" >&2
+    exit 1
+fi
+
+echo "labeled $TYPE: ${present[*]}"

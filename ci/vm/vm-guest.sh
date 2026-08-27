@@ -48,6 +48,10 @@ fail() {
         >&2 2>&1 || true
     # phase-deploy runs enforcing, where a denial is often the whole story
     # and is invisible in every other log here.
+    echo "---- diagnostics: SELinux mode + client-facing labels ----" >&2
+    getenforce >&2 2>/dev/null || true
+    ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin >&2 2>/dev/null || true
+    systemctl status desktop-selinux.service --no-pager -l >&2 2>/dev/null | head -20 || true
     echo "---- diagnostics: recent SELinux denials ----" >&2
     ausearch -m avc -ts recent 2>/dev/null | tail -20 >&2 || echo "(none / ausearch unavailable)" >&2
     if command -v k3s >/dev/null; then
@@ -101,9 +105,12 @@ phase_deploy() {
     # policycoreutils-python-utils matters here: it is what makes
     # desktop-selinux take its semanage path rather than the chcon fallback,
     # and the semanage path is the one hosts are meant to run.
+    # `audit` is purely for diagnostics, and it earns its place: without
+    # ausearch, fail() prints "(none / ausearch unavailable)" and an SELinux
+    # failure costs a whole CI round just to find out what was denied.
     log pd "install the deploy tree's prerequisites plus this phase's probes"
     dnf -y -q install podman psmisc policycoreutils-python-utils \
-        rsync pulseaudio-utils >/dev/null
+        rsync pulseaudio-utils audit >/dev/null
 
     log pd "load prebuilt images"
     podman load -q -i /tmp/images-desktop.tar >/dev/null
@@ -191,7 +198,7 @@ phase_deploy() {
     echo "$out"
     echo "$out" | grep -q 'done: 0 FAIL' || fail "preflight did not report 0 FAILs"
 
-    log pd "audio: HDA device visible, pulse socket reachable from VM host"
+    log pd "HOST audio: HDA device visible, pulse socket reachable from the host"
     podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
         sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
     PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
@@ -219,6 +226,38 @@ phase_deploy() {
         *) fail "published toolkit binary is $ctx, want container_file_t" ;;
     esac
 
+
+    # THE HOST IS A FIRST-CLASS CLIENT TOO. Everything below this comment
+    # tests containers; the host must render to the display, play audio and
+    # run the published tools just as well, and the container_file_t relabel
+    # is the thing most likely to take that away: a host process is
+    # unconfined_t, and it now has to execute a file and connect to a socket
+    # that both carry a CONTAINER type. Host audio is asserted above (pactl
+    # over the exported socket); these two cover the other two capabilities.
+    #
+    # Split deliberately into exec and connect. Run as one command, a denial
+    # on either would look identical, and they have different fixes: exec is
+    # about the toolkit dir's label, connect is about the socket dir's.
+    #
+    # The screenshot binary is the right probe because it is static
+    # (CGO_ENABLED=0) - the host needs no X client stack installed to run it,
+    # which is also why this VM has none.
+    log pd "HOST tools: the published binary is executable by an unconfined host process"
+    TOOLKIT=/var/lib/desktop-container/bin
+    "$TOOLKIT/screenshot" --help >/dev/null \
+        || fail "host cannot EXECUTE $TOOLKIT/screenshot - container_file_t not executable by unconfined_t?"
+
+    log pd "HOST display: that binary captures the live desktop from the host"
+    hostshot=/tmp/host-toolkit-shot.png
+    rm -f "$hostshot"
+    DISPLAY=:0 "$TOOLKIT/screenshot" "$hostshot" \
+        || fail "host could not capture :0 with the published binary - denied on the X socket?"
+    [ -s "$hostshot" ] || fail "host screenshot produced an empty file"
+    # PNG magic, so a truncated or half-written file cannot pass as success.
+    head -c8 "$hostshot" | od -An -tx1 | tr -d ' \n' | grep -qi '^89504e470d0a1a0a' \
+        || fail "host screenshot is not a PNG"
+    log pd "  host captured $(stat -c%s "$hostshot") bytes with no X client stack installed"
+    rm -f "$hostshot"
 
     # The whole client contract in one command, under podman: a SEPARATE
     # container that passes no -v and no -e reaches the display purely

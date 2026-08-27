@@ -524,7 +524,10 @@ Other semantics worth knowing:
   client-facing directories `container_file_t` at level `s0` with no MCS
   categories, before the desktop or any CRI starts. Confined pods therefore
   need **no** `seLinuxOptions` and **no** `privileged`, and podman clients
-  need no `--security-opt label=disable`. See `deploy/README.md` "SELinux".
+  need no `--security-opt label=disable`. **The host keeps full access** —
+  `unconfined_t` may use `container_file_t`, so rendering, audio and the
+  published toolkit all keep working from a host shell, and the e2e asserts
+  each from the host under enforcing. See `deploy/README.md` "SELinux".
   The desktop container itself is unaffected either way: `--privileged`
   already disables label separation.
 - **Audio clients**: pulse and PipeWire-native work via the injected env

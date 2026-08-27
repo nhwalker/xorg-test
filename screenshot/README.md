@@ -48,12 +48,14 @@ Three details of the delivery are load-bearing:
 Holding `desktop.local/tools` grants no capability by itself — the binary is
 inert without the X socket, which comes from `desktop.local/display`.
 
-**Known coverage gap:** nothing yet proves a *confined* (SELinux-enforcing)
-container may execute from the injected directory. Executing a host-labelled
-file inside a container is a harder case than opening a socket, and every
-client path in CI is exempt — the desktop is `--privileged`, the k8s phase runs
-permissive, and the podman probes run on non-SELinux runners. The mount and the
-exec are covered; the confined case is not.
+**SELinux:** executing a file from the injected directory is a harder case
+than opening a socket, and it used to be the gap here — every client path in
+CI was exempt. It is covered now. The deploy tree labels this directory
+`container_file_t` (`desktop-selinux.service`), and the VM e2e runs enforcing
+end to end: a *confined* client pod executes the binary from the injected
+mount, and the **host** executes the same published binary as an ordinary
+unconfined process. Both are asserted, so a labeling regression fails CI
+rather than a deployment.
 
 ## Why a binary, and not just documentation
 

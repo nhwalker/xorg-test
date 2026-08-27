@@ -208,14 +208,41 @@ It runs every boot because `/run/desktop-audio` is on tmpfs: destroyed and
 recreated by tmpfiles at each boot, so a one-off relabel would not survive.
 Two mechanisms, preferred in order:
 
-1. **`semanage fcontext` + `restorecon`** — the label becomes *policy*, so it
-   also survives a full filesystem relabel and applies at creation on later
-   boots. Needs `policycoreutils-python-utils` (see `HOST-REQUIRES.md`).
-2. **`chcon`** — direct, no extra package, but not policy: undone by any
-   `restorecon` and by a relabel. Converging every boot is what makes it hold
-   anyway.
+1. **`semanage fcontext` + `restorecon`** — best effort, so the label becomes
+   *policy* and survives a full filesystem relabel. Needs
+   `policycoreutils-python-utils` (see `HOST-REQUIRES.md`).
+2. **`chcon`** for anything policy did not cover — no extra package needed,
+   but not policy: undone by any `restorecon` and by a relabel. Converging
+   every boot is what makes it hold.
+3. **Verification**, and the unit fails if any directory is still wrong.
+   Running the commands is not the same as the labels landing, and that
+   distinction is not hypothetical — see below.
+
+> **`/run` needs the equivalency workaround.** The distribution ships a
+> file-context equivalency between `/var/run` and `/run`, and `semanage`
+> *refuses* an fcontext rule written against one side of it, naming the other
+> spelling in the error. The first version of this script swallowed that
+> error, so `/run/desktop-audio` silently kept `var_run_t` while
+> `/tmp/.X11-unix` relabeled fine — and it reported success. The script now
+> retries as `/var/run/...` (a rule stored there still governs `/run`), and
+> then verifies the result regardless.
 
 On a host without SELinux the script exits 0 having done nothing.
+
+**The host keeps full access.** Relabeling is for the benefit of confined
+containers, and it must not cost the host the desktop it is hosting. A host
+process is `unconfined_t`, which may use `container_file_t`, and the label
+goes on at `s0` with no categories, which `unconfined_t`'s range dominates —
+so rendering to the display, playing audio and running the published toolkit
+from a host shell all keep working. The e2e asserts each of those from the VM
+host under enforcing (`pactl` over the exported socket; the published
+`screenshot` binary executed, then run against `:0`), separately from the
+container tests, because a relabel is exactly the kind of change that could
+fix containers by breaking the host.
+
+Confined *host services* are the one case this does not serve — a daemon
+running in its own domain would need its own policy. Nothing in the tree runs
+that way.
 
 **Not covered.** The desktop container itself is `--privileged`, so label
 separation is already off for it — none of this applies there. If you tighten
