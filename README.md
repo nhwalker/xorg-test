@@ -266,12 +266,34 @@ nothing, and the desktop comes up autodetecting. `podman logs desktop | grep
 xorg-monitor-conf` is the whole story of what it decided, and the container's
 preflight flags an output name with no matching DRM connector before that.
 
-The e2e cannot honestly exercise the interesting half: QEMU's virtio-vga does
-not model DDC disconnect. What CI does pin is everything upstream of the
-hardware — the derived timings against `cvt(1)`, both driver paths, the
+**What CI proves.** The static job pins the pieces that have no hardware in
+them: the derived timings against `cvt(1)`, both driver paths, the config
 rejections, and the re-assert loop against a fake `xrandr`
-(`ci/monitor-layout-tests.sh`). **Try a real switch on real hardware early**,
-and read that grep afterwards.
+(`ci/monitor-layout-tests.sh`). The VM e2e proves the load-bearing claim
+itself. QEMU's virtio-vga is booted with `max_outputs=2`, and virtio-gpu
+reports connector status straight from whether QEMU has that scanout enabled —
+under `-display none` it never enables the second one, so the guest has a
+permanently **disconnected** `Virtual-2`: a monitor-shaped hole, with no DDC
+emulation involved. The e2e declares a two-monitor layout across both
+connectors and asserts that `xrandr` reports
+
+```
+Virtual-2 disconnected 1024x768+1024+0
+```
+
+— an output scanning out at its declared position with nothing plugged into
+it, on a screen pinned to the full 2048x768. It then turns that output off
+behind the session's back and asserts the loop restores it, and forces
+`Virtual-1`'s connector down under the running server and asserts the geometry
+does not move. "Monitor was never there" is a strict superset of the hard part
+of "monitor went away".
+
+**What it still does not prove**, and what to try on real hardware early: the
+physical layer — EDID re-read, link retraining, a sink that takes a moment to
+come back — and the asynchronous notification path, since forcing a connector
+down through sysfs reprobes it without emitting the hotplug uevent a real
+unplug carries. The e2e therefore drives X's probe with a client query rather
+than waiting for a notification the VM cannot deliver faithfully.
 
 ### Changing the VT
 
@@ -729,8 +751,12 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   get its capability and no other, input is typed in over the real virtual
   keyboard, hotplug is asserted through to the container's `/dev` and a full
   KVM-style remove/re-add cycle is exercised via QEMU (see "Input hotplug and
-  KVM switches"), the container's privileges are asserted to be less than
-  `--privileged` (see "Container privileges"), and
+  KVM switches"), a fixed monitor layout is declared across the GPU's two
+  connectors — one of which QEMU never connects — and asserted to come up
+  whole, hold when an output is switched off behind the session's back, and
+  hold again when a connector is forced down under the running server (see
+  "Fixed monitor layout"), the container's privileges are asserted to be less
+  than `--privileged` (see "Container privileges"), and
   `desktop-preflight` is asserted fully green. The podman clients run
   **confined** — no `label=disable` anywhere in the suite — against the
   `container_file_t` labels `desktop-selinux.service` applied, which are
