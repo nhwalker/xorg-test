@@ -346,13 +346,29 @@ fi
 # /etc/desktop-container is visible inside through the quadlet's existing
 # read-only mount, and is acted on at container start. No quadlet change was
 # needed for this feature, and that claim is exactly what would rot silently.
+#
+# Both halves wait on xorg-conf.service, never on the container merely being
+# reachable: the generator runs from that oneshot, which finishes seconds
+# AFTER `podman exec` starts working. Reading its output early is not just a
+# flaky failure - it would let the no-op assertion pass vacuously, on a
+# container that had not yet had the chance to write anything.
+wait_xorg_conf() {
+    for _ in $(seq 30); do
+        podman exec desktop systemctl is-active --quiet xorg-conf.service && return 0
+        sleep 2
+    done
+    podman exec desktop systemctl status xorg-conf.service --no-pager -l >&2 2>&1 || true
+    fail "xorg-conf.service never completed in the container"
+}
+
 log "fixed monitor layout: the shipped default is a genuine no-op"
 [ -f /etc/desktop-container/monitors.conf ] || fail "the tree did not ship monitors.conf"
+wait_xorg_conf
+podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null \
+    | grep -q 'xorg-monitor-conf' || fail "the layout generator never ran"
 if podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf; then
     fail "a config with no output lines still generated a layout"
 fi
-podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null \
-    | grep -q 'xorg-monitor-conf' || fail "the layout generator never ran"
 
 log "fixed monitor layout: a declared layout is applied at the next start"
 cat > /etc/desktop-container/monitors.conf <<'EOF'
@@ -371,6 +387,7 @@ done
 
 # The restart above is what re-runs xorg-conf.service, so the assertions on
 # the declared layout land here rather than beside the config that set it up.
+wait_xorg_conf
 mon=$(podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf 2>/dev/null || true)
 if [ -z "$mon" ]; then
     podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null | grep xorg-monitor-conf >&2 || true

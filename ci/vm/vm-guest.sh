@@ -438,7 +438,7 @@ desktop_up() {
 conn_connected() { [ "$(cat "$1/status")" = connected ]; }
 
 verify_fixed_layout() {
-    local conn conn2 dims out restored=""
+    local conn conn2 dims out before restored=""
 
     log pd "fixed monitor layout: the VM has a second connector, and it is disconnected"
     conn=$(ls -d /sys/class/drm/card*-Virtual-1 2>/dev/null | head -n1)
@@ -450,19 +450,31 @@ verify_fixed_layout() {
     [ "$(cat "$conn2/status")" = disconnected ] \
         || fail "Virtual-2 is connected - QEMU enabled a second scanout, so the hole this test needs is gone"
 
-    # 1024x768 for both, deliberately, and the reason is a virtio quirk rather
-    # than anything about this feature: virtio-gpu's mode_valid accepts a
-    # PREFERRED mode only if it matches the scanout's configured size, and it
-    # short-circuits to MODE_OK for exactly XRES_DEF x YRES_DEF, which is
-    # 1024x768. That covers Virtual-2, whose scanout QEMU never enabled and so
-    # has no size at all; for Virtual-1 it works because 1024x768 is also what
-    # QEMU boots this display at. State that dependency rather than let a
-    # future QEMU default turn "the declared layout did not take" into a
-    # mystery.
-    dims=$(dpy_dims)
-    [ "$dims" = 1024x768 ] || fail "the VM display is $dims, not the 1024x768 this test's declared modes assume: virtio's mode_valid will reject them (see the comment above this check)"
-
-    log pd "fixed monitor layout: declare both connectors, side by side"
+    # 1024x768 for both, and the reason is a virtio quirk rather than anything
+    # about this feature. A mode Xorg marks preferred - which Option
+    # "PreferredMode" does, and M_T_PREFERRED is bit-identical to
+    # DRM_MODE_TYPE_PREFERRED - has to survive virtio_gpu_conn_mode_valid:
+    #
+    #     if (!(mode->type & DRM_MODE_TYPE_PREFERRED))       return MODE_OK;
+    #     if (mode->hdisplay == XRES_DEF &&
+    #         mode->vdisplay == YRES_DEF)                    return MODE_OK;
+    #     if (mode->hdisplay <= width  && mode->hdisplay >= width  - 16 &&
+    #         mode->vdisplay <= height && mode->vdisplay >= height - 16)
+    #                                                        return MODE_OK;
+    #     return MODE_BAD;
+    #
+    # XRES_DEF x YRES_DEF is 1024x768, and that second line is unconditional -
+    # it does not consult the scanout's size at all. Which is what this test
+    # needs, because Virtual-2's scanout was never enabled and so HAS no size:
+    # the width/height check could never pass for it. Any other resolution
+    # would fail here on the quirk and say nothing about the feature.
+    #
+    # Note what is deliberately NOT assumed: the size QEMU boots this display
+    # at. That is a device property (xres/yres, 1280x800 on current QEMU), it
+    # has no bearing on the rule above, and the restore check at the end
+    # compares against whatever it actually is.
+    before=$(dpy_dims)
+    log pd "fixed monitor layout: declare both connectors side by side (display is $before)"
     cat > /etc/desktop-container/monitors.conf <<'EOF'
 Virtual-1  1024x768@60  +0+0      primary
 Virtual-2  1024x768@60  +1024+0
@@ -566,10 +578,18 @@ EOF
     if podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf; then
         fail "the shipped monitors.conf still generated a layout - it is not a no-op"
     fi
+    out=$(xr)
+    if echo "$out" | grep -qE '^Virtual-2 disconnected [0-9]+x[0-9]+\+'; then
+        fail "Virtual-2 is still enabled after the layout was withdrawn: $(echo "$out" | grep '^Virtual-2')"
+    fi
     dims=$(dpy_dims)
-    [ "$dims" = 1024x768 ] \
-        || fail "after restoring the shipped config the screen is $dims, want 1024x768"
-    log pd "fixed monitor layout: back to autodetection at $dims"
+    # Not an equality against $before: setting a scanout can leave QEMU
+    # reporting the new size as that display's geometry, so autodetection may
+    # legitimately settle somewhere other than where it started. What must be
+    # true is that the declared layout is gone - one output, not two.
+    [ "$dims" != 2048x768 ] \
+        || fail "the screen is still the declared two-monitor size after the layout was withdrawn"
+    log pd "fixed monitor layout: back to autodetection at $dims (was $before on entry)"
 }
 
 phase2() {
