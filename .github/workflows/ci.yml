@@ -151,10 +151,29 @@ jobs:
           [ -n "$q" ] || { echo "podman quadlet generator not found on runner"; podman --version; exit 1; }
           echo "using quadlet generator: $q"
           out=$(QUADLET_UNIT_DIRS="$tmp" "$q" -dryrun -no-kmsg-log)
-          echo "$out" | grep -q -- --privileged
+          echo "--- generated unit ---"; echo "$out"; echo "--- end ---"
+          # Assert against the GENERATED ExecStart, not against "anywhere in
+          # the output". Anywhere-in-the-output is how the old
+          # `grep -q -- --privileged` here survived the privilege reduction
+          # still passing: the .container source mentions --privileged only in
+          # comments now, and the check could not tell a comment from a flag.
+          # An assertion that cannot fail when the behaviour reverses is worse
+          # than no assertion, because it reads as coverage.
+          exec_line=$(echo "$out" | grep -m1 '^ExecStart=')
+          [ -n "$exec_line" ] || { echo "no ExecStart= in generated unit"; exit 1; }
+          echo "$exec_line" | grep -q -- '--privileged' \
+            && { echo "the generated unit is --privileged; the reduction regressed"; exit 1; }
+          # Patterns accept "--flag=value" or "--flag value": quadlet chooses
+          # the spelling and it is not worth a red build to guess which.
+          # The privilege reduction, as it reaches podman.
+          echo "$exec_line" | grep -qi -- '--cap-drop[= ]all'
+          echo "$exec_line" | grep -q  -- '--security-opt[= ]label=disable'
+          # The log bound, both halves (see the logging block in the unit).
+          echo "$exec_line" | grep -q  -- '--log-driver[= ]k8s-file'
+          echo "$exec_line" | grep -q  -- '--log-opt[= ]max-size=64m'
           echo "$out" | grep -q 'WantedBy=multi-user.target'
           echo "$out" | grep -q 'Conflicts=getty@tty1.service display-manager.service'
-          echo "$out" | grep -q 'device.*nvidia.com/gpu=all'
+          echo "$exec_line" | grep -q  -- '--device[= ]nvidia.com/gpu=all'
           echo "$out" | grep -q 'Wants=desktop-seat-prep.service'
           echo "$out" | grep -q 'Wants=desktop-cdi-refresh.service'
           echo "$out" | grep -q 'Wants=desktop-client-cdi.service'

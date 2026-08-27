@@ -797,6 +797,43 @@ in the suite passes either way:
 `build-smoke` repeats the two cheapest (`Privileged`, `Seccomp`), since it runs
 in a third of the time.
 
+## Log growth
+
+The desktop is meant to run for months, and `journal-console.service` inside
+the container runs `journalctl -b -f` into `/dev/console` forever — that is what
+makes `podman logs desktop` show the boot and the running journal. It is a
+*continuous stream*, so both sinks it lands in are bounded explicitly rather
+than left to whatever the host defaults to.
+
+| Sink | Bound | Where |
+|---|---|---|
+| Host: podman's container log | `LogDriver=k8s-file` + `--log-opt max-size=64m` | the quadlet |
+| Container: journald's own store | `Storage=volatile` + `RuntimeMaxUse=64M` | `image/systemd/journald-bounds.conf` |
+
+Neither was stated before, and what you got depended on the host. **Measured on
+the Rocky 9 target, podman's default log driver is `journald`** — so before this
+change the desktop's entire journal was being piped into the *host* journal,
+where it is capped by `SystemMaxUse` but evicts everything else the machine
+logs. On a host whose `containers.conf` leaves podman's built-in default in
+place the answer is worse: `k8s-file` with **no size limit**, an ever-growing
+file under `/var/lib/containers`. Naming the driver here means the deployment
+gets the same answer either way. Inside the container, journald
+has no `/var/log/journal` so it uses volatile storage, which defaults to **10%
+of the `/run` tmpfs** — and that tmpfs is sized from host RAM, so on a large
+workstation the desktop can quietly hold hundreds of megabytes of memory it
+never gives back.
+
+`Storage=volatile` is also stated rather than left at `auto`, because `auto`
+silently becomes *persistent* the moment anything creates `/var/log/journal` —
+which would put the journal on the container's writable layer, where it
+survives nothing and is invisible to `podman logs`.
+
+Both are asserted on the running container by `verify-log-bounds` in the e2e
+(and the cheap half in `build-smoke`), because a log option that silently failed
+to apply looks exactly like one that worked, right up until the disk or the RAM
+fills. Raise either number if a deployment wants more history; the point is that
+a number is stated at all.
+
 ## Security notes
 
 - The container is **not** `--privileged`, but it does hold `CAP_SYS_ADMIN`

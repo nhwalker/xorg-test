@@ -126,6 +126,36 @@ Volume=/etc/desktop-container:/etc/desktop-container:ro
 #   Volume=/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:ro
 AddDevice=nvidia.com/gpu=all
 Environment=NVIDIA_DRIVER_CAPABILITIES=all
+# --- logging ------------------------------------------------------------------
+# journal-console.service inside the image runs `journalctl -b -f` into
+# /dev/console forever, which is what makes `podman logs desktop` show the
+# container's boot and its running journal. That is a CONTINUOUS stream from a
+# machine meant to run for months, so the sink it lands in has to be bounded or
+# it is a slow disk-filling bug.
+#
+# Nothing bounded it before: with no driver named here the bound came from
+# whatever /usr/share/containers/containers.conf the host happens to ship.
+# podman's own built-in default is k8s-file with log_size_max unlimited - an
+# ever-growing file under /var/lib/containers - and a distro that defaults to
+# journald instead sends the container's entire journal into the HOST journal,
+# where it is bounded but evicts everything else. Neither is a property this
+# unit should inherit by accident.
+#
+# So both halves are stated explicitly:
+#   LogDriver=k8s-file   a per-container file, so the desktop's chatter cannot
+#                        push the host's own logs out of the host journal.
+#                        `podman logs` reads it either way.
+#   --log-opt max-size   the actual bound. In PodmanArgs rather than as a
+#                        LogOpt= key because that key needs podman 5.0, and
+#                        this tree still targets older quadlet (see the drop-in
+#                        note in ci.yml). LogDriver= has existed far longer, so
+#                        it stays a proper key.
+# Raise max-size if a deployment wants more history; the point is that a number
+# is stated at all. verify-log-bounds in the e2e asserts BOTH reached the
+# running container, because a log option that silently did not apply looks
+# exactly like one that did until the disk fills.
+LogDriver=k8s-file
+
 # --- privileges --------------------------------------------------------------
 # NOT --privileged. That single flag bundles six separate grants - every
 # capability, no seccomp filter, no SELinux separation, an open device cgroup,
@@ -211,6 +241,11 @@ AddDevice=-/dev/snd
 #   --ulimit memlock=...    replacing rtkit and CAP_IPC_LOCK respectively - see
 #                           the paragraph directly above.
 #
+#   --log-opt max-size=64m  Bound on the container log file - the sink that
+#                           journal-console.service streams the whole journal
+#                           into. See the logging block above; LogDriver= is a
+#                           proper key, this half has none before podman 5.0.
+#
 #   --device-cgroup-rule    The device allowlist; the majors and the reason
 #     (five of them)        each one is here are listed above. The values are
 #                           QUOTED because quadlet splits PodmanArgs on
@@ -218,6 +253,7 @@ AddDevice=-/dev/snd
 #                           containing two spaces - unquoted it becomes three.
 PodmanArgs=--systemd=always --tty \
     --security-opt apparmor=unconfined \
+    --log-opt max-size=64m \
     --ulimit rtprio=95 \
     --ulimit memlock=67108864 \
     --device-cgroup-rule="c 13:* rwm" \

@@ -140,6 +140,9 @@ COPY image/systemd/desktop-tools-publish.service /etc/systemd/system/desktop-too
 COPY image/systemd/xorg-conf.service /etc/systemd/system/xorg-conf.service
 COPY image/systemd/desktop-session.service /etc/systemd/system/desktop-session.service
 COPY image/systemd/journal-console.service /etc/systemd/system/journal-console.service
+# Bound the container's own (RAM-backed) journal - see the file's header. The
+# host-side half of the same concern is LogDriver=/--log-opt in the quadlet.
+COPY image/systemd/journald-bounds.conf /etc/systemd/journald.conf.d/10-bounds.conf
 COPY image/systemd/logind-container.conf /etc/systemd/logind.conf.d/10-container.conf
 # The UBI base image ships logind masked (containers normally have no seat);
 # this container manages its own seat0, so unmask it.
