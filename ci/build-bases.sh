@@ -23,6 +23,12 @@ ensure_base() {
         return 0
     fi
     echo "== building $name (cache miss for $ref)"
+    # Deliberately NOT --network=none: the bases are the layer that installs
+    # packages, and they are the ONLY layer allowed to reach the network. The
+    # application layers on top are built with --network=none in the workflows,
+    # which is what makes "no dependency appears without a base rebuild" an
+    # enforced property rather than a convention. No -t beyond :latest here -
+    # the content-addressed ref is applied separately below, only when pushing.
     podman build -t "localhost/$name:latest" -f "$containerfile" .
     if [ "$PUSH" = 1 ]; then
         podman tag "localhost/$name:latest" "$ref"

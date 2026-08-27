@@ -138,11 +138,16 @@ quadlet unit itself.
 The container boots systemd with its own `systemd-logind` and a
 container-internal `seat0`:
 
-- `--privileged` exposes the host's `/dev` (DRM, input, sound, ttys).
+- Devices are granted explicitly, not by `--privileged`: `/dev/dri` and
+  `/dev/snd` as devices, `/dev/input` as a live bind mount (see "Input
+  hotplug and KVM switches"), and the VTs created in the container's own
+  `/dev`. See "Container privileges" below.
 - `/run/udev` is mounted read-only from the host, so libudev/logind/libinput
   in the container see the host's udev database including its seat tags —
   no udevd runs in the container (it's masked).
-- `Network=host` lets libinput receive kernel uevents for input hotplug.
+- `Network=host` lets libinput receive kernel uevents (netlink is per-netns);
+  the `/dev/input` bind mount supplies the matching device nodes. Both are
+  needed — see "Input hotplug and KVM switches".
 - `desktop-session.service` uses the kiosk pattern (`User=desktop`,
   `PAMName=login`, `TTYPath=/dev/tty1`): pam_systemd registers a real logind
   session on the container's seat0 and starts the user manager, which brings
@@ -158,6 +163,40 @@ container-internal `seat0`:
   host uses the GPU — and systemd hands tty1 to the session user via
   `TTYPath=`. Xorg still tries logind device handover first and falls back
   to direct opens.
+
+### Input hotplug and KVM switches
+
+Devices plugged in after the container started **do** reach the session. That
+needs the quadlet's `Volume=/dev/input:/dev/input`: podman gives the container
+its own `/dev` — a tmpfs populated at creation, which is also why
+`ensure-vt-devices.sh` has to create the VT nodes itself — so without a live
+view of the host's input directory, a node the host gains later never appears
+inside. libinput would receive the uevent (that is what `Network=host` buys),
+try to open the path, and find nothing.
+
+This matters most for **KVM switches**. A USB KVM without HID emulation
+electrically disconnects the keyboard and mouse from this host on every switch
+and re-enumerates them on the way back, often at a different `eventN`. Without
+a live `/dev/input` that is not a degraded experience but a dead one: input
+stops working on the first switch back and stays dead until
+`desktop.service` restarts. A KVM that *does* emulate persistent HID devices
+(sold as "USB emulation" or DDM) never disconnects them and was never affected.
+
+The e2e simulates the full cycle on a **USB** keyboard (`device_del` then
+`device_add` of a `usb-kbd` on an xHCI controller — USB because that is what a
+KVM switch is, and because PCI hot-unplug waits on a guest acknowledgement a
+busy device may never send) and asserts the node leaves and returns *inside
+the container*, in both directions. The removal half matters as much as the addition: a stale node
+that never disappears is what a snapshot `/dev` looks like, and it would let the
+re-add half pass for the wrong reason.
+
+> **Video is a separate question.** A KVM switches the display too, and on
+> switch-away the monitor's EDID disappears and the GPU sees a connector
+> disconnect. That is not a `/dev` problem — `/dev/dri/card*` does not go away —
+> but whether Xorg restores the mode cleanly on switch-back is a distinct and
+> well-known pain point. Nothing here addresses it, and QEMU's virtio-vga does
+> not model DDC disconnect well enough to test it honestly. Try it on real
+> hardware early.
 
 ### Changing the VT
 
@@ -573,8 +612,8 @@ A failed "Host Terminal" click keeps its window open with the reason and
 the enablement command (`/usr/local/bin/host-terminal` wrapper) instead of
 flashing shut.
 
-Security framing: the desktop container is `--privileged`, so container
-root already has host-root-equivalent power; this key adds a *convenient*
+Security framing: the desktop container holds `CAP_SYS_ADMIN`, so container
+root is close to host-root-equivalent anyway; this key adds a *convenient*
 path for the unprivileged `desktop` user to a *specific*, unprivileged host
 account, with the ssh audit trail in the host journal. With the service
 switched off everything degrades gracefully — preflight WARNs and the menu
@@ -611,7 +650,10 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   client paths, the root-owned `desktop-shell` ssh trust is proven in both
   directions under enforcing, podman clients resolve each CDI device and
   get its capability and no other, input is typed in over the real virtual
-  keyboard and hotplug is exercised via QEMU `device_add`, and
+  keyboard, hotplug is asserted through to the container's `/dev` and a full
+  KVM-style remove/re-add cycle is exercised via QEMU (see "Input hotplug and
+  KVM switches"), the container's privileges are asserted to be less than
+  `--privileged` (see "Container privileges"), and
   `desktop-preflight` is asserted fully green. The podman clients run
   **confined** — no `label=disable` anywhere in the suite — against the
   `container_file_t` labels `desktop-selinux.service` applied, which are
@@ -657,10 +699,111 @@ aplay        /usr/share/sounds/alsa/Front_Center.wav   # via the ALSA drop-in
 Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 (uevents arrive because the container shares the host network namespace).
 
+## Container privileges
+
+The desktop container is **not** `--privileged`. That one flag bundles six
+separate grants — every capability, no seccomp filter, no SELinux separation,
+an open device cgroup, the host's device nodes, and a writable `/sys` — and
+this needs only some of them.
+
+What makes that possible is that **Xorg runs rootless**, as the `desktop` user,
+opening `/dev/dri` and `/dev/input` by plain group permission (see
+`image/xorg/Xwrapper.config` and `align-device-groups.sh`). Most containerised
+X needs broad capability because X runs as root. What is left is what systemd,
+logind, PAM and the audio stack need.
+
+| Grant | What it is for |
+|---|---|
+| `SYS_ADMIN` | systemd PID 1 mounting its own cgroup/tmpfs; logind |
+| `SYS_TTY_CONFIG` | VT ioctls (`TTYVHangup`, `TTYVTDisallocate`) |
+| `SYS_NICE` | systemd/logind scheduling |
+| `SYS_RESOURCE`, `MKNOD`, `AUDIT_WRITE` | systemd limits; VT node creation; `pam_loginuid` |
+| the ordinary systemd/PAM set | `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID`, `SETPCAP`, `SETFCAP`, `KILL`, `SYS_CHROOT`, `NET_BIND_SERVICE` |
+| `AddDevice=-/dev/dri`, `-/dev/snd` | GPU and audio, by explicit node (optional, so a host lacking either still starts and preflight reports it) |
+| device cgroup: majors 13, 4, 5, 226, 116 | evdev (the bind mount), VTs, console, DRM, sound |
+
+**Realtime audio without rtkit.** PipeWire runs as the unprivileged `desktop`
+user, so it cannot use a container capability — capabilities are per-process
+and a user session does not inherit them. `rtkit` existed to bridge that, and
+it cannot run here: it wants `SYS_PTRACE`, `DAC_READ_SEARCH` and `NET_ADMIN`,
+which are precisely the capabilities worth withholding. It is therefore masked
+in the image, and the quadlet sets `RLIMIT_RTPRIO` (and `RLIMIT_MEMLOCK`)
+instead — the other route to `SCHED_FIFO` for an unprivileged process, needing
+no capability at all. A masked unit also keeps `systemctl is-system-running`
+reporting `running`; a *failed* one reports `degraded`, which the deploy checks
+treat as not-up.
+
+The quadlet's `--ulimit` is **not sufficient on its own**, and this is easy to
+get wrong: it reaches the container's PID 1 and stops there, because systemd
+applies its own `DefaultLimit*=` to the units it spawns rather than passing on
+the rlimits it was started with — and the default for `RTPRIO` is 0. So
+`image/systemd/realtime-limits.conf` is installed into both
+`/etc/systemd/system.conf.d/` (covering `user@1000.service`) and
+`/etc/systemd/user.conf.d/` (covering the user units inside it).
+
+**And the rlimit alone is still not enough.** With the hard limit at 95,
+`module-rt` *still* went to RTKit and settled for priority 1: when PipeWire is
+built with D-Bus support it prefers RTKit rather than falling back to it only
+when direct scheduling fails. So the Containerfile patches `module-rt`'s stock
+args with `rlimits.enabled = true`, `rtkit.enabled = false` and
+`rtportal.enabled = false`, for the daemon and for RT clients. (A `conf.d`
+drop-in does *not* override module args — one was tried, and `module-rt` went
+on querying RTKit regardless.)
+
+None of this is visible in any audio test: a non-realtime stream produces
+exactly the same tone at exactly the same frequency. Only the realtime
+assertion catches it, and it is worth knowing what that assertion has to look
+at. PipeWire's realtime threads are the **data loops** (`data-loop.N`), not
+threads named `pipewire`, so it selects by the daemon's PID and examines all of
+its threads. And it requires `SCHED_FIFO` **above priority 1**, because the
+RTKit fallback takes `SCHED_FIFO` at priority 1 — still `FF`, still a degraded
+audio stack. "Is it `FF`" would have called that a pass.
+
+Everything else is dropped, including `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`,
+`SYS_BOOT`, `SYS_TIME`, `NET_ADMIN`, `NET_RAW`, `BPF`, `PERFMON`, `SYSLOG`,
+`DAC_READ_SEARCH`, `MAC_ADMIN` and `IPC_LOCK`. **Seccomp filtering is active**
+(`--privileged` would have removed it), which is the largest single piece of
+attack surface this takes back.
+
+**What this does not buy.** `CAP_SYS_ADMIN` is close to root, and it cannot go
+while systemd and logind run as PID 1 in the container. So this is
+attack-surface reduction, **not** a change of trust boundary — the image and
+anything allowed to start containers remain trusted. A genuine boundary change
+would mean not running systemd in there at all, which is a different design.
+
+SELinux separation is also still off (`SecurityLabelDisable=true`), and
+AppArmor with it (`--security-opt apparmor=unconfined`, which matters on
+Debian-family hosts and is inert on the RHEL/Rocky targets). Confining this
+container under either would need a profile of its own for DRM, evdev and VT
+access, which the stock container profiles cannot express — under podman's
+default AppArmor profile, `dbus-broker` does not even start. The two are
+treated alike rather than one being silently enforced because of what the host
+happens to run. The *client* containers are fully confined — that asymmetry is
+deliberate and is covered under `deploy/README.md` "SELinux".
+
+The e2e asserts all of this (`verify-privileges`), because none of it is
+visible in any other test — `--privileged` is a superset, so everything else
+in the suite passes either way:
+
+| Assertion | What it would catch |
+|---|---|
+| `Privileged=false` | the flag put back wholesale |
+| PID 1 `Seccomp=2` | the filter removed |
+| eleven named capabilities absent from `CapEff` | any of them granted back — the invariant is what must *never* be there, since a list of what we do grant would drift with the quadlet |
+| `/dev/mem` unreachable (created, then read) | the device cgroup unbounded |
+| `/sys` mounted `ro` | the sixth grant, which no capability check implies |
+| `rtkit-daemon` masked, `RLIMIT_RTPRIO=95` **on the PipeWire process itself**, ≥1 of its threads on `SCHED_FIFO` **above priority 1** | the audio stack silently losing realtime — the tone tests sound identical either way. Both qualifiers are load-bearing: the rlimit is read from `/proc/<pipewire>/limits` rather than `podman exec ulimit` (which reports the container spec's value whatever the session got), and priority 1 is what the RTKit fallback settles for, so a plain "is it `SCHED_FIFO`" would pass on a degraded stack. |
+
+`build-smoke` repeats the two cheapest (`Privileged`, `Seccomp`), since it runs
+in a third of the time.
+
 ## Security notes
 
-- The container is `--privileged` with host network — treat the image and
-  everything allowed to start containers as fully trusted.
+- The container is **not** `--privileged`, but it does hold `CAP_SYS_ADMIN`
+  and host network. `SYS_ADMIN` is close to root, so the image and anything
+  allowed to start containers are still trusted components — the reduction is
+  attack-surface reduction, not a change of trust boundary. See "Container
+  privileges".
 - Xorg runs rootless (as `desktop`), so an X server compromise yields that
   user, not root. Note the `desktop` user is still in the `input` group and
   can read every keyboard from `/dev/input` — inherent to running the
@@ -726,6 +869,6 @@ under `journalctl -t session-postmortem`, not under the unit).
   `systemctl restart desktop-selinux` re-converges them. `ausearch -m avc -ts
   recent | audit2why` names the denial. Do not reach for `audit2allow` here —
   the label is wrong, not the policy.
-- **SELinux denials from the desktop itself** — `--privileged` disables label
-  separation, so there should be none; if you tightened the unit, expect to
-  write policy for its device and VT access.
+- **SELinux denials from the desktop itself** — the unit sets
+  `SecurityLabelDisable=true`, so there should be none. Confining it would
+  need a policy module of its own for DRM, evdev and VT access.

@@ -17,6 +17,33 @@
 # setenforce: a client that only works permissive is a client that does not
 # work, and that is the whole point of the desktop-selinux labeling the
 # deploy tree ships.
+#
+# podman flag conventions used throughout, stated once here rather than at
+# each of the two dozen call sites:
+#
+#   podman exec -u desktop     Enter as the SESSION user, not root. Checks
+#                              about the desktop (can it open the display, can
+#                              it reach the audio socket, does ssh work) are
+#                              only meaningful as the user that actually runs
+#                              it; root would pass some of them for the wrong
+#                              reason.
+#   podman exec -e DISPLAY=... `podman exec` inherits the environment of the
+#              -e HOME=...     container's PID 1, NOT of the logind session -
+#              -e XDG_RUNTIME_DIR   so DISPLAY, HOME and XDG_RUNTIME_DIR are
+#                              absent and have to be supplied. Getting this
+#                              wrong looks like a broken desktop rather than a
+#                              broken test.
+#   podman exec -d             Detach, for the xterms that must stay up while
+#                              the screendump is taken. Without it the exec
+#                              blocks until the window is closed, which never
+#                              happens.
+#   podman run --rm            Every `podman run` here is a one-shot probe;
+#                              leftovers would pollute the container list the
+#                              later checks read.
+#
+# The flags NOT passed matter as much: no --security-opt label=disable and no
+# --privileged on any client, because the point is that a CONFINED client
+# works. See the block above the podman client probes in phase-deploy.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -33,7 +60,12 @@ CRIO_VERSION="${CRIO_VERSION:-v1.31}"
 
 log()  { echo "== vm-guest($1): $2"; }
 fail() {
-    echo "FAIL: vm-guest: $*" >&2
+    # Kept in a variable so it can be repeated at the very end: what follows is
+    # around 200 lines of diagnostics, which leaves the one line saying WHY
+    # scrolled far off the bottom of the job log. Reading the tail of a failed
+    # run should not require counting backwards past the Xorg log.
+    _failmsg="FAIL: vm-guest: $*"
+    echo "$_failmsg" >&2
     echo "---- diagnostics: podman logs desktop (tail) ----" >&2
     podman logs desktop 2>&1 | tail -80 >&2 || true
     echo "---- diagnostics: Xorg log (tail) ----" >&2
@@ -42,6 +74,12 @@ fail() {
     podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null | tail -30 >&2 || true
     echo "---- diagnostics: preflight ----" >&2
     podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
+    # A single failed unit makes `systemctl is-system-running` report
+    # "degraded", which the container_running() wait treats as not-up - so the
+    # symptom is a 120-second timeout that names nothing. List the culprits.
+    echo "---- diagnostics: failed units inside the container ----" >&2
+    podman exec desktop systemctl list-units --failed --no-pager >&2 2>&1 || true
+    podman exec desktop systemctl is-system-running >&2 2>&1 || true
     echo "---- diagnostics: desktop audio (export sockets + pipewire procs) ----" >&2
     podman exec desktop sh -c \
         'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
@@ -76,6 +114,7 @@ fail() {
         k3s kubectl describe pod x11-client-demo cdi-verify display-only audio-only >&2 2>/dev/null || true
         journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
     fi
+    echo "$_failmsg" >&2
     exit 1
 }
 
@@ -264,12 +303,31 @@ phase_deploy() {
     # because the runtime applied the spec's containerEdits. Same mechanism
     # k8s uses via the device plugin, minus kubernetes.
     #
-    # These run CONFINED - no --security-opt label=disable anywhere in this
-    # phase. desktop-selinux.service labeled the export dirs container_file_t,
-    # and a confined client reaching the display is exactly what that buys;
-    # without it each of these fails on connect(2) with the device resolved
-    # and the mounts in place. The desktop container itself is still exempt
-    # (--privileged), but nothing downstream of it is.
+    # Every podman flag on the three commands below, and why - including the
+    # one that is deliberately NOT there:
+    #
+    #   --device desktop.local/<cap>=all   the point of the test: the ONLY
+    #                                      thing granting access. No -v, no -e,
+    #                                      so anything the client sees came
+    #                                      from the CDI spec's containerEdits.
+    #   --rm                               these are one-shot probes; leaving
+    #                                      them behind would make the next
+    #                                      phase's `podman ps` output lie.
+    #   (no --security-opt label=disable)  LOAD-BEARING BY ITS ABSENCE. These
+    #                                      run CONFINED under enforcing
+    #                                      SELinux, which is what
+    #                                      desktop-selinux.service labeling the
+    #                                      export dirs container_file_t buys:
+    #                                      without those labels each of these
+    #                                      fails on connect(2) with the device
+    #                                      resolved and the mounts in place.
+    #                                      Adding the flag would make the test
+    #                                      pass while proving nothing.
+    #
+    # The desktop container is exempt from SELinux separation
+    # (SecurityLabelDisable=true in the quadlet - it is the trusted component,
+    # and confining it needs a policy module of its own). Nothing downstream of
+    # it is exempt, which is the asymmetry these commands exist to prove.
     log pd "a CONFINED podman client resolves desktop.local/display=all and opens :0"
     out=$(podman run --rm \
         --device desktop.local/display=all \
@@ -868,10 +926,197 @@ verify_screenshot() {
     log ss "captured from a client pod with only the injected display; pixels checked on the host"
 }
 
+verify_privileges() {
+    # The container must be running with LESS than --privileged, and stay that
+    # way. Without this, restoring --privileged would be invisible: everything
+    # else in this suite passes either way, because privileged is a superset.
+    log vp "the container is not --privileged"
+    priv=$(podman inspect desktop --format '{{.HostConfig.Privileged}}' 2>/dev/null || echo unknown)
+    [ "$priv" = false ] || fail "podman reports Privileged=$priv, want false"
+
+    # Seccomp: 0 = disabled, 2 = filtered. --privileged gives 0. This is the
+    # largest single piece of attack surface the change takes back, and it is
+    # the one that would silently regress if someone re-added the flag.
+    log vp "a seccomp filter is applied to PID 1"
+    mode=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/1/status" 2>/dev/null || echo "")
+    [ "$mode" = 2 ] || fail "PID 1 Seccomp=$mode, want 2 (filter). 0 means no filter - is --privileged back?"
+
+    # Capabilities: assert the dangerous ones are ABSENT rather than that the
+    # expected ones are present. A list of what we granted would drift with the
+    # quadlet; a list of what must never be granted is the actual invariant.
+    log vp "the capability bounding set excludes the dangerous ones"
+    capeff=$(podman exec desktop sh -c "awk '/^CapEff:/{print \$2}' /proc/1/status" 2>/dev/null || echo "")
+    [ -n "$capeff" ] || fail "could not read CapEff from the container's PID 1"
+    #             name            bit  why it must not be there
+    for spec in  "SYS_MODULE      16   load kernel modules" \
+                 "SYS_RAWIO       17   raw port and /dev/mem access" \
+                 "SYS_PTRACE      19   trace any process" \
+                 "SYS_BOOT        22   reboot the host" \
+                 "SYS_TIME        25   set the host clock" \
+                 "NET_ADMIN       12   reconfigure host networking" \
+                 "NET_RAW         13   raw sockets" \
+                 "DAC_READ_SEARCH  2   bypass file read permission checks" \
+                 "SYSLOG          34   read the kernel ring buffer" \
+                 "BPF             39   load BPF programs" \
+                 "PERFMON         38   perf_event_open"
+    do
+        # shellcheck disable=SC2086
+        set -- $spec
+        if [ $(( (0x$capeff >> $2) & 1 )) = 1 ]; then
+            fail "CAP_$1 is in the container's effective set (CapEff=$capeff): $3. --privileged back?"
+        fi
+    done
+    log vp "  CapEff=$capeff - none of the 11 forbidden capabilities present"
+
+    # And the device cgroup really is bounded: a node outside the allowlist
+    # must be unreachable. /dev/mem is major 1, which nothing here grants.
+    # Tested by trying to CREATE and read it, so a missing node cannot pass
+    # for a denied one.
+    log vp "a device outside the allowlist is unreachable"
+    if podman exec desktop sh -c \
+        'mknod /tmp/memprobe c 1 1 2>/dev/null && dd if=/tmp/memprobe of=/dev/null bs=1 count=1 2>/dev/null'
+    then
+        podman exec desktop rm -f /tmp/memprobe 2>/dev/null || true
+        fail "the container read /dev/mem (major 1): the device cgroup is not bounded"
+    fi
+    podman exec desktop rm -f /tmp/memprobe 2>/dev/null || true
+    log vp "  /dev/mem denied by the device cgroup"
+
+    # /sys read-only. This is the sixth of the grants --privileged bundles and
+    # the only one nothing else here would notice: a writable /sys is how a
+    # container reaches host tunables (sysfs writes to kernel objects it does
+    # not own), and the desktop never needs it - Xorg reads DRM through
+    # /dev/dri, not through sysfs writes. podman keeps /sys/fs/cgroup writable
+    # for systemd, which is why this checks the /sys mount itself rather than
+    # probing an arbitrary path underneath it.
+    log vp "/sys is read-only"
+    sysopts=$(podman exec desktop sh -c "awk '\$2==\"/sys\"{print \$4}' /proc/1/mounts" 2>/dev/null || true)
+    [ -n "$sysopts" ] \
+        || fail "could not read the container's /sys mount options from /proc/1/mounts"
+    case ",$sysopts," in
+        *,ro,*) log vp "  /sys mounted ro ($sysopts)" ;;
+        *) fail "/sys is mounted '$sysopts', want ro - a writable /sys is one of the six grants --privileged bundles and nothing here needs it" ;;
+    esac
+
+    # rtkit is masked, so PipeWire's realtime priorities have to come from
+    # RLIMIT_RTPRIO instead. Nothing else in this suite would notice if they
+    # did not: the audio tests check that the right tone comes out, and
+    # non-realtime audio still produces the right tone. Without this, the claim
+    # that the rlimit replaces the capability would be untested.
+    log vp "rtkit is masked and PipeWire has realtime anyway"
+    rt=$(podman exec desktop systemctl is-enabled rtkit-daemon.service 2>/dev/null || true)
+    [ "$rt" = masked ] \
+        || fail "rtkit-daemon.service is '$rt', want masked - it cannot work without SYS_PTRACE/DAC_READ_SEARCH/NET_ADMIN, and left unmasked it fails and degrades the container"
+
+    # The limit must have reached PIPEWIRE, which is not the same thing as
+    # having reached the container. `podman exec ... ulimit -Hr` reports 95
+    # here whatever PipeWire has, because the exec process is configured from
+    # the container spec directly - it never passes through systemd. PipeWire
+    # runs under user@1000.service, and systemd applies its own DefaultLimit*
+    # to the units it spawns rather than passing on the rlimits it was started
+    # with; the default for RTPRIO is 0. That check therefore passed while the
+    # process that needs the limit had none, which is precisely why the
+    # SCHED_FIFO assertion below is the one that matters. Read the limit off
+    # PipeWire's own /proc entry instead.
+    pwpid=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
+    [ -n "$pwpid" ] || fail "no pipewire process in the container to check RLIMIT_RTPRIO on"
+    # /proc/PID/limits column layout: Name (3 words here) Soft Hard Units.
+    lim=$(podman exec desktop sh -c \
+        "awk '/^Max realtime priority/{print \$5}' /proc/$pwpid/limits" 2>/dev/null || true)
+    [ "$lim" = 95 ] \
+        || fail "PipeWire's RLIMIT_RTPRIO hard limit is '$lim', want 95: the quadlet's --ulimit stopped at PID 1, so systemd's DefaultLimitRTPRIO applied instead (see image/systemd/realtime-limits.conf)"
+
+    # And the outcome: a PipeWire thread actually scheduled FIFO, at a priority
+    # that means it got realtime PROPERLY.
+    #
+    # Two things here were wrong before and are worth stating so they are not
+    # reintroduced. First, this used to filter threads by comm matching
+    # /pipewire/, which cannot work: PipeWire's realtime threads are the data
+    # loops, named data-loop.N, so the filter excluded exactly the threads it
+    # was looking for and only ever saw the TS main threads. Select by the
+    # daemon's PID and look at ALL of its threads instead.
+    #
+    # Second, SCHED_FIFO alone is too weak a claim. When module-rt falls back
+    # to RTKit and RTKit is unavailable it logs "does not give us
+    # MaxRealtimePriority, using 1" and takes SCHED_FIFO at priority 1 - still
+    # FF, still a degraded audio stack. The configured priority is 60, so
+    # requiring rtprio > 1 separates "got realtime" from "got the consolation
+    # prize", which is the distinction this assertion exists to make.
+    #
+    # awk prints an integer and exits 0 on no match, so a count of zero arrives
+    # as "0" rather than as a non-zero exit that the caller has to paper over.
+    fifo=$(podman exec desktop sh -c \
+        "ps -L -p $pwpid -o cls=,rtprio= 2>/dev/null | awk '\$1==\"FF\" && \$2+0 > 1 {n++} END{print n+0}'" \
+        2>/dev/null || echo 0)
+    if [ "${fifo:-0}" -le 0 ]; then
+        # Three things can produce this, and they need different fixes, so say
+        # which one it is rather than leaving the next reader to guess as I did
+        # twice: module-rt never asked (it went to RTKit), it asked and the
+        # kernel refused, or the limit is not where it needs to be.
+        echo "---- diagnostics: why no realtime ----" >&2
+        echo "-- every thread of the PipeWire daemon (FF = SCHED_FIFO, TS = normal)." >&2
+        echo "   Not filtered by name: the realtime threads are the data loops," >&2
+        echo "   named data-loop.N, so a /pipewire/ filter hides them:" >&2
+        podman exec desktop sh -c "ps -L -p $pwpid -o pid,tid,cls,rtprio,comm" >&2 2>&1 || true
+        echo "-- PipeWire's own rlimits:" >&2
+        podman exec desktop sh -c "grep -iE 'realtime|locked' /proc/$pwpid/limits" >&2 2>&1 || true
+        echo "-- can the desktop user take SCHED_FIFO at all? (separates 'module-rt" >&2
+        echo "   never asked' from 'the kernel refused' - RT throttling in a" >&2
+        echo "   non-root cgroup fails here even with the rlimit granted):" >&2
+        podman exec -u desktop desktop sh -c '
+            command -v chrt >/dev/null || { echo "   chrt not installed"; exit 0; }
+            if chrt -f 10 true; then
+                echo "   chrt -f 10: OK - the kernel allows it, so module-rt never asked"
+            else
+                echo "   chrt -f 10: REFUSED ($?) - the kernel is the blocker, not the config"
+            fi' >&2 2>&1 || true
+        echo "-- did module-rt consult RTKit? (any line here means rtkit.enabled" >&2
+        echo "   did not reach it):" >&2
+        podman logs desktop 2>&1 | grep 'mod.rt' | tail -8 >&2 || echo "   (none - good)" >&2
+        echo "-- module-rt args as the daemon config actually has them:" >&2
+        podman exec desktop sh -c \
+            "grep -n -A 10 'libpipewire-module-rt' /usr/share/pipewire/pipewire.conf" >&2 2>&1 || true
+        fail "no PipeWire thread holds SCHED_FIFO above priority 1: PipeWire did not get realtime properly, so masking rtkit cost the audio stack its priorities. The 'why no realtime' block above - just before the standard diagnostics dump - says which cause it is"
+    fi
+    log vp "  rtkit masked, RLIMIT_RTPRIO=95, $fifo PipeWire thread(s) on SCHED_FIFO"
+
+    log vp "verify-privileges passed"
+}
+
+hotplug_probe() {
+    # Two numbers on one line, for the host to diff across a QEMU device_add:
+    #   1. input device NODES visible inside the container
+    #   2. input devices Xorg has actually added
+    #
+    # Both matter, and they fail differently. The node not appearing means the
+    # container's /dev is not a live view of the host's - which is a real
+    # question here, since ensure-vt-devices.sh notes /dev is a tmpfs and
+    # creates the VT nodes itself. The node appearing but Xorg not adding it
+    # means the uevent did not reach libinput, which is what Network=host is
+    # for. Reporting one number could not tell those apart.
+    local nodes adds
+    nodes=$(podman exec desktop sh -c 'ls -1 /dev/input/event* 2>/dev/null | wc -l' 2>/dev/null || echo 0)
+    # grep -c prints 0 and exits 1 when nothing matches; keep the 0, drop the status.
+    adds=$(podman exec desktop sh -c \
+        'grep -c "Adding input device" /home/desktop/.local/share/xorg/Xorg.0.log 2>/dev/null' \
+        2>/dev/null || true)
+    [ -n "${nodes:-}" ] || nodes=0
+    [ -n "${adds:-}" ] || adds=0
+    echo "$nodes $adds"
+}
+
 input_sink_start() {
     # A sink xterm reads one line and records it. Geometry must match the
     # click coordinate the host computes (100x30 at +250+200 -> centre ~550,395).
+    #
+    # Called more than once (the plain input test, then again after the KVM
+    # switch cycle), so retire any previous sink first: a leftover still inside
+    # its `sleep 60` would sit at the same geometry and the click could land on
+    # whichever ended up on top. pkill exits 1 when nothing matches, which is
+    # the normal case on the first call.
     log is "launch a sink xterm that records one typed line"
+    podman exec desktop pkill -f 'xterm -T inputtest' 2>/dev/null || true
+    sleep 1
     podman exec desktop rm -f /tmp/inputproof
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
         xterm -T inputtest -geometry 100x30+250+200 -e \
@@ -1079,7 +1324,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase-deploy|phase2|verify-privileges|hotplug-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -1093,6 +1338,8 @@ case "${1:?phase-deploy|phase2|play-audio|play-audio-pod|verify-cdi|verify-split
     verify-record) verify_record ;;
     verify-concurrency) verify_concurrency ;;
     verify-teardown) verify_teardown ;;
+    verify-privileges) verify_privileges ;;
+    hotplug-probe) hotplug_probe ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
     *) fail "unknown phase $1" ;;

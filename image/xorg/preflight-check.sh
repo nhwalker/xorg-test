@@ -21,7 +21,7 @@ else
     as_desktop() { "$@" 2>/dev/null; }
 fi
 
-# --- devices visible (privileged /dev, hardware present) --------------------
+# --- devices visible (granted by the quadlet, hardware present) -------------
 shopt -s nullglob
 cards=(/dev/dri/card*)
 events=(/dev/input/event*)
@@ -31,13 +31,13 @@ shopt -u nullglob
 if [ ${#cards[@]} -gt 0 ]; then
     pass "DRM devices visible: ${cards[*]}"
 else
-    fail "no /dev/dri/card* visible: X cannot start. Container not privileged, host has no KMS video device, or (NVIDIA-driver host without GPU injection) nvidia_drm.modeset=1 is missing from the kernel cmdline"
+    fail "no /dev/dri/card* visible: X cannot start. The quadlet's AddDevice= for /dev/dri did not resolve, host has no KMS video device, or (NVIDIA-driver host without GPU injection) nvidia_drm.modeset=1 is missing from the kernel cmdline"
 fi
 
 if [ ${#events[@]} -gt 0 ]; then
     pass "input devices visible: ${#events[@]} /dev/input/event* node(s)"
 else
-    fail "no /dev/input/event* visible: no keyboard/mouse will work. Container not privileged, or host input drivers missing"
+    fail "no /dev/input/event* visible: no keyboard/mouse will work. The quadlet's /dev/input bind mount is missing, device cgroup does not allow major 13, or host input drivers missing"
 fi
 
 if [ ${#snds[@]} -gt 0 ]; then
@@ -102,8 +102,8 @@ fi
 
 # --- NVIDIA coherence ----------------------------------------------------------
 # NVIDIA_CDI_STUB=1 is injected by the deploy tree's stub CDI spec, written
-# when the host has no working GPU stack. Hardware visible anyway (via
-# --privileged /dev) means the stub is hiding a broken host, not a missing
+# when the host has no working GPU stack. Hardware visible anyway (via the
+# quadlet's device grants) means the stub is hiding a broken host, not a missing
 # GPU - the one silent-degradation case worth a FAIL. CDI env edits land on
 # PID 1; whether systemd forwards them to services is not a contract worth
 # depending on, so read PID 1's environment directly.

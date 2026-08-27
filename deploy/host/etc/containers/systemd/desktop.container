@@ -72,9 +72,33 @@ After=desktop-host-shell.service
 [Container]
 Image=localhost/desktop-container:latest
 ContainerName=desktop
-# Host network namespace: kernel uevents (input hotplug for libinput) are
-# delivered over netlink, which is per-netns.
+# Host network namespace: kernel uevents are delivered over netlink, which is
+# per-netns, so libinput in the container sees them. The uevent alone is not
+# enough - the device NODE has to be there too, which is what the /dev/input
+# bind mount below provides.
 Network=host
+# Live view of the host's input devices. Podman gives the container its own
+# /dev (a tmpfs populated at creation, which is also why ensure-vt-devices.sh
+# has to mknod the VT nodes), so without this a device node the host gains
+# later never appears inside: libinput gets the uevent, tries to open the path
+# and finds nothing.
+#
+# That matters beyond plugging in a new keyboard. A USB KVM switch without HID
+# emulation electrically disconnects the keyboard and mouse on every switch and
+# re-enumerates them on the way back, often at a different eventN - so without
+# a live view, input dies on the first switch back and stays dead until
+# desktop.service restarts.
+#
+# Just /dev/input, not all of /dev: podman's own /dev/console, /dev/pts and
+# /dev/shm are what --systemd=always and --tty depend on, and a blanket
+# /dev:/dev would shadow them. Read-write because libinput needs to write to
+# evdev nodes (EVIOCGRAB, LEDs).
+#
+# The device cgroup still governs access to what this exposes, and a bind
+# mount is not a device as far as that cgroup is concerned - so major 13 has
+# to be allowed explicitly below, or this mount resolves to nodes the
+# container may not open.
+Volume=/dev/input:/dev/input
 # Host udev database (read-only): lets libinput/logind enumerate devices and
 # see the host's seat tags without running udevd in the container.
 Volume=/run/udev:/run/udev:ro
@@ -102,11 +126,156 @@ Volume=/etc/desktop-container:/etc/desktop-container:ro
 #   Volume=/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:/usr/lib64/xorg/modules/extensions/libglxserver_nvidia.so:ro
 AddDevice=nvidia.com/gpu=all
 Environment=NVIDIA_DRIVER_CAPABILITIES=all
-# --privileged: host /dev (dri, input, snd, tty*) visible, no SELinux
-# separation, device cgroup open. --systemd=always: proper systemd PID 1.
-# --tty: gives the container a /dev/console wired to `podman logs`, which
-# journal-console.service mirrors the journal into.
-PodmanArgs=--privileged --systemd=always --tty
+# --- privileges --------------------------------------------------------------
+# NOT --privileged. That single flag bundles six separate grants - every
+# capability, no seccomp filter, no SELinux separation, an open device cgroup,
+# the host's device nodes, and a writable /sys - and this needs only some of
+# them. What follows grants those and nothing else.
+#
+# The display server is why this is possible at all: Xorg runs ROOTLESS as the
+# 'desktop' user and opens /dev/dri and /dev/input by plain group permission
+# (see image/xorg/Xwrapper.config and align-device-groups.sh). Most
+# containerised X needs broad capability because X runs as root; this does not.
+# What remains is what systemd, logind, PAM and the audio stack need.
+
+# Devices. Explicit nodes rather than the host's whole /dev.
+#   dri  the GPU: KMS and render nodes, opened by group by rootless Xorg
+#   snd  ALSA cards for PipeWire
+# Input is NOT here: it needs a LIVE view (hotplug, KVM switching), which the
+# /dev/input bind mount above provides. A --device snapshot would defeat it.
+# The leading '-' makes each OPTIONAL: podman refuses to create the container
+# at all if an AddDevice= path is missing ("stat /dev/snd: no such file or
+# directory"), and a host without a sound card or without KMS is a host the
+# desktop should still start on so that preflight can say what is wrong. That
+# is the same reasoning as the stub NVIDIA CDI spec: always resolve, and let
+# the in-container preflight report the real problem rather than failing at
+# container creation with a message about stat.
+AddDevice=-/dev/dri
+AddDevice=-/dev/snd
+# The device cgroup still gates every one of those, and bind mounts are not
+# devices as far as it is concerned - so /dev/input needs its major allowed
+# explicitly or the mount resolves to nodes the container may not open.
+#   13  input   (evdev; the bind mount)
+#   4   VTs     (tty0/tty1, created by ensure-vt-devices.sh)
+#   5   console (/dev/console, /dev/tty, ptmx)
+#   226 dri     (also granted by AddDevice= when the node exists)
+#   116 snd     (likewise)
+# The last two are stated here as well as implied by AddDevice=, because those
+# lines are optional ('-' prefix) and so may grant nothing: this keeps the
+# cgroup policy a property of the unit rather than of what the host happens to
+# have.
+
+# Realtime scheduling for the audio stack, WITHOUT rtkit. PipeWire runs as the
+# unprivileged 'desktop' user, so it cannot use the container's CAP_SYS_NICE -
+# capabilities are per-process and a user session does not inherit it. rtkit
+# existed to bridge that gap, and it cannot run here (see the mask in
+# Containerfile: it wants SYS_PTRACE, DAC_READ_SEARCH and NET_ADMIN, which are
+# exactly the capabilities worth withholding). RLIMIT_RTPRIO is the other route
+# to SCHED_FIFO for an unprivileged process and needs no capability at all, so
+# PipeWire gets its RT threads and the dangerous capabilities stay dropped.
+# memlock likewise replaces the CAP_IPC_LOCK that PipeWire would otherwise want
+# for its buffers. The image also needs a systemd drop-in for these to reach
+# PipeWire at all - see image/systemd/realtime-limits.conf.
+#
+# --- every flag on the PodmanArgs line, and why ------------------------------
+# These are the options quadlet has no key of its own for. Comments cannot be
+# interleaved into a line continuation, so they are indexed here instead; keep
+# this list in step with the line below.
+#
+#   --systemd=always        Run the image's /sbin/init as a real systemd PID 1:
+#                           podman then mounts /sys/fs/cgroup, puts tmpfs on
+#                           /run and /tmp, and stops the container with
+#                           SIGRTMIN+3. "always" rather than the default
+#                           "true" because "true" only switches systemd mode on
+#                           when podman recognises the entrypoint (/sbin/init
+#                           and friends); "always" does not depend on that
+#                           sniffing continuing to match. A silently
+#                           non-systemd PID 1 would take logind, the seat and
+#                           the whole session with it.
+#
+#   --tty                   Allocate a pty so the runtime creates
+#                           /dev/console, which is what `podman logs` reads and
+#                           what journal-console.service redirects the journal
+#                           into. Without it there is no /dev/console at all,
+#                           the container's boot is invisible from the host,
+#                           and that unit refuses to start rather than create a
+#                           regular file that grows forever on the /dev tmpfs.
+#                           See image/systemd/journal-console.service.
+#
+#   --security-opt          AppArmor off - the Debian-family counterpart of
+#     apparmor=unconfined   SecurityLabelDisable= below, and inert on the
+#                           RHEL/Rocky targets this tree is written for. The
+#                           full reasoning is with that directive.
+#
+#   --ulimit rtprio=95      RLIMIT_RTPRIO / RLIMIT_MEMLOCK for the audio stack,
+#   --ulimit memlock=...    replacing rtkit and CAP_IPC_LOCK respectively - see
+#                           the paragraph directly above.
+#
+#   --device-cgroup-rule    The device allowlist; the majors and the reason
+#     (five of them)        each one is here are listed above. The values are
+#                           QUOTED because quadlet splits PodmanArgs on
+#                           whitespace and "c 13:* rwm" is ONE argument
+#                           containing two spaces - unquoted it becomes three.
+PodmanArgs=--systemd=always --tty \
+    --security-opt apparmor=unconfined \
+    --ulimit rtprio=95 \
+    --ulimit memlock=67108864 \
+    --device-cgroup-rule="c 13:* rwm" \
+    --device-cgroup-rule="c 4:* rwm" \
+    --device-cgroup-rule="c 5:* rwm" \
+    --device-cgroup-rule="c 226:* rwm" \
+    --device-cgroup-rule="c 116:* rwm"
+
+# Capabilities: drop everything, add back only what is used.
+#   SYS_ADMIN        systemd PID 1 mounting its own /sys/fs/cgroup, tmpfs, etc;
+#                    logind. This is the one that keeps the container trusted -
+#                    see "Security notes" in README.md.
+#   SYS_TTY_CONFIG   VT ioctls (logind, TTYVHangup/TTYVTDisallocate)
+#   SYS_NICE         systemd/logind scheduling. NOT for PipeWire's RT threads:
+#                    those come from RLIMIT_RTPRIO below, because PipeWire runs
+#                    unprivileged and cannot use a container capability.
+#   SYS_RESOURCE     systemd raising its own limits
+#   MKNOD            ensure-vt-devices.sh creating tty0/tty1 on the container's
+#                    OWN /dev, deliberately: systemd chowns TTYPath= to the
+#                    session user, and doing that to a host node would change
+#                    the host's.
+#   AUDIT_WRITE      pam_loginuid, for the kiosk login session
+#   CHOWN DAC_OVERRIDE FOWNER FSETID SETUID SETGID SETPCAP SETFCAP KILL
+#                    SYS_CHROOT NET_BIND_SERVICE
+#                    the ordinary systemd/PAM set
+#
+# Notably NOT granted, all of which --privileged gave: SYS_MODULE, SYS_RAWIO,
+# SYS_PTRACE, SYS_BOOT, SYS_TIME, NET_ADMIN, NET_RAW, BPF, PERFMON, SYSLOG,
+# MAC_ADMIN, MAC_OVERRIDE, DAC_READ_SEARCH, IPC_LOCK, IPC_OWNER, LEASE,
+# LINUX_IMMUTABLE, AUDIT_CONTROL, AUDIT_READ, BLOCK_SUSPEND, WAKE_ALARM,
+# CHECKPOINT_RESTORE.
+DropCapability=ALL
+AddCapability=SYS_ADMIN SYS_TTY_CONFIG SYS_NICE SYS_RESOURCE MKNOD AUDIT_WRITE
+AddCapability=CHOWN DAC_OVERRIDE FOWNER FSETID SETUID SETGID SETPCAP SETFCAP
+AddCapability=KILL SYS_CHROOT NET_BIND_SERVICE
+
+# SELinux separation stays OFF. Confining this container would need a policy
+# module of its own for DRM, evdev and VT access from a container domain -
+# that is a project, not a setting, and container_t cannot do any of it. The
+# CLIENT containers are confined (see "SELinux" in deploy/README.md); this one
+# is the trusted component.
+SecurityLabelDisable=true
+# AppArmor is off too, via --security-opt apparmor=unconfined up in PodmanArgs
+# (quadlet has no key for it). The same call on a distro that uses AppArmor
+# instead of SELinux: --privileged was turning it off as well, and without it
+# podman applies its default profile, under which dbus-broker fails to start
+# and takes the login session with it (pam_systemd: "Transport endpoint is not
+# connected"). Confining this container under AppArmor would need a profile of
+# its own for exactly the reasons SELinux would, so the two are treated alike
+# rather than one being enforced because the host happens to be Ubuntu.
+#
+# Inert on hosts without AppArmor, which includes the RHEL/Rocky targets this
+# tree is written for; it matters for the CI runner and for anyone deploying on
+# a Debian-family host.
+
+# Seccomp is deliberately NOT disabled here. Omitting the flag leaves podman's
+# default filter in place, which --privileged would have removed - the single
+# largest piece of attack surface this change takes back.
 
 [Service]
 Restart=always

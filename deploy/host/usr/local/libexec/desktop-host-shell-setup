@@ -27,8 +27,9 @@ fi
 rm -f "$DIR/host-shell-key" "$DIR/host-shell-key.pub"
 ssh-keygen -q -t ed25519 -N '' -C desktop-container-host-shell \
     -f "$DIR/host-shell-key"
-# Root-only on the host; the (privileged) container's boot script installs a
-# desktop-user copy inside the container.
+# Root-only on the host; the container's boot script installs a desktop-user
+# copy inside the container (it reads this via the read-only
+# /etc/desktop-container mount, as root, before dropping to the session user).
 chmod 0400 "$DIR/host-shell-key"
 chmod 0644 "$DIR/host-shell-key.pub"
 
