@@ -5,6 +5,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
   # Runnable on a branch without opening a PR. e2e-vm has had this all along;
   # ci did not, so everything in it - including the quadlet dry-run - could
   # only be exercised through a PR. That is part of why a dry-run assertion

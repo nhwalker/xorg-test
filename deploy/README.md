@@ -368,6 +368,25 @@ fails loudly naming the culprit, instead of letting the desktop boot into
 The static `default.target` / getty-mask symlinks in the tree remain the
 boot-time baseline; the script is what makes them true again after drift.
 
+## Host login session
+
+The container runs its session processes itself (no systemd, no logind
+inside — see README.md "Boot model"), so the seat bookkeeping lives here:
+`desktop-session.service` opens a real PAM/logind login session as the
+`desktop` user (created by this tree's sysusers.d at the fixed uid 61000,
+matching the image's — one contract) on seat0/tty1. `loginctl` and utmp
+show the session; logind mounts `/run/user/61000`, which the quadlet's
+rslave `/run/user` bind carries into the container for the session's
+`XDG_RUNTIME_DIR`. The session's only process is a sleep
+(`desktop-session-lead`); the desktop's real work stays in the container,
+as the same uid.
+
+Lifecycle: the quadlet `Wants=` the session up with every container start
+and the session is `PartOf=desktop.service`, so the pair move together. A
+host that disables the unit still gets a working desktop — desktop-init
+waits briefly for the logind runtime dir and then fabricates one, the same
+degradation path as the Host Terminal key.
+
 ## Host Terminal: always on, dedicated account, boot-fresh key
 
 The desktop's "Host Terminal" menu entry lands in **`desktop-shell`**, a

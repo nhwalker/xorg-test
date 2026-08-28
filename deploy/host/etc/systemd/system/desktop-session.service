@@ -1,0 +1,54 @@
+# Host login session for the containerized desktop (see deploy/README.md
+# "Host login session").
+#
+# The container runs its session processes directly (image/init/desktop-init
+# - no systemd, no logind in there), so without this unit nothing on the
+# machine records that a session owns the seat: loginctl shows nothing, utmp
+# shows nothing, and desktop-init fabricates the runtime dir by hand. This
+# unit is the kiosk pattern the container used to run INSIDE, moved to the
+# host, which is where seats truthfully live: PAMName=login + TTYPath open a
+# real logind session for the 'desktop' user on seat0/tty1, pam_systemd
+# mounts the per-user runtime dir at /run/user/61000, and utmp gets a real
+# entry. The session's one process is a sleep (desktop-session-lead); the
+# actual desktop work happens in the container AS THE SAME UID, and the
+# runtime dir reaches it through the quadlet's rslave /run/user bind.
+#
+# Lifecycle: PartOf=desktop.service stops and restarts this session with the
+# container, and the quadlet's Wants= pulls it up whenever the container
+# starts - the two move together, but a session failure never takes the
+# desktop down (Wants, not Requires, in that direction). The desktop also
+# still runs on a host WITHOUT this unit: desktop-init waits briefly for the
+# logind runtime dir and then creates one itself, the same graceful
+# degradation the Host Terminal key uses.
+#
+# Deliberately NOT set: TTYReset/TTYVHangup/TTYVTDisallocate. The old
+# in-container unit had them, but here the tty is shared with the
+# container's Xorg (same underlying VT through the container's own tty1
+# node), and a vhangup on session restart would SIGHUP the X server - the
+# container supervises its own session; this unit only does the
+# bookkeeping.
+
+[Unit]
+Description=Host login session for the containerized desktop
+PartOf=desktop.service
+After=desktop.service systemd-user-sessions.service systemd-logind.service
+# Same backstop the quadlet carries: the session claims tty1's bookkeeping,
+# so a getty there is a conflict, not a neighbour.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+User=desktop
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty1
+UtmpMode=user
+ExecStart=/usr/local/libexec/desktop-session-lead
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

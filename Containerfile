@@ -57,10 +57,19 @@ RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/ensure-vt-devices.
         /usr/local/bin/xorg-monitor-conf.sh \
         /usr/local/bin/host-terminal /etc/X11/xinit/xinitrc.desktop
 
+# uid 61000, matching the HOST desktop account the deploy tree creates
+# (deploy/host/etc/sysusers.d/desktop-container.conf) - one contract, stated
+# in both places. The container shares the host pid namespace with no user
+# namespace, so this uid is a host-global identity: the host's
+# desktop-session.service opens the logind session as it, the session
+# processes in here run as it, and it must NEVER collide with a real host
+# user's uid (1000 did, on the e2e VM, with real casualties - see the KILL
+# note in the quadlet).
 RUN for g in input render video audio tty; do \
         getent group "$g" >/dev/null || groupadd -r "$g"; \
     done \
-    && useradd -m -u 1000 -G video,input,audio,render,tty desktop
+    && groupadd -g 61000 desktop \
+    && useradd -m -u 61000 -g desktop -G video,input,audio,render,tty desktop
 
 # --- Audio export (PipeWire native + Pulse sockets in /run/desktop-audio) ---
 # The native socket can't be added via a conf.d fragment (protocol-native

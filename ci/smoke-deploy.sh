@@ -289,6 +289,24 @@ for _ in $(seq 40); do
 done
 [ "$up" = 1 ] || fail "desktop-init never wrote /run/desktop-init-ready"
 
+log "host login session: enabled by the tree, active, real seat bookkeeping"
+# desktop-session.service ships pre-enabled (a .wants symlink the rsync must
+# preserve, like desktop-client-cdi's) and is pulled up by the quadlet's
+# Wants=. Even this GPU-less runner has a tty1, so the session itself must
+# open; only the X session inside the container is allowed to fail here.
+[ "$(systemctl is-enabled desktop-session.service)" = enabled ] \
+    || fail "desktop-session.service not enabled after rsync"
+sess=0
+for _ in $(seq 15); do
+    systemctl is-active --quiet desktop-session.service && { sess=1; break; }
+    sleep 2
+done
+[ "$sess" = 1 ] || { systemctl status desktop-session.service --no-pager -l || true; \
+    fail "desktop-session.service did not become active"; }
+loginctl list-sessions --no-pager | grep -Eq 'desktop +seat0' \
+    || { loginctl list-sessions --no-pager || true; fail "no logind session for desktop on seat0"; }
+[ -d /run/user/61000 ] || fail "logind did not mount /run/user/61000"
+
 log "stub CDI resolved through the container start (marker env on the init process)"
 # CDI env edits apply to the container's INIT process; podman exec sessions
 # do not get them. The container shares the HOST pid namespace (--pid=host),
@@ -406,7 +424,7 @@ DP-1  1920x1080@60  +0+0     primary
 DP-2  1920x1080@60  +1920+0
 EOF
 
-log "desktop.service survives a restart"
+log "desktop.service survives a restart (and the host session moves with it)"
 systemctl restart desktop.service
 up=0
 for _ in $(seq 20); do
@@ -414,6 +432,13 @@ for _ in $(seq 20); do
     sleep 2
 done
 [ "$up" = 1 ] || fail "container did not come back after restart"
+# PartOf=desktop.service restarted the session too; give PAM a moment.
+sess=0
+for _ in $(seq 15); do
+    systemctl is-active --quiet desktop-session.service && { sess=1; break; }
+    sleep 2
+done
+[ "$sess" = 1 ] || fail "desktop-session.service did not come back with the container (PartOf= broken?)"
 
 # The restart above is what re-runs xorg-conf.service, so the assertions on
 # the declared layout land here rather than beside the config that set it up.

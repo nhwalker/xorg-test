@@ -61,6 +61,15 @@ After=desktop-selinux.service
 # and the device would never be advertised until the next reboot.
 Wants=desktop-tools-cdi.path
 After=desktop-tools-cdi.path
+# Host login session: a real PAM/logind session for the desktop user on
+# seat0/tty1, opened host-side because the container has no logind of its
+# own (see that unit's header). Wants+PartOf make the pair move together:
+# this Wants= pulls the session up with every container start, and the
+# session's PartOf=desktop.service stops and restarts it with the
+# container. Wants and not Requires, deliberately: the desktop must still
+# run on a host that disables the session unit - desktop-init falls back to
+# fabricating the runtime dir itself.
+Wants=desktop-session.service
 # Host Terminal, always on: a fresh loopback-ssh keypair is generated every
 # boot for the dedicated 'desktop-shell' account (see deploy/README.md
 # "Host Terminal"). To ship hosts WITHOUT it, comment out the next two
@@ -115,6 +124,19 @@ Volume=/var/lib/desktop-container/bin:/var/lib/desktop-container/bin
 # shell-user file from this tree plus the boot-fresh keypair written by
 # desktop-host-shell.service (harmless when absent/empty).
 Volume=/etc/desktop-container:/etc/desktop-container:ro
+# The host's per-user runtime dirs, rslave so mounts PROPAGATE: logind
+# mounts a tmpfs at /run/user/61000 only when desktop-session.service opens
+# the session, which is after this container was created - a private bind
+# taken at create time would never see it. Through this, the container's
+# session uses the SAME runtime dir logind manages on the host (the
+# XDG_RUNTIME_DIR contract, met by the component that owns it), and
+# desktop-init stops fabricating one when the host session is present.
+# The parent dir rather than /run/user/61000 itself, because the subdir
+# does not exist yet at container-create time. Visibility note: this brings
+# every host user's runtime dir into the (trusted, unconfined) container's
+# mount view; permissions still apply, but it is one more reason DAC_OVERRIDE
+# below is on the trim list.
+Volume=/run/user:/run/user:rslave
 # systemd mode used to put tmpfs on /run and /tmp; without it (--systemd=false
 # below) state them explicitly. /run must not persist across restarts (stale
 # pids, sockets, the desktop-init-ready marker), and /tmp holds Xorg's own
@@ -318,17 +340,16 @@ PodmanArgs=--pid=host --systemd=false --tty \
 # KILL is dropped for a different reason: in the HOST pid namespace
 # (--pid=host above) CAP_KILL would mean "may signal any process on the
 # host". desktop-init never needs it - it signals the session by first
-# becoming uid 1000 via setpriv (SETUID/SETGID below), and same-uid
+# becoming the desktop uid via setpriv (SETUID/SETGID below), and same-uid
 # signaling needs no capability at all. That same-uid power is real and
-# cuts both ways: uid 1000 in this container IS uid 1000 on the host (no
-# user namespace), so the session user can signal any HOST uid-1000
-# process too. desktop-init therefore scopes every kill to the session's
-# own sid, never to the uid - the first e2e run of this shape used
-# `pkill -u 1000` and took down the test harness's ssh session, because
-# the VM's login user is uid 1000 as well. Deployments whose hosts have a
-# real uid-1000 user should consider moving the desktop user to a
-# collision-free uid; processes of other uids are not signalable from the
-# container at all.
+# cuts both ways without a user namespace, which is why the desktop uid is
+# 61000 (fixed in the image and in the tree's sysusers.d - one contract),
+# far from the uid-1000 range where real host users live: the first e2e
+# run of this shape used `pkill -u 1000` while the desktop still WAS uid
+# 1000, and took down the test harness's own ssh session (the VM's login
+# user shared the uid). desktop-init additionally scopes every kill to the
+# session's own sid, never to the uid; processes of other uids are not
+# signalable from the container at all.
 #
 #   SYS_TTY_CONFIG   Xorg's VT ioctls (VT_ACTIVATE at session start)
 #   MKNOD            ensure-vt-devices.sh creating tty0/tty1 on the container's
