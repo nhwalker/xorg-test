@@ -297,17 +297,16 @@ for _ in $(seq 40); do
 done
 [ "$up" = 1 ] || fail "desktop-init never wrote /run/desktop-init-ready"
 
-log "audio stack is independent of the X session's lifecycle"
-# This runner has no KMS, so the X session cannot start and desktop-init
-# restarts it every three seconds for the whole job. That makes it the
-# cheapest possible venue for the property that matters: under the old
-# shape the audio daemons were children of the X session and were killed
-# with it, so PipeWire was being torn down and rebuilt on every one of
-# those iterations. Now it must come up ONCE and stay up across them.
+log "audio stack is supervised independently of the X session"
+# Two deterministic checks, neither of which needs an X server - which
+# matters, because this runner has no KMS and, as the first run of this
+# assertion showed, its X session does NOT crash-loop the way I assumed.
+# An earlier version of this waited for spontaneous session restarts and
+# skipped itself when none came, which is a test that never tests anything.
 #
-# Asserted on the pid, not on the socket: a socket that goes away and comes
-# back within the polling interval looks identical to one that never moved,
-# and "it was restarted quickly" is exactly the failure being ruled out.
+# The e2e proves the X-restart half properly, against a real Xorg it can
+# kill (verify-audio-lifecycle). What is provable HERE, on a machine with
+# neither a GPU nor a sound card, is the structure and the recovery.
 pw_before=""
 for _ in $(seq 30); do
     pw_before=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
@@ -318,30 +317,52 @@ done
     || { podman logs desktop 2>&1 | tail -40 >&2 || true
          fail "no pipewire process in the container: the audio stack never started (it no longer waits on X, so a GPU-less host is not an excuse)"; }
 
-# Wait for the session loop to go round at least twice. Counting the log
-# lines is what makes this a real test: without an observed restart the pid
-# comparison below would pass on a box where nothing happened at all.
-restarts_before=$(podman logs desktop 2>&1 | grep -c 'session exited' || true)
-[ -n "$restarts_before" ] || restarts_before=0
-target=$((restarts_before + 2))
-seen=$restarts_before
+# 1. STRUCTURE: PipeWire must live in the audio tree's own process session,
+#    not the X session's. That is the whole change, and it is a property of
+#    the running system rather than of a restart having happened - so it is
+#    checkable at any moment, on any host. desktop-init records the audio
+#    tree's leader pid precisely because its supervisor is a separate
+#    process; the sid of PipeWire must be that pid.
+leader=$(podman exec desktop cat /run/desktop-audio-leader.pid 2>/dev/null || true)
+[ -n "$leader" ] \
+    || fail "no /run/desktop-audio-leader.pid: desktop-init never launched the audio tree through supervise_audio"
+pw_sid=$(podman exec desktop sh -c "ps -o sess= -p $pw_before 2>/dev/null | tr -d ' '" 2>/dev/null || true)
+[ "$pw_sid" = "$leader" ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "pipewire (pid $pw_before) has sid '$pw_sid', want the audio leader $leader: the audio stack is not in its own process session, so stopping the X session would kill it"; }
+log "  pipewire pid $pw_before is in the audio tree (sid $leader), not the X session's"
+
+# 2. RECOVERY: the half that had no answer at all before - a daemon dying
+#    alone went unnoticed, because the old bare `wait` only returned once
+#    every daemon had exited. Kill it and require a NEW one, with the
+#    exported socket back: the socket needs the stale file cleared first, or
+#    the restarted daemon cannot re-bind and clients keep getting
+#    ECONNREFUSED against a socket that looks present.
+# As the desktop uid, NOT as container root: CAP_KILL is deliberately
+# dropped from this container (in the host pid namespace it would mean
+# "may signal any process on the host"), so root in here cannot signal the
+# session user's processes at all. desktop-init has the same constraint and
+# solves it the same way, via setpriv. Same-uid signaling needs no capability.
+podman exec -u desktop desktop pkill -u desktop -x pipewire 2>/dev/null || true
+pw_after=""
 for _ in $(seq 30); do
-    seen=$(podman logs desktop 2>&1 | grep -c 'session exited' || true)
-    [ -n "$seen" ] || seen=0
-    [ "$seen" -ge "$target" ] && break
+    pw_after=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
+    [ -n "$pw_after" ] && [ "$pw_after" != "$pw_before" ] && break
+    pw_after=""
     sleep 2
 done
-if [ "$seen" -lt "$target" ]; then
-    # A runner that somehow brought X up is not a failure - it just cannot
-    # prove this property, so say so instead of asserting something else.
-    log "  (no X session restarts observed on this runner; skipping the pid comparison)"
-else
-    pw_after=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
-    [ "$pw_after" = "$pw_before" ] \
-        || { podman logs desktop 2>&1 | tail -40 >&2 || true
-             fail "pipewire pid changed from $pw_before to '$pw_after' across $((seen - restarts_before)) X session restarts: the audio stack is still tied to the session's lifecycle"; }
-    log "  pipewire pid $pw_before unchanged across $((seen - restarts_before)) X session restarts"
-fi
+[ -n "$pw_after" ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "pipewire never came back after being killed (was $pw_before): the audio stack has no supervisor of its own"; }
+sock=0
+for _ in $(seq 30); do
+    [ -S /run/desktop-audio/pulse ] && { sock=1; break; }
+    sleep 2
+done
+[ "$sock" = 1 ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "pipewire restarted as $pw_after but /run/desktop-audio/pulse was not re-exported: stale socket files were not cleared before the restart"; }
+log "  pipewire recovered on its own ($pw_before -> $pw_after) and re-exported its socket"
 
 log "host login session: enabled by the tree, active, real seat bookkeeping"
 # desktop-session.service ships pre-enabled (a .wants symlink the rsync must

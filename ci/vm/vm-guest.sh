@@ -1305,7 +1305,12 @@ verify_audio_lifecycle() {
     # Kill the X server, not the container: the session dies, desktop-init
     # notices and starts a new one. That is the ordinary failure this is
     # about - Xorg crashing - rather than an operator restarting the unit.
-    podman exec desktop pkill -u desktop -x Xorg || true
+    # As the desktop uid, NOT as container root: CAP_KILL is dropped from
+    # this container (in the host pid namespace it would mean "may signal any
+    # process on the host"), so root in here cannot signal the session user's
+    # processes. Xorg runs rootless as 'desktop', and same-uid signaling needs
+    # no capability - the same route desktop-init takes via setpriv.
+    podman exec -u desktop desktop pkill -u desktop -x Xorg || true
     wait_for 45 2 "the X session to come back" session_up
     log al "  the X session restarted"
 
@@ -1321,7 +1326,7 @@ verify_audio_lifecycle() {
     # NEW one, plus a reachable export - which needs the stale socket files
     # cleared, or the restarted daemon cannot re-bind and every client keeps
     # getting ECONNREFUSED against a socket that looks present.
-    podman exec desktop pkill -u desktop -x pipewire || true
+    podman exec -u desktop desktop pkill -u desktop -x pipewire || true
     recovered=""
     for _ in $(seq 30); do
         recovered=$(pipewire_pid)
