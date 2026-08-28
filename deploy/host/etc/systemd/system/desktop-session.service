@@ -21,12 +21,19 @@
 # logind runtime dir and then creates one itself, the same graceful
 # degradation the Host Terminal key uses.
 #
-# Deliberately NOT set: TTYReset/TTYVHangup/TTYVTDisallocate. The old
-# in-container unit had them, but here the tty is shared with the
-# container's Xorg (same underlying VT through the container's own tty1
-# node), and a vhangup on session restart would SIGHUP the X server - the
-# container supervises its own session; this unit only does the
-# bookkeeping.
+# Deliberately NOT set: TTYReset/TTYVHangup/TTYVTDisallocate, and no tty
+# stdio either (StandardInput=null below). The old in-container unit had
+# all of them, but here the tty is SHARED with the container's Xorg, and a
+# VT can be the controlling terminal of exactly one session: with
+# StandardInput=tty-fail, systemd acquired tty1 as THIS unit's ctty and the
+# container's `setsid -c` then failed forever with "failed to set the
+# controlling terminal" - X never came up (the first e2e run of this unit).
+# The container's X session is the rightful ctty holder; this unit only
+# does the bookkeeping, and TTYPath= alone is enough for that: systemd
+# passes it to PAM (exec_context_get_tty_for_pam does not require tty
+# stdio), so logind still registers the session on seat0/tty1 and utmp
+# still names the tty. Likewise a vhangup on session restart would SIGHUP
+# the X server - the container supervises its own session.
 
 [Unit]
 Description=Host login session for the containerized desktop
@@ -41,7 +48,7 @@ After=getty@tty1.service
 User=desktop
 PAMName=login
 TTYPath=/dev/tty1
-StandardInput=tty-fail
+StandardInput=null
 StandardOutput=journal
 StandardError=journal
 UtmpIdentifier=tty1
