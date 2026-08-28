@@ -5,6 +5,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Runnable on a branch without opening a PR. e2e-vm has had this all along;
+  # ci did not, so everything in it - including the quadlet dry-run - could
+  # only be exercised through a PR. That is part of why a dry-run assertion
+  # that had stopped being able to fail sat here undetected: there was no
+  # cheap way to run it against a work-in-progress branch and read the output.
+  workflow_dispatch:
 permissions:
   contents: read
   packages: write
@@ -179,13 +185,27 @@ jobs:
           # The log bound, both halves (see the logging block in the unit).
           echo "$exec_line" | grep -q  -- '--log-driver[= ]k8s-file'
           echo "$exec_line" | grep -q  -- '--log-opt[= ]max-size=64m'
-          echo "$out" | grep -q 'WantedBy=multi-user.target'
-          echo "$out" | grep -q 'Conflicts=getty@tty1.service display-manager.service'
           echo "$exec_line" | grep -q  -- '--device[= ]nvidia.com/gpu=all'
-          echo "$out" | grep -q 'Wants=desktop-seat-prep.service'
-          echo "$out" | grep -q 'Wants=desktop-cdi-refresh.service'
-          echo "$out" | grep -q 'Wants=desktop-client-cdi.service'
-          echo "$out" | grep -q 'Wants=desktop-host-shell.service'
+          # Unit directives, asserted as DIRECTIVES rather than as strings that
+          # appear somewhere. Every one of these also exists verbatim in the
+          # source .container, and quadlet copies the source's comments into
+          # its output - so an unanchored grep cannot distinguish "quadlet
+          # emitted this directive" from "this text is present somewhere". The
+          # ^ anchor excludes comment lines, which always begin with #.
+          #
+          # The value patterns allow other entries on the same line, because
+          # quadlet is free to merge several Wants= into one.
+          have() {
+            echo "$out" | grep -qE "^$1" \
+              || { echo "generated unit is missing directive: $1"; exit 1; }
+          }
+          have 'WantedBy=multi-user\.target'
+          have 'Conflicts=.*getty@tty1\.service'
+          have 'Conflicts=.*display-manager\.service'
+          have 'Wants=.*desktop-seat-prep\.service'
+          have 'Wants=.*desktop-cdi-refresh\.service'
+          have 'Wants=.*desktop-client-cdi\.service'
+          have 'Wants=.*desktop-host-shell\.service'
           # GPU-less runner: the converger must write the stub, and podman
           # must resolve AddDevice against it end-to-end.
           sudo deploy/host/usr/local/libexec/desktop-cdi-refresh
