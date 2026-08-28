@@ -244,8 +244,20 @@ phase_deploy() {
     podman exec desktop test -e /run/user/61000/.host-probe \
         || { rm -f /run/user/61000/.host-probe; fail "host runtime dir does not propagate into the container: the rslave /run/user bind is broken, desktop-init is running on a fabricated dir"; }
     rm -f /run/user/61000/.host-probe
-    podman logs desktop 2>/dev/null | grep -q "runtime dir /run/user/61000 provided by the host login session" \
-        || fail "desktop-init did not adopt the host session's runtime dir (fell back to standalone?)"
+    # Polled, not read once. Every assertion above this one reads LIVE state -
+    # pgrep for Xorg and mwm, loginctl for the session - which is current the
+    # instant it is queried. This one reads a LOG LINE, which has to travel
+    # from desktop-init through the --tty pty and conmon into the k8s-file log
+    # before `podman logs` can see it, and that lag is real: this assertion
+    # failed on main (dc1b3f0) and on this branch with the line already
+    # written, present in the very diagnostic dump the failure handler printed
+    # a moment later. Same wait_for shape as the seat0 check above.
+    #
+    # The meaning is unchanged: the standalone fallback logs a DIFFERENT line
+    # ("no host login session appeared"), so a genuine regression still fails
+    # here - it just takes the timeout to do it instead of failing instantly.
+    wait_for 15 2 "desktop-init to log that it adopted the host session's runtime dir (a standalone fallback never logs this, so a real regression still fails here)" \
+        sh -c "podman logs desktop 2>/dev/null | grep -q 'runtime dir /run/user/61000 provided by the host login session'"
 
     log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
     # This is the path only this phase can prove: sshd reading the key from
