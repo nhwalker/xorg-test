@@ -158,9 +158,15 @@ user's `XDG_RUNTIME_DIR`, launches the session, and restarts it on exit:
   (`setsid -c` for the controlling tty on tty1, `setpriv` for the uid/gid
   switch, an explicit environment in place of PAM's). `start-session`
   launches PipeWire/WirePlumber as plain children and then
-  `startx` → `xinitrc.desktop` → `mwm`. No logind, no seat bookkeeping:
-  the session's observable health IS the session (the e2e asserts mwm
-  running as the session user, where it used to ask loginctl).
+  `startx` → `xinitrc.desktop` → `mwm`.
+- Seat and session **bookkeeping live on the host**: the deploy tree's
+  `desktop-session.service` opens a real PAM/logind login session for the
+  same `desktop` user (fixed uid 61000, one contract between the image and
+  the tree's sysusers.d) on seat0/tty1 — `loginctl` and utmp tell the
+  truth, and logind provides `/run/user/61000`, which reaches the
+  container through the quadlet's rslave `/run/user` bind. desktop-init
+  adopts that dir when present and fabricates one only as a standalone
+  fallback (plain `podman run`, unit disabled).
 - Xorg runs **rootless**, as the `desktop` user (`needs_root_rights = no`
   in `image/xorg/Xwrapper.config`). Device access works by plain group
   permission: `/dev/dri/*` is group `video`, `/dev/input/*` is group
@@ -799,6 +805,7 @@ beyond what virtio emulates.
 systemctl status desktop.service
 podman exec desktop test -f /run/desktop-init-ready && echo booted
 podman exec desktop pgrep -u desktop -x mwm    # the session, in one probe
+loginctl list-sessions                         # desktop on seat0/tty1 (host session)
 podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf   # nvidia vs modesetting
 podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf  # fixed layout, if declared
 DISPLAY=:0 xrandr                              # display up, modes listed
@@ -835,10 +842,11 @@ X needs broad capability because X runs as root. And with systemd gone from
 the image, what is left is smaller still — notably **no `CAP_SYS_ADMIN`**,
 which the systemd-based design could never drop, and **no `CAP_KILL`**, which
 in the host pid namespace would mean "may signal any process on the host"
-(desktop-init signals the session by becoming uid 1000 first via `setpriv`,
-scoped to the session's sid — never to the uid, since without a user
-namespace "uid 1000" includes any host user with that uid; same-uid
-signaling needs no capability).
+(desktop-init signals the session by becoming the desktop uid first via
+`setpriv`, scoped to the session's sid — never to the uid, since without a
+user namespace a uid is host-global; the desktop uid is a fixed 61000,
+matched between the image and the deploy tree's sysusers.d, precisely so it
+never collides with a real host user's).
 
 | Grant | What it is for |
 |---|---|

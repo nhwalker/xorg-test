@@ -1,0 +1,13 @@
+#!/bin/bash
+# The one process inside the host login session desktop-session.service
+# opens (see that unit's header). Everything of value happened before this
+# ran: PAM opened the logind session, pam_systemd mounted /run/user/<uid>,
+# the tty and utmp bookkeeping is done. This process just has to exist for
+# as long as the session should, so it logs what it got and sleeps.
+#
+# exec, so the sleep IS the unit's main process: signals from systemd reach
+# it directly and there is no shell lingering in the session cgroup.
+set -u
+echo "desktop-session: session open as $(id -un) (uid $(id -u))," \
+    "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}, XDG_SESSION_ID=${XDG_SESSION_ID:-unset}"
+exec sleep infinity

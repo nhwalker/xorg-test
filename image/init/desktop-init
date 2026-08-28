@@ -34,7 +34,7 @@
 # CAP_KILL is deliberately NOT granted - in the host pid namespace it would
 # mean "can signal any process on the host" - so this root process cannot
 # signal the desktop user's session directly. Every kill goes through
-# setpriv to uid 1000 first: same-uid signaling needs no capability.
+# setpriv to the desktop uid first: same-uid signaling needs no capability.
 #
 # Test contract (ci/smoke-deploy.sh, ci/vm/vm-guest.sh):
 #   /run/desktop-init.pid    this process's pid, which IS a host pid -
@@ -48,7 +48,12 @@ set -u
 
 log() { echo "desktop-init: $*"; }
 
-DESK_UID=1000
+# 61000: fixed in the image (Containerfile useradd) and in the deploy
+# tree's sysusers.d for the HOST account of the same name - the host's
+# desktop-session.service logs in as it, and this uid must never collide
+# with a real host user's (see session_members below for what a collision
+# cost when this was 1000).
+DESK_UID=61000
 DESK_USER=desktop
 RUNDIR=/run/user/$DESK_UID
 
@@ -65,10 +70,13 @@ shutting_down=0
 session_members() {
     # Every pid in the session's SESSION (setsid made $session_pid a session
     # leader, and the sid survives the leader's death for orphans). NEVER
-    # scope this by uid: in the host pid namespace `pkill -u 1000` reaches
-    # every uid-1000 process ON THE HOST - the first e2e run of this shape
-    # killed the test harness's own ssh session that way (the VM's login
-    # user is uid 1000 too). The session id is unique to our tree; the
+    # scope this by uid: in the host pid namespace a uid-wide pkill reaches
+    # every same-uid process ON THE HOST - when the desktop was still uid
+    # 1000, the first e2e run of this shape killed the test harness's own
+    # ssh session that way (the VM's login user shared the uid). The uid
+    # has since moved to 61000, and the HOST desktop-session.service's lead
+    # process legitimately runs as it - one more process a uid-scoped kill
+    # would wrongly take down. The session id is unique to our tree; the
     # signals still go through setpriv because same-uid needs no capability.
     [ -n "$session_pid" ] || return 0
     ps -eo pid=,sess= | awk -v s="$session_pid" '$2==s{print $1}'
@@ -119,10 +127,27 @@ run_oneshots() {
 }
 
 prepare_runtime() {
-    # What pam_systemd used to do: the session user's runtime dir.
-    mkdir -p "$RUNDIR"
-    chown $DESK_UID:$DESK_UID "$RUNDIR"
-    chmod 700 "$RUNDIR"
+    # The runtime dir. First choice: the real thing - the host's
+    # desktop-session.service opens a PAM/logind session for the desktop
+    # user, logind mounts the per-user tmpfs at /run/user/61000 on the
+    # host, and it reaches this mount namespace through the quadlet's
+    # rslave /run/user bind. The session unit starts AFTER the container
+    # (After=desktop.service), so wait briefly for it. Fallback: fabricate
+    # the dir ourselves, exactly as before - a host without the session
+    # unit (plain podman run, the unit disabled) still gets a working
+    # desktop, just without the seat bookkeeping.
+    for _ in $(seq 30); do
+        [ -d "$RUNDIR" ] && break
+        sleep 0.5
+    done
+    if [ -d "$RUNDIR" ]; then
+        log "runtime dir $RUNDIR provided by the host login session"
+    else
+        log "no host login session appeared; creating $RUNDIR standalone"
+        mkdir -p "$RUNDIR"
+        chown $DESK_UID:$DESK_UID "$RUNDIR"
+        chmod 700 "$RUNDIR"
+    fi
     # Normally the host mount; keep working without it (was tmpfiles.d).
     mkdir -p /run/desktop-audio
     chmod 1777 /run/desktop-audio

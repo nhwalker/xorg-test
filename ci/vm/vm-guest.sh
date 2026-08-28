@@ -227,8 +227,25 @@ phase_deploy() {
         || fail "xdpyinfo could not talk to :0"
     owner=$(podman exec desktop sh -c 'ps -o user= -C Xorg | head -1' || true)
     [ "$owner" = desktop ] || fail "Xorg runs as '${owner:-nobody}', want desktop"
-    # No logind, no seat0 bookkeeping: the session itself is the assertion.
     session_up || fail "mwm not running as the session user"
+
+    log pd "the HOST owns the seat: a real logind session for the desktop user on seat0"
+    # The seat0 assertion the container's logind used to answer, back where
+    # it truthfully lives: desktop-session.service (this tree) opens a
+    # PAM/logind session on the host, pulled up by the quadlet's Wants=.
+    wait_for 15 2 "host login session on seat0" \
+        sh -c "loginctl list-sessions --no-pager | grep -Eq 'desktop +seat0'"
+    [ -d /run/user/61000 ] || fail "logind did not mount /run/user/61000 on the host"
+    # And the runtime dir the container session uses IS that dir, live:
+    # logind mounted it after the container was created, so only the
+    # quadlet's rslave /run/user bind can have carried it inside. Prove the
+    # propagation with a marker rather than trusting mount flags.
+    touch /run/user/61000/.host-probe
+    podman exec desktop test -e /run/user/61000/.host-probe \
+        || { rm -f /run/user/61000/.host-probe; fail "host runtime dir does not propagate into the container: the rslave /run/user bind is broken, desktop-init is running on a fabricated dir"; }
+    rm -f /run/user/61000/.host-probe
+    podman logs desktop 2>/dev/null | grep -q "runtime dir /run/user/61000 provided by the host login session" \
+        || fail "desktop-init did not adopt the host session's runtime dir (fell back to standalone?)"
 
     log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
     # This is the path only this phase can prove: sshd reading the key from
@@ -246,7 +263,7 @@ phase_deploy() {
     echo "$out" | grep -q 'done: 0 FAIL' || fail "preflight did not report 0 FAILs"
 
     log pd "HOST audio: HDA device visible, pulse socket reachable from the host"
-    podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
+    podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop \
         sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
     PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
         || fail "pulse socket unreachable from VM host"
@@ -856,7 +873,7 @@ play_audio() { # $1: pulse | pipewire | alsa (inside the desktop container)
     # reliably reflect the -e command, so the inner script leaves a marker
     # only when the player succeeded.
     podman exec -u desktop -e DISPLAY=:0 -e HOME=/home/desktop \
-        -e XDG_RUNTIME_DIR=/run/user/1000 desktop \
+        -e XDG_RUNTIME_DIR=/run/user/61000 desktop \
         timeout 60 xterm -T "audio-$path" -geometry 80x12+120+320 -e \
         sh -c "$player && touch /tmp/audio-ok" \
         || true
