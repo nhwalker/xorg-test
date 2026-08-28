@@ -321,7 +321,7 @@ assert_nonblank desktop-deploy
 
 log "privileges: the desktop container runs with less than --privileged"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-privileges' \
-    || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop grep -E "^(Cap|Seccomp)" /proc/1/status' \
+    || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop sh -c "grep -E \"^(Cap|Seccomp)\" /proc/\$(cat /run/desktop-init.pid)/status"' \
          2>&1 | tee "$ART/privileges-fail.log" || true; fail "privilege assertions failed"; }
 
 log "logging: both log sinks are bounded, on the running container"

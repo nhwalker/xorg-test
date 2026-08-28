@@ -1321,13 +1321,18 @@ verify_privileges() {
     # the only one nothing else here would notice: a writable /sys is how a
     # container reaches host tunables (sysfs writes to kernel objects it does
     # not own), and the desktop never needs it - Xorg reads DRM through
-    # /dev/dri, not through sysfs writes. podman keeps /sys/fs/cgroup writable
-    # for systemd, which is why this checks the /sys mount itself rather than
-    # probing an arbitrary path underneath it.
+    # /dev/dri, not through sysfs writes. The quadlet's Mount= makes /sys a
+    # NON-recursive ro bind, so there is no /sys/fs/cgroup (or any other
+    # host sysfs submount) in the container at all; the mount itself is the
+    # thing to check. Read it from the container's OWN mount namespace: under
+    # --pid=host, /proc/1/mounts is the HOST's mount table (whose /sys is
+    # legitimately rw) - reading it here failed this assertion for two runs
+    # while the container's /sys was already ro, which the in-container
+    # preflight had been reporting all along.
     log vp "/sys is read-only"
-    sysopts=$(podman exec desktop sh -c "awk '\$2==\"/sys\"{print \$4}' /proc/1/mounts" 2>/dev/null || true)
+    sysopts=$(podman exec desktop sh -c 'awk "\$2==\"/sys\"{print \$4}" "/proc/$(cat /run/desktop-init.pid)/mounts"' 2>/dev/null || true)
     [ -n "$sysopts" ] \
-        || fail "could not read the container's /sys mount options from /proc/1/mounts"
+        || fail "could not read the container's /sys mount options from the init process's mount table"
     case ",$sysopts," in
         *,ro,*) log vp "  /sys mounted ro ($sysopts)" ;;
         *) fail "/sys is mounted '$sysopts', want ro - a writable /sys is one of the six grants --privileged bundles and nothing here needs it" ;;
