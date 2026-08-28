@@ -187,6 +187,14 @@ systemctl daemon-reload
 systemd-sysusers
 systemd-tmpfiles --create || true   # unrelated runner entries may fail; ours asserted below
 [ -d /run/desktop-audio ] && [ -d /tmp/.X11-unix ] || fail "tmpfiles dirs missing"
+# /dev/snd is a bind mount now, not an AddDevice=, so it must EXIST or podman
+# refuses to create the container at all ("statfs /dev/snd: no such file or
+# directory") - there is no optional marker for Volume= the way AddDevice= has
+# its '-' prefix. This runner has no sound card, which makes it precisely the
+# host class that would break, and the container coming up below is the real
+# assertion; this one just names the cause if it does not.
+[ -d /dev/snd ] \
+    || fail "/dev/snd does not exist after tmpfiles: the quadlet's Volume=/dev/snd will fail container creation on any host without a sound card"
 [ -d "$TOOLS_BIN" ] || fail "toolkit dir $TOOLS_BIN not created by tmpfiles"
 # 0755, not the 1777 the two socket dirs use. This directory holds executables
 # that get mounted into every client, so world-writable would let anything on
@@ -288,6 +296,73 @@ for _ in $(seq 40); do
     sleep 3
 done
 [ "$up" = 1 ] || fail "desktop-init never wrote /run/desktop-init-ready"
+
+log "audio stack is supervised independently of the X session"
+# Two deterministic checks, neither of which needs an X server - which
+# matters, because this runner has no KMS and, as the first run of this
+# assertion showed, its X session does NOT crash-loop the way I assumed.
+# An earlier version of this waited for spontaneous session restarts and
+# skipped itself when none came, which is a test that never tests anything.
+#
+# The e2e proves the X-restart half properly, against a real Xorg it can
+# kill (verify-audio-lifecycle). What is provable HERE, on a machine with
+# neither a GPU nor a sound card, is the structure and the recovery.
+pw_before=""
+for _ in $(seq 30); do
+    pw_before=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
+    [ -n "$pw_before" ] && break
+    sleep 2
+done
+[ -n "$pw_before" ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "no pipewire process in the container: the audio stack never started (it no longer waits on X, so a GPU-less host is not an excuse)"; }
+
+# 1. STRUCTURE: PipeWire must live in the audio tree's own process session,
+#    not the X session's. That is the whole change, and it is a property of
+#    the running system rather than of a restart having happened - so it is
+#    checkable at any moment, on any host. desktop-init records the audio
+#    tree's leader pid precisely because its supervisor is a separate
+#    process; the sid of PipeWire must be that pid.
+leader=$(podman exec desktop cat /run/desktop-audio-leader.pid 2>/dev/null || true)
+[ -n "$leader" ] \
+    || fail "no /run/desktop-audio-leader.pid: desktop-init never launched the audio tree through supervise_audio"
+pw_sid=$(podman exec desktop sh -c "ps -o sess= -p $pw_before 2>/dev/null | tr -d ' '" 2>/dev/null || true)
+[ "$pw_sid" = "$leader" ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "pipewire (pid $pw_before) has sid '$pw_sid', want the audio leader $leader: the audio stack is not in its own process session, so stopping the X session would kill it"; }
+log "  pipewire pid $pw_before is in the audio tree (sid $leader), not the X session's"
+
+# 2. RECOVERY: the half that had no answer at all before - a daemon dying
+#    alone went unnoticed, because the old bare `wait` only returned once
+#    every daemon had exited. Kill it and require a NEW one, with the
+#    exported socket back: the socket needs the stale file cleared first, or
+#    the restarted daemon cannot re-bind and clients keep getting
+#    ECONNREFUSED against a socket that looks present.
+# As the desktop uid, NOT as container root: CAP_KILL is deliberately
+# dropped from this container (in the host pid namespace it would mean
+# "may signal any process on the host"), so root in here cannot signal the
+# session user's processes at all. desktop-init has the same constraint and
+# solves it the same way, via setpriv. Same-uid signaling needs no capability.
+podman exec -u desktop desktop pkill -u desktop -x pipewire 2>/dev/null || true
+pw_after=""
+for _ in $(seq 30); do
+    pw_after=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
+    [ -n "$pw_after" ] && [ "$pw_after" != "$pw_before" ] && break
+    pw_after=""
+    sleep 2
+done
+[ -n "$pw_after" ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "pipewire never came back after being killed (was $pw_before): the audio stack has no supervisor of its own"; }
+sock=0
+for _ in $(seq 30); do
+    [ -S /run/desktop-audio/pulse ] && { sock=1; break; }
+    sleep 2
+done
+[ "$sock" = 1 ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "pipewire restarted as $pw_after but /run/desktop-audio/pulse was not re-exported: stale socket files were not cleared before the restart"; }
+log "  pipewire recovered on its own ($pw_before -> $pw_after) and re-exported its socket"
 
 log "host login session: enabled by the tree, active, real seat bookkeeping"
 # desktop-session.service ships pre-enabled (a .wants symlink the rsync must

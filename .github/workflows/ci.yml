@@ -52,7 +52,8 @@ jobs:
           shellcheck --version
           shellcheck -S error ci/*.sh ci/vm/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
-            image/session/start-session image/session/session-postmortem \
+            image/session/start-session image/session/start-audio \
+            image/session/session-postmortem image/init/desktop-init \
             image/session/host-terminal image/tools/publish-tools.sh \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
             deploy/host/usr/local/libexec/desktop-client-cdi \

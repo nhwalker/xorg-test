@@ -58,6 +58,15 @@ hotplug_probe() {
     read -r nodes adds <<<"$out"
     echo "${nodes:-0} ${adds:-0}"
 }
+# snd_probe echoes "<container ALSA control nodes> <WirePlumber alsa devices>",
+# always as two integers, for the same reason and with the same defaulting as
+# hotplug_probe above.
+snd_probe() {
+    local out nodes devs
+    out=$(vm_ssh_quick 'sudo repo/ci/vm/vm-guest.sh snd-probe' 2>/dev/null || true)
+    read -r nodes devs <<<"$out"
+    echo "${nodes:-0} ${devs:-0}"
+}
 screendump() {
     # -f png needs QEMU >= 7.1. Monitor errors are invisible (socat output
     # is discarded), so check the file materialized and fall back to the
@@ -347,6 +356,14 @@ for path in pulse pipewire alsa; do
         || fail "$path audio capture is empty or silent"
 done
 
+log "audio lifecycle: independent of the X session, and recovers on its own"
+# Deliberately AFTER the three tone tests: they establish that a healthy
+# stack works, and this one then kills things. It restarts the X session
+# and PipeWire, so anything ordered after it must not assume either kept
+# its pid - the input tests below re-establish their own state anyway.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-audio-lifecycle' \
+    || fail "audio lifecycle assertions failed"
+
 log "input: type into an xterm with the real virtual keyboard, verify the app got it"
 # Prove the whole input path (QEMU HID -> evdev -> Xorg -> focused app), not
 # just that a device enumerates. A sink xterm runs `read`; we click it to
@@ -466,6 +483,79 @@ printf 'hotplug-add     host %s -> %s / container-nodes %s -> %s / xorg-adds %s 
 printf 'kvm-cycle       host %s -> %s -> %s / container-nodes %s -> %s -> %s\n' \
     "$kvm_base_host" "$kvm_off_host" "$kvm_on_host" \
     "$kvm_base_nodes" "$kvm_off_nodes" "$kvm_on_nodes" >> "$ART/xorg-input-count.txt"
+
+log "audio hotplug: plug and unplug a USB sound card while the desktop runs"
+# The same test as the KVM input cycle, on the other cable. /dev/snd was an
+# AddDevice= - a creation-time snapshot - so a USB headset, DAC or dock
+# connected after boot never produced a controlC* inside the container and
+# never reached WirePlumber, until desktop.service restarted. It is a bind
+# mount now, and this is what says so.
+#
+# usb-audio on the xHCI controller the KVM keyboard already uses: USB because
+# that is what the real device is, and because PCI hot-unplug waits on a guest
+# acknowledgement a busy device may never send. No boot-line change - the
+# controller is already there, and the card is added only here so the "before"
+# state is a machine that genuinely lacks it.
+#
+# Asserted in BOTH directions, like the input cycle: a node that never
+# disappears is exactly what a snapshot /dev looks like, and it would let the
+# add half pass for the wrong reason.
+read -r snd_base_nodes snd_base_devs <<<"$(snd_probe)"
+snd_base_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
+log "  base:      host=$snd_base_host container-nodes=$snd_base_nodes wireplumber-devices=$snd_base_devs"
+
+mon_cmd "device_add usb-audio,id=hotsnd,audiodev=snd0,bus=xhci.0"
+snd_on_host=$snd_base_host snd_on_nodes=$snd_base_nodes snd_on_devs=$snd_base_devs
+for _ in $(seq 30); do
+    snd_on_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
+    read -r snd_on_nodes snd_on_devs <<<"$(snd_probe)"
+    [ "$snd_on_host" -gt "$snd_base_host" ] && [ "$snd_on_nodes" -gt "$snd_base_nodes" ] \
+        && [ "$snd_on_devs" -gt "$snd_base_devs" ] && break
+    sleep 1
+done
+log "  plugged in: host=$snd_on_host container-nodes=$snd_on_nodes wireplumber-devices=$snd_on_devs"
+[ "$snd_on_host" -gt "$snd_base_host" ] \
+    || fail "device_add usb-audio did not create a card on the VM host ($snd_base_host -> $snd_on_host): QEMU never attached it, so nothing below means anything"
+[ "$snd_on_nodes" -gt "$snd_base_nodes" ] \
+    || fail "the hot-added sound card never reached the container ($snd_base_nodes -> $snd_on_nodes): its /dev/snd is a stale snapshot, so a USB headset plugged in after boot stays invisible until desktop.service restarts"
+[ "$snd_on_devs" -gt "$snd_base_devs" ] \
+    || fail "the container has the new /dev/snd node but WirePlumber never added a device ($snd_base_devs -> $snd_on_devs): the node arrived and the uevent did not (Network=host), or the session user cannot open it (audio gid alignment)"
+
+mon_cmd "device_del hotsnd"
+snd_off_host=$snd_on_host snd_off_nodes=$snd_on_nodes snd_off_devs=$snd_on_devs
+for _ in $(seq 30); do
+    snd_off_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
+    read -r snd_off_nodes snd_off_devs <<<"$(snd_probe)"
+    # Wait for the WirePlumber count to settle back too, not just the nodes:
+    # the tone check below needs a default sink, and WirePlumber has to pick
+    # one again after the card it may have switched to disappeared.
+    [ "$snd_off_host" -lt "$snd_on_host" ] && [ "$snd_off_nodes" -lt "$snd_on_nodes" ] \
+        && [ "$snd_off_devs" -le "$snd_base_devs" ] && break
+    sleep 1
+done
+log "  unplugged: host=$snd_off_host container-nodes=$snd_off_nodes wireplumber-devices=$snd_off_devs"
+[ "$snd_off_host" -lt "$snd_on_host" ] \
+    || fail "device_del hotsnd did not remove the card on the VM host ($snd_on_host -> $snd_off_host)"
+[ "$snd_off_nodes" -lt "$snd_on_nodes" ] \
+    || fail "the container still sees the removed sound card ($snd_on_nodes -> $snd_off_nodes): its /dev/snd is a stale snapshot, and the add half above passed for the wrong reason"
+[ "$snd_off_devs" -le "$snd_base_devs" ] \
+    || fail "WirePlumber still lists $snd_off_devs alsa devices after the card was unplugged (baseline $snd_base_devs): the node went away but the graph kept a phantom device"
+
+# Health after the cycle, the audio counterpart of the input-sink check: the
+# built-in card must still play. A remove/re-add that wedges WirePlumber is
+# the other way this could ruin the desktop.
+audio_capture_start "audio-after-hotplug"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio pulse' \
+    || { audio_capture_stop; fail "audio stopped working after a sound-card hotplug cycle"; }
+audio_capture_stop
+python3 check-audio.py "$ART/audio-after-hotplug.wav" 1 0.05 "$(freq_for pulse)" \
+    || fail "audio is silent after a sound-card hotplug cycle"
+log "  the built-in card still plays after a full plug/unplug cycle"
+
+printf 'snd-hotplug     host %s -> %s -> %s / container-nodes %s -> %s -> %s / wp-devices %s -> %s -> %s\n' \
+    "$snd_base_host" "$snd_on_host" "$snd_off_host" \
+    "$snd_base_nodes" "$snd_on_nodes" "$snd_off_nodes" \
+    "$snd_base_devs" "$snd_on_devs" "$snd_off_devs" >> "$ART/xorg-input-count.txt"
 
 log "phase 2: k3s + a cdi-device-plugin release per capability, desktop still on the quadlet"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \

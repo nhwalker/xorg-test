@@ -244,8 +244,20 @@ phase_deploy() {
     podman exec desktop test -e /run/user/61000/.host-probe \
         || { rm -f /run/user/61000/.host-probe; fail "host runtime dir does not propagate into the container: the rslave /run/user bind is broken, desktop-init is running on a fabricated dir"; }
     rm -f /run/user/61000/.host-probe
-    podman logs desktop 2>/dev/null | grep -q "runtime dir /run/user/61000 provided by the host login session" \
-        || fail "desktop-init did not adopt the host session's runtime dir (fell back to standalone?)"
+    # Polled, not read once. Every assertion above this one reads LIVE state -
+    # pgrep for Xorg and mwm, loginctl for the session - which is current the
+    # instant it is queried. This one reads a LOG LINE, which has to travel
+    # from desktop-init through the --tty pty and conmon into the k8s-file log
+    # before `podman logs` can see it, and that lag is real: this assertion
+    # failed on main (dc1b3f0) and on this branch with the line already
+    # written, present in the very diagnostic dump the failure handler printed
+    # a moment later. Same wait_for shape as the seat0 check above.
+    #
+    # The meaning is unchanged: the standalone fallback logs a DIFFERENT line
+    # ("no host login session appeared"), so a genuine regression still fails
+    # here - it just takes the timeout to do it instead of failing instantly.
+    wait_for 15 2 "desktop-init to log that it adopted the host session's runtime dir (a standalone fallback never logs this, so a real regression still fails here)" \
+        sh -c "podman logs desktop 2>/dev/null | grep -q 'runtime dir /run/user/61000 provided by the host login session'"
 
     log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
     # This is the path only this phase can prove: sshd reading the key from
@@ -1265,6 +1277,93 @@ verify_log_bounds() {
     log lb "verify-log-bounds passed"
 }
 
+pipewire_pid() { podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true; }
+pipewire_running() { [ -n "$(pipewire_pid)" ]; }
+
+audio_reachable() {
+    # The exported Pulse socket, from the HOST - the same probe phase-deploy
+    # uses for host audio. "PipeWire is running" and "clients can reach the
+    # export" are different claims, and a restart that leaves a stale socket
+    # behind satisfies the first while breaking the second (PipeWire will not
+    # re-bind over a leftover file), which is precisely the regression the
+    # per-restart socket clearing exists to prevent.
+    PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 20 pactl info >/dev/null 2>&1
+}
+
+verify_audio_lifecycle() {
+    # The audio stack and the X session are supervised separately, and this
+    # is the only test that can tell. Every other audio test here plays a
+    # tone through a healthy stack, which passes identically whether the two
+    # share a lifecycle or not.
+    #
+    # Two directions, and they used to fail differently:
+    #
+    #   X dies    -> the audio daemons were children of the X session, so
+    #                desktop-init's sid-scoped cleanup killed them with it and
+    #                every audio client on the host or in another pod got
+    #                ECONNREFUSED until the session came back.
+    #   audio dies-> nothing at all happened. The old start-session ended in a
+    #                bare `wait`, which returns only once ALL its children have
+    #                exited, so one dead daemon went unnoticed and the stack
+    #                stayed down - with a stale socket - until Xorg happened to
+    #                exit. There was no recovery path to test.
+    log al "audio survives an X session restart"
+    wait_for 30 2 "pipewire to be running" pipewire_running
+    pw_before=$(pipewire_pid)
+    [ -n "$pw_before" ] || fail "no pipewire process to start from"
+    audio_reachable || fail "audio was not reachable before the test even began"
+    session_up || fail "no X session to restart"
+
+    # Kill the X server, not the container: the session dies, desktop-init
+    # notices and starts a new one. That is the ordinary failure this is
+    # about - Xorg crashing - rather than an operator restarting the unit.
+    # As the desktop uid, NOT as container root: CAP_KILL is dropped from
+    # this container (in the host pid namespace it would mean "may signal any
+    # process on the host"), so root in here cannot signal the session user's
+    # processes. Xorg runs rootless as 'desktop', and same-uid signaling needs
+    # no capability - the same route desktop-init takes via setpriv.
+    podman exec -u desktop desktop pkill -u desktop -x Xorg || true
+    wait_for 45 2 "the X session to come back" session_up
+    log al "  the X session restarted"
+
+    pw_after=$(pipewire_pid)
+    [ "$pw_after" = "$pw_before" ] \
+        || fail "pipewire pid changed from $pw_before to '$pw_after' across an X session restart: the audio stack is still in the X session's process session and gets killed with it"
+    audio_reachable \
+        || fail "the exported pulse socket is unreachable after an X session restart, though pipewire kept its pid"
+    log al "  pipewire pid $pw_before unchanged, export still reachable"
+
+    log al "audio recovers from its own crash"
+    # The half that had no answer at all before: kill PipeWire and require a
+    # NEW one, plus a reachable export - which needs the stale socket files
+    # cleared, or the restarted daemon cannot re-bind and every client keeps
+    # getting ECONNREFUSED against a socket that looks present.
+    podman exec -u desktop desktop pkill -u desktop -x pipewire || true
+    recovered=""
+    for _ in $(seq 30); do
+        recovered=$(pipewire_pid)
+        [ -n "$recovered" ] && [ "$recovered" != "$pw_before" ] && break
+        recovered=""
+        sleep 2
+    done
+    [ -n "$recovered" ] \
+        || fail "pipewire never came back after being killed (was $pw_before): the audio stack has no supervisor of its own"
+    log al "  pipewire restarted as pid $recovered"
+
+    # wait_for fails the run on timeout, so the reason goes in the description.
+    wait_for 30 2 \
+        "the exported audio socket to be reachable again after a pipewire restart (stale socket files not cleared before the restart?)" \
+        audio_reachable
+
+    # And the session must not have been collateral damage in the other
+    # direction either - killing audio must not disturb X.
+    session_up \
+        || fail "the X session died when the audio stack was killed: the two are still coupled, in the other direction"
+    log al "  the X session was undisturbed"
+
+    log al "verify-audio-lifecycle passed"
+}
+
 verify_privileges() {
     # The container must be running with LESS than --privileged, and stay that
     # way. Without this, restoring --privileged would be invisible: everything
@@ -1462,6 +1561,34 @@ hotplug_probe() {
     [ -n "${nodes:-}" ] || nodes=0
     [ -n "${adds:-}" ] || adds=0
     echo "$nodes $adds"
+}
+
+snd_probe() {
+    # Two numbers on one line, for the host to diff across a QEMU
+    # device_add of a usb-audio - the audio counterpart of hotplug_probe:
+    #   1. ALSA card control NODES visible inside the container
+    #   2. audio devices WirePlumber has actually picked up
+    #
+    # Both matter, and they fail differently. The node not appearing means
+    # the container's /dev/snd is not a live view of the host's - which is
+    # exactly what it was before it became a bind mount, and the bug this
+    # probe exists to catch. The node appearing but WirePlumber not adding a
+    # device means the uevent did not reach it, which is what Network=host
+    # is for. Reporting one number could not tell those apart.
+    local nodes devs
+    nodes=$(podman exec desktop sh -c 'ls -1 /dev/snd/controlC* 2>/dev/null | wc -l' 2>/dev/null || echo 0)
+    # Count PipeWire Device objects named alsa_card.*, via pw-cli rather than
+    # `wpctl status`: wpctl prints friendly DESCRIPTIONS ("Built-in Audio"),
+    # so there is no stable string to count, while pw-cli prints the object's
+    # device.name. Devices only - wpctl's sinks/sources/streams are derived
+    # from them and move for reasons unrelated to hotplug. The session user's
+    # runtime dir has to be stated: `podman exec` inherits the container
+    # init's environment, not the session's.
+    devs=$(podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop \
+        desktop sh -c 'pw-cli ls Device 2>/dev/null | grep -c "device.name = \"alsa_card"' 2>/dev/null || true)
+    [ -n "${nodes:-}" ] || nodes=0
+    [ -n "${devs:-}" ] || devs=0
+    echo "$nodes $devs"
 }
 
 input_sink_start() {
@@ -1683,7 +1810,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|hotplug-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -1700,7 +1827,9 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|hotplug-pro
     verify-privileges) verify_privileges ;;
     verify-pod-identity) verify_pod_identity ;;
     verify-log-bounds) verify_log_bounds ;;
+    verify-audio-lifecycle) verify_audio_lifecycle ;;
     hotplug-probe) hotplug_probe ;;
+    snd-probe) snd_probe ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
     *) fail "unknown phase $1" ;;

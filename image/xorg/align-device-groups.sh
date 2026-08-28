@@ -10,6 +10,18 @@
 #
 # Runs as root from desktop-init, before the session starts (supplementary groups are picked up at session start).
 # Never chmod/chown the nodes themselves: /dev is the host's.
+#
+# Usage: align-device-groups.sh [group...]
+#   no arguments   all four groups (video render input audio) - the boot path
+#   group names    just those, e.g. `align-device-groups.sh audio`
+#
+# The narrow form exists for desktop-init's audio supervisor, which
+# re-aligns before every audio start: /dev/snd is a live bind mount, so a
+# sound card can appear long after boot, and on a host that booted without
+# one the boot-time pass had no node to measure and left the container's
+# audio gid at its image value. Re-running the WHOLE alignment there would
+# renumber video/input/render groups the running X session is already
+# using, to no purpose - hence the argument.
 set -u
 
 log() { echo "align-device-groups: $*"; }
@@ -54,10 +66,32 @@ align() {
     groupmod -g "$gid" "$group"
 }
 
-align video  /dev/dri/card*
-align render /dev/dri/renderD*
-align input  /dev/input/event*
-align audio  /dev/snd/controlC*
+# The node globs for each group, in one place so align and summary cannot
+# drift apart.
+nodes_for() { # $1: group
+    case "$1" in
+        video)  echo "/dev/dri/card*" ;;
+        render) echo "/dev/dri/renderD*" ;;
+        input)  echo "/dev/input/event*" ;;
+        audio)  echo "/dev/snd/controlC*" ;;
+        *)      echo "" ;;
+    esac
+}
+
+groups=("$@")
+[ ${#groups[@]} -gt 0 ] || groups=(video render input audio)
+
+for g in "${groups[@]}"; do
+    n=$(nodes_for "$g")
+    if [ -z "$n" ]; then
+        log "unknown group '$g'; known: video render input audio"
+        continue
+    fi
+    # Unquoted on purpose: these are globs, and align() takes the expansion
+    # as its candidate node list.
+    # shellcheck disable=SC2086
+    align "$g" $n
+done
 
 # Always log the final state, changes or not: "alignment ran but access
 # still fails" should be debuggable from this table alone.
@@ -75,10 +109,12 @@ summary() {
     fi
 }
 log "final state:"
-summary video  /dev/dri/card*
-summary render /dev/dri/renderD*
-summary input  /dev/input/event*
-summary audio  /dev/snd/controlC*
+for g in "${groups[@]}"; do
+    n=$(nodes_for "$g")
+    [ -n "$n" ] || continue
+    # shellcheck disable=SC2086
+    summary "$g" $n
+done
 log "desktop user: $(id desktop)"
 
 exit 0
