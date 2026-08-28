@@ -36,7 +36,7 @@
 # generated file is removed, and Xorg autodetects exactly as before. It is
 # opt-in per host because only the operator knows the layout.
 #
-# Runs from xorg-conf.service, AFTER xorg-gpu-conf.sh: the Screen section
+# Runs from desktop-init, AFTER xorg-gpu-conf.sh: the Screen section
 # below references that script's Device section by identifier, and what has
 # to be written differs by driver (see "two drivers, two mechanisms").
 set -u

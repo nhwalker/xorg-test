@@ -1,0 +1,164 @@
+#!/bin/bash
+# Container entrypoint: a small supervisor replacing systemd as this
+# container's init.
+#
+# Why no systemd: the quadlet runs this container in the HOST's PID
+# namespace (--pid=host) so that Xorg's own SO_PEERCRED sees real host
+# PIDs and the X-Resource extension can attribute every X client to the
+# k8s pod that owns it (/proc/<pid>/cgroup carries the pod UID; /proc
+# inside this container IS the host's proc). systemd as a system manager
+# refuses to run unless it is PID 1 of its namespace, and in the host
+# namespace the host's systemd already is - so the two are mutually
+# exclusive, and window-to-pod identity is what this image exists for.
+#
+# What systemd used to provide here, and where each duty went:
+#   oneshots (xorg-conf.service)        -> run_oneshots() below, same order
+#   PAM/logind session + user manager   -> run_session(): setpriv to the
+#                                          desktop user, XDG_RUNTIME_DIR
+#                                          created by hand; no seat, no utmp
+#   PipeWire user units                 -> started by start-session directly;
+#                                          the quadlet's --ulimit now reaches
+#                                          them VERBATIM (no more
+#                                          DefaultLimit* relay - that whole
+#                                          class of bug is gone)
+#   journald + journal-console.service  -> nothing: children inherit this
+#                                          process's stdout, which podman's
+#                                          --tty wires to /dev/console, so
+#                                          `podman logs` sees everything with
+#                                          no forwarder and no journal to
+#                                          bound
+#   Restart=always / ExecStopPost       -> the supervise loop + postmortem
+#                                          call at the bottom
+#
+# Signals: podman stop sends SIGTERM (STOPSIGNAL in the Containerfile).
+# CAP_KILL is deliberately NOT granted - in the host pid namespace it would
+# mean "can signal any process on the host" - so this root process cannot
+# signal the desktop user's session directly. Every kill goes through
+# setpriv to uid 1000 first: same-uid signaling needs no capability.
+#
+# Test contract (ci/smoke-deploy.sh, ci/vm/vm-guest.sh):
+#   /run/desktop-init.pid    this process's pid, which IS a host pid -
+#                            the replacement for every /proc/1/... probe
+#   /run/desktop-init-ready  written once the oneshots have run and the
+#                            session has been launched (the replacement for
+#                            `systemctl is-system-running`); the session
+#                            itself may still fail on a GPU-less host, which
+#                            the ready file deliberately does not gate on
+set -u
+
+log() { echo "desktop-init: $*"; }
+
+DESK_UID=1000
+DESK_USER=desktop
+RUNDIR=/run/user/$DESK_UID
+
+as_desktop() {
+    # Same-uid operations for the session user; used for signaling (see the
+    # CAP_KILL note above) and cleanup. --init-groups picks up the aligned
+    # device groups, which matters for the session itself, not for kill.
+    setpriv --reuid=$DESK_UID --regid=$DESK_UID --init-groups "$@"
+}
+
+session_pid=""
+shutting_down=0
+
+stop_session() {
+    # TERM the user's whole process tree, uid-scoped, then KILL stragglers.
+    # pkill -u from uid 1000 cannot touch anything outside the session:
+    # every other process this container can see belongs to other uids or
+    # to root, and same-uid is the only signaling power the session has.
+    as_desktop pkill -TERM -u $DESK_UID 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        as_desktop pgrep -u $DESK_UID >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    as_desktop pkill -KILL -u $DESK_UID 2>/dev/null || true
+}
+
+on_term() {
+    log "SIGTERM: stopping session"
+    shutting_down=1
+    stop_session
+    exit 0
+}
+trap on_term TERM INT
+
+echo $$ > /run/desktop-init.pid
+
+run_oneshots() {
+    # Same content and order as the old xorg-conf.service +
+    # desktop-tools-publish.service. "|| true" mirrors the units' "-"
+    # prefixes: diagnostics log but never block the session.
+    /usr/local/bin/ensure-vt-devices.sh || true
+    /usr/local/bin/align-device-groups.sh || true
+    /usr/local/bin/host-shell-setup.sh || true
+    /usr/local/bin/preflight-check.sh || true
+    /usr/local/bin/xorg-gpu-conf.sh \
+        || log "xorg-gpu-conf failed; session will try autodetection"
+    /usr/local/bin/xorg-monitor-conf.sh || true
+    # Publish failure must be loud (clients would get a missing/stale
+    # toolkit) but must not take the display down with it.
+    /usr/local/bin/publish-tools.sh \
+        || log "ERROR: publish-tools failed; desktop.local/tools clients get a stale or empty toolkit"
+}
+
+prepare_runtime() {
+    # What pam_systemd used to do: the session user's runtime dir.
+    mkdir -p "$RUNDIR"
+    chown $DESK_UID:$DESK_UID "$RUNDIR"
+    chmod 700 "$RUNDIR"
+    # Normally the host mount; keep working without it (was tmpfiles.d).
+    mkdir -p /run/desktop-audio
+    chmod 1777 /run/desktop-audio
+    # The session owns the VT (systemd's TTYPath= used to chown this).
+    [ -c /dev/tty1 ] && chown $DESK_UID:tty /dev/tty1 || true
+}
+
+clear_stale_audio_sockets() {
+    # PipeWire will NOT re-bind over a leftover socket file, and the export
+    # dir is host-shared, so sockets survive session AND container restarts
+    # as present-but-dead files; every audio client then gets ECONNREFUSED.
+    # Ran once per boot under systemd; per session iteration here, because
+    # the audio daemons now live and die with the session.
+    rm -f /run/desktop-audio/pulse /run/desktop-audio/pipewire-0 \
+        /run/desktop-audio/pipewire-0-manager /run/desktop-audio/pipewire-0.lock \
+        /run/desktop-audio/pipewire-0-manager.lock
+}
+
+run_session() {
+    # setsid -c: fresh session with fd 0's tty (tty1) as controlling tty -
+    # what StandardInput=tty used to arrange, and what lets Xorg -keeptty
+    # take the VT. env -i: no PAM to build the environment, so state it.
+    setsid -c env -i \
+        HOME=/home/$DESK_USER USER=$DESK_USER LOGNAME=$DESK_USER \
+        SHELL=/bin/bash PATH=/usr/local/bin:/usr/bin:/usr/sbin \
+        XDG_RUNTIME_DIR="$RUNDIR" XDG_SESSION_TYPE=x11 \
+        DESKTOP_VT=vt1 DESKTOP_DISPLAY=:0 \
+        setpriv --reuid=$DESK_UID --regid=$DESK_UID --init-groups \
+        /usr/local/bin/start-session < /dev/tty1 &
+    session_pid=$!
+    wait "$session_pid"
+}
+
+log "starting (host pid $$)"
+run_oneshots
+prepare_runtime
+touch /run/desktop-init-ready
+log "oneshots done; supervising session (restart on exit, 3s backoff)"
+
+while :; do
+    clear_stale_audio_sockets
+    [ -c /dev/tty1 ] && chown $DESK_UID:tty /dev/tty1 || true
+    run_session
+    rc=$?
+    [ "$shutting_down" = 1 ] && exit 0
+    # Orphans from the dead session (audio daemons, xterm) must not
+    # survive into the next iteration or PipeWire cannot re-bind.
+    stop_session
+    if [ "$rc" != 0 ]; then
+        SERVICE_RESULT=exit-code EXIT_CODE=exited EXIT_STATUS=$rc \
+            /usr/local/bin/session-postmortem || true
+    fi
+    log "session exited (rc=$rc); restarting in 3s"
+    sleep 3
+done

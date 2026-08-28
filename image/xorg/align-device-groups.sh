@@ -8,8 +8,7 @@
 # not match. Renumber the container's groups to the gids actually on the
 # nodes, so the rootless session user's memberships grant device access.
 #
-# Runs as root from xorg-conf.service, before desktop-session.service
-# starts (supplementary groups are picked up at session start).
+# Runs as root from desktop-init, before the session starts (supplementary groups are picked up at session start).
 # Never chmod/chown the nodes themselves: /dev is the host's.
 set -u
 

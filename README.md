@@ -1,10 +1,12 @@
 # Containerized desktop: UBI9 + Xorg + mwm + PipeWire
 
-Replaces a bare-metal desktop install with a container. The container runs a
-full systemd (PID 1) with its own `systemd-logind` seat, an Xorg server on the
-host's tty1/GPU/input devices, the Motif window manager (`mwm`), and a
-PipeWire audio stack whose sockets are shared with the host and other
-containers.
+Replaces a bare-metal desktop install with a container. The container runs in
+the **host PID namespace** under a small init script (`desktop-init` — no
+systemd inside), an Xorg server on the host's tty1/GPU/input devices, the
+Motif window manager (`mwm`), and a PipeWire audio stack whose sockets are
+shared with the host and other containers. The host pid namespace is a
+feature, not a shortcut: it is what lets every X client be attributed to the
+k8s pod that owns it (see "Window-to-pod identity" below).
 
 Works in two modes:
 
@@ -39,7 +41,7 @@ deploy/                     the deployment: host end state as plain files
 image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
-  systemd/                  xorg-conf.service, desktop-session.service, drop-ins
+  init/                     desktop-init: the container entrypoint/supervisor
   session/                  start-session, xinitrc.desktop, mwmrc, Xdefaults
   pipewire/                 socket-export config drop-ins
 ```
@@ -54,7 +56,7 @@ The desktop image is built in two stages with separate Containerfiles:
   or for security updates.
 - **`Containerfile`** → `desktop-container` — pure application logic and
   configuration on top (`FROM` the base via the `BASE_IMAGE` build arg):
-  scripts, systemd units, user creation, config patches. It is built with
+  scripts, the init supervisor, user creation, config patches. It is built with
   **`--network=none`**, which both proves and enforces that config
   iteration works completely offline:
 
@@ -120,7 +122,8 @@ Seat handover — the host must stop claiming the devices the container needs:
    `/etc/udev/rules.d/72-seat-*.rules` (created by `loginctl attach`) and
    re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems so all
    devices fall back to default `seat0` tagging (custom multi-seat splits
-   would otherwise hide devices from the container's logind); disables and
+   would otherwise hide devices from the container's libinput, which reads
+   the host udev database's seat tags); disables and
    stops whatever `display-manager.service` resolves to; re-asserts the
    default target and the getty mask; then verifies nothing still holds the
    VT or DRM master before `desktop.service` starts.
@@ -133,25 +136,31 @@ audio client configs (see below), the GPU CDI spec (real on NVIDIA hosts, a
 stub elsewhere), the client CDI specs, host-shell key material, and the
 quadlet unit itself.
 
-## Seat model inside the container
+## Boot model inside the container
 
-The container boots systemd with its own `systemd-logind` and a
-container-internal `seat0`:
+There is no systemd in the container: it cannot run there (a systemd system
+manager must be PID 1 of its pid namespace, and this container shares the
+HOST's, where the host's systemd holds that seat). Instead `desktop-init` — a
+~150-line bash supervisor — runs the boot oneshots, creates the session
+user's `XDG_RUNTIME_DIR`, launches the session, and restarts it on exit:
 
 - Devices are granted explicitly, not by `--privileged`: `/dev/dri` and
   `/dev/snd` as devices, `/dev/input` as a live bind mount (see "Input
   hotplug and KVM switches"), and the VTs created in the container's own
   `/dev`. See "Container privileges" below.
-- `/run/udev` is mounted read-only from the host, so libudev/logind/libinput
-  in the container see the host's udev database including its seat tags —
-  no udevd runs in the container (it's masked).
+- `/run/udev` is mounted read-only from the host, so libudev/libinput in the
+  container see the host's udev database including its seat tags — no udevd
+  runs in the container.
 - `Network=host` lets libinput receive kernel uevents (netlink is per-netns);
   the `/dev/input` bind mount supplies the matching device nodes. Both are
   needed — see "Input hotplug and KVM switches".
-- `desktop-session.service` uses the kiosk pattern (`User=desktop`,
-  `PAMName=login`, `TTYPath=/dev/tty1`): pam_systemd registers a real logind
-  session on the container's seat0 and starts the user manager, which brings
-  up PipeWire. The session then runs `startx` → `xinitrc.desktop` → `mwm`.
+- `desktop-init` runs the session as the `desktop` user directly
+  (`setsid -c` for the controlling tty on tty1, `setpriv` for the uid/gid
+  switch, an explicit environment in place of PAM's). `start-session`
+  launches PipeWire/WirePlumber as plain children and then
+  `startx` → `xinitrc.desktop` → `mwm`. No logind, no seat bookkeeping:
+  the session's observable health IS the session (the e2e asserts mwm
+  running as the session user, where it used to ask loginctl).
 - Xorg runs **rootless**, as the `desktop` user (`needs_root_rights = no`
   in `image/xorg/Xwrapper.config`). Device access works by plain group
   permission: `/dev/dri/*` is group `video`, `/dev/input/*` is group
@@ -160,9 +169,9 @@ container-internal `seat0`:
   (numeric gids are what the kernel checks, and dynamically-allocated
   groups like `input`/`render` need not match between host and image).
   DRM master is acquired by the first-opener rule — nothing else on the
-  host uses the GPU — and systemd hands tty1 to the session user via
-  `TTYPath=`. Xorg still tries logind device handover first and falls back
-  to direct opens.
+  host uses the GPU — and `desktop-init` chowns tty1 to the session user
+  (what systemd's `TTYPath=` used to do). With no logind in the container,
+  Xorg's direct-open fallback is now simply the path.
 
 ### Input hotplug and KVM switches
 
@@ -301,9 +310,9 @@ the static config covers and exactly what a VM cannot stage.
 
 ### Changing the VT
 
-tty1 is assumed in three places: the `getty@tty1` mask in the deploy tree, and
-`TTYPath=`/`DESKTOP_VT=` in `image/systemd/desktop-session.service`. Change
-all of them (a systemd drop-in works for the unit) to move the session.
+tty1 is assumed in three places: the `getty@tty1` mask in the deploy tree,
+the tty1 chown in `image/init/desktop-init`, and `DESKTOP_VT=` in the same
+file's session environment. Change all of them to move the session.
 
 ## GPU notes
 
@@ -467,7 +476,7 @@ does. Nothing schedules the X server, so nothing can contend for the seat —
 one host, one desktop, by construction.
 
 That split is why there is no chart for the desktop. A Deployment would have
-to reconstruct everything podman's `--systemd`/`--privileged`/`--tty` gives
+to reconstruct everything podman's `--pid=host`/`--tty`/device wiring gives
 it, gain nothing schedulable (it is pinned to one node's hardware anyway),
 and introduce the one failure mode the seat model cannot tolerate: two X
 servers fighting over DRM master.
@@ -715,8 +724,8 @@ A failed "Host Terminal" click keeps its window open with the reason and
 the enablement command (`/usr/local/bin/host-terminal` wrapper) instead of
 flashing shut.
 
-Security framing: the desktop container holds `CAP_SYS_ADMIN`, so container
-root is close to host-root-equivalent anyway; this key adds a *convenient*
+Security framing: the desktop container is a trusted component (host pid
+namespace, host network, unconfined by SELinux); this key adds a *convenient*
 path for the unprivileged `desktop` user to a *specific*, unprivileged host
 account, with the ssh audit trail in the host journal. With the service
 switched off everything degrades gracefully — preflight WARNs and the menu
@@ -742,7 +751,8 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   client-spec disjointness, overrides and atomic write, removal of the
   superseded combined spec, seat-prep on a staged dirty seat), then the
   full composition — rsync-apply, boot from the tree's quadlet, converger
-  oneshots, stub-CDI marker on container PID 1, seat0 session, audio
+  oneshots, stub-CDI marker on the container's init process (which is a
+  HOST pid — the pid-namespace shape is itself asserted, both ways), audio
   sockets, `desktop-shell` ssh in both directions, `desktop-preflight`
   green, service restart.
 - **`e2e-vm.yml`** — the full stack in a KVM-booted **Rocky 9 VM** with
@@ -787,15 +797,15 @@ beyond what virtio emulates.
 
 ```sh
 systemctl status desktop.service
-podman exec desktop systemctl status desktop-session xorg-conf
-podman exec desktop loginctl                   # session for "desktop" on seat0
+podman exec desktop test -f /run/desktop-init-ready && echo booted
+podman exec desktop pgrep -u desktop -x mwm    # the session, in one probe
 podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf   # nvidia vs modesetting
 podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf  # fixed layout, if declared
 DISPLAY=:0 xrandr                              # display up, modes listed
 DISPLAY=:0 glxinfo -B                          # GPU mode: "NVIDIA"; else llvmpipe
 fgconsole                                      # VT 1 active
 podman exec desktop ps -o user= -C Xorg        # "desktop", not root (rootless X)
-podman exec desktop journalctl -u xorg-conf -o cat | grep align  # gid alignment log
+podman logs desktop | grep align               # gid alignment log
 podman exec -u desktop desktop wpctl status    # sound devices present
 # audio, one per protocol (repeat from host and from a scratch container):
 pw-play      /usr/share/sounds/alsa/Front_Center.wav   # PIPEWIRE_REMOTE set
@@ -821,16 +831,19 @@ this needs only some of them.
 What makes that possible is that **Xorg runs rootless**, as the `desktop` user,
 opening `/dev/dri` and `/dev/input` by plain group permission (see
 `image/xorg/Xwrapper.config` and `align-device-groups.sh`). Most containerised
-X needs broad capability because X runs as root. What is left is what systemd,
-logind, PAM and the audio stack need.
+X needs broad capability because X runs as root. And with systemd gone from
+the image, what is left is smaller still — notably **no `CAP_SYS_ADMIN`**,
+which the systemd-based design could never drop, and **no `CAP_KILL`**, which
+in the host pid namespace would mean "may signal any process on the host"
+(desktop-init signals the session by becoming uid 1000 first via `setpriv`;
+same-uid signaling needs no capability).
 
 | Grant | What it is for |
 |---|---|
-| `SYS_ADMIN` | systemd PID 1 mounting its own cgroup/tmpfs; logind |
-| `SYS_TTY_CONFIG` | VT ioctls (`TTYVHangup`, `TTYVTDisallocate`) |
-| `SYS_NICE` | systemd/logind scheduling |
-| `SYS_RESOURCE`, `MKNOD`, `AUDIT_WRITE` | systemd limits; VT node creation; `pam_loginuid` |
-| the ordinary systemd/PAM set | `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID`, `SETPCAP`, `SETFCAP`, `KILL`, `SYS_CHROOT`, `NET_BIND_SERVICE` |
+| `SYS_TTY_CONFIG` | Xorg's VT ioctls (`VT_ACTIVATE` at session start) |
+| `MKNOD` | VT node creation on the container's own `/dev` |
+| `CHOWN`, `SETUID`, `SETGID` | desktop-init: tty1/runtime-dir ownership; the root→desktop switch; the suid Xorg wrapper |
+| `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETPCAP` | root convenience for the oneshots and postmortem; candidates for trimming |
 | `AddDevice=-/dev/dri`, `-/dev/snd` | GPU and audio, by explicit node (optional, so a host lacking either still starts and preflight reports it) |
 | device cgroup: majors 13, 4, 5, 226, 116 | evdev (the bind mount), VTs, console, DRM, sound |
 
@@ -838,20 +851,20 @@ logind, PAM and the audio stack need.
 user, so it cannot use a container capability — capabilities are per-process
 and a user session does not inherit them. `rtkit` existed to bridge that, and
 it cannot run here: it wants `SYS_PTRACE`, `DAC_READ_SEARCH` and `NET_ADMIN`,
-which are precisely the capabilities worth withholding. It is therefore masked
-in the image, and the quadlet sets `RLIMIT_RTPRIO` (and `RLIMIT_MEMLOCK`)
-instead — the other route to `SCHED_FIFO` for an unprivileged process, needing
-no capability at all. A masked unit also keeps `systemctl is-system-running`
-reporting `running`; a *failed* one reports `degraded`, which the deploy checks
-treat as not-up.
+which are precisely the capabilities worth withholding (and with no systemd or
+D-Bus in the image nothing can even activate it). The quadlet sets
+`RLIMIT_RTPRIO` (and `RLIMIT_MEMLOCK`, `RLIMIT_NICE`) instead — the other
+route to `SCHED_FIFO` for an unprivileged process, needing no capability at
+all.
 
-The quadlet's `--ulimit` is **not sufficient on its own**, and this is easy to
-get wrong: it reaches the container's PID 1 and stops there, because systemd
-applies its own `DefaultLimit*=` to the units it spawns rather than passing on
-the rlimits it was started with — and the default for `RTPRIO` is 0. So
-`image/systemd/realtime-limits.conf` is installed into both
-`/etc/systemd/system.conf.d/` (covering `user@1000.service`) and
-`/etc/systemd/user.conf.d/` (covering the user units inside it).
+Those `--ulimit` values now reach PipeWire by **plain rlimit inheritance**
+(desktop-init → start-session → the daemons). The systemd-era design needed
+`DefaultLimit*` relay drop-ins in both `system.conf.d` and `user.conf.d`,
+because systemd applies its own defaults rather than passing on the rlimits
+it was started with — an entire failure mode this shape deletes. The e2e
+still asserts the limit on PipeWire's own `/proc` entry, because "reached
+the container" and "reached the process that needs it" have disagreed
+before.
 
 **And the rlimit alone is still not enough.** With the hard limit at 95,
 `module-rt` *still* went to RTKit and settled for priority 1: when PipeWire is
@@ -877,11 +890,18 @@ Everything else is dropped, including `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`,
 (`--privileged` would have removed it), which is the largest single piece of
 attack surface this takes back.
 
-**What this does not buy.** `CAP_SYS_ADMIN` is close to root, and it cannot go
-while systemd and logind run as PID 1 in the container. So this is
-attack-surface reduction, **not** a change of trust boundary — the image and
-anything allowed to start containers remain trusted. A genuine boundary change
-would mean not running systemd in there at all, which is a different design.
+**What this buys, and what it costs.** Dropping systemd is what finally let
+`CAP_SYS_ADMIN` go — the systemd-era README said truthfully that it could not
+while systemd and logind ran as PID 1, and that not running systemd was "a
+different design". This is that design. The trade paid for it is the host pid
+namespace: the container can now *see* every host process (`/proc` is the
+host's — command lines included, which sometimes carry secrets), and that
+visibility is also the window-to-pod identity feature. What it can *touch* is
+still bounded: no `CAP_KILL` (signaling stays uid-scoped), no `CAP_SYS_PTRACE`
+(other processes' `environ` and memory stay unreadable — ptrace access checks
+gate them, and uid 0 in the container does not pass for a host uid-1000
+process). The image and anything allowed to start containers remain trusted
+components either way.
 
 SELinux separation is also still off (`SecurityLabelDisable=true`), and
 AppArmor with it (`--security-opt apparmor=unconfined`, which matters on
@@ -900,58 +920,86 @@ in the suite passes either way:
 | Assertion | What it would catch |
 |---|---|
 | `Privileged=false` | the flag put back wholesale |
-| PID 1 `Seccomp=2` | the filter removed |
-| eleven named capabilities absent from `CapEff` | any of them granted back — the invariant is what must *never* be there, since a list of what we do grant would drift with the quadlet |
+| the container init is a live, host-visible pid (`/run/desktop-init.pid` resolves on the host to `desktop-init`) | `--pid=host` silently lost, which would zero out every X client pid and break window-to-pod identity |
+| init `Seccomp=2` (read via that pid, never `/proc/1` — that is the host's systemd now) | the filter removed |
+| thirteen named capabilities absent from `CapEff` (the eleven historical ones plus `SYS_ADMIN` and `KILL`) | any of them granted back — the invariant is what must *never* be there, since a list of what we do grant would drift with the quadlet |
 | `/dev/mem` unreachable (created, then read) | the device cgroup unbounded |
 | `/sys` mounted `ro` | the sixth grant, which no capability check implies |
-| `rtkit-daemon` masked, `RLIMIT_RTPRIO=95` **on the PipeWire process itself**, ≥1 of its threads on `SCHED_FIFO` **above priority 1** | the audio stack silently losing realtime — the tone tests sound identical either way. Both qualifiers are load-bearing: the rlimit is read from `/proc/<pipewire>/limits` rather than `podman exec ulimit` (which reports the container spec's value whatever the session got), and priority 1 is what the RTKit fallback settles for, so a plain "is it `SCHED_FIFO`" would pass on a degraded stack. |
+| no `rtkit-daemon` process, `RLIMIT_RTPRIO=95` **on the PipeWire process itself**, ≥1 of its threads on `SCHED_FIFO` **above priority 1** | the audio stack silently losing realtime — the tone tests sound identical either way. Both qualifiers are load-bearing: the rlimit is read from `/proc/<pipewire>/limits` rather than `podman exec ulimit` (which reports the container spec's value whatever the session got), and priority 1 is what the RTKit fallback settles for, so a plain "is it `SCHED_FIFO`" would pass on a degraded stack. |
 
 `build-smoke` repeats the two cheapest (`Privileged`, `Seccomp`), since it runs
 in a third of the time.
 
+## Window-to-pod identity
+
+The reason this container runs in the host PID namespace at all: **every X
+client is attributable to the k8s pod that owns it, from inside the
+container, with stock Xorg.** The chain:
+
+1. A client connects to the X socket. Xorg reads its `SO_PEERCRED` — and
+   because Xorg shares the host PID namespace, the peer PID it sees is a
+   *real host PID*. (In the old shape, a client in a sibling pod namespace
+   read back as pid 0 — untranslatable — which killed every PID-based
+   identity mechanism at the root.)
+2. The stock X-Resource extension exposes that PID per client:
+   `screenshot --list-clients` (the same binary clients get via
+   `desktop.local/tools`) prints one `client-base=0x... pid=N` line per
+   connection.
+3. `/proc/<pid>/cgroup` — the host's proc, visible in-container for the same
+   reason — names the pod: kubelet puts the pod UID in the cgroup path
+   (verbatim under the cgroupfs driver, dashes-to-underscores in a `.slice`
+   name under the systemd driver).
+4. Pod UID → labels is an ordinary apiserver lookup, outside this image.
+
+A window manager or compositor in this container can therefore apply
+per-pod policy (placement, decoration, workspace) with one `getsockopt`
+away from having done so natively — which is the design being rehearsed
+here for the Wayland compositor this desktop is slated to become.
+
+The e2e asserts the whole chain (`verify-pod-identity`): with the
+testpattern pod painting, every listed client must have a nonzero PID, and
+at least one must resolve — through `/proc/<pid>/cgroup`, read from inside
+the container — to the testpattern pod's UID.
+
 ## Log growth
 
-The desktop is meant to run for months, and `journal-console.service` inside
-the container runs `journalctl -b -f` into `/dev/console` forever — that is what
-makes `podman logs desktop` show the boot and the running journal. It is a
-*continuous stream*, so both sinks it lands in are bounded explicitly rather
+The desktop is meant to run for months, and `desktop-init` plus the whole
+session write to `/dev/console` for the life of the container — that is what
+makes `podman logs desktop` show the boot and the running session. It is a
+*continuous stream*, so the sink it lands in is bounded explicitly rather
 than left to whatever the host defaults to.
 
 | Sink | Bound | Where |
 |---|---|---|
 | Host: podman's container log | `LogDriver=k8s-file` + `--log-opt max-size=64m` | the quadlet |
-| Container: journald's own store | `Storage=volatile` + `RuntimeMaxUse=64M` | `image/systemd/journald-bounds.conf` |
 
-Neither was stated before, and what you got depended on the host. **Measured on
-the Rocky 9 target, podman's default log driver is `journald`** — so before this
-change the desktop's entire journal was being piped into the *host* journal,
-where it is capped by `SystemMaxUse` but evicts everything else the machine
-logs. On a host whose `containers.conf` leaves podman's built-in default in
-place the answer is worse: `k8s-file` with **no size limit**, an ever-growing
-file under `/var/lib/containers`. Naming the driver here means the deployment
-gets the same answer either way. Inside the container, journald
-has no `/var/log/journal` so it uses volatile storage, which defaults to **10%
-of the `/run` tmpfs** — and that tmpfs is sized from host RAM, so on a large
-workstation the desktop can quietly hold hundreds of megabytes of memory it
-never gives back.
+(The systemd-era image had a second, container-side sink — journald's
+volatile store, with its own `RuntimeMaxUse` bound and a `journalctl -b -f`
+forwarder mirroring it to the console. No systemd means no journald: the
+console is the only sink now, and the forwarder and its bound went with it.)
 
-`Storage=volatile` is also stated rather than left at `auto`, because `auto`
-silently becomes *persistent* the moment anything creates `/var/log/journal` —
-which would put the journal on the container's writable layer, where it
-survives nothing and is invisible to `podman logs`.
+Neither driver nor size was stated before this repo bounded them, and what
+you got depended on the host. **Measured on the Rocky 9 target, podman's
+default log driver is `journald`** — the desktop's entire chatter piped into
+the *host* journal, where it is capped by `SystemMaxUse` but evicts
+everything else the machine logs. On a host whose `containers.conf` leaves
+podman's built-in default in place the answer is worse: `k8s-file` with **no
+size limit**, an ever-growing file under `/var/lib/containers`. Naming the
+driver here means the deployment gets the same answer either way.
 
-Both are asserted on the running container by `verify-log-bounds` in the e2e
-(and the cheap half in `build-smoke`), because a log option that silently failed
-to apply looks exactly like one that worked, right up until the disk or the RAM
-fills. Raise either number if a deployment wants more history; the point is that
-a number is stated at all.
+Both halves are asserted on the running container by `verify-log-bounds` in
+the e2e (and in `build-smoke`), because a log option that silently failed to
+apply looks exactly like one that worked, right up until the disk fills.
+Raise the number if a deployment wants more history; the point is that a
+number is stated at all.
 
 ## Security notes
 
-- The container is **not** `--privileged`, but it does hold `CAP_SYS_ADMIN`
-  and host network. `SYS_ADMIN` is close to root, so the image and anything
-  allowed to start containers are still trusted components — the reduction is
-  attack-surface reduction, not a change of trust boundary. See "Container
+- The container is **not** `--privileged`, and no longer holds
+  `CAP_SYS_ADMIN` — but it runs in the host PID namespace with host network,
+  so it can observe every host process. The image and anything allowed to
+  start containers are still trusted components; what changed is the shape
+  of the exposure (visibility up, capability down). See "Container
   privileges".
 - Xorg runs rootless (as `desktop`), so an X server compromise yields that
   user, not root. Note the `desktop` user is still in the `input` group and
@@ -961,31 +1009,23 @@ a number is stated at all.
   the session are visible to any local process that connects. Tighten by
   removing it from `image/session/xinitrc.desktop` and distributing the xauth
   cookie instead.
-- Exported audio sockets are world-connectable (`UMask=0000` drop-ins);
-  restrict `/run/desktop-audio` permissions in the tmpfiles.d entry if that
-  matters on your host.
+- Exported audio sockets are world-connectable (`umask 0000` around the
+  daemon spawns in `start-session`); restrict `/run/desktop-audio`
+  permissions in the tmpfiles.d entry if that matters on your host.
 
 ## Troubleshooting
 
-**Start here:** `podman logs desktop` — the container's full journal is
-mirrored to the console by `journal-console.service`, a `journalctl -f`
-forwarder writing to `/dev/console`. (This is why the quadlet passes
-`--tty`: without it the runtime creates no `/dev/console`, and PID 1's
-stdout is no alternative — systemd redirects its own stdio to `/dev/null`
-during boot. Without a tty the unit fails loudly rather than silently
-writing the journal into a RAM-backed file.) Two things to look for:
+**Start here:** `podman logs desktop` — desktop-init and everything it
+starts write to `/dev/console`, so the console log IS the container's log.
+(This is why the quadlet passes `--tty`: without it the runtime creates no
+`/dev/console` and the stream has nowhere to land.) Two things to look for:
 
 - the boot-time preflight report: one `PASS`/`WARN`/`FAIL` line per
   assumption (devices visible, udev db mounted, gid alignment, seat tags,
-  logind, shared socket dirs, NVIDIA coherence) with a remediation hint on
-  each failure — `podman logs desktop | grep preflight:`
+  shared socket dirs, NVIDIA coherence) with a remediation hint on each
+  failure — `podman logs desktop | grep preflight:`
 - the X session postmortem on every abnormal session exit: tail of the Xorg
   log plus a `LIKELY CAUSE:` verdict — `podman logs desktop | grep postmortem:`
-
-For filtered queries, the journal itself is still available:
-`podman exec desktop journalctl -u desktop-session` (note the postmortem
-runs from `ExecStopPost=` after the session cgroup is gone, so it appears
-under `journalctl -t session-postmortem`, not under the unit).
 
 - **Xorg: "cannot open /dev/tty1"** — something on the host owns the VT;
   check `getty@tty1` is masked and no host display manager is running.
@@ -998,8 +1038,7 @@ under `journalctl -t session-postmortem`, not under the unit).
   back (display manager, gettys, seat splits) before the desktop starts.
 - **Keyboard/mouse/GPU dead with rootless X (EACCES opening devices)** —
   gid alignment likely failed: check
-  `journalctl -u xorg-conf` inside the container for `align-device-groups`
-  lines. Escape hatch: set `needs_root_rights = yes` in
+  `podman logs desktop` for `align-device-groups` lines. Escape hatch: set `needs_root_rights = yes` in
   `/etc/X11/Xwrapper.config` (root Xorg) and report the alignment log.
 - **Xorg: "no screens found" without GPU** — no `/dev/dri/card*` with a
   connected output; check the container log for `xorg-gpu-conf` lines.

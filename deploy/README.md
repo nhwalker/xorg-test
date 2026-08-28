@@ -372,9 +372,9 @@ boot-time baseline; the script is what makes them true again after drift.
 
 The desktop's "Host Terminal" menu entry lands in **`desktop-shell`**, a
 deliberately boring unprivileged account created declaratively by
-sysusers.d (no groups, no sudo, locked password — the container is
-holding `CAP_SYS_ADMIN` anyway, so this path is convenience + audit trail, not a
-boundary). Three properties are worth calling out:
+sysusers.d (no groups, no sudo, locked password — the container is a
+trusted component anyway (host pid namespace, host network), so this path is
+convenience + audit trail, not a boundary). Three properties are worth calling out:
 
 - **Fresh key every boot.** `desktop-host-shell.service` regenerates the
   ed25519 keypair under `/etc/desktop-container` on every boot; key
@@ -406,8 +406,8 @@ and mouse on every switch, so a snapshot `/dev` leaves input dead from the
 first switch back until `desktop.service` restarts.
 
 Only `/dev/input`, not all of `/dev` — podman's `/dev/console`, `/dev/pts` and
-`/dev/shm` are what `--systemd=always` and `--tty` rely on, and a blanket
-`/dev:/dev` would shadow them.
+`/dev/shm` are what `--tty` (and the console logging it carries) rely on, and
+a blanket `/dev:/dev` would shadow them.
 
 The device cgroup allows major 13 (input) explicitly for this reason — a bind
 mount is not a device as far as the cgroup is concerned, so without that rule
@@ -472,28 +472,28 @@ disabled alongside it (`--security-opt apparmor=unconfined`) for the same
 reason, so a Debian-family host does not silently get a different answer than
 a RHEL one.
 
-`rtkit-daemon` is masked in the image — it cannot work without
-`SYS_PTRACE`/`DAC_READ_SEARCH`/`NET_ADMIN`, and a *failed* unit would leave
-`systemctl is-system-running` reporting `degraded`. PipeWire gets its realtime
-priorities from the quadlet's `--ulimit rtprio=95` instead — together with a
-systemd drop-in *inside* the image, because `--ulimit` reaches PID 1 and no
-further (systemd applies its own `DefaultLimitRTPRIO=`, which is 0). Both
-halves are needed; see README.md "Container privileges".
+`rtkit-daemon` cannot work without `SYS_PTRACE`/`DAC_READ_SEARCH`/
+`NET_ADMIN`, and with no systemd or D-Bus in the image nothing can start it.
+PipeWire gets its realtime priorities from the quadlet's
+`--ulimit rtprio=95` (plus `memlock`/`nice`) instead, delivered by plain
+rlimit inheritance now that no systemd sits in between; see README.md
+"Container privileges".
 
-`CAP_SYS_ADMIN` is still required by systemd and logind as PID 1, so this
-reduces attack surface without changing the trust boundary. See README.md
-"Container privileges" for the full table and reasoning.
+With systemd gone from the image, `CAP_SYS_ADMIN` is gone from the grant
+list too — the container instead runs in the **host pid namespace**
+(`--pid=host`), which is the window-to-pod identity feature; README.md
+"Window-to-pod identity" and "Container privileges" carry the full
+reasoning and the visibility-vs-capability trade.
 
 ## Log growth
 
-`journal-console.service` streams the container's journal into `/dev/console`
-continuously, which is what `podman logs desktop` reads. The quadlet bounds that
-sink explicitly — `LogDriver=k8s-file` plus `--log-opt max-size=64m` — rather
-than inheriting whatever the host's `containers.conf` sets, because podman's own
-default is an unbounded file and some distros default to `journald`, which would
-push the desktop's entire journal into the host journal. The container's own
-volatile journal is capped separately inside the image. See "Log growth" in
-README.md for the full reasoning and the numbers.
+`desktop-init` and the session stream to `/dev/console` continuously, which
+is what `podman logs desktop` reads. The quadlet bounds that sink explicitly
+— `LogDriver=k8s-file` plus `--log-opt max-size=64m` — rather than
+inheriting whatever the host's `containers.conf` sets, because podman's own
+default is an unbounded file and some distros default to `journald`, which
+would push the desktop's entire chatter into the host journal. See "Log
+growth" in README.md for the full reasoning and the numbers.
 
 ## Deliberately out of scope
 
@@ -564,12 +564,13 @@ podman logs desktop | grep xorg-monitor-conf  # what layout was applied, if any
   `ci/smoke-deploy.sh` — CDI converger branch tests (stub / generate /
   transient-failure / no-downgrade), seat-prep against a staged dirty seat,
   and the full composition on the runner: rsync-apply (the verbatim command
-  above), boot from this quadlet, all three oneshots, stub marker on
-  container PID 1, `desktop-shell` ssh from the host and from inside the
+  above), boot from this quadlet, all three oneshots, stub marker on the
+  container's init process (a host pid — the pid-namespace shape is itself
+  asserted), `desktop-shell` ssh from the host and from inside the
   container, `desktop-preflight` green, and a service restart.
 - `e2e-vm.yml` phase-deploy: the same flow on a Rocky 9 VM with **SELinux
   enforcing** and a real KMS display — seat-prep evicting the genuinely
-  running boot getty, rootless Xorg + mwm + seat0 under this quadlet, real
+  running boot getty, rootless Xorg + mwm under this quadlet, real
   audio over all three client paths, the root-owned `desktop-shell` trust
   path through a real sshd under enforcing, **confined** podman clients
   resolving each client CDI device with no `label=disable` anywhere,

@@ -43,6 +43,7 @@ type options struct {
 	heightSet bool
 	toStdout  bool
 	help      bool
+	list      bool
 	file      string
 }
 
@@ -55,6 +56,7 @@ func newFlagSet(o *options) *pflag.FlagSet {
 	fs.IntVarP(&o.width, "width", "w", 0, "width of the region (default: to the right screen edge)")
 	fs.IntVarP(&o.height, "height", "h", 0, "height of the region (default: to the bottom screen edge)")
 	fs.BoolVar(&o.toStdout, "to-stdout", false, "write the PNG to stdout instead of to a file")
+	fs.BoolVar(&o.list, "list-clients", false, "list connected X clients (resource-ID base and PID) instead of capturing")
 	// No -h shorthand: -h is height. Defining both names here also stops
 	// pflag installing its own -h/--help handling.
 	fs.BoolVar(&o.help, "help", false, "show this help and exit")
@@ -66,6 +68,8 @@ func writeUsage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   screenshot [flags] FILE.png     save the desktop (or a region of it) to FILE
   screenshot [flags] --to-stdout  write the PNG to stdout instead
+  screenshot --list-clients       list connected X clients (one per line:
+                                  client-base=0x... pid=N) and exit
 
 Captures the X display named by $DISPLAY. With no region flags the whole
 desktop is captured; -x/-y/-w/-h select a sub-region of it.
@@ -86,6 +90,15 @@ Exit status:
 // validate checks everything that can be known without talking to X.
 func (o *options) validate(fs *pflag.FlagSet) error {
 	args := fs.Args()
+	if o.list {
+		// A listing takes no file and captures nothing; refuse the mix
+		// rather than guess which of the two the caller wanted.
+		if len(args) > 0 || o.toStdout || fs.Changed("x") || fs.Changed("y") ||
+			fs.Changed("width") || fs.Changed("height") {
+			return usagef("--list-clients takes no file argument and no capture flags")
+		}
+		return nil
+	}
 	switch {
 	case o.toStdout && len(args) > 0:
 		return usagef("--to-stdout takes no FILE argument (got %q)", args[0])
@@ -185,6 +198,10 @@ func run(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer d.close()
+
+	if o.list {
+		return listClients(d.conn, stdout)
+	}
 
 	r, err := o.region(d.width, d.height)
 	if err != nil {

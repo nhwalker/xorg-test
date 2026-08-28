@@ -1,17 +1,40 @@
 #!/bin/bash
-# Entry point for desktop-session.service. Runs as the "desktop" user inside
-# a PAM login session on tty1. startx handles xauth cookie generation.
+# Entry point for the desktop session. Launched by desktop-init as the
+# "desktop" user on tty1 (setsid -c gave us the controlling tty; env -i
+# built the environment). startx handles xauth cookie generation.
+#
+# The audio stack is started here directly - there is no systemd user
+# manager in this image any more (see image/init/desktop-init). Two things
+# systemd drop-ins used to arrange now happen inline:
+#
+#   umask 0000   the exported sockets in /run/desktop-audio must be
+#                connectable by other uids (host users, other containers);
+#                sockets inherit the daemon's umask. Was
+#                pipewire-umask.conf.
+#   rlimits      RLIMIT_RTPRIO/MEMLOCK/NICE arrive VERBATIM from the
+#                quadlet's --ulimit flags: no PID-1 relay, no
+#                DefaultLimit* drop-ins. module-rt takes the rlimit path
+#                because the image config sets rlimits.enabled=true /
+#                rtkit.enabled=false (see Containerfile).
+#
+# The daemons die with the session: they are children of this shell, and
+# desktop-init's cleanup (uid-scoped pkill) reaps any survivor before the
+# next iteration, so a restarted session can always re-bind its sockets.
 #
 # No failure handling here: when Xorg exits, the tty hangup kills this
-# process group, so diagnosis runs from ExecStopPost= (session-postmortem).
+# process group, and desktop-init runs session-postmortem from outside.
 set -u
 
 VT="${DESKTOP_VT:-vt1}"
 DPY="${DESKTOP_DISPLAY:-:0}"
 
-# The user manager was just started by pam_systemd; make sure the audio
-# stack is up even if socket activation never gets poked from inside.
-systemctl --user start pipewire.service pipewire-pulse.service wireplumber.service || true
+(
+    umask 0000
+    pipewire &
+    wireplumber &
+    pipewire-pulse &
+    wait
+) &
 
 # No -novtswitch: Xorg must VT_ACTIVATE its own VT at startup so the session
 # becomes visible even if the console was left on another VT (chvt, rescue

@@ -72,15 +72,11 @@ fail() {
     echo "---- diagnostics: Xorg log (tail) ----" >&2
     podman exec desktop sh -c 'tail -40 /home/desktop/.local/share/xorg/Xorg.0.log' >&2 2>/dev/null || true
     echo "---- diagnostics: postmortem ----" >&2
-    podman exec desktop journalctl -t session-postmortem -o cat --no-pager 2>/dev/null | tail -30 >&2 || true
+    podman logs desktop 2>&1 | grep 'postmortem:' | tail -30 >&2 || true
     echo "---- diagnostics: preflight ----" >&2
     podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
-    # A single failed unit makes `systemctl is-system-running` report
-    # "degraded", which the container_running() wait treats as not-up - so the
-    # symptom is a 120-second timeout that names nothing. List the culprits.
-    echo "---- diagnostics: failed units inside the container ----" >&2
-    podman exec desktop systemctl list-units --failed --no-pager >&2 2>&1 || true
-    podman exec desktop systemctl is-system-running >&2 2>&1 || true
+    echo "---- diagnostics: desktop-init state ----" >&2
+    podman exec desktop sh -c 'ls -l /run/desktop-init-ready /run/desktop-init.pid 2>&1; echo "-- session procs:"; ps -o pid,user,comm -u desktop 2>&1' >&2 2>&1 || true
     echo "---- diagnostics: desktop audio (export sockets + pipewire procs) ----" >&2
     podman exec desktop sh -c \
         'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
@@ -130,7 +126,17 @@ wait_for() { # tries interval description command...
 }
 
 container_running() {
-    [ "$(podman exec desktop systemctl is-system-running 2>/dev/null || true)" = running ]
+    # desktop-init writes the marker after the boot oneshots; the session's
+    # own health is asserted separately (session_up below), matching the old
+    # split between is-system-running and the display checks.
+    podman exec desktop test -f /run/desktop-init-ready 2>/dev/null
+}
+
+session_up() {
+    # The replacement for the old loginctl seat0 assertion: with no logind
+    # in the container the observable fact is the session itself - mwm
+    # running as the session user.
+    podman exec desktop pgrep -u desktop -x mwm >/dev/null 2>&1
 }
 
 phase_deploy() {
@@ -188,12 +194,14 @@ phase_deploy() {
     fi
 
     log pd "container reaches running"
-    wait_for 40 3 "systemd running in container" container_running
+    wait_for 40 3 "desktop-init ready in container" container_running
 
-    log pd "stub CDI spec resolved (no NVIDIA in the VM; marker on container PID 1)"
+    log pd "stub CDI spec resolved (no NVIDIA in the VM; marker on the init process)"
     grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
-    podman exec desktop sh -c "tr '\0' '\n' </proc/1/environ | grep -qx NVIDIA_CDI_STUB=1" \
-        || fail "stub marker not on container PID 1"
+    # /proc/1 is the HOST's systemd under --pid=host; the CDI env edits land
+    # on the container's init process, whose (host) pid desktop-init records.
+    podman exec desktop sh -c 'tr "\0" "\n" </proc/$(cat /run/desktop-init.pid)/environ | grep -qx NVIDIA_CDI_STUB=1' \
+        || fail "stub marker not on the container init process"
 
     log pd "the tree's oneshot wrote both client CDI specs"
     grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
@@ -219,9 +227,8 @@ phase_deploy() {
         || fail "xdpyinfo could not talk to :0"
     owner=$(podman exec desktop sh -c 'ps -o user= -C Xorg | head -1' || true)
     [ "$owner" = desktop ] || fail "Xorg runs as '${owner:-nobody}', want desktop"
-    podman exec desktop sh -c 'loginctl list-sessions --no-pager | grep -q seat0' \
-        || fail "no seat0 session"
-    podman exec desktop ps -C mwm >/dev/null || fail "mwm not running"
+    # No logind, no seat0 bookkeeping: the session itself is the assertion.
+    session_up || fail "mwm not running as the session user"
 
     log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
     # This is the path only this phase can prove: sshd reading the key from
@@ -474,7 +481,7 @@ xr_is() {
 # the container, so a stale node from the instance just stopped can satisfy a
 # test -S immediately and hand the next check a dead socket.
 desktop_up() {
-    wait_for 40 3 "systemd running in container" container_running
+    wait_for 40 3 "desktop-init ready in container" container_running
     wait_for 60 4 "X answering on :0" \
         podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo
 }
@@ -1042,6 +1049,55 @@ screenshot_pattern_stop() {
     k3s kubectl delete pod testpattern --now --ignore-not-found
 }
 
+# verify_pod_identity proves the point of the host-pid-namespace container
+# shape: every X client is attributable, from inside the desktop container,
+# to the k8s pod that owns it.
+#
+# The chain under test, end to end:
+#   X client connects -> Xorg's SO_PEERCRED sees a REAL host pid (only true
+#   under --pid=host; sibling pid namespaces read 0) -> stock X-Resource
+#   QueryClientIds reports it -> /proc/<pid>/cgroup (the host's proc, visible
+#   in-container for the same reason) carries the owning pod's UID.
+#
+# Runs while the testpattern pod is painting, so there is a known pod-owned
+# client on the display to attribute. The listing comes from the desktop's
+# own staged copy of the screenshot tool - the same binary clients get.
+verify_pod_identity() {
+    log pi "every X client reports a real host pid via X-Resource"
+    clients=$(podman exec -u desktop -e DISPLAY=:0 desktop \
+        /usr/libexec/desktop-tools/screenshot --list-clients 2>&1) \
+        || fail "screenshot --list-clients failed: $clients"
+    echo "$clients" | sed 's/^/== vm-guest(pi): /'
+    n=$(echo "$clients" | grep -c '^client-base=' || true)
+    [ "$n" -ge 3 ] || fail "only $n X clients listed; expected at least mwm, xterm and the testpattern pod"
+    if echo "$clients" | grep -q ' pid=0$'; then
+        fail "an X client reports pid=0: Xorg is not seeing host pids - is --pid=host gone from the quadlet?"
+    fi
+
+    log pi "an X client resolves to the testpattern pod through /proc/<pid>/cgroup"
+    uid=$(k3s kubectl get pod testpattern -o jsonpath='{.metadata.uid}')
+    [ -n "$uid" ] || fail "could not read the testpattern pod UID"
+    # kubelet spells the UID two ways depending on cgroup driver: verbatim
+    # (cgroupfs) or dashes-to-underscores inside a .slice name (systemd).
+    uidu=$(echo "$uid" | tr - _)
+    match=""
+    for pid in $(echo "$clients" | sed -n 's/.* pid=//p'); do
+        cg=$(cat "/proc/$pid/cgroup" 2>/dev/null || true)
+        case "$cg" in
+            *"$uid"*|*"$uidu"*) match=$pid; break ;;
+        esac
+    done
+    [ -n "$match" ] || fail "no X client's cgroup carries the testpattern pod UID $uid - window-to-pod attribution is broken"
+
+    # And the same read must work from INSIDE the container: the compositor
+    # is the eventual consumer, and it lives in there. Same pid, same file,
+    # through the container's own /proc.
+    podman exec desktop grep -q -e "$uid" -e "$uidu" "/proc/$match/cgroup" \
+        || fail "host pid $match resolves on the host but not inside the container - /proc is not the host's in there"
+    log pi "  X client pid $match belongs to pod testpattern ($uid), resolved from inside the container"
+    log pi "verify-pod-identity passed"
+}
+
 # verify_screenshot proves the whole point of the binary: an ordinary client
 # image, carrying no X client stack of its own and declaring no env or mounts,
 # captures the real Xorg display using only what desktop.local/display injects.
@@ -1156,14 +1212,17 @@ verify_screenshot() {
 }
 
 verify_log_bounds() {
-    # Both sinks the container's logging lands in must be BOUNDED, and both
-    # are asserted on the running container rather than on the config that was
-    # meant to produce them - a log option that silently did not apply looks
-    # exactly like one that did, right up until a disk or the RAM fills.
+    # The sink the container's logging lands in must be BOUNDED, and it is
+    # asserted on the running container rather than on the config that was
+    # meant to produce it - a log option that silently did not apply looks
+    # exactly like one that did, right up until the disk fills.
     #
-    # Why this needs asserting at all: journal-console.service runs
-    # `journalctl -b -f` into /dev/console forever, so this is a continuous
-    # stream on a machine meant to run for months, not a boot-time burst.
+    # Why this needs asserting at all: desktop-init and the whole session
+    # write to /dev/console for the life of the container, so this is a
+    # continuous stream on a machine meant to run for months, not a
+    # boot-time burst. (With no systemd in the image there is no journald
+    # and no second, container-side sink any more - podman's log file is
+    # the one and only place this stream lands.)
 
     # 1. The HOST-side sink: podman's own log for the container.
     log lb "the container log has an explicit driver and a size bound"
@@ -1183,29 +1242,8 @@ verify_log_bounds() {
     # Older podman may not expose .Size; fall back to the whole LogConfig blob.
     [ -n "$size" ] || size=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}' 2>/dev/null || echo '')
     echo "$size" | grep -qiE '64 ?mb|67108864' \
-        || fail "no 64M max-size on the container log (got '$size'): --log-opt did not reach podman, so journal-console.service is streaming into an unbounded sink"
+        || fail "no 64M max-size on the container log (got '$size'): --log-opt did not reach podman and the console stream lands in an unbounded sink"
     log lb "  driver=k8s-file, max-size=$size"
-
-    # 2. The CONTAINER-side sink: journald's own volatile store, which is RAM.
-    log lb "the container's journal is volatile and capped"
-    st=$(podman exec desktop sh -c \
-        'systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -iE "^[[:space:]]*(Storage|RuntimeMaxUse)=" | tr -d " "' \
-        2>/dev/null || true)
-    echo "$st" | grep -qix 'storage=volatile' \
-        || fail "journald Storage is not volatile (got: $(echo "$st" | tr '\n' ' ')): the journal may be landing on the container's writable layer"
-    echo "$st" | grep -qix 'runtimemaxuse=64m' \
-        || fail "journald RuntimeMaxUse is not 64M (got: $(echo "$st" | tr '\n' ' ')): the volatile journal falls back to 10% of the /run tmpfs, which is RAM sized from the host"
-
-    # And the outcome, not just the setting: journald is actually using the
-    # volatile path. If /var/log/journal ever appears, Storage=volatile is the
-    # only thing keeping the journal off the writable layer - assert the store
-    # it really opened.
-    podman exec desktop test -d /run/log/journal \
-        || fail "no /run/log/journal in the container: journald is not using the volatile store the cap applies to"
-    used=$(podman exec desktop sh -c 'du -sk /run/log/journal 2>/dev/null | cut -f1' || echo 0)
-    [ "${used:-0}" -lt 65536 ] \
-        || fail "the volatile journal is already ${used}K, past the 64M cap - RuntimeMaxUse is not being honoured"
-    log lb "  volatile journal at ${used:-?}K of a 64M cap"
 
     log lb "verify-log-bounds passed"
 }
@@ -1221,16 +1259,27 @@ verify_privileges() {
     # Seccomp: 0 = disabled, 2 = filtered. --privileged gives 0. This is the
     # largest single piece of attack surface the change takes back, and it is
     # the one that would silently regress if someone re-added the flag.
-    log vp "a seccomp filter is applied to PID 1"
-    mode=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/1/status" 2>/dev/null || echo "")
-    [ "$mode" = 2 ] || fail "PID 1 Seccomp=$mode, want 2 (filter). 0 means no filter - is --privileged back?"
+    # Under --pid=host the container's /proc/1 is the HOST's systemd, so
+    # every process-level assertion targets the container's own init via the
+    # pid desktop-init records. First pin down that pid-namespace shape
+    # itself - it is the feature this container exists for, and everything
+    # below reads through it.
+    log vp "the container shares the host pid namespace and init is visible on the host"
+    initpid=$(podman exec desktop cat /run/desktop-init.pid 2>/dev/null || echo "")
+    [ -n "$initpid" ] || fail "no /run/desktop-init.pid in the container"
+    grep -q desktop-init "/proc/$initpid/comm" 2>/dev/null \
+        || fail "host pid $initpid is not desktop-init: --pid=host not in effect, or stale pid file"
+
+    log vp "a seccomp filter is applied to the container init"
+    mode=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/$initpid/status" 2>/dev/null || echo "")
+    [ "$mode" = 2 ] || fail "desktop-init Seccomp=$mode, want 2 (filter). 0 means no filter - is --privileged back?"
 
     # Capabilities: assert the dangerous ones are ABSENT rather than that the
     # expected ones are present. A list of what we granted would drift with the
     # quadlet; a list of what must never be granted is the actual invariant.
     log vp "the capability bounding set excludes the dangerous ones"
-    capeff=$(podman exec desktop sh -c "awk '/^CapEff:/{print \$2}' /proc/1/status" 2>/dev/null || echo "")
-    [ -n "$capeff" ] || fail "could not read CapEff from the container's PID 1"
+    capeff=$(podman exec desktop sh -c "awk '/^CapEff:/{print \$2}' /proc/$initpid/status" 2>/dev/null || echo "")
+    [ -n "$capeff" ] || fail "could not read CapEff from the container's init process"
     #             name            bit  why it must not be there
     for spec in  "SYS_MODULE      16   load kernel modules" \
                  "SYS_RAWIO       17   raw port and /dev/mem access" \
@@ -1242,7 +1291,9 @@ verify_privileges() {
                  "DAC_READ_SEARCH  2   bypass file read permission checks" \
                  "SYSLOG          34   read the kernel ring buffer" \
                  "BPF             39   load BPF programs" \
-                 "PERFMON         38   perf_event_open"
+                 "PERFMON         38   perf_event_open" \
+                 "SYS_ADMIN       21   near-root; dropped with systemd, must stay dropped" \
+                 "KILL             5   in the host pid namespace this signals ANY host process"
     do
         # shellcheck disable=SC2086
         set -- $spec
@@ -1250,7 +1301,7 @@ verify_privileges() {
             fail "CAP_$1 is in the container's effective set (CapEff=$capeff): $3. --privileged back?"
         fi
     done
-    log vp "  CapEff=$capeff - none of the 11 forbidden capabilities present"
+    log vp "  CapEff=$capeff - none of the 13 forbidden capabilities present"
 
     # And the device cgroup really is bounded: a node outside the allowlist
     # must be unreachable. /dev/mem is major 1, which nothing here grants.
@@ -1287,28 +1338,30 @@ verify_privileges() {
     # did not: the audio tests check that the right tone comes out, and
     # non-realtime audio still produces the right tone. Without this, the claim
     # that the rlimit replaces the capability would be untested.
-    log vp "rtkit is masked and PipeWire has realtime anyway"
-    rt=$(podman exec desktop systemctl is-enabled rtkit-daemon.service 2>/dev/null || true)
-    [ "$rt" = masked ] \
-        || fail "rtkit-daemon.service is '$rt', want masked - it cannot work without SYS_PTRACE/DAC_READ_SEARCH/NET_ADMIN, and left unmasked it fails and degrades the container"
+    log vp "no rtkit and PipeWire has realtime anyway"
+    # rtkit used to be masked; with no systemd (and no D-Bus) in the image it
+    # cannot even be activated. What must hold is the outcome: no rtkit
+    # process, and PipeWire on the rlimit path regardless (asserted below).
+    if podman exec desktop pgrep -x rtkit-daemon >/dev/null 2>&1; then
+        fail "an rtkit-daemon process is running in the container - it cannot work without SYS_PTRACE/DAC_READ_SEARCH/NET_ADMIN and nothing should be starting it"
+    fi
 
     # The limit must have reached PIPEWIRE, which is not the same thing as
-    # having reached the container. `podman exec ... ulimit -Hr` reports 95
-    # here whatever PipeWire has, because the exec process is configured from
-    # the container spec directly - it never passes through systemd. PipeWire
-    # runs under user@1000.service, and systemd applies its own DefaultLimit*
-    # to the units it spawns rather than passing on the rlimits it was started
-    # with; the default for RTPRIO is 0. That check therefore passed while the
-    # process that needs the limit had none, which is precisely why the
-    # SCHED_FIFO assertion below is the one that matters. Read the limit off
-    # PipeWire's own /proc entry instead.
+    # having reached the container. With no systemd the delivery is plain
+    # rlimit inheritance (desktop-init -> start-session -> pipewire), which
+    # removes the old DefaultLimit* relay failure mode entirely - but the
+    # assertion deliberately stays on PipeWire's own /proc entry: it is the
+    # process that needs the limit, and reading anything else (podman exec
+    # ulimit, the quadlet file) has already produced a green while the real
+    # stack ran with a limit of 0. The SCHED_FIFO assertion below is still
+    # the one that matters.
     pwpid=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
     [ -n "$pwpid" ] || fail "no pipewire process in the container to check RLIMIT_RTPRIO on"
     # /proc/PID/limits column layout: Name (3 words here) Soft Hard Units.
     lim=$(podman exec desktop sh -c \
         "awk '/^Max realtime priority/{print \$5}' /proc/$pwpid/limits" 2>/dev/null || true)
     [ "$lim" = 95 ] \
-        || fail "PipeWire's RLIMIT_RTPRIO hard limit is '$lim', want 95: the quadlet's --ulimit stopped at PID 1, so systemd's DefaultLimitRTPRIO applied instead (see image/systemd/realtime-limits.conf)"
+        || fail "PipeWire's RLIMIT_RTPRIO hard limit is '$lim', want 95: the quadlet's --ulimit did not reach the audio stack (inheritance broke between desktop-init and pipewire)"
 
     # And the outcome: a PipeWire thread actually scheduled FIFO, at a priority
     # that means it got realtime PROPERLY.
@@ -1608,7 +1661,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|hotplug-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|hotplug-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -1623,6 +1676,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|hotplug-probe|play-audio|play-a
     verify-concurrency) verify_concurrency ;;
     verify-teardown) verify_teardown ;;
     verify-privileges) verify_privileges ;;
+    verify-pod-identity) verify_pod_identity ;;
     verify-log-bounds) verify_log_bounds ;;
     hotplug-probe) hotplug_probe ;;
     input-sink-start) input_sink_start ;;

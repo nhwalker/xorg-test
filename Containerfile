@@ -107,22 +107,13 @@ RUN for f in /usr/share/pipewire/pipewire.conf /usr/share/pipewire/client-rt.con
         || { echo "module-rt patch did not apply exactly once to $f; the block reads:"; \
              grep -n -A 12 'libpipewire-module-rt' "$f"; exit 1; }; \
     done
-COPY image/systemd/pipewire-umask.conf /etc/systemd/user/pipewire.service.d/10-umask.conf
-COPY image/systemd/pipewire-umask.conf /etc/systemd/user/pipewire-pulse.service.d/10-umask.conf
-# Realtime limits, the other half of masking rtkit - see the file's header.
-# systemd does not pass its own rlimits to the units it starts, so the
-# quadlet's --ulimit stops at PID 1 without these.
-COPY image/systemd/realtime-limits.conf /etc/systemd/system.conf.d/10-realtime.conf
-COPY image/systemd/realtime-limits.conf /etc/systemd/user.conf.d/10-realtime.conf
-# The exported sockets are served by the daemons themselves (not socket
-# activation), so start the audio stack with every user manager.
-RUN mkdir -p /etc/systemd/user/default.target.wants \
-    && ln -sf /usr/lib/systemd/user/pipewire.service \
-        /etc/systemd/user/default.target.wants/pipewire.service \
-    && ln -sf /usr/lib/systemd/user/pipewire-pulse.service \
-        /etc/systemd/user/default.target.wants/pipewire-pulse.service \
-    && ln -sf /usr/lib/systemd/user/wireplumber.service \
-        /etc/systemd/user/default.target.wants/wireplumber.service
+# No systemd in this image (see the init section at the bottom): the audio
+# daemons are started by start-session as plain children of the session.
+# Their socket umask is set inline there (was pipewire-umask.conf), and the
+# quadlet's --ulimit rtprio/memlock/nice reach them verbatim by ordinary
+# rlimit inheritance - the DefaultLimit* relay drop-ins this image used to
+# carry (realtime-limits.conf) existed only because systemd does not pass
+# its own rlimits to the units it starts, and are gone with it.
 
 # --- client tools -----------------------------------------------------------
 # The tools client containers run against this desktop (currently just
@@ -139,44 +130,16 @@ COPY --from=tools /screenshot /usr/libexec/desktop-tools/screenshot
 COPY image/tools/publish-tools.sh /usr/local/bin/publish-tools.sh
 RUN chmod 0755 /usr/local/bin/publish-tools.sh /usr/libexec/desktop-tools/*
 
-# --- systemd ----------------------------------------------------------------
-COPY image/systemd/desktop-tools-publish.service /etc/systemd/system/desktop-tools-publish.service
-COPY image/systemd/xorg-conf.service /etc/systemd/system/xorg-conf.service
-COPY image/systemd/desktop-session.service /etc/systemd/system/desktop-session.service
-COPY image/systemd/journal-console.service /etc/systemd/system/journal-console.service
-# Bound the container's own (RAM-backed) journal - see the file's header. The
-# host-side half of the same concern is LogDriver=/--log-opt in the quadlet.
-COPY image/systemd/journald-bounds.conf /etc/systemd/journald.conf.d/10-bounds.conf
-COPY image/systemd/logind-container.conf /etc/systemd/logind.conf.d/10-container.conf
-# The UBI base image ships logind masked (containers normally have no seat);
-# this container manages its own seat0, so unmask it.
-RUN systemctl unmask systemd-logind.service dbus-org.freedesktop.login1.service \
-    # keep /run/desktop-audio working even if the host mount is absent
-    && echo 'd /run/desktop-audio 1777 root root -' > /etc/tmpfiles.d/desktop-audio.conf \
-    && systemctl enable xorg-conf.service desktop-session.service \
-        journal-console.service desktop-tools-publish.service \
-    # host udev owns the devices; /run/udev is mounted read-only from the host
-    && systemctl mask systemd-udevd.service systemd-udevd-kernel.socket \
-        systemd-udevd-control.socket systemd-udev-trigger.service \
-    # the session service owns tty1
-    && systemctl mask getty@tty1.service console-getty.service \
-    # rtkit cannot work in this container and must not be left failing.
-    #
-    # It hands PipeWire its realtime thread priorities, and to do that it wants
-    # CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH (to verify the calling process)
-    # plus CAP_NET_ADMIN (its own PrivateNetwork= sandbox needs to configure
-    # loopback). The quadlet deliberately grants none of those - they are three
-    # of the most powerful capabilities there are, and not granting them is
-    # most of the point of not being --privileged. Without them rtkit's
-    # cap_set_proc() returns EPERM and the unit hits its start limit.
-    #
-    # A failed unit is not cosmetic here: systemctl is-system-running then
-    # reports "degraded" rather than "running", which is what the deploy checks
-    # wait for. Masking is the honest resolution - the service genuinely cannot
-    # run, so say so - and PipeWire gets its realtime priorities from
-    # RLIMIT_RTPRIO instead, which the quadlet sets and which needs no
-    # capability at all. See "Container privileges" in README.md.
-    && systemctl mask rtkit-daemon.service
+# --- init -------------------------------------------------------------------
+# desktop-init is the container's entrypoint: a small supervisor that runs
+# the boot oneshots and keeps the session alive - see its header for why
+# this image runs no systemd (the quadlet puts the container in the HOST
+# pid namespace for window-to-pod identity, and a systemd system manager
+# cannot run without being PID 1 of its namespace).
+COPY image/init/desktop-init /usr/local/bin/desktop-init
+RUN chmod 0755 /usr/local/bin/desktop-init
 
-STOPSIGNAL SIGRTMIN+3
-CMD ["/sbin/init"]
+# SIGTERM, not systemd's SIGRTMIN+3: desktop-init traps TERM, stops the
+# session tree (via setpriv; see the CAP_KILL note in its header) and exits.
+STOPSIGNAL SIGTERM
+CMD ["/usr/local/bin/desktop-init"]
