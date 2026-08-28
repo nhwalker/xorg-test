@@ -122,6 +122,22 @@ Volume=/etc/desktop-container:/etc/desktop-container:ro
 # this tmpfs, unaffected.
 Tmpfs=/run
 Tmpfs=/tmp
+# /sys, read-only and NON-recursive, stated explicitly. Rootful podman with
+# no user namespace takes its fresh-sysfs path and mounts /sys WRITABLE by
+# default; the old systemd-mode container ended up read-only anyway, so the
+# writable mount only surfaced once systemd left the image (the e2e's
+# verify-privileges caught it) - and a writable /sys is the sixth grant
+# --privileged bundles. A user mount at /sys supersedes podman's default
+# (SupersedeUserMounts in podman's specgen). Via the first-class Mount= key,
+# NOT PodmanArgs: an extra PodmanArgs= line carrying this --mount was
+# silently dropped by quadlet on the e2e host.
+# Non-recursive on purpose: everything the session reads (/sys/class,
+# /sys/devices) is sysfs proper, and the host's sysfs SUBMOUNTS (cgroupfs,
+# selinuxfs, debugfs) are not carried into the container at all, which beats
+# remounting each of them read-only. podman's default masks over
+# /sys/firmware etc. still apply on top. The container preflight reports the
+# mount state at every boot; verify-privileges asserts it.
+Mount=type=bind,source=/sys,destination=/sys,ro=true,bind-nonrecursive=true
 # GPU, always on: most deployments have an NVIDIA GPU, and the rest resolve
 # this against the stub CDI spec desktop-cdi-refresh writes (which injects
 # only the NVIDIA_CDI_STUB=1 marker), so the same unit serves both. The env
@@ -280,21 +296,6 @@ AddDevice=-/dev/snd
 #                           QUOTED because quadlet splits PodmanArgs on
 #                           whitespace and "c 13:* rwm" is ONE argument
 #                           containing two spaces - unquoted it becomes three.
-#
-#   --mount .../sys ro      /sys, read-only and NON-recursive, stated
-#                           explicitly. With the host network namespace,
-#                           podman's default /sys handling left the mount
-#                           WRITABLE once systemd left the image (the e2e's
-#                           verify-privileges caught it rw) - and a writable
-#                           /sys is the sixth grant --privileged bundles.
-#                           Non-recursive on purpose: everything the session
-#                           reads (/sys/class, /sys/devices) is sysfs proper,
-#                           and the host's sysfs SUBMOUNTS (cgroupfs,
-#                           selinuxfs, debugfs) are not carried into the
-#                           container at all, which beats remounting each of
-#                           them read-only. podman's default masks over
-#                           /sys/firmware etc. still apply on top.
-PodmanArgs=--mount type=bind,src=/sys,dst=/sys,ro=true,bind-nonrecursive=true
 PodmanArgs=--pid=host --systemd=false --tty \
     --security-opt apparmor=unconfined \
     --log-opt max-size=64m \

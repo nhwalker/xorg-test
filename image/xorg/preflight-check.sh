@@ -93,6 +93,18 @@ else
     pass "host pid namespace shared (init is host pid $initpid)"
 fi
 
+# --- /sys read-only ----------------------------------------------------------
+# The quadlet states /sys as a read-only non-recursive bind (see its Mount=
+# entry). Rootful podman's default is a WRITABLE fresh sysfs here, and the
+# regression is invisible in normal use - everything works either way - so
+# report it where verify-privileges is not running.
+sysopts=$(awk '$2=="/sys"{print $4; exit}' /proc/self/mounts)
+case ",$sysopts," in
+    *,ro,*) pass "/sys is read-only ($sysopts)" ;;
+    "")     warn "/sys not found in /proc/self/mounts" ;;
+    *)      fail "/sys is mounted WRITABLE ($sysopts): the quadlet's Mount= for /sys did not apply - a writable /sys is one of the grants --privileged bundles" ;;
+esac
+
 # --- shared socket directories ------------------------------------------------
 for d in /tmp/.X11-unix /run/desktop-audio; do
     if [ -d "$d" ] && as_desktop test -w "$d"; then
