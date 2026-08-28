@@ -303,9 +303,16 @@ PodmanArgs=--pid=host --systemd=false --tty \
 # (--pid=host above) CAP_KILL would mean "may signal any process on the
 # host". desktop-init never needs it - it signals the session by first
 # becoming uid 1000 via setpriv (SETUID/SETGID below), and same-uid
-# signaling needs no capability at all. The session user's reach is
-# likewise uid-scoped: processes of OTHER uids on the host are exactly as
-# signalable as before, which is not at all.
+# signaling needs no capability at all. That same-uid power is real and
+# cuts both ways: uid 1000 in this container IS uid 1000 on the host (no
+# user namespace), so the session user can signal any HOST uid-1000
+# process too. desktop-init therefore scopes every kill to the session's
+# own sid, never to the uid - the first e2e run of this shape used
+# `pkill -u 1000` and took down the test harness's ssh session, because
+# the VM's login user is uid 1000 as well. Deployments whose hosts have a
+# real uid-1000 user should consider moving the desktop user to a
+# collision-free uid; processes of other uids are not signalable from the
+# container at all.
 #
 #   SYS_TTY_CONFIG   Xorg's VT ioctls (VT_ACTIVATE at session start)
 #   MKNOD            ensure-vt-devices.sh creating tty0/tty1 on the container's

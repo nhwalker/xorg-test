@@ -62,17 +62,33 @@ as_desktop() {
 session_pid=""
 shutting_down=0
 
+session_members() {
+    # Every pid in the session's SESSION (setsid made $session_pid a session
+    # leader, and the sid survives the leader's death for orphans). NEVER
+    # scope this by uid: in the host pid namespace `pkill -u 1000` reaches
+    # every uid-1000 process ON THE HOST - the first e2e run of this shape
+    # killed the test harness's own ssh session that way (the VM's login
+    # user is uid 1000 too). The session id is unique to our tree; the
+    # signals still go through setpriv because same-uid needs no capability.
+    [ -n "$session_pid" ] || return 0
+    ps -eo pid=,sess= | awk -v s="$session_pid" '$2==s{print $1}'
+}
+
 stop_session() {
-    # TERM the user's whole process tree, uid-scoped, then KILL stragglers.
-    # pkill -u from uid 1000 cannot touch anything outside the session:
-    # every other process this container can see belongs to other uids or
-    # to root, and same-uid is the only signaling power the session has.
-    as_desktop pkill -TERM -u $DESK_UID 2>/dev/null || true
+    # TERM the session tree, then KILL stragglers. Root's own pid never
+    # appears here (desktop-init is not in that session), so no self-kill.
+    local pids
+    pids=$(session_members)
+    [ -n "$pids" ] || return 0
+    # shellcheck disable=SC2086
+    as_desktop kill -TERM $pids 2>/dev/null || true
     for _ in 1 2 3 4 5; do
-        as_desktop pgrep -u $DESK_UID >/dev/null 2>&1 || return 0
+        pids=$(session_members)
+        [ -n "$pids" ] || return 0
         sleep 1
     done
-    as_desktop pkill -KILL -u $DESK_UID 2>/dev/null || true
+    # shellcheck disable=SC2086
+    as_desktop kill -KILL $pids 2>/dev/null || true
 }
 
 on_term() {

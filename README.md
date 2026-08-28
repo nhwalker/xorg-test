@@ -835,8 +835,10 @@ X needs broad capability because X runs as root. And with systemd gone from
 the image, what is left is smaller still — notably **no `CAP_SYS_ADMIN`**,
 which the systemd-based design could never drop, and **no `CAP_KILL`**, which
 in the host pid namespace would mean "may signal any process on the host"
-(desktop-init signals the session by becoming uid 1000 first via `setpriv`;
-same-uid signaling needs no capability).
+(desktop-init signals the session by becoming uid 1000 first via `setpriv`,
+scoped to the session's sid — never to the uid, since without a user
+namespace "uid 1000" includes any host user with that uid; same-uid
+signaling needs no capability).
 
 | Grant | What it is for |
 |---|---|
