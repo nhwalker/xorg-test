@@ -31,6 +31,17 @@ DPY="${DESKTOP_DISPLAY:-:0}"
 (
     umask 0000
     pipewire &
+    # WirePlumber exits fatally ("Failed to connect to PipeWire") if the
+    # core socket is not there yet, and unlike the systemd user units there
+    # is no socket activation and no Restart= to hide that race - the first
+    # e2e run of this shape lost its session manager to it (pipewire and
+    # pipewire-pulse survived; wireplumber was simply gone, and with it
+    # every ALSA device). PipeWire binds the socket within milliseconds,
+    # but "within" is not "before": wait for it, bounded.
+    for _ in $(seq 100); do
+        [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
+        sleep 0.1
+    done
     wireplumber &
     pipewire-pulse &
     wait
