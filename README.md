@@ -146,8 +146,8 @@ HOST's, where the host's systemd holds that seat). Instead `desktop-init` — a
 user's `XDG_RUNTIME_DIR`, and then supervises two independent trees, the X
 session and the audio stack, restarting each on its own exit:
 
-- Devices are granted explicitly, not by `--privileged`: `/dev/dri` and
-  `/dev/snd` as devices, `/dev/input` as a live bind mount (see "Input
+- Devices are granted explicitly, not by `--privileged`: `/dev/dri` as a
+  device, `/dev/input` and `/dev/snd` as live bind mounts (see "Input
   hotplug and KVM switches"), and the VTs created in the container's own
   `/dev`. See "Container privileges" below.
 - `/run/udev` is mounted read-only from the host, so libudev/libinput in the
@@ -155,7 +155,7 @@ session and the audio stack, restarting each on its own exit:
   runs in the container.
 - `Network=host` lets libinput receive kernel uevents (netlink is per-netns);
   the `/dev/input` bind mount supplies the matching device nodes. Both are
-  needed — see "Input hotplug and KVM switches".
+  needed — see "Input and audio hotplug, and KVM switches".
 - `desktop-init` runs the session as the `desktop` user directly
   (`setsid -c` for the controlling tty on tty1, `setpriv` for the uid/gid
   switch, an explicit environment in place of PAM's). `start-session` is
@@ -183,15 +183,25 @@ session and the audio stack, restarting each on its own exit:
   (what systemd's `TTYPath=` used to do). With no logind in the container,
   Xorg's direct-open fallback is now simply the path.
 
-### Input hotplug and KVM switches
+### Input and audio hotplug, and KVM switches
 
 Devices plugged in after the container started **do** reach the session. That
-needs the quadlet's `Volume=/dev/input:/dev/input`: podman gives the container
-its own `/dev` — a tmpfs populated at creation, which is also why
-`ensure-vt-devices.sh` has to create the VT nodes itself — so without a live
-view of the host's input directory, a node the host gains later never appears
-inside. libinput would receive the uevent (that is what `Network=host` buys),
-try to open the path, and find nothing.
+needs the quadlet's `Volume=/dev/input:/dev/input` and
+`Volume=/dev/snd:/dev/snd`: podman gives the container its own `/dev` — a
+tmpfs populated at creation, which is also why `ensure-vt-devices.sh` has to
+create the VT nodes itself — so without a live view of those host
+directories, a node the host gains later never appears inside. libinput or
+WirePlumber would receive the uevent (that is what `Network=host` buys), try
+to open the path, and find nothing.
+
+Both are bind mounts for the same reason, and neither can be an
+`AddDevice=`, which is a **creation-time snapshot**. `/dev/dri` still is one,
+because a GPU is not a thing that appears on a running desk.
+
+The device cgroup gates them regardless, and a bind mount is not a device as
+far as it is concerned — so majors 13 (evdev) and 116 (ALSA) are allowed
+explicitly in the quadlet. That rule is also what admits a node the host
+gains *later*: nothing evaluated at container creation could.
 
 This matters most for **KVM switches**. A USB KVM without HID emulation
 electrically disconnects the keyboard and mouse from this host on every switch
@@ -208,6 +218,23 @@ busy device may never send) and asserts the node leaves and returns *inside
 the container*, in both directions. The removal half matters as much as the addition: a stale node
 that never disappears is what a snapshot `/dev` looks like, and it would let the
 re-add half pass for the wrong reason.
+
+**Sound has the same shape**, and used to have the wrong answer: `/dev/snd`
+was an `AddDevice=`, so a USB headset, DAC or dock connected after boot never
+produced a `controlC*` inside the container and never reached WirePlumber —
+until `desktop.service` restarted. The e2e now runs the same add/remove cycle
+on a QEMU `usb-audio` device on that same xHCI controller, asserting in both
+directions on two numbers: the nodes visible in the container, and the
+devices WirePlumber actually has. They fail differently — a missing node
+means `/dev` is a stale snapshot, a node with no WirePlumber device means the
+uevent never arrived — and reporting one could not tell them apart.
+
+One thing a hot-added card needs beyond the node: a usable gid. On a host
+that booted with no sound card, `align-device-groups.sh` had no node to
+measure and left the container's `audio` group at its image value, so a card
+appearing later would be visible but not openable by the unprivileged
+session user. The audio supervisor re-runs the audio-group alignment before
+every start of the stack, which closes that gap.
 
 > **Video is a separate question**, with a separate answer — the next
 > section. A KVM switches the display too, but that is not a `/dev` problem:
@@ -826,8 +853,10 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   directions under enforcing, podman clients resolve each CDI device and
   get its capability and no other, input is typed in over the real virtual
   keyboard, hotplug is asserted through to the container's `/dev` and a full
-  KVM-style remove/re-add cycle is exercised via QEMU (see "Input hotplug and
-  KVM switches"), a fixed monitor layout is declared across the GPU's two
+  KVM-style remove/re-add cycle is exercised via QEMU for both a USB keyboard
+  and a USB sound card — the latter through to WirePlumber, and in both
+  directions (see "Input and audio hotplug, and KVM switches"), a fixed
+  monitor layout is declared across the GPU's two
   connectors — one of which QEMU never connects — and asserted to come up
   whole and to hold when a connector is forced down under the running server
   (see "Fixed monitor layout"), the container's privileges are asserted to be less
@@ -878,6 +907,9 @@ aplay        /usr/share/sounds/alsa/Front_Center.wav   # via the ALSA drop-in
 
 Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 (uevents arrive because the container shares the host network namespace).
+Audio hotplug: plug in a USB headset or DAC; a new `controlC*` must appear in
+the container (`podman exec desktop ls /dev/snd`) and the device must show up
+in `podman exec -u desktop desktop wpctl status`.
 
 Video, on a host that declared a layout ("Fixed monitor layout" above): switch
 the KVM away and back. `DISPLAY=:0 xrandr` must report the same geometry
@@ -910,7 +942,8 @@ never collides with a real host user's).
 | `MKNOD` | VT node creation on the container's own `/dev` |
 | `CHOWN`, `SETUID`, `SETGID` | desktop-init: tty1/runtime-dir ownership; the root→desktop switch; the suid Xorg wrapper |
 | `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETPCAP` | root convenience for the oneshots and postmortem; candidates for trimming |
-| `AddDevice=-/dev/dri`, `-/dev/snd` | GPU and audio, by explicit node (optional, so a host lacking either still starts and preflight reports it) |
+| `AddDevice=-/dev/dri` | the GPU, by explicit node (optional, so a host without KMS still starts and preflight reports it) |
+| `Volume=/dev/input`, `/dev/snd` | input and sound as LIVE bind mounts, not device grants — see "Input and audio hotplug" |
 | device cgroup: majors 13, 4, 5, 226, 116 | evdev (the bind mount), VTs, console, DRM, sound |
 
 **Realtime audio without rtkit.** PipeWire runs as the unprivileged `desktop`

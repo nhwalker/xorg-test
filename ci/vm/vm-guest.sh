@@ -1546,6 +1546,34 @@ hotplug_probe() {
     echo "$nodes $adds"
 }
 
+snd_probe() {
+    # Two numbers on one line, for the host to diff across a QEMU
+    # device_add of a usb-audio - the audio counterpart of hotplug_probe:
+    #   1. ALSA card control NODES visible inside the container
+    #   2. audio devices WirePlumber has actually picked up
+    #
+    # Both matter, and they fail differently. The node not appearing means
+    # the container's /dev/snd is not a live view of the host's - which is
+    # exactly what it was before it became a bind mount, and the bug this
+    # probe exists to catch. The node appearing but WirePlumber not adding a
+    # device means the uevent did not reach it, which is what Network=host
+    # is for. Reporting one number could not tell those apart.
+    local nodes devs
+    nodes=$(podman exec desktop sh -c 'ls -1 /dev/snd/controlC* 2>/dev/null | wc -l' 2>/dev/null || echo 0)
+    # Count PipeWire Device objects named alsa_card.*, via pw-cli rather than
+    # `wpctl status`: wpctl prints friendly DESCRIPTIONS ("Built-in Audio"),
+    # so there is no stable string to count, while pw-cli prints the object's
+    # device.name. Devices only - wpctl's sinks/sources/streams are derived
+    # from them and move for reasons unrelated to hotplug. The session user's
+    # runtime dir has to be stated: `podman exec` inherits the container
+    # init's environment, not the session's.
+    devs=$(podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop \
+        desktop sh -c 'pw-cli ls Device 2>/dev/null | grep -c "device.name = \"alsa_card"' 2>/dev/null || true)
+    [ -n "${nodes:-}" ] || nodes=0
+    [ -n "${devs:-}" ] || devs=0
+    echo "$nodes $devs"
+}
+
 input_sink_start() {
     # A sink xterm reads one line and records it. Geometry must match the
     # click coordinate the host computes (100x30 at +250+200 -> centre ~550,395).
@@ -1784,6 +1812,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     verify-log-bounds) verify_log_bounds ;;
     verify-audio-lifecycle) verify_audio_lifecycle ;;
     hotplug-probe) hotplug_probe ;;
+    snd-probe) snd_probe ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
     *) fail "unknown phase $1" ;;

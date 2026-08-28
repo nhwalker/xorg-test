@@ -222,30 +222,60 @@ LogDriver=k8s-file
 
 # Devices. Explicit nodes rather than the host's whole /dev.
 #   dri  the GPU: KMS and render nodes, opened by group by rootless Xorg
-#   snd  ALSA cards for PipeWire
-# Input is NOT here: it needs a LIVE view (hotplug, KVM switching), which the
-# /dev/input bind mount above provides. A --device snapshot would defeat it.
-# The leading '-' makes each OPTIONAL: podman refuses to create the container
-# at all if an AddDevice= path is missing ("stat /dev/snd: no such file or
-# directory"), and a host without a sound card or without KMS is a host the
-# desktop should still start on so that preflight can say what is wrong. That
-# is the same reasoning as the stub NVIDIA CDI spec: always resolve, and let
-# the in-container preflight report the real problem rather than failing at
+# Input and SOUND are not here: both need a LIVE view, which their bind
+# mounts (above, and just below) provide. A --device snapshot would defeat
+# it. /dev/dri is the one that can stay a device grant, because a GPU is not
+# a thing that appears on a running desk.
+# The leading '-' makes it OPTIONAL: podman refuses to create the container
+# at all if an AddDevice= path is missing ("stat /dev/dri: no such file or
+# directory"), and a host without KMS is a host the desktop should still
+# start on so that preflight can say what is wrong. That is the same
+# reasoning as the stub NVIDIA CDI spec: always resolve, and let the
+# in-container preflight report the real problem rather than failing at
 # container creation with a message about stat.
 AddDevice=-/dev/dri
-AddDevice=-/dev/snd
+# Live view of the host's sound cards, for exactly the reason /dev/input is
+# one. This was AddDevice=-/dev/snd, and that is a CREATION-TIME SNAPSHOT:
+# podman gives the container its own /dev tmpfs and populates it once, so a
+# USB headset, DAC or dock plugged in afterwards never appeared inside -
+# no new controlC*, no device in WirePlumber - until desktop.service
+# restarted. On a KVM'd desk that is the same scenario as the keyboard,
+# with the same answer.
+#
+# The uevent half is already covered: Network=host above is what lets the
+# container receive kernel uevents at all (netlink is per-netns), and
+# /run/udev gives libudev the host's database. This mount supplies the
+# matching device nodes, which is the half that was missing.
+#
+# Read-write: ALSA device nodes are opened for playback and capture, and
+# PipeWire sets mixer controls.
+#
+# On a host with no sound hardware /dev/snd does not exist, and podman
+# REFUSES to create a container whose bind source is missing ("statfs
+# /dev/snd: no such file or directory"). It does not create the source, and
+# Volume= has no optional marker the way AddDevice= has its '-' prefix - so
+# the graceful degradation that prefix used to buy is preserved by the
+# tmpfiles.d entry in this tree, which creates an empty /dev/snd at boot.
+# The container then starts and its preflight reports "no /dev/snd/controlC*
+# visible", exactly as before. ci/smoke-deploy.sh runs on a runner with no
+# sound card, so that path is exercised on every PR.
+Volume=/dev/snd:/dev/snd
 # The device cgroup still gates every one of those, and bind mounts are not
-# devices as far as it is concerned - so /dev/input needs its major allowed
-# explicitly or the mount resolves to nodes the container may not open.
+# devices as far as it is concerned - so /dev/input and /dev/snd need their
+# majors allowed explicitly or those mounts resolve to nodes the container
+# may not open.
 #   13  input   (evdev; the bind mount)
+#   116 snd     (ALSA; the bind mount)
 #   4   VTs     (tty0/tty1, created by ensure-vt-devices.sh)
 #   5   console (/dev/console, /dev/tty, ptmx)
 #   226 dri     (also granted by AddDevice= when the node exists)
-#   116 snd     (likewise)
-# The last two are stated here as well as implied by AddDevice=, because those
-# lines are optional ('-' prefix) and so may grant nothing: this keeps the
-# cgroup policy a property of the unit rather than of what the host happens to
-# have.
+# 116 used to be listed as merely redundant with AddDevice=-/dev/snd; it is
+# now the ONLY thing granting sound, since that line became a bind mount.
+# 226 is still stated here as well as implied, because AddDevice=-/dev/dri is
+# optional ('-' prefix) and so may grant nothing: this keeps the cgroup policy
+# a property of the unit rather than of what the host happens to have. It also
+# has to cover majors the host gains LATER - a hot-added USB card's nodes are
+# permitted by this rule, not by anything evaluated at creation.
 
 # Realtime scheduling for the audio stack, WITHOUT rtkit. PipeWire runs as the
 # unprivileged 'desktop' user, so it cannot use the container's CAP_SYS_NICE -

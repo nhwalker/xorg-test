@@ -319,7 +319,7 @@ point of the declarative form — the file list above *is* the state).
 | `etc/systemd/system/default.target` → `multi-user.target` | the default boot target, as a symlink rather than `systemctl set-default` |
 | `etc/systemd/system/getty@tty1.service` → `/dev/null` | masks the getty (frees the VT), as a symlink rather than `systemctl mask` |
 | `etc/systemd/logind.conf.d/50-desktop-container.conf` | logind `NAutoVTs=0` / `ReserveVT=0` drop-in |
-| `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix` |
+| `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix`; `/dev/snd` so its bind mount resolves on a soundless host |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
 | `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket. A drop-in rather than `/etc/asound.conf`, so a host-local `asound.conf` still wins; the `/etc/alsa/conf.d` mechanism is EL/Fedora packaging |
 | `usr/local/bin/desktop-preflight` | read-only debug tool: PASS/WARN/FAIL per host-side assumption; not wired into boot |
@@ -413,24 +413,41 @@ sshd itself: the unit `Wants=sshd.service` (started each boot while the
 desktop is deployed), but whether sshd is *enabled* on the host stays the
 admin's/provisioning's call.
 
-## Input hotplug and KVM switches
+## Input and audio hotplug, and KVM switches
 
-`Volume=/dev/input:/dev/input` gives the container a live view of the host's
-input devices. Without it podman's own `/dev` is a snapshot taken at creation,
-so devices added later never appear inside and libinput has nothing to open.
+`Volume=/dev/input:/dev/input` and `Volume=/dev/snd:/dev/snd` give the
+container a live view of the host's input devices and sound cards. Without
+them podman's own `/dev` is a snapshot taken at creation, so devices added
+later never appear inside and libinput or WirePlumber has nothing to open.
 
 The case that makes this load-bearing rather than cosmetic is a **USB KVM
 switch without HID emulation**: it disconnects and re-enumerates the keyboard
 and mouse on every switch, so a snapshot `/dev` leaves input dead from the
-first switch back until `desktop.service` restarts.
+first switch back until `desktop.service` restarts. Sound is the same story
+with a different cable — a USB headset, DAC or dock connected after boot.
+`/dev/snd` was an `AddDevice=` until it was found to have exactly this bug.
 
-Only `/dev/input`, not all of `/dev` — podman's `/dev/console`, `/dev/pts` and
-`/dev/shm` are what `--tty` (and the console logging it carries) rely on, and
-a blanket `/dev:/dev` would shadow them.
+`/dev/dri` is still an `AddDevice=`, because a GPU is not a thing that
+appears on a running desk.
 
-The device cgroup allows major 13 (input) explicitly for this reason — a bind
-mount is not a device as far as the cgroup is concerned, so without that rule
-it would resolve to nodes the container may not open.
+Only those two directories, not all of `/dev` — podman's `/dev/console`,
+`/dev/pts` and `/dev/shm` are what `--tty` (and the console logging it
+carries) rely on, and a blanket `/dev:/dev` would shadow them.
+
+The device cgroup allows majors 13 (input) and 116 (ALSA) explicitly for this
+reason — a bind mount is not a device as far as the cgroup is concerned, so
+without those rules they would resolve to nodes the container may not open.
+Those rules are also what admit a node the host gains *later*; nothing
+evaluated at container creation could.
+
+A host with no sound hardware has no `/dev/snd` at all, and podman **refuses
+to create a container whose bind source is missing** — it does not create the
+source, and `Volume=` has no optional marker the way `AddDevice=` has its `-`
+prefix. The tmpfiles.d entry in this tree therefore creates an empty
+`/dev/snd` at boot, so such a host still starts and the container's preflight
+reports `no /dev/snd/controlC* visible` — the same graceful degradation the
+old `AddDevice=-` prefix provided. On a host that has sound, udev has already
+populated the directory and the entry is a no-op.
 
 Video is the other half of the same switch, and it is handled by declaring the
 layout rather than by a mount — see the next section.
@@ -481,10 +498,10 @@ not on the NVIDIA one.
 ## Container privileges
 
 The quadlet does not use `--privileged`. Devices are granted explicitly
-(`AddDevice=-/dev/dri` and `-/dev/snd` — the `-` makes them optional, so a host
-without a GPU or a sound card still starts and lets `desktop-preflight` name
-what is missing — the `/dev/input` bind mount, and device cgroup rules for
-majors 13/4/5/226/116), capabilities are dropped to a named set, and podman's
+(`AddDevice=-/dev/dri` — the `-` makes it optional, so a host without a GPU
+still starts and lets `desktop-preflight` name what is missing — the
+`/dev/input` and `/dev/snd` bind mounts, and device cgroup rules for majors
+13/4/5/226/116), capabilities are dropped to a named set, and podman's
 default seccomp filter stays in place. `SecurityLabelDisable=true` remains,
 because confining this container needs a policy module of its own; AppArmor is
 disabled alongside it (`--security-opt apparmor=unconfined`) for the same

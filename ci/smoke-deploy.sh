@@ -187,6 +187,14 @@ systemctl daemon-reload
 systemd-sysusers
 systemd-tmpfiles --create || true   # unrelated runner entries may fail; ours asserted below
 [ -d /run/desktop-audio ] && [ -d /tmp/.X11-unix ] || fail "tmpfiles dirs missing"
+# /dev/snd is a bind mount now, not an AddDevice=, so it must EXIST or podman
+# refuses to create the container at all ("statfs /dev/snd: no such file or
+# directory") - there is no optional marker for Volume= the way AddDevice= has
+# its '-' prefix. This runner has no sound card, which makes it precisely the
+# host class that would break, and the container coming up below is the real
+# assertion; this one just names the cause if it does not.
+[ -d /dev/snd ] \
+    || fail "/dev/snd does not exist after tmpfiles: the quadlet's Volume=/dev/snd will fail container creation on any host without a sound card"
 [ -d "$TOOLS_BIN" ] || fail "toolkit dir $TOOLS_BIN not created by tmpfiles"
 # 0755, not the 1777 the two socket dirs use. This directory holds executables
 # that get mounted into every client, so world-writable would let anything on
