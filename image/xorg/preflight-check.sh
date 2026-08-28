@@ -1,10 +1,10 @@
 #!/bin/bash
 # Boot-time sanity checks for every assumption the desktop container makes.
 # One line per assumption -- PASS / WARN / FAIL -- with a remediation hint
-# on anything not green, so `journalctl -u xorg-conf` (or `podman logs`)
+# on anything not green, so `podman logs desktop`
 # explains a failure before anyone reads Xorg logs.
 #
-# Informational only: always exits 0. Runs from xorg-conf.service after
+# Informational only: always exits 0. Runs from desktop-init after
 # align-device-groups.sh (the readability checks depend on aligned gids).
 set -u
 
@@ -77,12 +77,33 @@ for n in "${cards[0]:-}" "${events[0]:-}" "${snds[0]:-}"; do
     fi
 done
 
-# --- logind ------------------------------------------------------------------
-if [ "$(systemctl is-enabled systemd-logind.service 2>/dev/null)" = "masked" ]; then
-    fail "systemd-logind is masked: PAM session/seat registration will fail (the image build should have unmasked it)"
+# --- pid namespace -----------------------------------------------------------
+# The quadlet runs this container with --pid=host: that is what makes X
+# client PIDs real host PIDs (window-to-pod identity, see README). If the
+# flag is lost, everything still LOOKS fine - the desktop runs, clients
+# connect - but every attribution silently reads pid 0. Catch it at boot:
+# in a private pid namespace our init would be PID 1; in the host's it
+# cannot be (the host's systemd is).
+initpid=$(cat /run/desktop-init.pid 2>/dev/null || echo "")
+if [ -z "$initpid" ]; then
+    warn "no /run/desktop-init.pid: preflight running outside desktop-init?"
+elif [ "$initpid" = 1 ]; then
+    fail "container init is PID 1: the container is NOT in the host pid namespace (--pid=host missing from the quadlet), so X clients cannot be attributed to pods"
 else
-    pass "systemd-logind is not masked"
+    pass "host pid namespace shared (init is host pid $initpid)"
 fi
+
+# --- /sys read-only ----------------------------------------------------------
+# The quadlet states /sys as a read-only non-recursive bind (see its Mount=
+# entry). Rootful podman's default is a WRITABLE fresh sysfs here, and the
+# regression is invisible in normal use - everything works either way - so
+# report it where verify-privileges is not running.
+sysopts=$(awk '$2=="/sys"{print $4; exit}' /proc/self/mounts)
+case ",$sysopts," in
+    *,ro,*) pass "/sys is read-only ($sysopts)" ;;
+    "")     warn "/sys not found in /proc/self/mounts" ;;
+    *)      fail "/sys is mounted WRITABLE ($sysopts): the quadlet's Mount= for /sys did not apply - a writable /sys is one of the grants --privileged bundles" ;;
+esac
 
 # --- shared socket directories ------------------------------------------------
 for d in /tmp/.X11-unix /run/desktop-audio; do
@@ -136,9 +157,10 @@ fi
 # when the host has no working GPU stack. Hardware visible anyway (via the
 # quadlet's device grants) means the stub is hiding a broken host, not a missing
 # GPU - the one silent-degradation case worth a FAIL. CDI env edits land on
-# PID 1; whether systemd forwards them to services is not a contract worth
-# depending on, so read PID 1's environment directly.
-cdi_stub=$(tr '\0' '\n' </proc/1/environ 2>/dev/null | sed -n 's/^NVIDIA_CDI_STUB=//p')
+# the container's init process (NOT /proc/1, which is the host's systemd
+# under --pid=host), so read desktop-init's environment via the pid it
+# records; plain inheritance covers the fallback when that is unreadable.
+cdi_stub=$(tr '\0' '\n' </proc/"$(cat /run/desktop-init.pid 2>/dev/null || echo self)"/environ 2>/dev/null | sed -n 's/^NVIDIA_CDI_STUB=//p')
 if [ "${cdi_stub:-${NVIDIA_CDI_STUB:-}}" = 1 ] && [ -e /dev/nvidiactl ]; then
     fail "NVIDIA hardware visible but the host injected a STUB CDI spec: nvidia container toolkit missing/broken on the host (desktop-cdi-refresh fell back). GPU acceleration is OFF; fix the host toolkit and restart"
 fi

@@ -5,7 +5,7 @@
 # plus the boot-fresh keypair desktop-host-shell.service writes, see README
 # "Host terminal from the desktop").
 #
-# Runs as root from xorg-conf.service. Degrades gracefully: without the
+# Runs as root from desktop-init. Degrades gracefully: without the
 # mount the menu entry fails visibly and everything else is unaffected.
 set -u
 

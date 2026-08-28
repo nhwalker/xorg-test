@@ -276,26 +276,26 @@ for _ in $(seq 20); do
 done
 [ "$up" = 1 ] || fail "container never answered exec"
 
-log "stub CDI resolved through the systemd start (marker env on PID 1)"
-# CDI env edits apply to the container's INIT process; podman exec sessions
-# do not get them - read PID 1's environment, not the exec env.
-podman exec desktop sh -c "tr '\0' '\n' </proc/1/environ | grep -qx NVIDIA_CDI_STUB=1" \
-    || fail "NVIDIA_CDI_STUB not injected via AddDevice + stub spec"
-
-log "wait for the container to settle"
-st=""
+log "wait for the container to settle (desktop-init ready marker)"
+# The replacement for `systemctl is-system-running`: desktop-init writes the
+# marker once the boot oneshots have run and the session has been launched.
+# Deliberately NOT gated on the session surviving - on a GPU-less runner the
+# X session may fail exactly like the old suite tolerated a failed
+# desktop-session.service.
+up=0
 for _ in $(seq 40); do
-    st=$(podman exec desktop systemctl is-system-running 2>/dev/null || true)
-    case "$st" in running|degraded) break ;; esac
+    podman exec desktop test -f /run/desktop-init-ready 2>/dev/null && { up=1; break; }
     sleep 3
 done
-case "$st" in running|degraded) ;; *) fail "container state: ${st:-unreachable}" ;; esac
-failed=$(podman exec desktop systemctl --failed --no-legend --plain 2>/dev/null \
-    | awk '{print $1}' | sort | tr '\n' ' ')
-case "$failed" in
-    ""|"desktop-session.service ") ;;
-    *) fail "unexpected failed units: $failed" ;;
-esac
+[ "$up" = 1 ] || fail "desktop-init never wrote /run/desktop-init-ready"
+
+log "stub CDI resolved through the container start (marker env on the init process)"
+# CDI env edits apply to the container's INIT process; podman exec sessions
+# do not get them. The container shares the HOST pid namespace (--pid=host),
+# so /proc/1 is the host's systemd - read desktop-init's own environ via the
+# pid it records, not PID 1's.
+podman exec desktop sh -c 'tr "\0" "\n" </proc/$(cat /run/desktop-init.pid)/environ | grep -qx NVIDIA_CDI_STUB=1' \
+    || fail "NVIDIA_CDI_STUB not injected via AddDevice + stub spec"
 
 log "host terminal: loopback ssh as desktop-shell with the boot-fresh key"
 [ -f /etc/desktop-container/host-shell-key ] || fail "boot-fresh key missing"
@@ -306,8 +306,8 @@ who=$(ssh -i /etc/desktop-container/host-shell-key -o BatchMode=yes -o ConnectTi
 
 log "host terminal: same path from inside the container ('ssh host')"
 # -u desktop because the Host Terminal menu entry runs as the session user, and
-# -e HOME because `podman exec` inherits PID 1's environment rather than the
-# logind session's, so ssh would otherwise look for its config under /root.
+# -e HOME because `podman exec` inherits the init process's environment rather
+# than the session's, so ssh would otherwise look for its config under /root.
 cwho=""
 for _ in $(seq 10); do
     cwho=$(podman exec -u desktop -e HOME=/home/desktop desktop \
@@ -323,14 +323,22 @@ log "privileges: not --privileged, and a seccomp filter is applied"
 # the e2e's runtime, so the regression surfaces sooner.
 priv=$(podman inspect desktop --format '{{.HostConfig.Privileged}}')
 [ "$priv" = false ] || fail "podman reports Privileged=$priv, want false"
-seccomp=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/1/status")
-[ "$seccomp" = 2 ] || fail "PID 1 Seccomp=$seccomp, want 2 (filter active)"
-log "  Privileged=false, Seccomp=2"
+# /proc/1 is the host's systemd under --pid=host; check the container's own
+# init process. Also assert the pid-namespace shape itself, both ways: the
+# recorded pid must be meaningful on the HOST (that is the whole feature),
+# and its absence would mean the quadlet lost --pid=host.
+initpid=$(podman exec desktop cat /run/desktop-init.pid)
+[ -d "/proc/$initpid" ] || fail "desktop-init pid $initpid is not visible on the host: --pid=host not in effect?"
+grep -q desktop-init "/proc/$initpid/comm" \
+    || fail "host pid $initpid is not desktop-init ($(cat /proc/$initpid/comm 2>/dev/null)): stale pid file or pid-ns mismatch"
+seccomp=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/$initpid/status")
+[ "$seccomp" = 2 ] || fail "desktop-init Seccomp=$seccomp, want 2 (filter active)"
+log "  Privileged=false, Seccomp=2, init is host pid $initpid"
 
 log "logging: the container log is bounded, not inherited from the host default"
 # The cheap half of verify-log-bounds in the VM e2e. Worth repeating here for
-# the same reason the privilege checks are: journal-console.service streams the
-# journal into this sink continuously, so an unbounded one is a slow
+# the same reason the privilege checks are: desktop-init and the whole session
+# stream to /dev/console continuously, so an unbounded sink is a slow
 # disk-filling bug that nothing else in the suite would notice.
 drv=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Type}}')
 [ "$drv" = k8s-file ] || fail "container log driver is '$drv', want k8s-file (LogDriver= did not reach podman)"
@@ -362,18 +370,19 @@ fi
 # read-only mount, and is acted on at container start. No quadlet change was
 # needed for this feature, and that claim is exactly what would rot silently.
 #
-# Both halves wait on xorg-conf.service, never on the container merely being
-# reachable: the generator runs from that oneshot, which finishes seconds
-# AFTER `podman exec` starts working. Reading its output early is not just a
-# flaky failure - it would let the no-op assertion pass vacuously, on a
-# container that had not yet had the chance to write anything.
+# Both halves wait on the ready marker, never on the container merely being
+# reachable: desktop-init writes it AFTER the oneshots (the generator among
+# them), and `podman exec` starts working seconds earlier. Reading the
+# output early is not just a flaky failure - it would let the no-op
+# assertion pass vacuously, on a container that had not yet had the chance
+# to write anything.
 wait_xorg_conf() {
     for _ in $(seq 30); do
-        podman exec desktop systemctl is-active --quiet xorg-conf.service && return 0
+        podman exec desktop test -f /run/desktop-init-ready 2>/dev/null && return 0
         sleep 2
     done
-    podman exec desktop systemctl status xorg-conf.service --no-pager -l >&2 2>&1 || true
-    fail "xorg-conf.service never completed in the container"
+    podman logs --tail 40 desktop >&2 2>&1 || true
+    fail "desktop-init oneshots never completed in the container"
 }
 
 log "fixed monitor layout: the shipped default is a genuine no-op"
@@ -382,7 +391,7 @@ wait_xorg_conf
 # Captured, not piped into grep -q: this script runs under `set -o pipefail`,
 # and a grep that stops at the first match leaves podman writing into a closed
 # pipe - SIGPIPE, exit 141, and a passing check reported as a failure.
-gen_log=$(podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null || true)
+gen_log=$(podman logs desktop 2>/dev/null || true)
 case "$gen_log" in
     *xorg-monitor-conf*) ;;
     *) fail "the layout generator never ran" ;;
@@ -411,7 +420,7 @@ done
 wait_xorg_conf
 mon=$(podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf 2>/dev/null || true)
 if [ -z "$mon" ]; then
-    podman exec desktop journalctl -u xorg-conf -o cat 2>/dev/null | grep xorg-monitor-conf >&2 || true
+    podman logs desktop 2>/dev/null | grep xorg-monitor-conf >&2 || true
     fail "the declared layout produced no /etc/X11/xorg.conf.d/30-monitors.conf"
 fi
 echo "$mon" | grep -q 'Identifier  "DP-2"' || fail "generated config does not name the declared outputs"

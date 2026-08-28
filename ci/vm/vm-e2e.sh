@@ -321,7 +321,7 @@ assert_nonblank desktop-deploy
 
 log "privileges: the desktop container runs with less than --privileged"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-privileges' \
-    || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop grep -E "^(Cap|Seccomp)" /proc/1/status' \
+    || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop sh -c "grep -E \"^(Cap|Seccomp)\" /proc/\$(cat /run/desktop-init.pid)/status"' \
          2>&1 | tee "$ART/privileges-fail.log" || true; fail "privilege assertions failed"; }
 
 log "logging: both log sinks are bounded, on the running container"
@@ -545,6 +545,12 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-screenshot' \
          2>&1 | tee "$ART/screenshot-fail.log" || true; fail "screenshot capture check failed"; }
 vm_ssh 'sudo tar -C /tmp/screenshots -cf - .' | tar -C "$ART" -xf - \
     || fail "could not retrieve the captured screenshots from the VM"
+# While the pattern pod is still connected: every X client must be
+# attributable to its k8s pod from inside the desktop container - the
+# window-to-pod identity chain the host-pid-namespace shape exists for
+# (SO_PEERCRED -> X-Resource pid -> /proc/<pid>/cgroup -> pod UID).
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-pod-identity' \
+    || fail "pod identity check failed"
 # Down again before the concurrency phase screendumps the display.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh screenshot-pattern-stop' || true
 

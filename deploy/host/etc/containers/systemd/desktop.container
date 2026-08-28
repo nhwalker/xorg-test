@@ -90,8 +90,8 @@ Network=host
 # desktop.service restarts.
 #
 # Just /dev/input, not all of /dev: podman's own /dev/console, /dev/pts and
-# /dev/shm are what --systemd=always and --tty depend on, and a blanket
-# /dev:/dev would shadow them. Read-write because libinput needs to write to
+# /dev/shm are what --tty (and the console logging it carries) depend on, and
+# a blanket /dev:/dev would shadow them. Read-write because libinput needs to write to
 # evdev nodes (EVIOCGRAB, LEDs).
 #
 # The device cgroup still governs access to what this exposes, and a bind
@@ -115,6 +115,29 @@ Volume=/var/lib/desktop-container/bin:/var/lib/desktop-container/bin
 # shell-user file from this tree plus the boot-fresh keypair written by
 # desktop-host-shell.service (harmless when absent/empty).
 Volume=/etc/desktop-container:/etc/desktop-container:ro
+# systemd mode used to put tmpfs on /run and /tmp; without it (--systemd=false
+# below) state them explicitly. /run must not persist across restarts (stale
+# pids, sockets, the desktop-init-ready marker), and /tmp holds Xorg's own
+# .X0-lock. The /run/udev and /run/desktop-audio volumes above mount over
+# this tmpfs, unaffected.
+Tmpfs=/run
+Tmpfs=/tmp
+# /sys, read-only and NON-recursive, stated explicitly. Rootful podman with
+# no user namespace takes its fresh-sysfs path and mounts /sys WRITABLE by
+# default; the old systemd-mode container ended up read-only anyway, so the
+# writable mount only surfaced once systemd left the image (the e2e's
+# verify-privileges caught it) - and a writable /sys is the sixth grant
+# --privileged bundles. A user mount at /sys supersedes podman's default
+# (SupersedeUserMounts in podman's specgen). Via the first-class Mount= key,
+# NOT PodmanArgs: an extra PodmanArgs= line carrying this --mount was
+# silently dropped by quadlet on the e2e host.
+# Non-recursive on purpose: everything the session reads (/sys/class,
+# /sys/devices) is sysfs proper, and the host's sysfs SUBMOUNTS (cgroupfs,
+# selinuxfs, debugfs) are not carried into the container at all, which beats
+# remounting each of them read-only. podman's default masks over
+# /sys/firmware etc. still apply on top. The container preflight reports the
+# mount state at every boot; verify-privileges asserts it.
+Mount=type=bind,source=/sys,destination=/sys,ro=true,bind-nonrecursive=true
 # GPU, always on: most deployments have an NVIDIA GPU, and the rest resolve
 # this against the stub CDI spec desktop-cdi-refresh writes (which injects
 # only the NVIDIA_CDI_STUB=1 marker), so the same unit serves both. The env
@@ -127,11 +150,12 @@ Volume=/etc/desktop-container:/etc/desktop-container:ro
 AddDevice=nvidia.com/gpu=all
 Environment=NVIDIA_DRIVER_CAPABILITIES=all
 # --- logging ------------------------------------------------------------------
-# journal-console.service inside the image runs `journalctl -b -f` into
-# /dev/console forever, which is what makes `podman logs desktop` show the
-# container's boot and its running journal. That is a CONTINUOUS stream from a
-# machine meant to run for months, so the sink it lands in has to be bounded or
-# it is a slow disk-filling bug.
+# desktop-init and everything it starts write straight to /dev/console (the
+# pty --tty allocates), which is what `podman logs desktop` reads. No journal,
+# no forwarder: with no systemd in the image there is no journald, so the
+# console IS the log. It is still a CONTINUOUS stream from a machine meant to
+# run for months, so the sink it lands in has to be bounded or it is a slow
+# disk-filling bug.
 #
 # Nothing bounded it before: with no driver named here the bound came from
 # whatever /usr/share/containers/containers.conf the host happens to ship.
@@ -144,7 +168,10 @@ Environment=NVIDIA_DRIVER_CAPABILITIES=all
 # So both halves are stated explicitly:
 #   LogDriver=k8s-file   a per-container file, so the desktop's chatter cannot
 #                        push the host's own logs out of the host journal.
-#                        `podman logs` reads it either way.
+#                        `podman logs` reads it either way. (The in-container
+#                        half of the old logging bound - journald's
+#                        RuntimeMaxUse - is gone WITH journald; this file is
+#                        now the only sink and the only bound needed.)
 #   --log-opt max-size   the actual bound. In PodmanArgs rather than as a
 #                        LogOpt= key because that key needs podman 5.0, and
 #                        this tree still targets older quadlet (see the drop-in
@@ -166,7 +193,10 @@ LogDriver=k8s-file
 # 'desktop' user and opens /dev/dri and /dev/input by plain group permission
 # (see image/xorg/Xwrapper.config and align-device-groups.sh). Most
 # containerised X needs broad capability because X runs as root; this does not.
-# What remains is what systemd, logind, PAM and the audio stack need.
+# With systemd gone from the image (see --pid=host below and desktop-init's
+# header), what remains is what the init script, the suid Xorg wrapper and the
+# VT need - notably NOT CAP_SYS_ADMIN, which the systemd design could never
+# drop and which was the single capability keeping this container "trusted".
 
 # Devices. Explicit nodes rather than the host's whole /dev.
 #   dri  the GPU: KMS and render nodes, opened by group by rootless Xorg
@@ -204,33 +234,40 @@ AddDevice=-/dev/snd
 # to SCHED_FIFO for an unprivileged process and needs no capability at all, so
 # PipeWire gets its RT threads and the dangerous capabilities stay dropped.
 # memlock likewise replaces the CAP_IPC_LOCK that PipeWire would otherwise want
-# for its buffers. The image also needs a systemd drop-in for these to reach
-# PipeWire at all - see image/systemd/realtime-limits.conf.
+# for its buffers. With no systemd in the image the limits reach PipeWire by
+# plain inheritance (desktop-init -> start-session -> the daemons).
 #
 # --- every flag on the PodmanArgs line, and why ------------------------------
 # These are the options quadlet has no key of its own for. Comments cannot be
 # interleaved into a line continuation, so they are indexed here instead; keep
 # this list in step with the line below.
 #
-#   --systemd=always        Run the image's /sbin/init as a real systemd PID 1:
-#                           podman then mounts /sys/fs/cgroup, puts tmpfs on
-#                           /run and /tmp, and stops the container with
-#                           SIGRTMIN+3. "always" rather than the default
-#                           "true" because "true" only switches systemd mode on
-#                           when podman recognises the entrypoint (/sbin/init
-#                           and friends); "always" does not depend on that
-#                           sniffing continuing to match. A silently
-#                           non-systemd PID 1 would take logind, the seat and
-#                           the whole session with it.
+#   --pid=host              THE point of this container shape: the desktop
+#                           shares the host's PID namespace, so Xorg's own
+#                           SO_PEERCRED sees real host PIDs for every client
+#                           connection, the stock X-Resource extension
+#                           (XResQueryClientIds) works, and /proc inside the
+#                           container is the host's - /proc/<pid>/cgroup then
+#                           attributes any X client to the k8s pod that owns
+#                           it (the pod UID is in the cgroup path). The cost
+#                           and the mitigations are in the capability notes
+#                           below; the image-side consequence is that systemd
+#                           cannot run (it must be PID 1 of its namespace,
+#                           and here the host's systemd is), which is why the
+#                           image boots via desktop-init instead.
+#
+#   --systemd=false         Explicit, not merely the default: podman's
+#                           default "true" AUTODETECTS systemd mode from the
+#                           entrypoint, and this container must never get
+#                           systemd mode (tmpfs remounts, SIGRTMIN+3 stop
+#                           signal) by accident of entrypoint naming.
 #
 #   --tty                   Allocate a pty so the runtime creates
-#                           /dev/console, which is what `podman logs` reads and
-#                           what journal-console.service redirects the journal
-#                           into. Without it there is no /dev/console at all,
-#                           the container's boot is invisible from the host,
-#                           and that unit refuses to start rather than create a
-#                           regular file that grows forever on the /dev tmpfs.
-#                           See image/systemd/journal-console.service.
+#                           /dev/console, which is what `podman logs` reads
+#                           and where desktop-init and everything it starts
+#                           write. Without it there is no /dev/console at
+#                           all and the container's boot is invisible from
+#                           the host.
 #
 #   --security-opt          AppArmor off - the Debian-family counterpart of
 #     apparmor=unconfined   SecurityLabelDisable= below, and inert on the
@@ -239,56 +276,83 @@ AddDevice=-/dev/snd
 #
 #   --ulimit rtprio=95      RLIMIT_RTPRIO / RLIMIT_MEMLOCK for the audio stack,
 #   --ulimit memlock=...    replacing rtkit and CAP_IPC_LOCK respectively - see
-#                           the paragraph directly above.
+#                           the paragraph directly above. With no systemd in
+#                           the image these now reach PipeWire by ordinary
+#                           inheritance - the DefaultLimit* relay drop-ins are
+#                           gone with the user manager.
 #
-#   --log-opt max-size=64m  Bound on the container log file - the sink that
-#                           journal-console.service streams the whole journal
-#                           into. See the logging block above; LogDriver= is a
-#                           proper key, this half has none before podman 5.0.
+#   --ulimit nice=31        RLIMIT_NICE for module-rt's nice.level = -11
+#                           (expressed as 20 - nice). Was DefaultLimitNICE=31
+#                           in the deleted realtime-limits.conf; stated here
+#                           because rlimits are now the only delivery path.
+#
+#   --log-opt max-size=64m  Bound on the container log file - the sink the
+#                           console stream lands in. See the logging block
+#                           above; LogDriver= is a proper key, this half has
+#                           none before podman 5.0.
 #
 #   --device-cgroup-rule    The device allowlist; the majors and the reason
 #     (five of them)        each one is here are listed above. The values are
 #                           QUOTED because quadlet splits PodmanArgs on
 #                           whitespace and "c 13:* rwm" is ONE argument
 #                           containing two spaces - unquoted it becomes three.
-PodmanArgs=--systemd=always --tty \
+PodmanArgs=--pid=host --systemd=false --tty \
     --security-opt apparmor=unconfined \
     --log-opt max-size=64m \
     --ulimit rtprio=95 \
     --ulimit memlock=67108864 \
+    --ulimit nice=31 \
     --device-cgroup-rule="c 13:* rwm" \
     --device-cgroup-rule="c 4:* rwm" \
     --device-cgroup-rule="c 5:* rwm" \
     --device-cgroup-rule="c 226:* rwm" \
     --device-cgroup-rule="c 116:* rwm"
 
-# Capabilities: drop everything, add back only what is used.
-#   SYS_ADMIN        systemd PID 1 mounting its own /sys/fs/cgroup, tmpfs, etc;
-#                    logind. This is the one that keeps the container trusted -
-#                    see "Security notes" in README.md.
-#   SYS_TTY_CONFIG   VT ioctls (logind, TTYVHangup/TTYVTDisallocate)
-#   SYS_NICE         systemd/logind scheduling. NOT for PipeWire's RT threads:
-#                    those come from RLIMIT_RTPRIO below, because PipeWire runs
-#                    unprivileged and cannot use a container capability.
-#   SYS_RESOURCE     systemd raising its own limits
+# Capabilities: drop everything, add back only what is used. This set shrank
+# when systemd left the image: SYS_ADMIN (systemd mounting cgroupfs/tmpfs,
+# logind - the capability README.md used to single out as the one keeping
+# this container trusted), SYS_NICE and SYS_RESOURCE (systemd scheduling and
+# limit-raising), AUDIT_WRITE (pam_loginuid), SYS_CHROOT and NET_BIND_SERVICE
+# (the ordinary systemd/PAM set) are all gone with it.
+#
+# KILL is dropped for a different reason: in the HOST pid namespace
+# (--pid=host above) CAP_KILL would mean "may signal any process on the
+# host". desktop-init never needs it - it signals the session by first
+# becoming uid 1000 via setpriv (SETUID/SETGID below), and same-uid
+# signaling needs no capability at all. That same-uid power is real and
+# cuts both ways: uid 1000 in this container IS uid 1000 on the host (no
+# user namespace), so the session user can signal any HOST uid-1000
+# process too. desktop-init therefore scopes every kill to the session's
+# own sid, never to the uid - the first e2e run of this shape used
+# `pkill -u 1000` and took down the test harness's ssh session, because
+# the VM's login user is uid 1000 as well. Deployments whose hosts have a
+# real uid-1000 user should consider moving the desktop user to a
+# collision-free uid; processes of other uids are not signalable from the
+# container at all.
+#
+#   SYS_TTY_CONFIG   Xorg's VT ioctls (VT_ACTIVATE at session start)
 #   MKNOD            ensure-vt-devices.sh creating tty0/tty1 on the container's
-#                    OWN /dev, deliberately: systemd chowns TTYPath= to the
+#                    OWN /dev, deliberately: desktop-init chowns tty1 to the
 #                    session user, and doing that to a host node would change
 #                    the host's.
-#   AUDIT_WRITE      pam_loginuid, for the kiosk login session
-#   CHOWN DAC_OVERRIDE FOWNER FSETID SETUID SETGID SETPCAP SETFCAP KILL
-#                    SYS_CHROOT NET_BIND_SERVICE
-#                    the ordinary systemd/PAM set
+#   CHOWN            desktop-init: tty1 and XDG_RUNTIME_DIR to the session user
+#   SETUID SETGID    setpriv (root -> desktop) for the session and for every
+#                    signal desktop-init sends; the suid Xorg wrapper
+#   DAC_OVERRIDE FOWNER FSETID SETPCAP
+#                    root convenience for the oneshots and postmortem (reading
+#                    the session user's Xorg log, fixing perms on host-shared
+#                    dirs); candidates for trimming once the shape settles
 #
-# Notably NOT granted, all of which --privileged gave: SYS_MODULE, SYS_RAWIO,
-# SYS_PTRACE, SYS_BOOT, SYS_TIME, NET_ADMIN, NET_RAW, BPF, PERFMON, SYSLOG,
-# MAC_ADMIN, MAC_OVERRIDE, DAC_READ_SEARCH, IPC_LOCK, IPC_OWNER, LEASE,
-# LINUX_IMMUTABLE, AUDIT_CONTROL, AUDIT_READ, BLOCK_SUSPEND, WAKE_ALARM,
-# CHECKPOINT_RESTORE.
+# Notably NOT granted: everything --privileged gave, and now also SYS_ADMIN
+# and KILL - see above. Still absent as before: SYS_MODULE, SYS_RAWIO,
+# SYS_PTRACE (which is also what keeps host /proc's environ/mem unreadable
+# from in here despite --pid=host), SYS_BOOT, SYS_TIME, NET_ADMIN, NET_RAW,
+# BPF, PERFMON, SYSLOG, MAC_ADMIN, MAC_OVERRIDE, DAC_READ_SEARCH, IPC_LOCK,
+# IPC_OWNER, LEASE, LINUX_IMMUTABLE, AUDIT_CONTROL, AUDIT_READ,
+# BLOCK_SUSPEND, WAKE_ALARM, CHECKPOINT_RESTORE.
 DropCapability=ALL
-AddCapability=SYS_ADMIN SYS_TTY_CONFIG SYS_NICE SYS_RESOURCE MKNOD AUDIT_WRITE
-AddCapability=CHOWN DAC_OVERRIDE FOWNER FSETID SETUID SETGID SETPCAP SETFCAP
-AddCapability=KILL SYS_CHROOT NET_BIND_SERVICE
+AddCapability=SYS_TTY_CONFIG MKNOD CHOWN SETUID SETGID
+AddCapability=DAC_OVERRIDE FOWNER FSETID SETPCAP
 
 # SELinux separation stays OFF. Confining this container would need a policy
 # module of its own for DRM, evdev and VT access from a container domain -

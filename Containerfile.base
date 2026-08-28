@@ -48,4 +48,5 @@ RUN dnf -y install \
         procps-ng \
         hostname \
         openssh-clients \
+        util-linux \
     && dnf clean all

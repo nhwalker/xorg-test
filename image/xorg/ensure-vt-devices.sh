@@ -12,7 +12,7 @@
 # would change the HOST's /dev/tty1. See the MKNOD entry in
 # deploy/host/etc/containers/systemd/desktop.container.
 #
-# Runs first from xorg-conf.service.
+# Runs first from desktop-init.
 set -u
 
 log() { echo "ensure-vt-devices: $*"; }
