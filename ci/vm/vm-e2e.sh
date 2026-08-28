@@ -347,6 +347,14 @@ for path in pulse pipewire alsa; do
         || fail "$path audio capture is empty or silent"
 done
 
+log "audio lifecycle: independent of the X session, and recovers on its own"
+# Deliberately AFTER the three tone tests: they establish that a healthy
+# stack works, and this one then kills things. It restarts the X session
+# and PipeWire, so anything ordered after it must not assume either kept
+# its pid - the input tests below re-establish their own state anyway.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-audio-lifecycle' \
+    || fail "audio lifecycle assertions failed"
+
 log "input: type into an xterm with the real virtual keyboard, verify the app got it"
 # Prove the whole input path (QEMU HID -> evdev -> Xorg -> focused app), not
 # just that a device enumerates. A sink xterm runs `read`; we click it to

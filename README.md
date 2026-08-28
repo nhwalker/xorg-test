@@ -42,7 +42,8 @@ image/                      files baked into the image
   rocky9.repo               Rocky 9 BaseOS/AppStream/CRB at priority=200
   xorg/                     Xwrapper.config, boot-time GPU config generator
   init/                     desktop-init: the container entrypoint/supervisor
-  session/                  start-session, xinitrc.desktop, mwmrc, Xdefaults
+  session/                  start-session, start-audio, xinitrc.desktop,
+                            mwmrc, Xdefaults
   pipewire/                 socket-export config drop-ins
 ```
 
@@ -142,7 +143,8 @@ There is no systemd in the container: it cannot run there (a systemd system
 manager must be PID 1 of its pid namespace, and this container shares the
 HOST's, where the host's systemd holds that seat). Instead `desktop-init` — a
 ~150-line bash supervisor — runs the boot oneshots, creates the session
-user's `XDG_RUNTIME_DIR`, launches the session, and restarts it on exit:
+user's `XDG_RUNTIME_DIR`, and then supervises two independent trees, the X
+session and the audio stack, restarting each on its own exit:
 
 - Devices are granted explicitly, not by `--privileged`: `/dev/dri` and
   `/dev/snd` as devices, `/dev/input` as a live bind mount (see "Input
@@ -156,9 +158,11 @@ user's `XDG_RUNTIME_DIR`, launches the session, and restarts it on exit:
   needed — see "Input hotplug and KVM switches".
 - `desktop-init` runs the session as the `desktop` user directly
   (`setsid -c` for the controlling tty on tty1, `setpriv` for the uid/gid
-  switch, an explicit environment in place of PAM's). `start-session`
-  launches PipeWire/WirePlumber as plain children and then
-  `startx` → `xinitrc.desktop` → `mwm`.
+  switch, an explicit environment in place of PAM's). `start-session` is
+  then `startx` → `xinitrc.desktop` → `mwm`, and nothing else.
+- **The audio stack is supervised separately** — `start-audio`, in a
+  process session of its own, under its own restart loop. See "Audio has
+  its own lifecycle" below for why the two are not one.
 - Seat and session **bookkeeping live on the host**: the deploy tree's
   `desktop-session.service` opens a real PAM/logind login session for the
   same `desktop` user (fixed uid 61000, one contract between the image and
@@ -471,6 +475,55 @@ For ALSA-only apps in other containers, add the same two-stanza config the
 deploy tree drops at `/etc/alsa/conf.d/60-desktop-container.conf` (requires
 `alsa-plugins-pulseaudio` in that image).
 
+### Audio has its own lifecycle
+
+The audio stack does not live in the X session. `desktop-init` supervises two
+independent trees, each the leader of its own process session:
+
+| tree | what it is | restarts when |
+|---|---|---|
+| X session | `start-session` → `startx` → `mwm`, on tty1 | Xorg exits |
+| audio | `start-audio` → PipeWire, WirePlumber, pipewire-pulse | any of the three exits |
+
+Neither can reap the other: `desktop-init` stops a tree by killing every pid
+in *that tree's* session id, and the two sessions are disjoint. (Never by uid
+— in the host pid namespace a uid-wide `pkill` reaches every same-uid process
+on the host, which once killed the e2e's own ssh session.)
+
+They used to be one tree, and it cost availability in both directions:
+
+- **Xorg exiting took audio down with it.** The daemons were children of the X
+  session, so the sid-scoped cleanup killed them too, and every audio client —
+  on the host, in another container, in an audio-only pod that has nothing to
+  do with the display — got `ECONNREFUSED` until the session came back.
+- **A dead audio daemon never came back at all.** `start-session` ended in a
+  bare `wait`, which returns only once *all* its children have exited, so one
+  dead daemon went unnoticed and the stack stayed down — with a stale socket
+  file PipeWire will not re-bind over — until Xorg happened to exit. The X
+  session had `Restart=always` semantics; the audio stack had none.
+
+What did **not** change: the daemons still run as the same uid with the same
+`XDG_RUNTIME_DIR`, so apps inside this container still use the default
+per-user sockets and `pipewire-alsa` exactly as before, and the quadlet's
+`--ulimit` still reaches PipeWire by plain inheritance — one hop shorter
+(`desktop-init` → `start-audio` → the daemons).
+
+The e2e asserts both directions (`verify-audio-lifecycle`), because no other
+test can tell: every other audio test plays a tone through a healthy stack and
+passes identically whether the two share a lifecycle or not. The deploy smoke
+job asserts the cheap half for free — that runner has no KMS, so the X session
+crash-loops for the whole job, and PipeWire's pid must not move across those
+restarts.
+
+> **Why not a separate audio container?** It was considered and rejected. The
+> client contract is already capability-split (`desktop.local/display` vs
+> `desktop.local/audio`), so a second container would change no client
+> manifest, and the isolation it adds beyond the above is small: a media
+> container would want the host PID namespace too, the moment per-pod
+> attribution matters for capture the way it already does for windows (see
+> "Window-to-pod identity" — PipeWire records the peer pid per client just as
+> Xorg does). Splitting the lifecycle is the part that was actually load-bearing.
+
 ## Kubernetes (single-node k3s + CRI-O)
 
 **Kubernetes here carries application containers, not the desktop.** The
@@ -759,14 +812,17 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   full composition — rsync-apply, boot from the tree's quadlet, converger
   oneshots, stub-CDI marker on the container's init process (which is a
   HOST pid — the pid-namespace shape is itself asserted, both ways), audio
-  sockets, `desktop-shell` ssh in both directions, `desktop-preflight`
-  green, service restart.
+  sockets, PipeWire's pid holding still across the X session restarts that
+  runner's missing KMS causes anyway, `desktop-shell` ssh in both
+  directions, `desktop-preflight` green, service restart.
 - **`e2e-vm.yml`** — the full stack in a KVM-booted **Rocky 9 VM** with
   virtio display/input/sound and **SELinux enforcing**
   (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`). The `deploy/` tree is applied
   to the stock host: seat-prep evicts the boot getty, real Xorg starts
   rootless on a real KMS device, mwm runs, audio plays over all three
-  client paths, the root-owned `desktop-shell` ssh trust is proven in both
+  client paths and is proven independent of the X session's lifecycle in
+  both directions (see "Audio has its own lifecycle"), the root-owned
+  `desktop-shell` ssh trust is proven in both
   directions under enforcing, podman clients resolve each CDI device and
   get its capability and no other, input is typed in over the real virtual
   keyboard, hotplug is asserted through to the container's `/dev` and a full
@@ -868,7 +924,7 @@ route to `SCHED_FIFO` for an unprivileged process, needing no capability at
 all.
 
 Those `--ulimit` values now reach PipeWire by **plain rlimit inheritance**
-(desktop-init → start-session → the daemons). The systemd-era design needed
+(desktop-init → start-audio → the daemons). The systemd-era design needed
 `DefaultLimit*` relay drop-ins in both `system.conf.d` and `user.conf.d`,
 because systemd applies its own defaults rather than passing on the rlimits
 it was started with — an entire failure mode this shape deletes. The e2e
@@ -1020,7 +1076,7 @@ number is stated at all.
   removing it from `image/session/xinitrc.desktop` and distributing the xauth
   cookie instead.
 - Exported audio sockets are world-connectable (`umask 0000` around the
-  daemon spawns in `start-session`); restrict `/run/desktop-audio`
+  daemon spawns in `start-audio`); restrict `/run/desktop-audio`
   permissions in the tmpfiles.d entry if that matters on your host.
 
 ## Troubleshooting

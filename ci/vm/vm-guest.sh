@@ -1265,6 +1265,88 @@ verify_log_bounds() {
     log lb "verify-log-bounds passed"
 }
 
+pipewire_pid() { podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true; }
+pipewire_running() { [ -n "$(pipewire_pid)" ]; }
+
+audio_reachable() {
+    # The exported Pulse socket, from the HOST - the same probe phase-deploy
+    # uses for host audio. "PipeWire is running" and "clients can reach the
+    # export" are different claims, and a restart that leaves a stale socket
+    # behind satisfies the first while breaking the second (PipeWire will not
+    # re-bind over a leftover file), which is precisely the regression the
+    # per-restart socket clearing exists to prevent.
+    PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 20 pactl info >/dev/null 2>&1
+}
+
+verify_audio_lifecycle() {
+    # The audio stack and the X session are supervised separately, and this
+    # is the only test that can tell. Every other audio test here plays a
+    # tone through a healthy stack, which passes identically whether the two
+    # share a lifecycle or not.
+    #
+    # Two directions, and they used to fail differently:
+    #
+    #   X dies    -> the audio daemons were children of the X session, so
+    #                desktop-init's sid-scoped cleanup killed them with it and
+    #                every audio client on the host or in another pod got
+    #                ECONNREFUSED until the session came back.
+    #   audio dies-> nothing at all happened. The old start-session ended in a
+    #                bare `wait`, which returns only once ALL its children have
+    #                exited, so one dead daemon went unnoticed and the stack
+    #                stayed down - with a stale socket - until Xorg happened to
+    #                exit. There was no recovery path to test.
+    log al "audio survives an X session restart"
+    wait_for 30 2 "pipewire to be running" pipewire_running
+    pw_before=$(pipewire_pid)
+    [ -n "$pw_before" ] || fail "no pipewire process to start from"
+    audio_reachable || fail "audio was not reachable before the test even began"
+    session_up || fail "no X session to restart"
+
+    # Kill the X server, not the container: the session dies, desktop-init
+    # notices and starts a new one. That is the ordinary failure this is
+    # about - Xorg crashing - rather than an operator restarting the unit.
+    podman exec desktop pkill -u desktop -x Xorg || true
+    wait_for 45 2 "the X session to come back" session_up
+    log al "  the X session restarted"
+
+    pw_after=$(pipewire_pid)
+    [ "$pw_after" = "$pw_before" ] \
+        || fail "pipewire pid changed from $pw_before to '$pw_after' across an X session restart: the audio stack is still in the X session's process session and gets killed with it"
+    audio_reachable \
+        || fail "the exported pulse socket is unreachable after an X session restart, though pipewire kept its pid"
+    log al "  pipewire pid $pw_before unchanged, export still reachable"
+
+    log al "audio recovers from its own crash"
+    # The half that had no answer at all before: kill PipeWire and require a
+    # NEW one, plus a reachable export - which needs the stale socket files
+    # cleared, or the restarted daemon cannot re-bind and every client keeps
+    # getting ECONNREFUSED against a socket that looks present.
+    podman exec desktop pkill -u desktop -x pipewire || true
+    recovered=""
+    for _ in $(seq 30); do
+        recovered=$(pipewire_pid)
+        [ -n "$recovered" ] && [ "$recovered" != "$pw_before" ] && break
+        recovered=""
+        sleep 2
+    done
+    [ -n "$recovered" ] \
+        || fail "pipewire never came back after being killed (was $pw_before): the audio stack has no supervisor of its own"
+    log al "  pipewire restarted as pid $recovered"
+
+    # wait_for fails the run on timeout, so the reason goes in the description.
+    wait_for 30 2 \
+        "the exported audio socket to be reachable again after a pipewire restart (stale socket files not cleared before the restart?)" \
+        audio_reachable
+
+    # And the session must not have been collateral damage in the other
+    # direction either - killing audio must not disturb X.
+    session_up \
+        || fail "the X session died when the audio stack was killed: the two are still coupled, in the other direction"
+    log al "  the X session was undisturbed"
+
+    log al "verify-audio-lifecycle passed"
+}
+
 verify_privileges() {
     # The container must be running with LESS than --privileged, and stay that
     # way. Without this, restoring --privileged would be invisible: everything
@@ -1683,7 +1765,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|hotplug-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -1700,6 +1782,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|hotplug-pro
     verify-privileges) verify_privileges ;;
     verify-pod-identity) verify_pod_identity ;;
     verify-log-bounds) verify_log_bounds ;;
+    verify-audio-lifecycle) verify_audio_lifecycle ;;
     hotplug-probe) hotplug_probe ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;

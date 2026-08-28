@@ -289,6 +289,52 @@ for _ in $(seq 40); do
 done
 [ "$up" = 1 ] || fail "desktop-init never wrote /run/desktop-init-ready"
 
+log "audio stack is independent of the X session's lifecycle"
+# This runner has no KMS, so the X session cannot start and desktop-init
+# restarts it every three seconds for the whole job. That makes it the
+# cheapest possible venue for the property that matters: under the old
+# shape the audio daemons were children of the X session and were killed
+# with it, so PipeWire was being torn down and rebuilt on every one of
+# those iterations. Now it must come up ONCE and stay up across them.
+#
+# Asserted on the pid, not on the socket: a socket that goes away and comes
+# back within the polling interval looks identical to one that never moved,
+# and "it was restarted quickly" is exactly the failure being ruled out.
+pw_before=""
+for _ in $(seq 30); do
+    pw_before=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
+    [ -n "$pw_before" ] && break
+    sleep 2
+done
+[ -n "$pw_before" ] \
+    || { podman logs desktop 2>&1 | tail -40 >&2 || true
+         fail "no pipewire process in the container: the audio stack never started (it no longer waits on X, so a GPU-less host is not an excuse)"; }
+
+# Wait for the session loop to go round at least twice. Counting the log
+# lines is what makes this a real test: without an observed restart the pid
+# comparison below would pass on a box where nothing happened at all.
+restarts_before=$(podman logs desktop 2>&1 | grep -c 'session exited' || true)
+[ -n "$restarts_before" ] || restarts_before=0
+target=$((restarts_before + 2))
+seen=$restarts_before
+for _ in $(seq 30); do
+    seen=$(podman logs desktop 2>&1 | grep -c 'session exited' || true)
+    [ -n "$seen" ] || seen=0
+    [ "$seen" -ge "$target" ] && break
+    sleep 2
+done
+if [ "$seen" -lt "$target" ]; then
+    # A runner that somehow brought X up is not a failure - it just cannot
+    # prove this property, so say so instead of asserting something else.
+    log "  (no X session restarts observed on this runner; skipping the pid comparison)"
+else
+    pw_after=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
+    [ "$pw_after" = "$pw_before" ] \
+        || { podman logs desktop 2>&1 | tail -40 >&2 || true
+             fail "pipewire pid changed from $pw_before to '$pw_after' across $((seen - restarts_before)) X session restarts: the audio stack is still tied to the session's lifecycle"; }
+    log "  pipewire pid $pw_before unchanged across $((seen - restarts_before)) X session restarts"
+fi
+
 log "host login session: enabled by the tree, active, real seat bookkeeping"
 # desktop-session.service ships pre-enabled (a .wants symlink the rsync must
 # preserve, like desktop-client-cdi's) and is pulled up by the quadlet's

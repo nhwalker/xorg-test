@@ -42,6 +42,10 @@ COPY image/xorg/xorg-monitor-conf.sh /usr/local/bin/xorg-monitor-conf.sh
 
 # --- Session ----------------------------------------------------------------
 COPY image/session/start-session /usr/local/bin/start-session
+# The audio stack, deliberately NOT part of the X session: desktop-init
+# supervises it in a session of its own, so an Xorg exit no longer takes
+# PipeWire down and a daemon crash actually recovers. See its header.
+COPY image/session/start-audio /usr/local/bin/start-audio
 COPY image/session/session-postmortem /usr/local/bin/session-postmortem
 COPY image/session/host-shell-setup.sh /usr/local/bin/host-shell-setup.sh
 COPY image/session/host-terminal /usr/local/bin/host-terminal
@@ -51,7 +55,7 @@ COPY image/session/mwmrc /etc/skel/.mwmrc
 # because nothing sets RESOURCE_MANAGER — see the file's header comment.
 COPY image/session/Xdefaults /etc/skel/.Xdefaults
 RUN chmod 0755 /usr/local/bin/xorg-gpu-conf.sh /usr/local/bin/ensure-vt-devices.sh \
-        /usr/local/bin/start-session \
+        /usr/local/bin/start-session /usr/local/bin/start-audio \
         /usr/local/bin/session-postmortem /usr/local/bin/align-device-groups.sh \
         /usr/local/bin/preflight-check.sh /usr/local/bin/host-shell-setup.sh \
         /usr/local/bin/xorg-monitor-conf.sh \

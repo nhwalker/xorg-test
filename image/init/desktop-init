@@ -16,19 +16,37 @@
 #   PAM/logind session + user manager   -> run_session(): setpriv to the
 #                                          desktop user, XDG_RUNTIME_DIR
 #                                          created by hand; no seat, no utmp
-#   PipeWire user units                 -> started by start-session directly;
-#                                          the quadlet's --ulimit now reaches
-#                                          them VERBATIM (no more
-#                                          DefaultLimit* relay - that whole
-#                                          class of bug is gone)
+#   PipeWire user units                 -> start-audio, under supervise_audio()
+#                                          below: its OWN session and its own
+#                                          restart loop, independent of X (see
+#                                          "Two trees" below). The quadlet's
+#                                          --ulimit reaches it VERBATIM (no
+#                                          more DefaultLimit* relay - that
+#                                          whole class of bug is gone)
 #   journald + journal-console.service  -> nothing: children inherit this
 #                                          process's stdout, which podman's
 #                                          --tty wires to /dev/console, so
 #                                          `podman logs` sees everything with
 #                                          no forwarder and no journal to
 #                                          bound
-#   Restart=always / ExecStopPost       -> the supervise loop + postmortem
+#   Restart=always / ExecStopPost       -> the supervise loops + postmortem
 #                                          call at the bottom
+#
+# Two trees, supervised separately. This process runs two independent
+# children, each the leader of its OWN process session:
+#
+#   the X session   start-session -> startx -> mwm, on tty1
+#   the audio stack start-audio   -> pipewire/wireplumber/pipewire-pulse
+#
+# They are separate because nothing about audio needs a display, and
+# fusing them cost real availability in both directions: an Xorg exit
+# killed the audio stack (this script stops a session by killing every pid
+# in its sid, and the daemons were in the X session's), and a PipeWire
+# crash had no recovery at all - the old bare `wait` in start-session only
+# returned once all three daemons had exited, so a single dead daemon went
+# unnoticed until Xorg happened to exit. Each tree now restarts on its own
+# terms, and neither can reap the other: the sid scoping that makes
+# stop_tree() safe is also what keeps the two apart.
 #
 # Signals: podman stop sends SIGTERM (STOPSIGNAL in the Containerfile).
 # CAP_KILL is deliberately NOT granted - in the host pid namespace it would
@@ -51,7 +69,7 @@ log() { echo "desktop-init: $*"; }
 # 61000: fixed in the image (Containerfile useradd) and in the deploy
 # tree's sysusers.d for the HOST account of the same name - the host's
 # desktop-session.service logs in as it, and this uid must never collide
-# with a real host user's (see session_members below for what a collision
+# with a real host user's (see tree_members below for what a collision
 # cost when this was 1000).
 DESK_UID=61000
 DESK_USER=desktop
@@ -65,33 +83,48 @@ as_desktop() {
 }
 
 session_pid=""
+audio_pid=""
+audio_sup_pid=""
 shutting_down=0
 
-session_members() {
-    # Every pid in the session's SESSION (setsid made $session_pid a session
-    # leader, and the sid survives the leader's death for orphans). NEVER
-    # scope this by uid: in the host pid namespace a uid-wide pkill reaches
+# The audio stack's session leader pid, recorded in a file rather than
+# just a variable: supervise_audio runs as a BACKGROUND CHILD of this
+# process, so its $audio_pid is a copy in another process and this one's
+# SIGTERM handler cannot see it. Same reasoning as /run/desktop-init.pid.
+AUDIO_LEADER_PID=/run/desktop-audio-leader.pid
+
+tree_members() { # $1: session leader pid
+    # Every pid in that leader's SESSION (setsid made it a session leader,
+    # and the sid survives the leader's death for orphans). NEVER scope
+    # this by uid: in the host pid namespace a uid-wide pkill reaches
     # every same-uid process ON THE HOST - when the desktop was still uid
     # 1000, the first e2e run of this shape killed the test harness's own
     # ssh session that way (the VM's login user shared the uid). The uid
     # has since moved to 61000, and the HOST desktop-session.service's lead
     # process legitimately runs as it - one more process a uid-scoped kill
-    # would wrongly take down. The session id is unique to our tree; the
-    # signals still go through setpriv because same-uid needs no capability.
-    [ -n "$session_pid" ] || return 0
-    ps -eo pid=,sess= | awk -v s="$session_pid" '$2==s{print $1}'
+    # would wrongly take down. The session id is unique to each of our
+    # trees; the signals still go through setpriv because same-uid needs no
+    # capability.
+    #
+    # Taking the sid as an argument is what keeps the X session and the
+    # audio stack from reaping each other: they are separate sessions, so
+    # stopping one selects none of the other's pids.
+    local leader="${1:-}"
+    [ -n "$leader" ] || return 0
+    ps -eo pid=,sess= | awk -v s="$leader" '$2==s{print $1}'
 }
 
-stop_session() {
-    # TERM the session tree, then KILL stragglers. Root's own pid never
-    # appears here (desktop-init is not in that session), so no self-kill.
-    local pids
-    pids=$(session_members)
+stop_tree() { # $1: session leader pid
+    # TERM the tree, then KILL stragglers. Root's own pid never appears
+    # here (desktop-init is in neither session), so no self-kill.
+    local leader="${1:-}" pids
+    [ -n "$leader" ] || return 0
+    pids=$(tree_members "$leader")
     [ -n "$pids" ] || return 0
     # shellcheck disable=SC2086
     as_desktop kill -TERM $pids 2>/dev/null || true
     for _ in 1 2 3 4 5; do
-        pids=$(session_members)
+        pids=$(tree_members "$leader")
         [ -n "$pids" ] || return 0
         sleep 1
     done
@@ -99,10 +132,44 @@ stop_session() {
     as_desktop kill -KILL $pids 2>/dev/null || true
 }
 
+assert_session_leader() { # $1: pid we launched with setsid, $2: label
+    # The pid we captured must BE the sid, or every stop_tree() call for
+    # this tree silently selects nothing and the "restart on exit" contract
+    # quietly becomes "leak the old processes and fail to re-bind".
+    #
+    # It holds because this script is non-interactive and so has no job
+    # control: a background child is not a process-group leader, so
+    # setsid(1) does not fork and the pid we got from $! is the process
+    # that called setsid(). That is a real dependency on how bash starts
+    # background jobs, and it is invisible when it breaks - hence the
+    # check rather than a comment alone.
+    # Polled, because we are racing the child: between the fork and
+    # setsid(2) the child is still in OUR session, so a single immediate
+    # read would report a false violation almost every time.
+    local pid="${1:-}" what="${2:-tree}" sid=""
+    [ -n "$pid" ] || return 0
+    for _ in $(seq 20); do
+        sid=$(ps -o sess= -p "$pid" 2>/dev/null | tr -d ' ')
+        # Gone already (a fast failure) - nothing to assert about.
+        [ -n "$sid" ] || return 0
+        [ "$sid" = "$pid" ] && return 0
+        sleep 0.1
+    done
+    log "WARNING: $what leader pid $pid is not its own session leader (sid $sid);" \
+        "setsid forked, so cleanup for this tree will not find its processes"
+}
+
 on_term() {
-    log "SIGTERM: stopping session"
+    log "SIGTERM: stopping the session and the audio stack"
     shutting_down=1
-    stop_session
+    # The audio supervisor goes FIRST, and by killing the loop itself: it
+    # is a separate process, so setting shutting_down here does not reach
+    # it, and left running it would cheerfully restart the audio stack
+    # three seconds after we took it down. A background child inherits no
+    # TERM trap, so this is an outright kill of the loop.
+    [ -n "$audio_sup_pid" ] && kill -TERM "$audio_sup_pid" 2>/dev/null
+    stop_tree "$session_pid"
+    stop_tree "$(cat "$AUDIO_LEADER_PID" 2>/dev/null || true)"
     exit 0
 }
 trap on_term TERM INT
@@ -157,13 +224,62 @@ prepare_runtime() {
 
 clear_stale_audio_sockets() {
     # PipeWire will NOT re-bind over a leftover socket file, and the export
-    # dir is host-shared, so sockets survive session AND container restarts
+    # dir is host-shared, so sockets survive daemon AND container restarts
     # as present-but-dead files; every audio client then gets ECONNREFUSED.
-    # Ran once per boot under systemd; per session iteration here, because
-    # the audio daemons now live and die with the session.
+    # Ran once per boot under systemd; per AUDIO iteration here, which is
+    # where it belongs - these are the audio stack's own sockets, and it is
+    # the audio stack's restarts that strand them. It used to run per X
+    # session iteration, which is exactly the coupling this shape removes.
     rm -f /run/desktop-audio/pulse /run/desktop-audio/pipewire-0 \
         /run/desktop-audio/pipewire-0-manager /run/desktop-audio/pipewire-0.lock \
         /run/desktop-audio/pipewire-0-manager.lock
+}
+
+run_audio() {
+    # No -c and no tty: the audio stack has no controlling terminal to want
+    # (that is the X session's tty1), just its own session so that stopping
+    # one tree never selects the other's pids. env -i for the same reason
+    # run_session does it - no PAM here to build an environment - but a
+    # smaller one: no DISPLAY, no VT, nothing about a screen.
+    setsid env -i \
+        HOME=/home/$DESK_USER USER=$DESK_USER LOGNAME=$DESK_USER \
+        SHELL=/bin/bash PATH=/usr/local/bin:/usr/bin:/usr/sbin \
+        XDG_RUNTIME_DIR="$RUNDIR" \
+        setpriv --reuid=$DESK_UID --regid=$DESK_UID --init-groups \
+        /usr/local/bin/start-audio &
+    audio_pid=$!
+    echo "$audio_pid" > "$AUDIO_LEADER_PID"
+    assert_session_leader "$audio_pid" "audio"
+    wait "$audio_pid"
+}
+
+supervise_audio() {
+    # The audio stack's own restart loop, the counterpart of the session
+    # loop at the bottom of this file. Runs as a background child of this
+    # process, so the two loops make progress independently. It has no
+    # shutdown check of its own: on SIGTERM the parent kills this loop
+    # outright (see on_term) precisely because a flag set there would
+    # never reach this process.
+    while :; do
+        # Re-align the audio group before every start. A host that booted
+        # with no sound card leaves align-device-groups with nothing to
+        # measure ("no device nodes present, skipping"), so the container's
+        # audio gid keeps its image value - and a card that appears LATER
+        # (the /dev/snd bind mount is live) would then be visible but not
+        # openable by the unprivileged session user. Cheap, idempotent, and
+        # it logs the final state either way. Audio only: re-running the
+        # whole alignment would renumber groups the running X session is
+        # already using, for no reason.
+        /usr/local/bin/align-device-groups.sh audio || true
+        clear_stale_audio_sockets
+        run_audio
+        rc=$?
+        # Orphans from the dead stack must not survive into the next
+        # iteration or PipeWire cannot re-bind its sockets.
+        stop_tree "$audio_pid"
+        log "audio stack exited (rc=$rc); restarting in 3s"
+        sleep 3
+    done
 }
 
 run_session() {
@@ -178,24 +294,31 @@ run_session() {
         setpriv --reuid=$DESK_UID --regid=$DESK_UID --init-groups \
         /usr/local/bin/start-session < /dev/tty1 &
     session_pid=$!
+    assert_session_leader "$session_pid" "X session"
     wait "$session_pid"
 }
 
 log "starting (host pid $$)"
 run_oneshots
+# Before the audio stack: PipeWire binds its native socket inside
+# XDG_RUNTIME_DIR, so the dir has to exist (or the host's have appeared)
+# first. Nothing in the other direction - the X session does not wait on
+# audio, and audio does not wait on X.
 prepare_runtime
+supervise_audio &
+audio_sup_pid=$!
 touch /run/desktop-init-ready
-log "oneshots done; supervising session (restart on exit, 3s backoff)"
+log "oneshots done; supervising the session and the audio stack separately (restart on exit, 3s backoff)"
 
 while :; do
-    clear_stale_audio_sockets
     [ -c /dev/tty1 ] && chown $DESK_UID:tty /dev/tty1 || true
     run_session
     rc=$?
     [ "$shutting_down" = 1 ] && exit 0
-    # Orphans from the dead session (audio daemons, xterm) must not
-    # survive into the next iteration or PipeWire cannot re-bind.
-    stop_session
+    # Orphans from the dead session (xterm, mwm) must not survive into the
+    # next iteration. The audio stack is NOT among them: it is a session of
+    # its own, which is the point - stop_tree selects by sid.
+    stop_tree "$session_pid"
     if [ "$rc" != 0 ]; then
         SERVICE_RESULT=exit-code EXIT_CODE=exited EXIT_STATUS=$rc \
             /usr/local/bin/session-postmortem || true

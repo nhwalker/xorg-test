@@ -1,0 +1,112 @@
+#!/bin/bash
+# The audio stack: PipeWire, WirePlumber and pipewire-pulse. Launched by
+# desktop-init as the "desktop" user, in its OWN session (setsid) with its
+# own supervise loop - deliberately NOT as part of the X session.
+#
+# Why this is not in start-session any more. It used to be: a backgrounded
+# subshell there, with startx exec'd over the top. That made the audio
+# stack a member of the X session's process session, and desktop-init
+# stops a session by killing every pid in its sid - so every Xorg exit
+# took the audio stack down with it, and every audio client on the host
+# or in another container got ECONNREFUSED for as long as the restart
+# took. Nothing about audio needs the X server: PipeWire wants /dev/snd,
+# the runtime dir, the rlimits and the export directory, none of which
+# have anything to do with a display. The two now live and die
+# independently.
+#
+# The other half of the same bug was worse and quieter: that subshell
+# ended in a bare `wait`, which returns only once ALL of its children
+# have exited. If pipewire or wireplumber died alone, nothing noticed and
+# nothing restarted it - the audio stack stayed dead, with a stale socket
+# file that PipeWire will not re-bind over, until Xorg happened to exit.
+# The X session had Restart=always semantics from desktop-init's loop;
+# the audio stack had none at all. Hence `wait -n` at the bottom: it
+# returns as soon as ANY of the three exits, which is what lets this
+# script tear the rest down and hand a nonzero status to the supervisor.
+#
+# Two things systemd drop-ins used to arrange still happen inline here:
+#
+#   umask 0000   the exported sockets in /run/desktop-audio must be
+#                connectable by other uids (host users, other containers);
+#                sockets inherit the daemon's umask. Was
+#                pipewire-umask.conf.
+#   rlimits      RLIMIT_RTPRIO/MEMLOCK/NICE arrive VERBATIM from the
+#                quadlet's --ulimit flags: no PID-1 relay, no
+#                DefaultLimit* drop-ins. The chain is one hop shorter than
+#                it was (desktop-init -> start-audio -> the daemons), and
+#                it is still plain inheritance. module-rt takes the rlimit
+#                path because the image config sets rlimits.enabled=true /
+#                rtkit.enabled=false (see Containerfile). The e2e asserts
+#                the limit on PipeWire's own /proc entry, so a break here
+#                is loud.
+set -u
+
+log() { echo "start-audio: $*"; }
+
+umask 0000
+
+pipewire &
+pw=$!
+
+# WirePlumber exits fatally ("Failed to connect to PipeWire") if the core
+# socket is not there yet, and there is no socket activation and no
+# Restart= to hide that race - the first e2e run of the systemd-less shape
+# lost its session manager to it (pipewire and pipewire-pulse survived;
+# wireplumber was simply gone, and with it every ALSA device). PipeWire
+# binds the socket within milliseconds, but "within" is not "before": wait
+# for it, bounded.
+for _ in $(seq 100); do
+    [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
+    sleep 0.1
+done
+
+wireplumber &
+wp=$!
+pipewire-pulse &
+pp=$!
+
+log "started (pipewire=$pw wireplumber=$wp pipewire-pulse=$pp)"
+
+# Return on the FIRST exit rather than the last. Which daemon it was is
+# worth naming: "wireplumber keeps dying" and "pipewire keeps dying" are
+# different problems, and from the supervisor's side both look like one
+# nonzero status.
+wait -n
+rc=$?
+for pid in $pw $wp $pp; do
+    kill -0 "$pid" 2>/dev/null && continue
+    case "$pid" in
+        "$pw") log "pipewire exited" ;;
+        "$wp") log "wireplumber exited" ;;
+        "$pp") log "pipewire-pulse exited" ;;
+    esac
+done
+
+# One of the three is gone, so the stack is degraded whichever it was:
+# without wireplumber there are no devices, without pipewire-pulse no
+# Pulse clients, and without pipewire nothing at all. Take the survivors
+# down so the supervisor can restart a complete set over clean sockets.
+log "audio stack degraded (rc=$rc); stopping the survivors"
+kill -TERM $pw $wp $pp 2>/dev/null || true
+
+# Bounded, NOT a bare `wait`. A daemon that ignores SIGTERM would block
+# that forever, and this process is what desktop-init's supervisor is
+# waiting on - so a single stuck daemon would silently disable audio
+# recovery altogether, which is the exact class of failure this whole
+# shape exists to remove. Escalate instead; the supervisor's own
+# stop_tree sweeps anything still standing after we exit.
+for _ in $(seq 50); do
+    still=""
+    for pid in $pw $wp $pp; do
+        kill -0 "$pid" 2>/dev/null && still="$still $pid"
+    done
+    [ -z "$still" ] && break
+    sleep 0.1
+done
+if [ -n "${still:-}" ]; then
+    log "daemon(s)$still ignored SIGTERM; killing"
+    # shellcheck disable=SC2086
+    kill -KILL $still 2>/dev/null || true
+fi
+
+exit "${rc:-1}"
