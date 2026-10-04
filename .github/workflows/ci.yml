@@ -63,6 +63,11 @@ jobs:
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight \
             deploy/host/usr/local/bin/desktop-monitors-capture
+      - name: python syntax (VM harness)
+        # The VM harness's Python runs only inside e2e-vm, after the image
+        # builds and the VM boot; a syntax error there should cost seconds
+        # here, not that whole run. The runner's python3 is all it needs.
+        run: python3 -m py_compile ci/vm/*.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the

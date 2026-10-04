@@ -16,8 +16,16 @@ COPY image/rocky9.repo /etc/yum.repos.d/rocky9.repo
 # Just the clients: xdpyinfo (X connect), pulse/pipewire/alsa players, and
 # pipewire-alsa so ALSA routes to the injected PIPEWIRE_REMOTE. Deliberately
 # no xorg-x11-server-Xorg / wireplumber / motif.
+#
+# xwininfo and xprop are how the operator stories (ci/vm/operator-e2e.py)
+# look at the screen: a container of this image is their observer, reading
+# the window tree and properties while every input event comes from QEMU's
+# devices. It sends no input. Its one write is the copy-and-paste story's
+# control, `xprop -set` on the root's cut buffer.
 RUN dnf -y install \
         xdpyinfo \
+        xwininfo \
+        xprop \
         pulseaudio-utils \
         pipewire-utils \
         pipewire-alsa \

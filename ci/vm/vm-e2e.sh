@@ -557,6 +557,26 @@ printf 'snd-hotplug     host %s -> %s -> %s / container-nodes %s -> %s -> %s / w
     "$snd_base_nodes" "$snd_on_nodes" "$snd_off_nodes" \
     "$snd_base_devs" "$snd_on_devs" "$snd_off_devs" >> "$ART/xorg-input-count.txt"
 
+log "operator: the person at the display, through QEMU's own input devices (E11)"
+# Requirements.md E11, and the parts of F3.3 and F3.5 only a screen can show:
+# the desktop as the operator finds it, windows arranged with the mouse and
+# from the keyboard alone, text moved between applications in different
+# containers, every root-menu entry, and the operator's own sound controls.
+# operator-e2e.py sends every pointer and key event over QMP to QEMU's virtio
+# devices - never into the X server - and looks at X from a confined observer
+# container. Each story leaves $ART/<story>/evidence.md, indexing its
+# screendumps, video frames, state diffs, pid tables and audio capture.
+#
+# A failed story does not stop the others; the step fails once they have all
+# run. Placed before phase 2, which it hands a freshly restarted desktop: the
+# sound story ends with systemctl restart desktop.service.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh operator-setup' || fail "operator setup failed"
+op_rc=0
+python3 operator-e2e.py --qmp "$QMP" --ssh-port "$SSHPORT" --ssh-key id_ed25519 --art "$ART" \
+    || op_rc=$?
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh operator-teardown' || true
+[ "$op_rc" = 0 ] || fail "operator stories failed: see $ART/operator-summary.md and $ART/S*/evidence.md"
+
 log "phase 2: k3s + a cdi-device-plugin release per capability, desktop still on the quadlet"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' 2>&1 | tee "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
