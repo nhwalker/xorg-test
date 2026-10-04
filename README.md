@@ -864,9 +864,19 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   `desktop-preflight` is asserted fully green. The podman clients run
   **confined** — no `label=disable` anywhere in the suite — against the
   `container_file_t` labels `desktop-selinux.service` applied, which are
-  themselves asserted directly beforehand. Then k3s + CRI-O join the
-  same machine **with the desktop still running on its quadlet and SELinux
-  still enforcing**, and one `cdi-device-plugin` release per capability makes
+  themselves asserted directly beforehand. Before kubernetes arrives, an
+  operator phase (`ci/vm/operator-e2e.py`) works the desktop the way the
+  person at the display does, through QEMU's own tablet and keyboard and
+  never by injecting into X: windows moved, resized, iconified, maximized,
+  raised and closed with the mouse and again from the keyboard alone, text
+  carried by PRIMARY and CLIPBOARD between the desktop's xterm and two
+  client containers', every root-menu entry chosen, and volume, mute and
+  output changed from a desktop terminal while a client container plays a
+  tone. Each story leaves an evidence directory in the artifacts:
+  screendumps, video frames, window-tree diffs, pid tables, the audio
+  capture, and an `evidence.md` saying what to look for in each. Then k3s +
+  CRI-O join the same machine **with the desktop still running on its
+  quadlet and SELinux still enforcing**, and one `cdi-device-plugin` release per capability makes
   each resource allocatable — confined client pods (asserted to be
   `container_t`, declaring no `securityContext`) then draw on the display and
   play/record audio

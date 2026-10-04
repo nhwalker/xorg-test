@@ -98,8 +98,8 @@ helpers still to build.
 |---|---|---|---|
 | **EV-SHOT** | a still of the virtual display at a named moment | QEMU monitor `screendump <file>.png -f png` (PPM fallback) | taken at the moments the story names (before / after / on failure), file named `<story>-<moment>.png`, and the index says what should be visible (a window at a position, a colour, a cursor) |
 | **EV-SHOT-CLIENT** | a still captured **by a client container** of its own view of the display | the injected `screenshot` tool run inside the client (`"$DESKTOP_TOOLS_BIN"/screenshot`) | proves what the *client* could see, independently of QEMU's framebuffer; paired with an EV-SHOT of the same moment |
-| **EV-VIDEO** | a recording of the display across a dynamic step (hotplug, restart, window movement) | a screendump loop at ≥ 2 fps for the step's duration, assembled with `ffmpeg -framerate 2 -i frame-%04d.png` into an mp4 (or an animated gif via imagemagick); raw frames kept | the index names the frames / timestamps where the event happens ("device removed at frame 12, text appears at frame 31"); an EV-TIMELINE correlates |
-| **EV-AUDIO** | what the machine's audio output actually carried | QEMU monitor `wavcapture <file>.wav <audiodev> 44100 16 2` … `stopcapture 0`; then `ci/vm/check-audio.py` output and a spectrogram PNG (`sox <wav> -n spectrogram` or `ffmpeg -lavfi showspectrumpic`) | a reviewer can *listen*, see the tone at the expected frequency and time in the spectrogram, and read the analyser's verdict; each path uses a distinct pitch (pulse 440, pipewire 880, ALSA 1320, record 660, hot-added device 990 Hz, client-continuity 1100 Hz) so overlapping sources are distinguishable |
+| **EV-VIDEO** | a recording of the display across a dynamic step (hotplug, restart, window movement) | a screendump loop at ≥ 2 fps for the step's duration, assembled with `ffmpeg -framerate 2 -i frame-%04d.png` into an mp4, or into an animated gif with imagemagick's `convert` where ffmpeg is not installed (the e2e runner installs imagemagick only); raw frames kept | the index names the frames / timestamps where the event happens ("device removed at frame 12, text appears at frame 31"); an EV-TIMELINE correlates |
+| **EV-AUDIO** | what the machine's audio output actually carried | QEMU monitor `wavcapture <file>.wav <audiodev> 44100 16 2` … `stopcapture 0`; then `ci/vm/check-audio.py` output and a spectrogram PNG (`sox <wav> -n spectrogram` or `ffmpeg -lavfi showspectrumpic`), or, where neither tool is installed, a plot of the level at the story's pitch over time with each event marked, drawn by the harness (`ci/vm/operator-e2e.py` does this). `wavcapture` writes only while one of the guest's sound devices is running: a stretch with none running is missing from the file, not silent in it, so a story about gaps also compares the capture's length with the wall-clock time it ran | a reviewer can *listen*, see the tone at the expected frequency and time in the spectrogram, and read the analyser's verdict; each path uses a distinct pitch (pulse 440, pipewire 880, ALSA 1320, record 660, hot-added device 990 Hz, client-continuity 1100 Hz) so overlapping sources are distinguishable |
 | **EV-AUDIO-REC** | a recording made **by a client** (capture direction) | `parec`/`arecord` inside the client, file pulled out via `kubectl exec … cat` / `podman cp`; spectrogram + analyser as above | proves the client's microphone/monitor path, not the machine output |
 | **EV-STATE** | a command's output at a named moment, kept as text | `xrandr --query --verbose`, `xinput list`, `xwininfo -root -tree`, `wpctl status`, `pw-cli ls Device`, `pactl list short sinks/sources/sink-inputs`, `ls -l /dev/input /dev/snd` (host and container), `podman inspect`, `loginctl`, `systemctl status`, `ls -Z`, `cat /proc/<pid>/status`, `kubectl get pod -o wide` | always captured as **before / after pairs** for a change, with `diff -u` attached (**EV-DIFF**); the index says which lines must differ and which must not |
 | **EV-PIDS** | the process table that proves what did and did not restart | `pid, ppid, sid, user, comm, start time` for desktop-init, Xorg, mwm, pipewire, wireplumber, pipewire-pulse, the client's processes; for pods `restartCount` and `containerID`; for podman clients `podman inspect … StartedAt` | before / after; the index states which pids must be unchanged (no restart) and which must have changed (a restart that was supposed to happen) |
@@ -160,7 +160,9 @@ the same directory also receives the diagnostics the harness already prints
    its view (EV-SHOT-CLIENT, EV-LOG-CLIENT, `restartCount`) alongside the
    machine's view.
 6. **Audio is heard, not inferred.** Any story about sound attaches an
-   EV-AUDIO or EV-AUDIO-REC; a socket being connectable is not sound.
+   EV-AUDIO or EV-AUDIO-REC; a socket being connectable is not sound. "No
+   gap" is measured twice: as quiet inside the capture, and as capture time
+   missing against the wall clock (EV-AUDIO above).
 7. **"Without restarting" is a measurement.** It means the same container id,
    `restartCount` 0 (or unchanged), and the same application pid, captured
    before and after.
@@ -638,8 +640,8 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.6.3 "Restart mwm" re-reads `.mwmrc` without a new X session**
 - Requirement: `f.restart` replaces mwm in place; Xorg pid unchanged; windows stay.
-- Acceptance: trigger via menu (synthetic click path) or T4; new mwm pid, same Xorg pid, same window tree.
-- Evidence: EV-PIDS; EV-DIFF of the window tree; EV-SHOT.
+- Acceptance: trigger via the menu (S11.1.1) or T4; mwm's connection to the X server is a new one (the socket inode in `/proc/<mwm>/fd` changes), the Xorg pid is the same, and every client window is still there in the state it was in, normal or iconic. Not "a new mwm pid": `f.restart` re-executes mwm in place, so its pid stays. Not new frame window ids either: the server hands the new connection the slot the old one freed, so the frames mwm makes again can carry the old ids.
+- Evidence: EV-PIDS; EV-DIFF of the window tree; EV-SHOT; EV-VIDEO.
 - Tier: T3/T4 · Coverage: ❌.
 
 **S3.6.4 Host Terminal menu entry**
@@ -2041,6 +2043,30 @@ other epic owns. The session is mwm alone, with no panel and no desktop
 environment (`README.md` "Look and feel (dark theme)"), so the root menu, the
 window frames, the key bindings, the X selections and a terminal are the
 operator's whole toolset.
+
+How these stories are run (`ci/vm/operator-e2e.py`, a phase of its own
+between the hotplug checks and phase 2), and what that takes for granted:
+
+- The input is QEMU's: pointer and key events go over QMP to the virtio
+  tablet and keyboard. The harness only looks at X, with `xwininfo` and
+  `xprop` in an observer container of the lean client image that holds
+  `desktop.local/display` and nothing else (the host has no X tools), and
+  at QEMU's screendumps. The observer sends no input; its one write is
+  S11.2.1's cut-buffer control.
+- "A client pod" is a podman client container (F7.1): the desktop image
+  holding only `desktop.local/display`, or for S11.3.1's player the lean
+  image holding only `desktop.local/audio`. It is the same CDI contract
+  and the same SELinux confinement as a pod, without kubernetes, which
+  nothing in E11 looks at. A pod's `restartCount` reads as the
+  container's `RestartCount`, start time and pid.
+- "The desktop's xterm" is the session's own (`xinitrc.desktop`) where a
+  story moves, closes or types into it; where a story needs one that
+  records its input, it runs in the desktop container as the session user.
+- Order matters: S11.1.1's last entry ends the X session and S11.3.1 ends
+  by restarting `desktop.service`, so those two run last, in that order.
+  The operator-facing F3.3 and F3.5 checks (S3.3.2, S3.3.3, S3.5.2,
+  S3.5.3) run first, on the desktop as the session leaves it.
+
 **Common set**: EV-SHOT before and after each action, and EV-VIDEO across any
 action with movement; the EV-QEMU transcript of every pointer and key event
 sent, because these stories drive the machine only through QEMU's input
@@ -2108,15 +2134,14 @@ them without root or a container. Defaults must remain the production paths.
 | `deploy/host/usr/local/libexec/desktop-selinux` | takes paths as args already | — | S5.6.4–S5.6.6 |
 | `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | also honour an env override | S5.5.4 |
 
-Probe tooling the client-side and hotplug stories need, none of it shipped
-today:
+Probe tooling the client-side and hotplug stories need, and where it stands:
 
 | Tool | Needed by | Where |
 |---|---|---|
 | `xinput` | S3.9.2, S3.9.4, S3.9.5, S3.9.8, S3.9.10, S3.9.11, S3.9.12 | `Containerfile.testclient` (CI-only); run as a podman client in phase-deploy or from `x11-testclient` in phase 2 |
-| `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S10.2.2, S11.1.1, S11.1.2 | same; on a T4 host, built and loaded there too (Appendix C) |
-| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | runner (`e2e-vm.yml` apt line) |
-| `sox` or `ffmpeg` | spectrograms for EV-AUDIO | runner |
+| `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.5.3, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S10.2.2, S11.1.1–S11.1.3, S11.2.1 | **shipped**: `Containerfile.testclient` carries both, and the operator phase runs them in its observer container; on a T4 host, built and loaded there too (Appendix C) |
+| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | **shipped**: imagemagick is on the `e2e-vm.yml` apt line and makes the gifs; ffmpeg is not installed |
+| `sox` or `ffmpeg` | spectrograms for EV-AUDIO | not installed; the operator phase draws a level plot at the story's pitch instead (EV-AUDIO) |
 | `inotify-tools` | S7.2.3 | VM guest |
 | `alsa-utils` + `alsa-plugins-pulseaudio` | S4.2.2 | VM guest |
 | `pipewire-utils`, `pulseaudio-utils`, `alsa-utils` as declared host probes | S10.1.1, S10.2.1 | VM guest, installed after the documented package line, so S10.1.1 can tell the two apart |
@@ -2130,7 +2155,7 @@ S1.1.3, S2.3.5, S2.4.4, S2.4.5, S3.1.x, S3.4.12, S5.7.5, S5.7.7, S5.7.8.
 
 | New phase | Stories |
 |---|---|
-| `verify-session-tree` | S2.3.1, S2.3.3 (host-process half), S2.3.4, S2.3.6, S2.4.2 (wireplumber / pipewire-pulse), S2.4.7, S3.2.4, S3.2.5, S3.3.2, S3.5.2 |
+| `verify-session-tree` | S2.3.1, S2.3.3 (host-process half), S2.3.4, S2.3.6 (mwm killed; Quit session is the operator phase's), S2.4.2 (wireplumber / pipewire-pulse), S2.4.7, S3.2.4, S3.2.5 |
 | `verify-shutdown` | S2.5.1 |
 | `verify-host-audio-clients` | S4.2.1, S4.2.2 |
 | `verify-host-shell-hardening` | S5.7.3, S5.7.4 |
@@ -2154,7 +2179,7 @@ S1.1.3, S2.3.5, S2.4.4, S2.4.5, S3.1.x, S3.4.12, S5.7.5, S5.7.7, S5.7.8.
 | `verify-maintainer-routine` (new) | S10.4.1, S10.4.2 |
 | `verify-maintainer-troubleshooting` (new; one documented fault per story, staged and restored) | S10.5.1–S10.5.4 |
 | `verify-maintainer-onboarding` (extend phase 2; the README's steps verbatim) | S10.6.1, S10.6.2 |
-| `verify-operator-desktop` (new; QMP pointer and key events only) | S11.1.1–S11.1.3, S11.2.1, S11.3.1 |
+| operator phase (**exists**: `ci/vm/operator-e2e.py`, between the hotplug checks and phase 2; QMP pointer and key events only) | S3.3.2, S3.3.3, S3.5.2, S3.5.3, S11.1.1–S11.1.3, S11.2.1, S11.3.1; with them S2.3.6 (Quit session), S3.6.1 (menu), S3.6.3, S5.7.2 (menu-launched shell) |
 
 ## Appendix C — Hardware acceptance checklist (T4)
 
@@ -2164,8 +2189,9 @@ row record the command output **and** the photo/video named in the story.
 The host has no X client tools (`deploy/HOST-REQUIRES.md`), so X queries run
 inside the desktop image, which carries `xrandr`, `xdpyinfo` and `glxinfo`
 (`xq` below). `xinput` and `xwininfo` are in neither the image nor the host:
-the lines using them need the Appendix A probe image (`Containerfile.testclient`
-with those tools added), built and loaded onto the T4 host first (`probe`
+the lines using them need the Appendix A probe image
+(`Containerfile.testclient`, which carries `xwininfo` and `xprop`; `xinput`
+is still to be added), built and loaded onto the T4 host first (`probe`
 below).
 
 ```sh
@@ -2240,9 +2266,17 @@ done
 
 ## Appendix E — Evidence capture helpers to build
 
-The evidence standard needs a handful of harness functions that do not exist
-yet. All of them belong in `ci/vm/vm-e2e.sh` (host side) or `vm-guest.sh`
-(guest side) and should be written once and reused by every story.
+The evidence standard needs a handful of harness functions. All of them
+belong in `ci/vm/vm-e2e.sh` (host side) or `vm-guest.sh` (guest side) and
+should be written once and reused by every story.
+
+The operator phase has its own, in Python (`ci/vm/operator-e2e.py`): `Story`
+covers `ev_begin`/`ev_end`/`ev_note` and writes each story's `evidence.md`,
+`timeline.log` and `qemu.log` (its QMP transcript); `Ctx.shot`, `Ctx.video`,
+`Ctx.pids` and `Ctx.diff` cover `ev_shot`, `ev_video_*`, `ev_pids` and
+`ev_diff`; S11.3.1 captures and analyses its own audio. The shell phases
+still have none of these, and `artifacts/timeline.log` holds the operator
+phase alone until they do.
 
 | Helper | Side | Does |
 |---|---|---|
