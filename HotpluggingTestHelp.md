@@ -628,8 +628,9 @@ straight from the server), `xrandr --verbose` (EDID bytes), `cat
 | §4.1 keyboards | S3.9.1–S3.9.6, S3.9.12 |
 | §4.2 pointers | S3.9.7–S3.9.12 |
 | §4.3 monitors | S3.4.9, S3.4.10, S3.10.1–S3.10.8 |
-| §4.4 audio | S4.7.1–S4.7.12, S2.4.6 |
-| §4.5 composite | S3.11.1, S3.11.2 |
+| §4.4 audio | S4.7.1–S4.7.12, S2.4.6, and the client-side proofs S7.7.4–S7.7.7, S7.7.9 |
+| §4.5 composite | S3.11.1, S3.11.2, S7.7.8 |
+| §4.1–4.3 from a running client container | S7.7.1, S7.7.2, S7.7.3 |
 | §6 hardware | S8.2.1, S8.2.2, S8.2.3, S8.3.1 |
 
 ---
