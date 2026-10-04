@@ -182,7 +182,7 @@ jobs:
           # the spelling and it is not worth a red build to guess which.
           # The privilege reduction, as it reaches podman.
           echo "$exec_line" | grep -qi -- '--cap-drop[= ]all'
-          echo "$exec_line" | grep -q  -- '--security-opt[= ]label=disable'
+          echo "$exec_line" | grep -qE -- '--security-opt[= ]label[=:]disable'
           # The log bound, both halves (see the logging block in the unit).
           echo "$exec_line" | grep -q  -- '--log-driver[= ]k8s-file'
           echo "$exec_line" | grep -q  -- '--log-opt[= ]max-size=64m'
