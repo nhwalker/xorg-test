@@ -1635,8 +1635,17 @@ operator_setup() {
     podman rm -f op-observer >/dev/null 2>&1 || true
     podman run -d --name op-observer --device desktop.local/display=all \
         localhost/desktop-testclient:latest >/dev/null
+    # podman applies a CDI device's edits to the container's own process,
+    # not to `podman exec` sessions: the X socket mount is there for every
+    # process in the container, but the injected DISPLAY is in PID 1's
+    # environment only. Read it from there, so the spec still says where the
+    # display is; operator-e2e.py passes it to every exec into the observer.
+    disp=$(podman exec op-observer sh -c 'tr "\0" "\n" </proc/1/environ' | sed -n 's/^DISPLAY=//p') \
+        || fail "could not read the observer's environment"
+    [ "$disp" = ":0" ] \
+        || fail "the observer's CDI-injected DISPLAY is '$disp', want :0 (operator-e2e.py assumes :0)"
     wait_for 20 1 "the observer to read the window tree" \
-        podman exec op-observer xwininfo -root -tree
+        podman exec -e DISPLAY="$disp" op-observer xwininfo -root -tree
 
     # The input tests' sink terminals idle in a `sleep 60` after their read,
     # and one may still be up. The operator's first story looks at the

@@ -345,7 +345,11 @@ class Guest:
         return p.stdout
 
     def xprobe(self, script, *args, label=None, check=True):
-        return self.sh(shlex.join(["podman", "exec", OBSERVER, "sh", "-c", script, "sh", *args]),
+        # DISPLAY passed explicitly: CDI's env edits reach the observer's own
+        # process but not `podman exec` sessions. operator-setup checks that
+        # CDI gave the observer this value (vm-guest.sh).
+        return self.sh(shlex.join(["podman", "exec", "-e", "DISPLAY=:0", OBSERVER,
+                                   "sh", "-c", script, "sh", *args]),
                        label=label or f"observer: {script.strip()}", check=check)
 
     def desk(self, argv, user="desktop", detach=False, check=True, timeout=60):
