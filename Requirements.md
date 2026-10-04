@@ -26,6 +26,10 @@ what is under test.
 - **Tier** — where the test runs (below).
 - **Coverage** — current status and the test that provides it.
 
+**Companion.** `HotpluggingTestHelp.md` holds the mechanics (QEMU commands,
+layer-by-layer probes, failure signatures, the hardware procedure) behind every
+hotplug story in F3.9, F3.10, F3.11 and F4.7.
+
 **ID scheme.** `E<n>` epic, `F<n>.<m>` feature, `S<n>.<m>.<k>` story. IDs are
 stable; retire a story by marking it *withdrawn* rather than renumbering.
 
@@ -486,20 +490,10 @@ Reference shorthand: `smoke` = `ci/smoke-deploy.sh`; `guest:<fn>` =
 - Acceptance: `e2e` "input: type into an xterm".
 - Tier: T3 · Coverage: ✅.
 
-**S3.8.2 Hot-added input devices reach the container**
-- Requirement: a device added after boot appears under the container's `/dev/input` (live bind mount) and Xorg logs `Adding input device`.
-- Acceptance: `e2e` "input hotplug" (nodes asserted; Xorg add count recorded, not asserted).
-- Tier: T3 · Coverage: ✅ nodes; 🟡 Xorg adoption.
-
-**S3.8.3 KVM-style remove/re-add cycle**
-- Requirement: a USB keyboard removed and re-added disappears from and returns to the container's `/dev/input`, and the session still accepts input afterwards.
-- Acceptance: `e2e` "KVM switch simulation" (both directions, typing after).
-- Tier: T3 · Coverage: ✅.
-
-**S3.8.4 The re-added device itself carries input**
-- Requirement: after the cycle, keystrokes sent specifically through the re-added USB keyboard reach the app (not only through the PS/2/virtio keyboard that never left).
-- Acceptance: `input-send-event` with `"device": "kvmkbd"` after re-add; sink receives the text.
-- Tier: T3 · Coverage: ❌ (README notes the current typing check is a session-health check, not device proof).
+> **Retired IDs:** S3.8.2 (hot-added input reaches the container), S3.8.3
+> (KVM-style remove/re-add cycle) and S3.8.4 (the re-added device itself
+> carries input) were split per device and per direction into **F3.9**; their
+> coverage is carried by S3.9.1–S3.9.6.
 
 **S3.8.5 The host udev database is mounted read-only and used**
 - Requirement: `/run/udev` is mounted `ro` and non-empty; no udevd runs in the container.
@@ -510,6 +504,130 @@ Reference shorthand: `smoke` = `ci/smoke-deploy.sh`; `guest:<fn>` =
 - Requirement: a device attached to another seat (`loginctl attach seat1 …` → `72-seat-*.rules`, `ID_SEAT=seat1`) is reported by the container preflight as a WARN until `seat-prep` removes the rule and re-triggers udev, after which `ID_SEAT` is gone.
 - Acceptance: on the VM: attach the virtio keyboard to `seat1`, assert `udevadm info` shows `ID_SEAT=seat1`; restart `desktop-seat-prep`; assert the rule is gone and `ID_SEAT` absent; restart desktop; preflight `PASS: no foreign seat tags`.
 - Tier: T3 · Coverage: 🟡 `smoke` removes a staged rule *file* only; the udev effect and the preflight WARN are unasserted.
+
+### F3.9 HMI hotplug: keyboards and pointers
+
+Mechanics, QEMU commands and layer-by-layer probes for every story here are in
+`HotpluggingTestHelp.md` §4.1–4.2. Plug-in and plug-out are separate stories
+throughout because they fail differently: a stale node that never disappears is
+what a snapshot `/dev` looks like, and it lets a plug-in assertion pass for the
+wrong reason.
+
+**S3.9.1 Keyboard plug-in reaches the container**
+- Requirement: a keyboard added while the desktop runs appears as a new `/dev/input/event*` inside the container.
+- Acceptance: the container node count rises after `device_add` (USB `usb-kbd` on xHCI, and PCI `virtio-keyboard-pci`).
+- Tier: T3 · Coverage: ✅ `e2e` "input hotplug" and "KVM switch simulation" (re-add half).
+
+**S3.9.2 Keyboard plug-in is adopted by Xorg**
+- Requirement: Xorg/libinput opens the new device and lists it as an input device.
+- Acceptance: `xinput list` (from a display client) gains an entry named for the QEMU device, or the Xorg log gains an `Adding input device` **and** a matching `XINPUT: Adding extended input device` line for it.
+- Tier: T3 · Coverage: 🟡 the `Adding input device` count is recorded, not asserted, and it also increments for devices Xorg then ignores.
+
+**S3.9.3 Keyboard plug-out removes the node from the container**
+- Requirement: after `device_del`, the node is gone inside the container.
+- Acceptance: the container node count drops to the pre-add value.
+- Tier: T3 · Coverage: ✅ `e2e` "KVM switch simulation" (USB keyboard).
+
+**S3.9.4 Keyboard plug-out is seen by Xorg**
+- Requirement: Xorg/libinput closes the device: it leaves `xinput list` and the log records `removing device` for it.
+- Acceptance: as stated, polled.
+- Tier: T3 · Coverage: ❌.
+
+**S3.9.5 A hot-added keyboard delivers keystrokes**
+- Requirement: keys sent specifically through the re-added device reach the focused application.
+- Acceptance: `input-send-event` with `"device": "kvmkbd"` after the re-add; the sink xterm records the text (or `xinput test <id>` shows the key events).
+- Tier: T3 · Coverage: ❌ (the post-cycle typing today goes through whatever keyboard the input core has, the PS/2 one included).
+
+**S3.9.6 The session accepts input after a keyboard cycle**
+- Requirement: a remove/re-add cycle does not wedge the X session or its input stack.
+- Acceptance: click + type after the cycle lands in the sink xterm.
+- Tier: T3 · Coverage: ✅ `e2e` ("kvmok").
+
+**S3.9.7 Pointer plug-in reaches the container**
+- Requirement: a mouse or tablet added while the desktop runs appears as a new `event*` node inside the container.
+- Acceptance: the node count rises after `device_add usb-mouse` (relative) and after `device_add usb-tablet` (absolute), both on xHCI.
+- Tier: T3 · Coverage: ❌ (no pointer is hot-plugged today; only the boot-time virtio tablet exists).
+
+**S3.9.8 Pointer plug-in is adopted by Xorg**
+- Requirement: the device appears in `xinput list` as a pointer.
+- Acceptance: as stated, for a relative and for an absolute device.
+- Tier: T3 · Coverage: ❌.
+
+**S3.9.9 Pointer plug-out removes the node from the container**
+- Requirement and acceptance: as S3.9.3, for the pointer.
+- Tier: T3 · Coverage: ❌.
+
+**S3.9.10 Pointer plug-out is seen by Xorg**
+- Requirement and acceptance: as S3.9.4, for the pointer.
+- Tier: T3 · Coverage: ❌.
+
+**S3.9.11 A hot-added pointer delivers motion and buttons**
+- Requirement: events sent through the hot-added device move the pointer and click.
+- Acceptance: `xinput test <id>` shows motion and button events sent via `input-send-event` with that device id; a click on the sink xterm through the hot-added tablet focuses it, so typed text then lands.
+- Tier: T3 · Coverage: ❌.
+
+**S3.9.12 Repeated input cycles leave no residue**
+- Requirement: at least five remove/re-add cycles of the same device return node counts and `xinput list` to baseline, with no stale device entries.
+- Acceptance: counts equal baseline after the last cycle; the session still accepts input.
+- Tier: T3 · Coverage: ❌.
+
+### F3.10 HMI hotplug: monitors
+
+A headless QEMU cannot enable a second scanout, so a monitor *appearing* is
+staged through the DRM connector-force interface and, where modes are needed,
+an injected firmware EDID; `HotpluggingTestHelp.md` §4.3 has the exact writes
+and their limits. Everything about the physical link is T4.
+
+**S3.10.1 Monitor plug-out with a declared layout holds the geometry**
+- Requirement: forcing a declared connector down under the running server changes neither the screen size nor any output's position.
+- Acceptance: S3.4.10.
+- Tier: T3 · Coverage: ✅ `guest:verify_fixed_layout`.
+
+**S3.10.2 Monitor plug-out is reported by RandR**
+- Requirement: after the connector goes down, `xrandr` reports it `disconnected` while it stays enabled under the layout.
+- Acceptance: `xr_is Virtual-1 disconnected 1024x768+0+0`.
+- Tier: T3 · Coverage: ✅ `guest:verify_fixed_layout`.
+
+**S3.10.3 Monitor re-plug after plug-out restores connected status without moving anything**
+- Requirement: returning the connector (`detect`) under the running server brings `xrandr` back to `connected` with the same geometry.
+- Acceptance: after `echo detect`, poll `xrandr` for `Virtual-1 connected 1024x768+0+0`; dims still `2048x768`.
+- Tier: T3 · Coverage: 🟡 the e2e restores the connector and waits for sysfs to say `connected`, but restarts the desktop before querying X; the running-server half is unasserted.
+
+**S3.10.4 Monitor plug-in on an empty connector, layout declared**
+- Requirement: forcing the never-connected `Virtual-2` to `on` under a layout that already declares it changes nothing: same dims, same positions, and `xrandr` now says `connected`.
+- Acceptance: `echo on > /sys/class/drm/card*-Virtual-2/status`; `xr_is Virtual-2 connected 1024x768+1024+0`; dims `2048x768`; `echo detect` afterwards.
+- Tier: T3 · Coverage: ❌.
+
+**S3.10.5 Monitor plug-in without a layout is detected and does not reflow**
+- Requirement: under autodetection a connector coming up is reported `connected` by `xrandr`, and because nothing in this session listens to RandR the screen size and the existing output's geometry are unchanged (no auto-enable).
+- Acceptance: record `xrandr` and dims before; force `Virtual-2` on; `xrandr` shows it connected; dims and `Virtual-1` geometry unchanged.
+- Tier: T3 · Coverage: ❌.
+
+**S3.10.6 Monitor plug-out without a layout is characterised**
+- Requirement: under autodetection with one output enabled, forcing its connector down must not crash or restart X, and the resulting `xrandr`/dims are recorded so the README's description of the degradation rests on an observation.
+- Acceptance: Xorg pid unchanged; `xdpyinfo` answers; the observed `xrandr` output is written to the artifacts.
+- Tier: T3 · Coverage: ❌.
+
+**S3.10.7 A plugged-in monitor with an EDID exposes modes**
+- Requirement: when the forced-on connector carries an injected EDID (`drm_kms_helper.edid_firmware=Virtual-2:edid/1024x768.bin`), `xrandr --verbose` lists that EDID's modes for it, and under autodetection an explicit `xrandr --output Virtual-2 --auto` enables it without disturbing `Virtual-1`.
+- Acceptance: as stated; needs `CONFIG_DRM_LOAD_EDID_FIRMWARE` in the guest kernel (confirm on Rocky 9 first).
+- Tier: T3 · Coverage: ❌.
+
+**S3.10.8 Physical monitor plug-out and plug-in**
+- Requirement: S8.2.2 and S8.2.3 (real EDID re-read, link retraining, KVM video).
+- Tier: T4 · Coverage: 🔧.
+
+### F3.11 HMI hotplug: KVM switch composite
+
+**S3.11.1 Keyboard, pointer and sound card leave and return together**
+- Requirement: a KVM switch disconnects every USB device at once; the desktop survives all three leaving in the same instant and all three returning.
+- Acceptance: `device_del` of the USB keyboard, tablet and sound card back to back; all node counts drop; re-add all three; all counts return; typed text lands, the hot-added tablet clicks, the built-in card still plays; Xorg pid and PipeWire pid unchanged throughout.
+- Tier: T3 · Coverage: ❌.
+
+**S3.11.2 Composite cycle with the video link down at the same time**
+- Requirement: S3.11.1 with `Virtual-1` forced down during the away period and `detect`ed on return, layout declared; geometry holds throughout.
+- Acceptance: S3.11.1's assertions plus dims `2048x768` at every step.
+- Tier: T3 · Coverage: ❌.
 
 ---
 
@@ -556,12 +674,10 @@ Reference shorthand: `smoke` = `ci/smoke-deploy.sh`; `guest:<fn>` =
 - Acceptance: `ps -L` on the daemon.
 - Tier: T3 · Coverage: ✅ `guest:verify_privileges`.
 
-### F4.4 Hotplug
+### F4.4 Soundless host
 
-**S4.4.1 A hot-added sound card reaches the container and WirePlumber**
-- Requirement: after `usb-audio` is added, a new `controlC*` appears in the container and WirePlumber gains an `alsa_card` device; after removal both go away and the built-in card still plays.
-- Acceptance: `e2e` "audio hotplug" (both directions, three counters, tone afterwards).
-- Tier: T3 · Coverage: ✅.
+> **Retired ID:** S4.4.1 (sound-card hotplug, both directions) was split per
+> direction and per layer into **F4.7** (S4.7.1–S4.7.6).
 
 **S4.4.2 Soundless host boots and degrades gracefully**
 - Requirement: with no `/dev/snd` on the host, tmpfiles creates an empty one, the container starts, preflight WARNs `no /dev/snd/controlC* visible`, PipeWire runs and exports sockets.
@@ -586,6 +702,73 @@ Reference shorthand: `smoke` = `ci/smoke-deploy.sh`; `guest:<fn>` =
 - Requirement: a pod with `desktop.local/audio` records the sink monitor and the recording carries the played tone.
 - Acceptance: `guest:verify_record` (660 Hz).
 - Tier: T3 · Coverage: ✅.
+
+### F4.7 HMI hotplug: audio
+
+The VM stages real USB sound-card hotplug today; `HotpluggingTestHelp.md` §4.4
+documents the commands, the three counters, and why QEMU's limits do not
+prevent it. Playback and capture are separate stories because QEMU's
+`usb-audio` has only ever offered playback; a capture-capable hot-add needs a
+different vehicle (see the guide).
+
+**S4.7.1 Sound card plug-in reaches the container**
+- Requirement: a card added while the desktop runs produces a new `/dev/snd/controlC*` inside the container.
+- Acceptance: the container node count rises after `device_add usb-audio,…,bus=xhci.0`.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug".
+
+**S4.7.2 Sound card plug-in reaches WirePlumber**
+- Requirement: WirePlumber gains an `alsa_card.*` Device object for it.
+- Acceptance: the `pw-cli ls Device` count rises (as the session user, with its runtime dir).
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug".
+
+**S4.7.3 A hot-added card plays**
+- Requirement: audio routed to the hot-added card's sink is rendered by that device.
+- Acceptance: `wpctl set-default <id>`; play a tone at a frequency no other test uses (e.g. 990 Hz); `wavcapture` on the shared `audiodev` and `check-audio.py` assert it; restore the default sink.
+- Tier: T3 · Coverage: ❌.
+
+**S4.7.4 Sound card plug-out removes the node from the container**
+- Requirement: after `device_del`, the `controlC*` node is gone inside the container.
+- Acceptance: the container node count returns to baseline.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug".
+
+**S4.7.5 Sound card plug-out removes the WirePlumber device**
+- Requirement: WirePlumber drops the Device object and re-selects a default sink.
+- Acceptance: the `pw-cli ls Device` count returns to baseline (polled); `pactl get-default-sink` names a surviving sink.
+- Tier: T3 · Coverage: ✅ count; 🟡 the default-sink re-selection is implied by the tone that follows, not asserted.
+
+**S4.7.6 The built-in card plays after a cycle**
+- Requirement: a plug/unplug cycle does not wedge the audio stack.
+- Acceptance: a pulse tone is captured at 440 Hz afterwards.
+- Tier: T3 · Coverage: ✅ `e2e` "audio-after-hotplug".
+
+**S4.7.7 A stream playing on the card that is unplugged fails cleanly**
+- Requirement: a client streaming to the hot-added card when it is removed is either moved to the remaining sink or gets a clean error; `pipewire`, `wireplumber` and `pipewire-pulse` keep their pids.
+- Acceptance: start a long `pw-play`/`paplay` to the new sink; `device_del`; the three daemon pids are unchanged; the export stays reachable; the client exits or continues on the built-in sink within 10 s.
+- Tier: T3 · Coverage: ❌.
+
+**S4.7.8 Capture device plug-in and plug-out reach WirePlumber**
+- Requirement: a hot-added card with a capture path appears as an `alsa_input.*` source and disappears on removal.
+- Acceptance: `pactl list short sources` gains and loses the source. Vehicle: PCI hot-add of `intel-hda` plus `hda-duplex` (or `hda-micro`) on the shared `audiodev`, if the HDA codec bus accepts `device_add`; otherwise T4 only, with the attempt and its error recorded here.
+- Tier: T3/T4 · Coverage: ❌.
+
+**S4.7.9 Recording from a hot-added capture device works**
+- Requirement: a client can `parec`/`arecord` from the new source.
+- Acceptance: the stream opens and delivers frames (with QEMU's null backend the content is silence, so no frequency assertion).
+- Tier: T3/T4 · Coverage: ❌.
+
+**S4.7.10 A card that arrives after a soundless boot is openable**
+- Requirement: S2.4.6 (the audio gid is re-aligned before each stack start).
+- Acceptance: a VM profile booted without `intel-hda`; hot-add `usb-audio`; after the next stack start WirePlumber lists it and it plays.
+- Tier: T3 · Coverage: ❌.
+
+**S4.7.11 Repeated audio cycles leave no phantom devices**
+- Requirement: at least five plug/unplug cycles return node and Device counts to baseline; no `alsa_card` object outlives its node.
+- Acceptance: counts equal baseline after the last cycle; the built-in tone still plays.
+- Tier: T3 · Coverage: ❌.
+
+**S4.7.12 Physical USB audio plug-in and plug-out**
+- Requirement: S8.3.1 (headset, DAC, dock; microphone capture).
+- Tier: T4 · Coverage: 🔧.
 
 ---
 
@@ -1133,9 +1316,12 @@ The T3 gaps above group naturally into a few additions to `vm-guest.sh`:
 | `verify-seat-gate` | S5.3.3, S3.8.6 |
 | `verify-isolation-negatives` | S6.1.3, S6.1.5 (submounts), S6.2.1, S6.2.3 |
 | `verify-fixed-layout` (extend) | S3.4.11, S3.4.12 |
-| `verify-input-device` (extend KVM cycle) | S3.8.4 |
+| `verify-hotplug-input` (new; pointers, per-device proof, Xorg plug-out) | S3.9.2, S3.9.4, S3.9.5, S3.9.7–S3.9.12 |
+| `verify-hotplug-monitor` (new; DRM force on + firmware EDID) | S3.10.3–S3.10.7 |
+| `verify-hotplug-audio` (extend) | S4.7.3, S4.7.5 (default sink), S4.7.7, S4.7.8, S4.7.9, S4.7.11 |
+| `verify-kvm-composite` (new) | S3.11.1, S3.11.2 |
 | reboot sub-phase after `phase-deploy` | S5.1.3, S5.5.5 (reboot half) |
-| second VM profile booted without `intel-hda` | S2.4.6 |
+| second VM profile booted without `intel-hda` | S2.4.6 / S4.7.10 |
 
 ## Appendix C — Hardware acceptance checklist (T4)
 
@@ -1181,12 +1367,12 @@ is 🔧 is counted in that column.
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 5 | 3 | 6 | 0 |
 | E2 Boot & supervision | 25 | 4 | 7 | 14 | 0 |
-| E3 Display & session | 43 | 16 | 11 | 16 | 0 |
-| E4 Audio | 12 | 7 | 1 | 4 | 0 |
+| E3 Display & session | 62 | 20 | 12 | 29 | 1 |
+| E4 Audio | 23 | 10 | 2 | 10 | 1 |
 | E5 Deploy tree | 50 | 14 | 9 | 26 | 1 |
 | E6 Privileges | 9 | 2 | 2 | 5 | 0 |
 | E7 Client contract | 15 | 10 | 2 | 3 | 0 |
-| **Total** | **168** | **58** | **35** | **74** | **1** |
+| **Total** | **198** | **65** | **37** | **93** | **3** |
 
 Regenerate after editing with:
 
