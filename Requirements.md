@@ -356,7 +356,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
 - Acceptance: kill mwm as uid desktop; Xorg pid changes; new mwm; display answers.
 - Evidence: EV-VIDEO; EV-PIDS before/after; EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: 🟡 "Quit session" ✅ `operator-e2e:menu_quit_session` (S11.1.1: new Xorg and mwm pids, the session's xterm and root colour back, with the video, pid tables and desktop log); mwm dying (killed) ❌.
 
 ### F2.4 Audio supervision
 
@@ -516,13 +516,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `xset s off` and `xset -dpms` took effect.
 - Acceptance: `xset q` shows `timeout:  0` and `DPMS is Disabled`.
 - Evidence: `xset q` (EV-STATE); optionally an EV-SHOT after 11 idle minutes, non-blank.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_3_2` (the optional idle-minutes shot is not taken).
 
 **S3.3.3 Root window colour and initial xterm**
 - Requirement: the operator sees a `#101216` root, one xterm at `100x30+60+60`, and mwm frames.
 - Acceptance: screendump pixel at an uncovered root coordinate is `16,18,22`; an xterm window exists; mwm running.
 - Evidence: EV-SHOT at boot with the sampled coordinate and value in the index; `xwininfo -root -tree` (EV-STATE).
-- Tier: T3 · Coverage: 🟡 mwm ✅; colour and xterm ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_3_3` (the sampled root pixel, `xwininfo -geometry 100x30+60+60`, the mwm frame, mwm's pid as `desktop`).
 
 ### F3.4 Fixed monitor layout
 
@@ -607,16 +607,16 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T3 · Coverage: ✅.
 
 **S3.5.2 `~/.Xdefaults` is honoured because nothing sets `RESOURCE_MANAGER`**
-- Requirement: no `RESOURCE_MANAGER` on the root; the operator sees the dark xterm, not a white one.
+- Requirement: no `RESOURCE_MANAGER` on the root; the operator sees the dark xterm, not a white one. That holds for the desktop's own applications only: a client container's Xt applications read the resources in their own home, so they are not themed (a client's xterm is the stock white one).
 - Acceptance: `xprop -root RESOURCE_MANAGER` → no such atom; xterm background pixel `22,25,29`.
 - Evidence: `xprop` output (EV-STATE); EV-SHOT with the sampled coordinate.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_5_2`.
 
 **S3.5.3 mwm frame colours are applied**
-- Requirement: focused frame `#41637f`, unfocused `#22262d`, menus `#22262d`.
-- Acceptance: sample title-bar pixels of a focused and an unfocused window.
+- Requirement: focused frame `#41637f`, unfocused `#22262d`, menus `#22262d`. Those are all the palette reaches: mwm marks an armed (selected) menu entry with the menu's own shadow colours, not `#41637f`, and draws a focused icon in its built-in default, CadetBlue `#5f9ea0` with white text, because `Xdefaults` sets no `Mwm*icon*active*` resources.
+- Acceptance: sample a flat stretch of each frame - the middle of the left border, clear of the title text and the bevels; mwm paints the whole frame in the frame's colour - for a focused and an unfocused window, and the menu's background between two entries.
 - Evidence: EV-SHOT with two windows, sampled coordinates and values in the index.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_5_3`.
 
 **S3.5.4 Palette keeps the render test's margin**
 - Requirement: the theme's screendump stddev stays ≥ 2× the 0.02 threshold.
@@ -630,7 +630,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `mwm` runs as `desktop` with `~/.mwmrc` loaded; the root menu has "Desktop", "New Terminal", "Host Terminal", "Refresh", "Pack Icons", "Restart mwm", "Quit session".
 - Acceptance: `pgrep -u desktop -x mwm`; a synthetic root click (QMP button on bare root) shows the menu in a screendump.
 - Evidence: EV-PIDS; EV-SHOT of the open root menu with the seven entries legible.
-- Tier: T3 · Coverage: ✅ process; ❌ menu.
+- Tier: T3 · Coverage: ✅ process; ✅ menu (`operator-e2e`, every S11.1.1 entry: the menu posts at the pointer with seven legible rows, an EV-SHOT each time).
 
 **S3.6.2 Click-to-focus and keyboard delivery**
 - Requirement: a left click focuses a window and subsequent keys reach it.
@@ -642,13 +642,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `f.restart` replaces mwm in place; Xorg pid unchanged; windows stay.
 - Acceptance: trigger via the menu (S11.1.1) or T4; mwm's connection to the X server is a new one (the socket inode in `/proc/<mwm>/fd` changes), the Xorg pid is the same, and every client window is still there in the state it was in, normal or iconic. Not "a new mwm pid": `f.restart` re-executes mwm in place, so its pid stays. Not new frame window ids either: the server hands the new connection the slot the old one freed, so the frames mwm makes again can carry the old ids.
 - Evidence: EV-PIDS; EV-DIFF of the window tree; EV-SHOT; EV-VIDEO.
-- Tier: T3/T4 · Coverage: ❌.
+- Tier: T3/T4 · Coverage: ✅ `operator-e2e:menu_restart_mwm` (S11.1.1).
 
 **S3.6.4 Host Terminal menu entry**
 - Requirement: the entry opens an xterm whose shell is on the host as `desktop-shell`.
 - Acceptance: `ssh host whoami` from the container returns `desktop-shell` (✅); the failure path keeps the window open with the hint (S5.7.8).
 - Evidence: EV-SHOT of the host-terminal xterm showing `whoami` output; `ssh` transcript (EV-STATE).
-- Tier: T2/T3 · Coverage: 🟡.
+- Tier: T2/T3 · Coverage: 🟡 the entry's success path ✅ `operator-e2e:menu_host_terminal` (`whoami` typed into the window, its answer on screen and on the host); the failure path's hint ❌.
 
 ### F3.7 Window-to-pod identity
 
@@ -1229,7 +1229,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `ssh -i <key> desktop-shell@127.0.0.1 whoami` from the host and `ssh host whoami` from the container return `desktop-shell`; the "Host Terminal" menu entry shows a prompt on the host.
 - Acceptance: `smoke`, `guest:phase_deploy`; T3 launch `host-terminal` in an xterm and screendump.
 - Evidence: both `whoami` transcripts (EV-STATE); EV-SHOT of the host-terminal xterm showing `desktop-shell@<host>`; EV-LOG-JOURNAL of `sshd` (the accepted publickey line).
-- Tier: T2/T3 · Coverage: ✅ ssh; ❌ the menu-launched xterm shot.
+- Tier: T2/T3 · Coverage: ✅ ssh; ✅ the menu-launched xterm: its shot, the `whoami` typed into it and sshd's accepted-publickey line (`operator-e2e:menu_host_terminal`).
 
 **S5.7.3 Restrictions are enforced**
 - Requirement: the key is refused from a non-loopback source; port forwarding is refused.
@@ -1434,6 +1434,15 @@ because "it works" without "and nothing restarted" is not the claim.
 - Acceptance: `guest:phase_deploy` probes; a grep over `ci/` matches only comments.
 - Evidence: `getenforce`; `ps -Z` of a probe; `ausearch -m avc -ts recent` (empty) (EV-STATE); the grep output.
 - Tier: T3/T0 · Coverage: ✅ / ❌ guard.
+
+> **`podman exec` does not get a device's env.** podman applies the edits
+> when the container starts, to the process it starts with: an exec session
+> sees the mounts but not `DISPLAY`, `PULSE_SERVER` or `PIPEWIRE_REMOTE`.
+> Found by the operator phase, whose observer runs its probes with `podman
+> exec` and so passes `DISPLAY` itself (after checking the observer's own
+> process got `:0` from the spec); seen with the podman the e2e VM installs
+> and with podman 4.9. `kubectl exec` into a pod does get them
+> (`guest:assert_pod_env`). The README's client sections say so.
 
 ### F7.2 Published toolkit
 
@@ -2076,30 +2085,30 @@ EV-PIDS for Xorg, mwm and any client application involved; EV-TIMELINE.
 ### F11.1 Working the desktop
 
 **S11.1.1 Every root-menu action does what its label says when chosen with the mouse**
-- Requirement: the operator opens the root menu by pressing a button on the bare root window (left or right, per `.mwmrc`), and each action works. "New Terminal" opens an xterm. "Host Terminal" opens a window titled `host` showing a `desktop-shell` prompt on the host (S5.7.2). "Refresh" and "Pack Icons" leave every window and process in place ("Pack Icons", with two windows iconified and their icons moved apart, packs the icons). "Restart mwm" replaces mwm with no new X session (S3.6.3). "Quit session" ends the session, and the desktop comes back (S2.3.6). A confirmation dialog mwm posts is part of the journey and is answered through the dialog; the image sets no `showFeedback`, so mwm's default decides whether one appears.
-- Acceptance: per entry: QMP pointer to an uncovered root coordinate, button press, EV-SHOT of the open menu, pointer to the entry, release; then the entry's observable; the Xorg pid unchanged except for "Quit session".
+- Requirement: the operator opens the root menu by pressing a button on the bare root window (left or right, per `.mwmrc`): mwm posts it on the press, with its top-left corner at the pointer, and an entry is chosen by letting go on it. Each action works. "New Terminal" opens an xterm. "Host Terminal" opens an xterm showing a `desktop-shell` prompt on the host (S5.7.2); xterm titles it `host`, but the host shell's prompt retitles it at once (`desktop-shell@<host>:~`), so the title does not identify it. "Refresh" and "Pack Icons" leave every window and process in place ("Pack Icons", with two windows iconified and their icons moved apart, puts the icons back in the places mwm first gave them). "Restart mwm" replaces mwm with no new X session (S3.6.3). "Quit session" ends the session, and the desktop comes back (S2.3.6). Both of those last two ask first: with mwm's defaults (the image sets no `showFeedback`) each posts a confirmation dialog centred on the screen, OK the default button, and the journey answers it through the dialog.
+- Acceptance: per entry: QMP pointer to a point on bare root with room for the menu below and to the right, button press, EV-SHOT of the open menu (its seven rows legible, S3.6.1), pointer to the entry with the button held, release; then the entry's observable; the Xorg pid unchanged except for "Quit session". For "Host Terminal", `whoami` typed into the window answers `desktop-shell` on the host, and sshd logs the key login.
 - Evidence: per entry an EV-SHOT pair (menu open, result) and EV-PIDS; EV-VIDEO for "Restart mwm" and "Quit session"; `xwininfo -root -tree` before and after (EV-DIFF).
-- Tier: T3 · Coverage: ❌. S3.6.1 asserts only that the menu shows its entries; S2.3.6 and S3.6.3 reach their outcomes without the menu.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_1`, one `menu_*` step per entry.
 
 **S11.1.2 Windows can be arranged with the mouse**
-- Requirement: the operator arranges windows with the controls mwm draws on every frame and with the `.mwmrc` button bindings, and a client application's window behaves exactly like the desktop's own xterm. Dragging the title bar moves the window; dragging the border resizes it; the minimize button iconifies it, and its icon (double-click, or Restore from the icon's window menu) brings it back where it was; the maximize button enlarges it and a second press restores it; button 3 on a frame posts the window menu (`<Btn3Down> icon|frame f.post_wmenu`), whose Close closes the window; button 1 on a frame raises the window (`<Btn1Down> icon|frame f.raise`).
-- Acceptance: the desktop's xterm and a client pod's xterm, overlapping; QMP pointer events only; per action, `xwininfo -id` of the window before and after matches the drag, resize, iconify, restore or maximize; `xwininfo -root -tree` shows the stacking change after a raise; on a two-output layout, whether maximize fills one output or the whole screen is recorded; Close ends the client's xterm (its pid exits) and leaves the desktop's xterm untouched.
+- Requirement: the operator arranges windows with the controls mwm draws on every frame and with the `.mwmrc` button bindings, and a client application's window behaves exactly like the desktop's own xterm. Dragging the title bar moves the window; dragging the border resizes it; the minimize button iconifies it, and its icon (double-click, or Restore from the icon's window menu) brings it back where it was; the maximize button enlarges it and a second press restores it; button 3 on a frame posts the window menu (`<Btn3Down> icon|frame f.post_wmenu`), whose Close closes the window; button 1 on a frame raises the window (`<Btn1Down> icon|frame f.raise`). mwm posts the window menu on the button-3 press and takes it down on a release anywhere but an entry, so Close is chosen by dragging to it with the button held. A single click on an icon posts the icon's window menu and leaves it posted (mwm's `iconClick` default). In a normal window's menu Restore is insensitive.
+- Acceptance: the desktop's xterm and a client pod's xterm, overlapping; QMP pointer events only; per action, `xwininfo -id` of the window before and after matches the drag, resize, iconify, restore or maximize; `xwininfo -root -tree` shows the stacking change after a raise; on a two-output layout, whether maximize fills one output or the whole screen is recorded; Close ends the client's xterm (its pid exits) and leaves the desktop's xterm untouched. A corner drag puts the frame's corner where the pointer stops, not where in the handle it was grabbed, and xterm's size snaps down to its character grid: a drag ending n columns and m rows of that grid beyond the frame's corner resizes it by exactly n by m. A raised window can bury the other completely, so the order of the actions keeps a stretch of each frame visible.
 - Evidence: common set; per action an EV-SHOT pair and the `xwininfo` output before and after (EV-DIFF); EV-VIDEO of the drags.
-- Tier: T3 · Coverage: ❌. S3.6.2 asserts click-to-focus and typing only; no test moves, resizes, iconifies, maximizes or closes a window.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_2`, both windows taken through every action. The e2e VM has one output; maximize gives a `1275x789+5+11` frame on its 1280x800 screen, the character grid keeping it short of the edges.
 
 **S11.1.3 Windows can be managed from the keyboard alone**
-- Requirement: an operator whose pointer is gone (a KVM that dropped the mouse) can still manage windows through the `.mwmrc` bindings: `Alt+Tab` and `Alt+Shift+Tab` move keyboard focus between windows, `Shift+Escape` and `Alt+Space` post the window menu, and the window menu's accelerators act on the focused window (`Alt+F9` minimize, `Alt+F4` close).
-- Acceptance: two xterms on screen, one of them from a client pod, and no pointer events after setup; `Alt+Tab` moves focus (the frame colours swap, by S3.5.3's samples, and typed text lands in the newly focused window); `Shift+Escape` shows the window menu (EV-SHOT); `Alt+F9` iconifies the focused window and the window menu's Restore brings it back; `Alt+F4` closes the local xterm (its pid exits), and focus can then be moved to the remaining window by keyboard.
+- Requirement: an operator whose pointer is gone (a KVM that dropped the mouse) can still manage windows through the `.mwmrc` bindings: `Alt+Tab` and `Alt+Shift+Tab` move keyboard focus between windows, `Shift+Escape` and `Alt+Space` post the window menu, and the window menu's accelerators act on the focused window (`Alt+F9` minimize, `Alt+F4` close). `Alt+Tab` cycles icons as well as windows. A window menu posted from the keyboard appears at the top-left corner of the focused window's client area, or just above a focused icon, and its entries can also be chosen by mnemonic (R for Restore).
+- Acceptance: two xterms on screen, one of them from a client pod, and no pointer events after setup; `Alt+Tab` moves focus (the frame colours swap, by S3.5.3's samples, and typed text lands in the newly focused window); `Shift+Escape` shows the window menu (EV-SHOT); `Alt+F9` iconifies the focused window and the window menu's Restore brings it back (`Alt+Tab` to the icon, `Shift+Escape`, R); `Alt+F4` closes the local xterm (its pid exits), and focus can then be moved to the remaining window by keyboard. The local xterm is the session's own: nothing starts another, and the session carries on without a terminal until the operator opens one.
 - Evidence: EV-SHOT per step with sampled frame colours; the sink files; the EV-QEMU transcript of the key events; EV-PIDS.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_3`. Recorded on the e2e VM: after `Alt+F9`, and again after `Alt+F4`, mwm put the keyboard focus on the remaining window, and one `Alt+Tab` then reached the icon.
 
 ### F11.2 Working across applications
 
 **S11.2.1 Text moves between applications by selection and paste, across containers**
 - Requirement: text the operator selects in one window can be pasted into another. The applications share one X server whichever containers they run in, so the X selections work between the desktop's own xterm and a client pod's window, and between two client pods' windows, in both directions. That holds for PRIMARY (select, then middle-click; xterm's default) and for CLIPBOARD (xterm with its `selectToClipboard` resource set; the selection toolkit applications use for copy and paste).
-- Acceptance: three xterms (the desktop's, pod A's, pod B's), each showing a word of its own and reading its input into a sink file; for each pair, in both directions and for both selections: QMP double-click on the source's word, middle-click in the target, Enter; the target's sink records the word. Then pod A's xterm exits, and what a paste into pod B yields is recorded: the session runs no clipboard manager, and xterm also writes the X cut buffer, which outlives it.
+- Acceptance: three xterms (the desktop's, pod A's, pod B's), each showing a word of its own and reading its input into a sink file; for each pair, in both directions and for both selections: QMP double-click on the source's word, middle-click in the target, Enter; the target's sink records the word. Before each paste the harness overwrites the root's cut buffer with a decoy word, so a word that arrives can only have come through the selection. Then pod A's xterm exits, and what a paste into pod B yields is recorded: the session runs no clipboard manager, and xterm also writes the X cut buffer, which outlives it.
 - Evidence: common set; per pair an EV-SHOT of the selected word and of the pasted text; the sink files (EV-LOG-CLIENT).
-- Tier: T3 · Coverage: ❌. No test moves text between applications.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_2_1`, all twelve transfers. Recorded on the e2e VM: with pod A's xterm gone, a paste into pod B gave pod A's word, from the cut buffer (`CUT_BUFFER0`) xterm had written.
 
 ### F11.3 Sound under the operator's control
 

@@ -411,7 +411,7 @@ The palette, shared by all three:
 |---|---|---|
 | base | `#101216` | root window |
 | surface | `#22262d` | unfocused frames, menus, icons |
-| accent | `#41637f` | focused frame, selected menu entry |
+| accent | `#41637f` | focused frame |
 | accent+ | `#6b8ba6` | accent bevel highlight, terminal cursor |
 | text | `#d7dae0` | foreground on surfaces |
 | dim | `#9aa1ab` | foreground on unfocused frames |
@@ -420,6 +420,13 @@ The accent is deliberately desaturated: mwm paints the **whole frame** with
 the active color, not just the title bar, so a saturated accent dominates the
 screen. With a muted fill the bevel highlight does most of the focus
 signalling.
+
+Two things the palette does not reach, as the e2e operator phase's
+screendumps show: mwm marks the armed entry of a menu with the menu's own
+bevel colors rather than a fill (so `Mwm*menu*activeBackground` shows
+nowhere), and it draws a focused icon in its built-in active color,
+CadetBlue `#5f9ea0` with white text, because `~/.Xdefaults` sets no
+`Mwm*icon*active*` resources.
 
 xterm gets a matching background, a themed scrollbar, and a desaturated
 16-color ANSI palette. Only colors are set: the e2e input test computes a
@@ -431,6 +438,12 @@ would break it.
 `RESOURCE_MANAGER` property — the image needs no `xrdb`. **If an `xrdb` call
 is ever added to `xinitrc.desktop`, that property starts existing and this
 file is silently ignored**; load it explicitly (`xrdb -merge`) at that point.
+
+The same choice keeps the theme to the desktop's own applications. A client
+container's X applications never read this file: Xt looks in the client's
+own home, so they draw with their own defaults (a client's xterm is the stock
+white one in the e2e screendumps). Resources loaded into the server with
+`xrdb` would reach every client, whatever its container.
 
 One constraint when retuning the palette: `ci/vm/vm-e2e.sh` proves the X
 server is actually drawing by asserting the screendump's grayscale stddev is
@@ -665,6 +678,13 @@ podman run --rm --device desktop.local/display=all <image> xterm
 podman run --rm --device desktop.local/audio=all   <image> paplay sound.wav
 podman run --rm --device desktop.local/display=all --device desktop.local/audio=all <image>
 ```
+
+podman applies a device's edits to the process the container starts with,
+and its children. A later `podman exec` into the container sees the mounted
+sockets but **not** `DISPLAY`, `PULSE_SERVER` or `PIPEWIRE_REMOTE`: start
+the application as the container's command, as above, or pass the variable
+(`podman exec -e DISPLAY=:0 <ctr> xterm`). `kubectl exec` into a pod does get
+them.
 
 ### Kubernetes: a device plugin per capability
 

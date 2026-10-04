@@ -118,6 +118,11 @@ podman run --rm --device desktop.local/display=all <image> xterm
 podman run --rm --device desktop.local/audio=all   <image> paplay sound.wav
 ```
 
+The edits reach the process a podman container starts with, not a later
+`podman exec` into it: an exec session sees the sockets but not `DISPLAY`,
+`PULSE_SERVER` or `PIPEWIRE_REMOTE`, so pass them (`podman exec -e
+DISPLAY=:0 …`). `kubectl exec` into a pod does get them.
+
 In kubernetes there is no pod field naming a CDI device, so a device
 plugin bridges the gap (`charts/cdi-device-plugin` in this repo), one
 release per device since kubelet's `Register` takes a single resource
