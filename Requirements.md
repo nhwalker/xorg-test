@@ -648,7 +648,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the entry opens an xterm whose shell is on the host as `desktop-shell`.
 - Acceptance: `ssh host whoami` from the container returns `desktop-shell` (✅); the failure path keeps the window open with the hint (S5.7.8).
 - Evidence: EV-SHOT of the host-terminal xterm showing `whoami` output; `ssh` transcript (EV-STATE).
-- Tier: T2/T3 · Coverage: 🟡 the entry's success path ✅ `operator-e2e:menu_host_terminal` (`whoami` typed into the window, its answer on screen and on the host); the failure path's hint ❌.
+- Tier: T2/T3 · Coverage: 🟡 the entry's success path ✅ `operator-e2e:menu_host_terminal` (`whoami` typed into the window, its answer on screen and on the host); the failure path's hint is not asserted (S5.7.8 tracks it).
 
 ### F3.7 Window-to-pod identity
 
