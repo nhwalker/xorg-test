@@ -1860,27 +1860,47 @@ def audio_snapshot(ctx, moment, what):
 
 
 def s11_3_1(ctx, st):
-    plugged = []
+    # What has to be put back however the story ends: the hot-added card,
+    # and the built-in output's volume as the story found it.
+    held = {"card": None, "volume": None}
     try:
-        sound_controls(ctx, st, plugged)
+        sound_controls(ctx, st, held)
         sound_persistence(ctx, st)
     finally:
         with contextlib.suppress(Exception):
             ctx.g.client_stop("player")
-        if plugged:
+        if held["card"] is not None:
             with contextlib.suppress(Exception):
                 ctx.m.device_del("opsnd")
-                wait_until(lambda: not any(node_name(ctx, i) == plugged[0]
+                wait_until(lambda: not any(node_name(ctx, i) == held["card"]
                                            for i in wp_sinks(wpctl(ctx, "status"))), 30, 1)
-        # Whatever the operator's choices survived, the next phase gets a
-        # desktop at full volume.
         with contextlib.suppress(Exception):
-            wpctl(ctx, "set-volume", "@DEFAULT_AUDIO_SINK@", "1.0")
+            if held["volume"]:
+                wpctl(ctx, "set-volume", "@DEFAULT_AUDIO_SINK@", held["volume"])
             wpctl(ctx, "set-mute", "@DEFAULT_AUDIO_SINK@", "0")
-            audio_snapshot(ctx, "end", "the audio state handed to the next phase")
+            audio_snapshot(ctx, "end", "the audio state handed to the next phase: the built-in "
+                           "output at the volume the story found it at")
 
 
-def sound_controls(ctx, st, plugged):
+# Marks the analysis reads the capture against. The built-in output's own
+# volume steps are recorded, not asserted: QEMU's emulated HDA output does not
+# follow the volume it is set to (Requirements.md S11.3.1), so a level read
+# there says more about the emulator than about the desktop. The emulated USB
+# card does follow it, so the volume and mute assertions are made on it.
+M_START = "capture starts"
+M_B100 = "built-in output: set-volume 100%"
+M_B50 = "built-in output: set-volume 50%"
+M_PLUG = "USB sound card plugged in (QMP device_add)"
+M_TO_BUILTIN = "set-default: the built-in output"
+M_TO_USB = "set-default: the USB card"
+M_U100 = "USB card: set-volume 100%"
+M_U50 = "USB card: set-volume 50%"
+M_MUTE = "USB card: set-mute 1"
+M_UNMUTE = "USB card: set-mute 0"
+M_END = "capture ends"
+
+
+def sound_controls(ctx, st, held):
     """The operator's own controls, typed into a desktop terminal, with the
     machine's sound output captured throughout."""
     g, m = ctx.g, ctx.m
@@ -1891,12 +1911,24 @@ def sound_controls(ctx, st, plugged):
         marks.append((label, time.monotonic() - t0[0]))
         ctx.run.log("mark", f"{label} at +{marks[-1][1]:.2f}s into the capture", echo=True)
 
+    def command(text, label):
+        # The mark goes at Enter, when the command takes effect.
+        ctx.type(text)
+        mark(label)
+        ctx.chord("ret", settle=0.8)
+
+    def volume_is(value):
+        return wait_until(lambda: value in wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"), 6, 0.5)
+
     # The application: a client container playing one long, continuous
     # 1100 Hz tone through nothing but desktop.local/audio.
     g.client_run("player", ["paplay", "/tmp/tone.wav"], devices=("audio",), image=TESTCLIENT_IMAGE,
                  copy_in={"/tmp/tone.wav": "/tmp/op-tone-1100.wav"})
     builtin = wait_until(lambda: stream_sink(ctx), 20, 0.5)
     st.check(builtin, "the client's player has a stream on the desktop's audio", f"on {builtin}")
+    found_at = re.search(r"Volume: ([\d.]+)", wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"))
+    held["volume"] = found_at.group(1) if found_at else None
+    st.record(f"the built-in output's volume before the operator touched it: {held['volume']}")
     player = g.client_inspect("player")
     pids_before = ctx.pids("pids-start")
     pw_before = ctx.session_pid(pids_before, "pipewire")
@@ -1906,8 +1938,8 @@ def sound_controls(ctx, st, plugged):
     m.hmp(f"wavcapture {wav} snd0 44100 16 2")
     t0[0] = time.monotonic()
     try:
-        mark("capture starts (full volume)")
-        time.sleep(3)
+        mark(M_START)
+        time.sleep(2)
 
         # The operator's terminal, opened the operator's way.
         xs, _ = ctx.root_menu("New Terminal", "terminal")
@@ -1916,66 +1948,70 @@ def sound_controls(ctx, st, plugged):
         ctx.click(*found[0].parts(found[1])["drag"])
         audio_snapshot(ctx, "wpctl-status-start", "`wpctl status` before the operator types anything (EV-STATE)")
 
-        ctx.type_line("wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%")
-        mark("wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%")
-        st.check(wait_until(lambda: "0.50" in wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"), 6, 0.5),
-                 "typed into the terminal, wpctl set the default output's volume to 50%",
-                 f"wpctl get-volume: {wpctl(ctx, 'get-volume', '@DEFAULT_AUDIO_SINK@').strip()}")
-        time.sleep(2.5)
-        audio_snapshot(ctx, "wpctl-status-volume", "`wpctl status` after set-volume 50%")
+        command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 100%", M_B100)
+        st.check(volume_is("1.00"), "typed into the terminal, wpctl set the built-in output to 100%")
+        time.sleep(3)
+        command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%", M_B50)
+        st.check(volume_is("0.50"), "and then to 50%")
+        time.sleep(3)
 
-        ctx.type_line("wpctl set-mute @DEFAULT_AUDIO_SINK@ 1")
-        mark("wpctl set-mute @DEFAULT_AUDIO_SINK@ 1")
-        st.check(wait_until(lambda: "MUTED" in wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"), 6, 0.5),
-                 "wpctl set-mute 1 muted the default output")
-        time.sleep(2.5)
-        ctx.type_line("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0")
-        mark("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0")
-        st.check(wait_until(lambda: "MUTED" not in wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"), 6, 0.5),
-                 "wpctl set-mute 0 unmuted it")
-        time.sleep(2.5)
-        ctx.shot("terminal", "the operator's terminal with the wpctl commands typed into it")
-
-        # A USB headset arrives, and the operator moves the sound to it.
+        # A USB headset arrives, and the operator chooses where the sound goes.
         before = wp_sinks(wpctl(ctx, "status"))
         st.write("info-usb-before", m.hmp("info usb"), "QEMU's `info usb` before the card is plugged (EV-QEMU)")
         m.device_add(driver="usb-audio", id="opsnd", audiodev="snd0", bus="xhci.0")
-        plugged.append(None)
-        mark("USB sound card plugged in (QMP device_add)")
+        held["card"] = ""
+        mark(M_PLUG)
         new = wait_until(lambda: [i for i in wp_sinks(wpctl(ctx, "status")) if i not in before], 30, 1)
         st.check(new, "the hot-added card shows up as a new output in wpctl status")
         st.write("info-usb-after", m.hmp("info usb"), "QEMU's `info usb` with the card plugged (EV-QEMU)")
         usb_id = new[0]
         usb_name = node_name(ctx, usb_id)
-        plugged[0] = usb_name
+        held["card"] = usb_name
         status, _, _ = audio_snapshot(ctx, "wpctl-status-plugged",
                                       f"`wpctl status` with the USB card plugged: its sink is id {usb_id}")
+        time.sleep(1)
         on_plug = stream_sink(ctx)
-        st.record(f"on plug-in, before the operator chose anything, the stream was on {on_plug} "
+        st.record(f"on plug-in, before the operator chose anything, the stream went to {on_plug} "
                   f"(WirePlumber {'moved it by itself' if on_plug == usb_name else 'left it where it was'})")
         time.sleep(2)
         if on_plug == usb_name:
-            # Already moved by WirePlumber: send it back first, so that the
-            # operator's choice of the card below is a move that can be seen.
+            # Already moved: choose the built-in output first, so that both
+            # directions of the choice are seen.
             builtin_id = next(i for i in wp_sinks(status) if node_name(ctx, i) == builtin)
-            ctx.type_line(f"wpctl set-default {builtin_id}")
-            mark(f"wpctl set-default {builtin_id} (back to the built-in output)")
+            command(f"wpctl set-default {builtin_id}", M_TO_BUILTIN)
             st.check(wait_until(lambda: stream_sink(ctx) == builtin, 8, 0.5),
-                     "wpctl set-default moved the stream back to the built-in output")
-            time.sleep(2.5)
-        ctx.type_line(f"wpctl set-default {usb_id}")
-        mark(f"wpctl set-default {usb_id} (the USB card)")
+                     "wpctl set-default moved the client's stream to the built-in output")
+            time.sleep(3)
+        command(f"wpctl set-default {usb_id}", M_TO_USB)
         st.check(wait_until(lambda: stream_sink(ctx) == usb_name, 8, 0.5),
                  "wpctl set-default moved the client's stream to the USB card",
                  f"the stream is on {stream_sink(ctx)}, the card is {usb_name}")
-        time.sleep(4)
-        mark("capture ends")
-        audio_snapshot(ctx, "wpctl-status-moved", "`wpctl status` with the stream on the USB card")
+        time.sleep(3)
+
+        # Volume and mute on the output the stream now plays from.
+        command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 100%", M_U100)
+        st.check(volume_is("1.00"), "wpctl set the USB card to 100%")
+        time.sleep(3)
+        command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%", M_U50)
+        st.check(volume_is("0.50"), "and then to 50%")
+        time.sleep(3)
+        audio_snapshot(ctx, "wpctl-status-volume", "`wpctl status` with the USB card at 50%")
+        command("wpctl set-mute @DEFAULT_AUDIO_SINK@ 1", M_MUTE)
+        st.check(volume_is("MUTED"), "wpctl set-mute 1 muted it")
+        time.sleep(3)
+        command("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0", M_UNMUTE)
+        st.check(wait_until(lambda: "MUTED" not in wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"), 6, 0.5),
+                 "wpctl set-mute 0 unmuted it")
+        time.sleep(3)
+        mark(M_END)
     finally:
         m.hmp("stopcapture 0")
         wall = time.monotonic() - t0[0]
-    st.attach(wav_name, "EV-AUDIO: the machine's output across the whole sequence - the tone drops at "
-              "50%, goes silent while muted, and carries on through the move to the USB card")
+    st.attach(wav_name, "EV-AUDIO: the machine's output across the whole sequence - listen for the "
+              "tone moving between the outputs, dropping at 50% on the USB card, and going silent "
+              "while muted")
+    ctx.shot("terminal", "the operator's terminal with every wpctl command typed into it")
+    audio_snapshot(ctx, "wpctl-status-end", "`wpctl status` at the end of the sequence")
 
     player_after = g.client_inspect("player")
     pids_after = ctx.pids("pids-after-controls")
@@ -1988,7 +2024,7 @@ def sound_controls(ctx, st, plugged):
 
 def analyse_capture(ctx, st, wav, marks, wall):
     """The level of the 1100 Hz tone in each 0.1 s of the capture, read
-    against the moments the commands were typed.
+    against the moments the commands were entered.
 
     wavcapture records what the guest's sound devices play, and only while
     one of them is running: a stretch with no device running at all is
@@ -1998,28 +2034,44 @@ def analyse_capture(ctx, st, wav, marks, wall):
     levels = tone_levels(wav, 1100)
     with wave.open(wav, "rb") as w:
         duration = w.getnframes() / w.getframerate()
-    t_of = dict(marks)
-    labels = [label for label, _ in marks]
+    t = dict(marks)
+    times = sorted(t.values())
 
     def level(start, end):
-        vals = sorted(a for t, a in levels if start <= t < end)
+        vals = sorted(a for at, a in levels if start <= at < end)
         return vals[len(vals) // 2] if vals else 0.0
 
-    t_vol, t_mute, t_unmute = t_of[labels[1]], t_of[labels[2]], t_of[labels[3]]
-    t_move = t_of[labels[-2]]
-    full = level(0.5, t_vol - 0.2)
-    half = level(t_vol + 1.5, t_mute - 0.2)
-    muted = level(t_mute + 1.5, t_unmute - 0.2)
-    back = level(t_unmute + 1.5, t_unmute + 4.0)
-    after_move = level(t_move + 1.0, t_move + 3.5)
-    # The longest quiet stretch from the unmute to the end: the card's
-    # arrival, and every move between outputs, are inside it.
-    quiet = 0.1 * back
-    gap = run = 0.0
-    for t, a in levels:
-        if t_unmute + 1.5 <= t < duration - 0.5:
-            run = run + 0.1 if a < quiet else 0.0
-            gap = max(gap, run)
+    def until_next(label):
+        later = [x for x in times if x > t[label]]
+        return later[0] if later else duration
+
+    def settled(label):
+        """The level once the command has taken effect, until the next one."""
+        return level(t[label] + 1.0, until_next(label) - 0.3)
+
+    def db(a, b):
+        return 20 * math.log10(max(a, 1e-9) / max(b, 1e-9))
+
+    b_start, b100, b50 = level(0.5, t[M_B100] - 0.3), settled(M_B100), settled(M_B50)
+    u100, u50, muted, back = settled(M_U100), settled(M_U50), settled(M_MUTE), settled(M_UNMUTE)
+
+    # Every change of output - the card's arrival and each set-default - must
+    # leave no silence: nothing below a tenth of the quieter of the levels
+    # either side of it.
+    moves = []
+    for label in (M_PLUG, M_TO_BUILTIN, M_TO_USB):
+        if label not in t:
+            continue
+        at = t[label]
+        before = level(at - 2.0, at - 0.3)
+        after = level(at + 1.0, min(at + 3.0, until_next(label) - 0.3))
+        floor = 0.1 * min(before, after)
+        gap = run = 0.0
+        for start, a in levels:
+            if at - 0.5 <= start < min(at + 3.0, until_next(label)):
+                run = run + 0.1 if a < floor else 0.0
+                gap = max(gap, run)
+        moves.append((label, before, after, gap))
     missing = wall - duration
 
     plot = st.name("level", "png")
@@ -2027,32 +2079,38 @@ def analyse_capture(ctx, st, wav, marks, wall):
     checker = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                            "check-audio.py"), wav, "10", "0.02", "1100"],
                              capture_output=True, text=True)
-    db = 20 * math.log10(max(half, 1e-9) / max(full, 1e-9))
-    text = ["1100 Hz level, median per phase, as a fraction of full scale:",
-            f"  full volume      {full:.4f}",
-            f"  after 50%        {half:.4f}  ({db:+.1f} dB)",
-            f"  muted            {muted:.4f}",
-            f"  unmuted          {back:.4f}",
-            f"  after the move   {after_move:.4f}",
-            f"  longest drop below 10% of the unmuted level, unmute to end: {gap:.1f} s",
-            f"  capture {duration:.2f} s against {wall:.2f} s of wall clock: {missing:.2f} s with no "
-            "sound device running", "",
-            "marks, in seconds into the capture, with their colour in the level plot:"]
-    text += [f"  {t:7.2f}  #{r:02x}{g:02x}{b:02x}  {label}"
-             for (label, t), (_, (r, g, b)) in zip(marks, legend)]
+    text = ["1100 Hz level, median once each command had taken effect (fraction of full scale):",
+            f"  built-in output, as found        {b_start:.4f}",
+            f"  built-in output at 100%          {b100:.4f}",
+            f"  built-in output at 50%           {b50:.4f}  ({db(b50, b100):+.1f} dB; recorded only)",
+            f"  USB card at 100%                 {u100:.4f}",
+            f"  USB card at 50%                  {u50:.4f}  ({db(u50, u100):+.1f} dB; wpctl's cubic "
+            "scale makes 50% -18.1 dB)",
+            f"  USB card muted                   {muted:.4f}",
+            f"  USB card unmuted                 {back:.4f}", "",
+            "changes of output (level before -> after, longest stretch below a tenth of the quieter):"]
+    text += [f"  {label}: {b:.4f} -> {a:.4f}, {g:.1f} s" for label, b, a, g in moves]
+    text += ["", f"capture {duration:.2f} s against {wall:.2f} s of wall clock: {missing:.2f} s with no "
+             "sound device running", "",
+             "marks, in seconds into the capture, with their colour in the level plot:"]
+    text += [f"  {at:7.2f}  #{r:02x}{g:02x}{b:02x}  {label}"
+             for (label, at), (_, (r, g, b)) in zip(marks, legend)]
     text += ["", "check-audio.py (whole capture, loudest 0.75 s window):",
              (checker.stdout + checker.stderr).rstrip()]
     st.attach(plot, "the tone's level over the capture: one green bar per 0.1 s on a -60..0 dBFS scale "
-              "(grey lines at -20 and -40), a coloured line at each command (legend in the analysis file)")
+              "(grey lines at -20 and -40), a coloured line at each mark (legend in the analysis file)")
     st.write("analysis", "\n".join(text) + "\n", "the analyser's reading of the capture, phase by phase")
+    st.record(f"the built-in output (QEMU's emulated HDA) read {b_start:.4f} as found, {b100:.4f} at 100% "
+              f"and {b50:.4f} at 50%: recorded, not asserted")
     st.check(checker.returncode == 0, "the capture carries the client's 1100 Hz tone")
-    st.check(half < 0.8 * full, "set-volume 50% lowered what the machine played", f"{full:.4f} -> {half:.4f}")
-    st.check(muted < 0.1 * half, "set-mute 1 silenced it", f"{half:.4f} -> {muted:.4f}")
-    st.check(back > 0.5 * half, "set-mute 0 brought it back", f"{muted:.4f} -> {back:.4f}")
-    st.check(after_move > quiet, "the tone carries on, from the USB card, after the move", f"{after_move:.4f}")
-    st.check(gap <= 0.5, "the card's arrival and the move left no quiet stretch longer than 0.5 s",
-             f"longest drop {gap:.1f} s")
-    st.check(missing <= 1.0, "and no stretch with no sound device running at all longer than 1 s",
+    st.check(u50 < 0.5 * u100, "set-volume 50% on the USB card lowered what the machine played, by "
+             "more than 6 dB", f"{u100:.4f} -> {u50:.4f}, {db(u50, u100):+.1f} dB")
+    st.check(muted < 0.1 * u50, "set-mute 1 silenced it", f"{u50:.4f} -> {muted:.4f}")
+    st.check(back > 0.5 * u50, "set-mute 0 brought it back", f"{muted:.4f} -> {back:.4f}")
+    for label, b, a, g in moves:
+        st.check(g <= 0.5, f"{label}: the sound carried on, with no silence longer than 0.5 s",
+                 f"{b:.4f} -> {a:.4f}, longest drop {g:.1f} s")
+    st.check(missing <= 1.0, "no stretch with no sound device running at all longer than 1 s",
              f"the capture is {duration:.2f} s of {wall:.2f} s")
 
 
