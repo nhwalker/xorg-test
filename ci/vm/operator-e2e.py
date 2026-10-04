@@ -1549,7 +1549,9 @@ def s11_1_1(ctx, st):
     # One entry after another, each leaving what the next one needs: the two
     # terminals the first two open are what Pack Icons iconifies, and Quit
     # session, which ends the X session, has to come last.
-    state = {"since": ctx.g.sh("date -u +%Y-%m-%dT%H:%M:%SZ", label="date").strip()}
+    # The VM's clock, both ways: podman logs takes RFC 3339, journalctl @epoch.
+    state = {"since": ctx.g.sh("date -u +%Y-%m-%dT%H:%M:%SZ", label="date").strip(),
+             "epoch": ctx.g.sh("date +%s", label="date +%s").strip()}
     table = ctx.pids("pids-start")
     state["xorg"] = ctx.session_pid(table, "Xorg")
     st.check(state["xorg"], "one X server runs for the session", f"Xorg pid {state['xorg']}")
@@ -1596,13 +1598,20 @@ def menu_host_terminal(ctx, st, state):
     st.check(shell_up, "a shell runs on the host as desktop-shell, behind the Host Terminal window")
     ctx.g.sh("rm -f /tmp/op-host-whoami")
     ctx.click(*xs.parts(t2)["drag"])
-    ctx.type_line("whoami >/tmp/op-host-whoami")
+    # tee, so the answer is on the screen for the shot as well as in a file
+    # the harness can read.
+    ctx.type_line("whoami | tee /tmp/op-host-whoami")
     who = wait_until(lambda: ctx.g.sh("cat /tmp/op-host-whoami 2>/dev/null; true",
                                       label="cat /tmp/op-host-whoami").strip(), 10, 0.5)
-    ctx.shot("host-terminal", "the Host Terminal window: a desktop-shell prompt on the host, and the "
-             "whoami typed into it")
+    ctx.shot("host-terminal", "the Host Terminal window: a desktop-shell prompt on the host, the "
+             "whoami typed into it and its answer")
     st.check(who == "desktop-shell", "typing into Host Terminal runs commands on the host as desktop-shell",
              f"whoami wrote {who!r} on the host")
+    journal = ctx.g.sh(f"journalctl -u sshd --since @{state['epoch']} -o short-precise --no-pager "
+                       "| grep 'Accepted publickey for desktop-shell'; true", label="sshd's journal")
+    st.write("sshd-journal", journal, "EV-LOG-JOURNAL: sshd accepting the desktop-shell key for this "
+             "login")
+    st.check(journal.strip(), "sshd logged the publickey login behind the window")
     xorg_kept(ctx, st, state, "Host Terminal", before)
 
 
