@@ -896,8 +896,8 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   screendumps, video frames, window-tree diffs, pid tables, the audio
   capture, and an `evidence.md` saying what to look for in each. Then k3s +
   CRI-O join the same machine **with the desktop still running on its
-  quadlet and SELinux still enforcing**, and one `cdi-device-plugin` release per capability makes
-  each resource allocatable — confined client pods (asserted to be
+  quadlet and SELinux still enforcing**, and one `cdi-device-plugin`
+  release per capability makes each resource allocatable — confined client pods (asserted to be
   `container_t`, declaring no `securityContext`) then draw on the display and
   play/record audio
   purely through CDI injection, checked against a control pod that

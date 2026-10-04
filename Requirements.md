@@ -2113,10 +2113,10 @@ EV-PIDS for Xorg, mwm and any client application involved; EV-TIMELINE.
 ### F11.3 Sound under the operator's control
 
 **S11.3.1 The operator can set the volume, mute, and choose the output from the desktop**
-- Requirement: the session has no graphical mixer and no volume keys (`.mwmrc` binds none), so the operator's sound controls are commands in a desktop terminal ("New Terminal"), whose environment already carries the session's runtime directory: `wpctl` (the image also carries `pactl` and `alsamixer`). From there, changing the default output's volume, muting and unmuting, and choosing the output device (`wpctl set-default`, for example a headset just plugged in, S4.7.3) take effect on what is already playing, a client pod's stream included, with no restart of anything. What survives an audio-stack restart and a `systemctl restart desktop.service` is recorded: WirePlumber keeps such choices in state files under the session user's home (`/home/desktop`), which does not survive the container being recreated (`README.md` "Look and feel" says the same of the dotfiles), so a reset at that point is expected.
-- Acceptance: a client pod plays a continuous 1100 Hz tone; in a "New Terminal" xterm, typed through QMP: `wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%` lowers the captured level; `wpctl set-mute @DEFAULT_AUDIO_SINK@ 1` silences it and `0` restores it; with a USB card hot-added (S4.7.1), `wpctl set-default <its sink id>` moves the client's stream to it (`pactl list short sink-inputs`) with no gap in the capture; the client pod's `restartCount` and the player's pid are unchanged throughout. Then the volume, mute state and default output are read after killing `pipewire`, and again after restarting the desktop.
-- Evidence: common set; EV-AUDIO across the sequence, with each command's timestamp marked on the spectrogram; `wpctl status` after each step (EV-STATE); EV-LOG-CLIENT of the player.
-- Tier: T3 · Coverage: ❌. S4.7.3 sets the default output from the harness to prove the new card plays; nothing exercises the operator's own controls, or records what they keep across restarts.
+- Requirement: the session has no graphical mixer and no volume keys (`.mwmrc` binds none), so the operator's sound controls are commands in a desktop terminal ("New Terminal"), whose environment already carries the session's runtime directory: `wpctl` (the image also carries `pactl` and `alsamixer`). From there, changing the default output's volume, muting and unmuting, and choosing the output device (`wpctl set-default`, for example a headset just plugged in, S4.7.3) take effect on what is already playing, a client pod's stream included, with no restart of anything. What survives an audio-stack restart and a `systemctl restart desktop.service` is recorded: WirePlumber keeps such choices in state files under the session user's home (`/home/desktop`), which does not survive the container being recreated (`README.md` "Look and feel" says the same of the dotfiles), so a reset at that point is expected. Two things the operator should know, seen on the e2e VM: WirePlumber starts an output it has not seen before at 0.40 on wpctl's scale, not 100%; and a USB card plugged in becomes the default output, WirePlumber moving what is playing onto it by itself.
+- Acceptance: a client pod plays a continuous 1100 Hz tone; in a "New Terminal" xterm, typed through QMP: with a USB card hot-added (S4.7.1), `wpctl set-default <sink id>` moves the client's stream from the card to the built-in output and back (`pactl list sink-inputs`), with no gap in the capture; then on the card, `wpctl set-volume @DEFAULT_AUDIO_SINK@ 100%` and then `50%` lowers the captured level (by 18 dB on wpctl's cubic scale), and `wpctl set-mute @DEFAULT_AUDIO_SINK@ 1` silences it and `0` restores it; the client pod's `restartCount` and the player's pid are unchanged throughout. Then the volume, mute state and default output are read after killing `pipewire`, and again after restarting the desktop. pactl's sink indexes are not the PipeWire ids wpctl prints, so the stream's sink is compared by name. The volume and mute steps are made on the USB card because QEMU's emulated HDA output does not follow the volume it is set to: on the e2e VM it played the tone 0.8 dB down at WirePlumber's 0.40, at full level at 100% and 2.5 dB down at 50%, while the emulated card followed the cubic scale to within half a decibel. The built-in output's own response is still captured and recorded each run. A gap with no sound device running at all would be missing from the capture rather than silent in it, so the capture's length is checked against the wall clock (EV-AUDIO).
+- Evidence: common set; EV-AUDIO across the sequence, with each command's timestamp marked on a level plot of the 1100 Hz tone (the runner has no spectrogram tool); `wpctl status` after each step (EV-STATE); EV-LOG-CLIENT of the player.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_3_1`. Recorded on the e2e VM: after `pipewire` was killed, the default output (the card) and its 50% were kept; after `systemctl restart desktop.service` the card was the default again, which is also WirePlumber's own pick for a present USB card, so this cannot tell whether the choice itself survived, and its volume was back at 0.40.
 
 ---
 
@@ -2255,14 +2255,14 @@ gap by this document's definition.
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 4 | 3 | 7 | 0 |
 | E2 Boot & supervision | 25 | 3 | 7 | 15 | 0 |
-| E3 Display & session | 62 | 17 | 11 | 33 | 1 |
+| E3 Display & session | 62 | 23 | 11 | 27 | 1 |
 | E4 Audio | 23 | 6 | 2 | 14 | 1 |
-| E5 Deploy tree | 50 | 13 | 9 | 27 | 1 |
+| E5 Deploy tree | 50 | 14 | 9 | 26 | 1 |
 | E6 Privileges | 9 | 2 | 2 | 5 | 0 |
 | E7 Client contract & journeys | 40 | 12 | 5 | 23 | 0 |
 | E10 Maintainer experience | 23 | 0 | 3 | 19 | 1 |
-| E11 Operator experience | 5 | 0 | 0 | 5 | 0 |
-| **Total** | **251** | **57** | **42** | **148** | **4** |
+| E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
+| **Total** | **251** | **69** | **42** | **136** | **4** |
 
 Regenerate after editing with:
 
