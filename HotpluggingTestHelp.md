@@ -65,9 +65,12 @@ The parts that matter for hotplug:
 - **`usb-kbd,id=kvmkbd`** — the keyboard the KVM-switch simulation removes and
   re-adds. The `id` is what `device_del` takes.
 - **`virtio-keyboard-pci` / `virtio-tablet-pci`** — permanent input devices.
-  They are what keeps the guest typeable and clickable during USB cycles, which
-  is also why "typing still works after the cycle" is a session-health check,
-  not proof about the re-added device (§4.1.4 fixes that).
+  They keep the guest typeable and clickable during USB cycles. QEMU sends
+  unrouted key events to the keyboard it activated last: a newly added USB
+  keyboard activates itself, a virtio keyboard activates when its guest driver
+  starts. So after the KVM cycle the typing does go through the re-added
+  `kvmkbd`, and Xorg must have opened it; what the check lacks is any record of
+  that (§4.1.4).
 - **`-audiodev none,id=snd0`** — the audio backend. It renders nothing, but
   QEMU's `wavcapture` taps the backend's mixing engine regardless, so anything
   played by *any* device attached to `snd0` can be captured and analysed.
@@ -182,7 +185,7 @@ Package names on Rocky 9 AppStream: `xinput`, `xev` (split out of the old
 |---|---|---|---|---|
 | `usb-kbd` | `bus=xhci.0` | `device_add usb-kbd,id=<id>,bus=xhci.0` | `device_del <id>` — immediate | **the KVM-switch model**: USB is what a KVM switches, and removal needs no guest ACK |
 | `virtio-keyboard-pci` | PCI | `device_add virtio-keyboard-pci,id=<id>` | `device_del <id>` — waits for guest ACPI eject; may hang on a busy device | used today for the plain hot-add test |
-| PS/2 (i8042) | — | always present | never | **always there**: it is why "typing works" after a cycle is not proof about the hot-added device |
+| PS/2 (i8042) | — | always present | never | always there, but QEMU never makes it the active keyboard while another exists, so it does not carry the typing in this rig |
 
 #### 4.1.2 What the e2e does today
 
@@ -196,8 +199,9 @@ mon_cmd "device_add usb-kbd,id=kvmkbd,bus=xhci.0"
 
 Asserted: host node count (layer 2), container node count (layer 3), in both
 directions for the USB cycle; then a click+type into a sink xterm proves the
-session still accepts input. Recorded but not asserted: the Xorg
-`Adding input device` count (layer 4).
+session still accepts input. Because QEMU routes keys to the newest keyboard,
+that typing goes through the re-added `kvmkbd`, but nothing records it.
+Recorded but not asserted: the Xorg `Adding input device` count (layer 4).
 
 #### 4.1.3 Observing each layer
 
@@ -226,18 +230,23 @@ Removal in the Xorg log looks like:
 
 #### 4.1.4 Proving the hot-added keyboard itself carries keystrokes (S3.9.5)
 
-`input-send-event` accepts an optional `"device"` naming a QEMU input device
-id. Events sent with it bypass the PS/2 and virtio keyboards entirely:
+`input-send-event`'s optional `"device"` names a **display** device, not an
+input device: `"device":"kvmkbd"` is refused ("not bound to a QemuConsole").
+To aim events at one input device, create it bound to the display —
+`usb-kbd`, `usb-tablet` and virtio-input take `display=<id>` — and send with
+`"device"` set to that display's id; a bound device takes precedence over the
+unbound ones. That needs an `id=` on the e2e's `-device virtio-vga`:
 
 ```json
-{"execute":"input-send-event","arguments":{"device":"kvmkbd","events":[
+{"execute":"device_add","arguments":{"driver":"usb-kbd","id":"kvmkbd","bus":"xhci.0","display":"vga0"}}
+{"execute":"input-send-event","arguments":{"device":"vga0","events":[
   {"type":"key","data":{"key":{"type":"qcode","data":"k"},"down":true}},
   {"type":"key","data":{"key":{"type":"qcode","data":"k"},"down":false}}]}}
 ```
 
-Extend `ci/vm/qmp-type.py` with an optional `--device <id>` argument that adds
-that field to every event. Then, after the re-add, type `kvmdev` through
-`kvmkbd` and read it back from the sink xterm — or run
+Extend `ci/vm/qmp-type.py` with an optional `--device <display id>` argument
+that adds that field to the command. Then, after the re-add, type `kvmdev`
+through `kvmkbd` and read it back from the sink xterm — or run
 `xinput test <id-of-"QEMU QEMU USB Keyboard">` in the background from the
 testclient and assert `key press`/`key release` lines appear.
 
@@ -275,9 +284,11 @@ Same four layers as the keyboard. Names in `/proc/bus/input/devices` and
 
 #### 4.2.3 Proving the hot-added pointer works (S3.9.11)
 
-- **Relative** (`usb-mouse`): `input-send-event` with `"device":"hotmouse"`
-  and `{"type":"rel","data":{"axis":"x","value":40}}`; assert motion lines from
-  `xinput test <id>`.
+- **Relative** (`usb-mouse`): it has no `display` property, so it cannot be
+  aimed at with `"device"`. Make it QEMU's current mouse with HMP
+  `mouse_set <index>` (indexes from `query-mice`, which then shows it current),
+  send `{"type":"rel","data":{"axis":"x","value":40}}`, and assert motion
+  lines from `xinput test <id>`.
 - **Absolute** (`usb-tablet`): `{"type":"abs","data":{"axis":"x","value":N}}`
   (0..32767 across the screen, as `qmp-type.py` computes) plus
   `{"type":"btn","data":{"button":"left","down":true}}`/`false`; assert the
@@ -302,9 +313,14 @@ scanouts only when a UI frontend reports geometry for them. Under
 - `Virtual-1` is connected from boot and carries an EDID (virtio-gpu
   `edid=on` is the default since QEMU 5.0).
 - `Virtual-2` is **permanently disconnected**: a monitor-shaped hole, with no
-  EDID and no modes, that no QEMU command in a headless run will fill.
+  EDID, that no QMP or HMP command can fill.
 
-So QEMU itself cannot stage "a second monitor is plugged in". What it gives
+So QMP cannot stage "a second monitor is plugged in". QEMU itself can: it
+enables or disables a virtio-gpu head, and gives it an EDID of the requested
+size, whenever a display frontend reports a size for that head. Two frontends
+need no window: a VNC server bound to the head (`-vnc …,display=<vga id>,head=1`)
+receiving SetDesktopSize (0x0 unplugs), or `-display dbus` with SetUIInfo.
+That route is untested here. What it gives
 for free is the hard half of the problem — an output that must be driven with
 nothing on the other end — and that is what the fixed-layout e2e uses
 (S3.4.9).
@@ -460,9 +476,9 @@ wpctl set-default <builtin-id>
 Because `usb-audio` shares `audiodev=snd0` with the HDA codec, the capture
 sees it. Pick the frequency table up from `vm-e2e.sh`'s `freq_for` and
 `vm-guest.sh`'s `gen_tone` so a human can tell the beeps apart in the
-artifacts. (First run of this is also the confirmation that `wavcapture`
-captures the USB path on this QEMU; if it does not, `info qtree` and the
-`usb-audio` `audiodev` property are the first things to check.)
+artifacts. Confirmed by `operator-e2e:s11_3_1`: `wavcapture` on `snd0`
+carries a stream played on the hot-added `usb-audio`, at the level the card
+is set to (0.4697 at 100%, 0.0587 at 50%, 0.0000 muted on the e2e VM).
 
 #### 4.4.4 Plug-out under a live stream (S4.7.7)
 
@@ -645,14 +661,17 @@ facts observed in this repository's CI:
    on a never-enabled scanout is not).
 2. The Rocky 9 guest kernel has `CONFIG_DRM_LOAD_EDID_FIRMWARE` and the
    runtime `edid_firmware` parameter write is accepted.
-3. `wavcapture` on `snd0` captures a stream rendered by the hot-added
-   `usb-audio` device (expected from the backend model; not yet exercised).
-4. A hot-added `intel-hda` accepts a hot-added `hda-duplex` codec (capture
-   vehicle). If not, capture hotplug is T4 only.
+3. ~~`wavcapture` on `snd0` captures a stream rendered by the hot-added
+   `usb-audio` device~~ — confirmed by `operator-e2e:s11_3_1` (§4.4.3).
+4. A capture vehicle for hotplug. Settled from QEMU's source: the HDA codec
+   bus refuses `device_add`, and `usb-audio` is playback-only. Still to try:
+   a PCI hot-add of `AC97` or `ES1370` (both capture), if the guest image has
+   the driver. If not, capture hotplug is T4 only.
 5. Package names `xinput` and `xev` on Rocky 9 AppStream.
 6. The runner's QEMU version supports `screendump -f png` (the script already
-   falls back to PPM) and `input-send-event` `"device"` routing for
-   `usb-kbd`/`usb-mouse`/`usb-tablet` ids (documented QMP behaviour).
+   falls back to PPM). `input-send-event`'s `"device"` routes by display
+   device, not by input device id (§4.1.4); `usb-mouse` cannot be routed that
+   way and needs HMP `mouse_set`.
 
 Each of these should be turned into a one-line assertion in the first test
 that depends on it, so the unknown becomes a recorded fact or a recorded
