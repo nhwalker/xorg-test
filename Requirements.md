@@ -791,25 +791,28 @@ slice, EV-TIMELINE.
 - Requirement: events through the hot-added device move the pointer and click; the operator sees the cursor move and a window take focus.
 - Acceptance: the events reach the hot-added device (a `usb-tablet` added with `display=<virtio-vga id>` and sent with that `device`; a `usb-mouse`, which has no `display` property, selected with HMP `mouse_set` and shown current by `query-mice`); `xinput test <id>` shows its motion/button events; a click on the sink xterm through the hot-added tablet focuses it and typed text lands.
 - Evidence: EV-VIDEO (cursor crossing the screen, window frame turning the focused colour); `xinput test` output; sink file; EV-QEMU.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_9_11`: a `usb-tablet` added with `display=vga0` is listed by Xorg; driven alone (its events naming `vga0`), it carries the pointer across the screen and clicks the sink xterm. Its own X device sees the motion and the click (`xinput test`), the focus moves from the session's xterm to the sink (the frames `#41637f` and `#22262d`), and the line typed next lands in the sink. A `usb-mouse` added beside it, made QEMU's current mouse with `mouse_set` (`query-mice` before and after), moves the pointer by relative motion and clicks inside the session's xterm, and its own X device sees both. `artifacts/S3.9.11/` (artifact `evidence-vm-operator`) holds F3.9's common set before and with the tablet, each device's `xinput test`, `query-mice` before and after `mouse_set`, a video of each pointer's motion and click, the screen after the tablet's click, and the sink file.
 
 **S3.9.12 Repeated input cycles leave no residue**
 - Requirement: ≥ 5 remove/re-add cycles return node counts and `xinput list` to baseline.
 - Acceptance: counts equal baseline after the last cycle; the session still accepts input.
 - Evidence: per-cycle counter table (EV-STATE); `xinput list` baseline vs final (EV-DIFF empty); EV-PIDS Xorg unchanged.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_9_12`: five remove/re-add cycles of the USB keyboard. Each removal takes it out of `xinput` and its nodes off the host and out of the container, and each return brings the counts back to the baseline (host 8, container 8, one USB keyboard in `xinput`). After the fifth, `xinput` lists the same device names as before the first, Xorg has kept its pid, and a sink xterm still takes a typed line. `artifacts/S3.9.12/` (artifact `evidence-vm-operator`) holds F3.9's common set at the baseline and after the fifth cycle, the counter table (a row per removal and per return), `xinput`'s names before and after with their diff (empty), the sink file and the screen with the typed line.
 
 ### F3.10 HMI hotplug: monitors
 
-Under `-display none` nothing enables a second virtio-gpu scanout and no
-QMP/HMP command can, so a monitor *appearing* is staged through the DRM
-connector-force interface and, where modes are needed, an injected firmware
-EDID; `HotpluggingTestHelp.md` §4.3. QEMU itself does enable or disable a head,
-with an EDID of the requested size, when a display frontend reports a size for
-it: a VNC server bound to that head (`-vnc …,display=<vga id>,head=1`)
-receiving SetDesktopSize, or `-display dbus` SetUIInfo. That route is
-untested here; the hot-plug batch tries it first, and what it cannot prove
-honestly goes to the guided hardware script. The user-facing
+Under `-display none` no QMP or HMP command enables a second virtio-gpu
+scanout. QEMU itself enables or disables a head, with an EDID of the requested
+size, when a display frontend reports a size for it: the e2e binds a VNC server
+to head 1 (`-vnc unix:…,display=vga0,head=1`), and `ci/vm/vnc-head.py` sends it
+RFB SetDesktopSize (0x0 takes the monitor away). virtio-gpu then raises a
+display event, and the guest reads every head's EDID and geometry again. That
+is how a monitor is plugged in here (S3.10.5, S3.10.7). Plug-outs, and the
+plug-in under a declared layout (S3.10.4), go through the DRM connector-force
+interface; a connector forced on gets virtio-gpu's own mode list and no EDID,
+even with an EDID override or `drm.edid_firmware` set, because virtio-gpu
+reads an EDID only at boot and on a display event. `HotpluggingTestHelp.md`
+§4.3 has the mechanics. The user-facing
 outcome: **when the KVM takes the monitors away and brings them back, every
 window is where it was.** **Common set**: `xrandr --query --verbose`
 before/after (EV-DIFF), `xwininfo -root -tree` before/after (EV-DIFF, must be
@@ -845,19 +848,19 @@ event, EV-TIMELINE.
 - Requirement: under autodetection a connector coming up is `connected` in `xrandr`; screen size and existing geometry unchanged (no auto-enable).
 - Acceptance: as stated.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:ad_plugin`, with the host's `vnc-head.py`: QEMU plugs a 1024x768 monitor into Virtual-2 (SetDesktopSize answered `request forwarded`). Under autodetection Virtual-2 reads connected in sysfs and in `xrandr` and is not enabled; the screen stays 1280x800, Virtual-1 stays at `1280x800+0+0`, and no client window moves or resizes. Taken away (0x0), Virtual-2 reads disconnected and unused again. `artifacts/S3.10.5/` (artifact `evidence-vm-core`) holds F3.10's common set before, plugged in and after (sysfs, `xrandr --verbose`, the window tree), the `xrandr` and tree diffs (the tree's empty), the Xorg log since the plug-in, QEMU's answers to the plug and unplug, and a video of head 0 across both.
 
 **S3.10.6 Monitor plug-out without a layout is characterised**
 - Requirement: under autodetection, forcing the only enabled connector down must not crash or restart X; the result is recorded.
 - Acceptance: Xorg pid unchanged; `xdpyinfo` answers; `xrandr` captured.
 - Evidence: common set + EV-PIDS.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:ad_unplug`: under autodetection Virtual-1, the only enabled output, is forced off. Xorg keeps its pid and `xdpyinfo` answers. What X reports is recorded: `Virtual-1 disconnected primary 1280x800+0+0`, the screen still 1280x800. Set back to `detect`, Virtual-1 reads connected and the screen is 1280x800; desktop-init, Xorg and mwm kept their pids and start times. `artifacts/S3.10.6/` (artifact `evidence-vm-core`) holds the pids before and after with their diff (empty), F3.10's common set before, forced off and after the re-detect with the diffs, the Xorg log across it, and a video of head 0.
 
 **S3.10.7 A plugged-in monitor with an EDID exposes modes**
-- Requirement: with an injected EDID on the forced-on connector, `xrandr --verbose` lists its modes; `xrandr --output Virtual-2 --auto` enables it without disturbing `Virtual-1`.
-- Acceptance: as stated; needs `CONFIG_DRM_LOAD_EDID_FIRMWARE` (confirm first).
+- Requirement: with an EDID injected for `Virtual-2` (its debugfs `edid_override`), a monitor QEMU plugs in there carries that EDID: the kernel and X both list exactly its modes; `xrandr --output Virtual-2 --auto` enables it without disturbing `Virtual-1`.
+- Acceptance: the EDID (1024x768@60 preferred, 640x480@60 and 800x600@60 established, no continuous-frequency flag) written to the override; QEMU plugs a 1024x768 monitor into Virtual-2 (`vnc-head.py`); the kernel's sysfs `edid` equals the injected bytes and its `modes` are exactly the three, `xrandr`'s plain query lists exactly the three for Virtual-2 and X's EDID property is the injected EDID; `--auto` enables Virtual-2 at 1024x768 with Virtual-1 unmoved; QEMU's head 1 shows the scanout; off, unplugged, and the override reset with `printf reset` (exactly five bytes: with echo's newline the kernel reads the write as an EDID and refuses it). The connector force cannot carry this story: forced on, virtio-gpu gives its own mode list and no EDID, override or not.
 - Evidence: common set; `cat /sys/class/drm/card*-Virtual-2/edid | od -An -tx1 | head` (EV-STATE); EV-SHOT after enabling.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:ad_edid`, with the host's `vnc-head.py`: the kernel takes the EDID as Virtual-2's override; forced on, Virtual-2 still has no EDID and virtio-gpu's own 24 mode sizes (recorded). QEMU plugs the monitor in, and the kernel gives Virtual-2 the injected EDID byte for byte (128 bytes) and offers exactly its modes, `640x480,800x600,1024x768`. `xrandr` lists exactly those for Virtual-2, and X's EDID property is the injected EDID. After its last output `xrandr` also lists the modes no output offers, here `1280x800 (0x44)`, which Virtual-1 still runs; `--verbose` prints those as it prints an output's own, so the modes are read from the plain query. `xrandr --output Virtual-2 --auto` enables it at `1024x768+0+0` with Virtual-1 at `1280x800+0+0` and the screen 1280x800, and QEMU's head 1 shows the scanout (1024x768, not blank). Turned off and taken away, Virtual-2 reads disconnected and unused, Virtual-1 where it was. `artifacts/S3.10.7/` (artifact `evidence-vm-core`) holds the injection route, the EDID injected and as the kernel reports it, the kernel's modes, F3.10's common set before, plugged in, enabled and after, the plain query, the Xorg log, the `xrandr` and tree diffs (the tree's empty), QEMU's answers, head 1's screendump and a video of head 0.
 
 **S3.10.8 Physical monitor plug-out and plug-in**
 - Requirement: S8.2.2 and S8.2.3.
@@ -870,13 +873,13 @@ event, EV-TIMELINE.
 - Requirement: a KVM switch disconnects every USB device at once; the desktop survives all three leaving in the same instant and all three returning; the operator types, clicks and hears audio afterwards.
 - Acceptance: `device_del` of the USB keyboard, tablet and sound card back to back; all node counts drop; re-add all three; all counts return; typed text lands, the hot-added tablet clicks, and a tone sent to the built-in sink **by name** is captured (WirePlumber makes a returning USB card the default, so an untargeted tone would prove the USB card); Xorg pid and PipeWire pid unchanged.
 - Evidence: EV-VIDEO of the whole cycle; EV-TIMELINE; the three counter tables; EV-PIDS; EV-AUDIO after; EV-SHOT of typed text.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_11_1`: with the KVM's tablet and sound card plugged in beside its keyboard and the built-in card's sink the default, the three are deleted back to back. Every count drops (input and sound nodes on the host and in the container, PipeWire's devices, the keyboard and tablet in `xinput`), and every count returns when the three are added back; Xorg and PipeWire keep their pids. The returned tablet clicks a sink xterm (its own X device sees the press), the line typed next comes through the returned keyboard (13 key presses on its own device) and lands there, and a client's 660 Hz tone sent to the built-in sink by name is heard, its `paplay` exiting 0. `artifacts/S3.11.1/` (artifact `evidence-vm-operator`) holds F3.9's and F4.7's common sets before and away, the three counter tables in one, the desktop's processes before and after, a video of the cycle, each returned device's `xinput test`, the sink file, the screen with the typed line, and the tone's capture with the player's exit status, verdict and level plot.
 
 **S3.11.2 Composite cycle with the video link down at the same time**
 - Requirement: S3.11.1 with `Virtual-1` forced down during the away period and `detect`ed on return, layout declared; geometry and windows hold throughout.
 - Acceptance: S3.11.1's assertions plus dims `2048x768` and an unchanged window tree at every step.
 - Evidence: S3.11.1's set plus the F3.10 common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_11_2`, last in the operator shard, under the declared two-monitor layout (2048x768): S3.11.1's cycle with Virtual-1 forced off while the devices are away and set back to `detect` as they return. Every count drops and returns. While away the screen stays 2048x768 and Virtual-1 reads disconnected at `1024x768+0+0`; after the return it reads connected there, and no window moves or resizes at either step. Xorg and PipeWire keep their pids, the returned tablet clicks, the returned keyboard types into the sink it clicked, and the tone sent to the built-in sink by name is heard. `artifacts/S3.11.2/` (artifact `evidence-vm-operator`) holds S3.11.1's set plus F3.10's (sysfs and `xrandr --verbose` before, away and after) and the window tree at each step.
 
 ---
 
@@ -1029,7 +1032,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: a client can `parec`/`arecord` from the new source.
 - Acceptance: the stream opens and delivers frames.
 - Evidence: EV-AUDIO-REC (duration > 0, silence with the null backend is acceptable and stated); EV-LOG-CLIENT.
-- Tier: T3/T4 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug: a capture-capable card on PCI": with the AC97 card hot-added (S4.7.8), the session user's `parecord` records its source, `alsa_input.pci-0000_00_0b.0.analog-stereo`, for 3 s and exits 0, and the WAV holds 2.90 s of frames at 44.1 kHz stereo (silence: QEMU's `none` audiodev captures nothing else). What a real microphone records is S4.7.12's, on hardware. `artifacts/S4.7.9/` (artifact `evidence-vm-core`) holds the recorder's command, output and exit status, the recording, and its frames, duration, format and peak.
 
 **S4.7.10 A card that arrives after a soundless boot is openable**
 - Requirement: S2.4.6.
@@ -1041,7 +1044,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: ≥ 5 plug/unplug cycles return node and Device counts to baseline; no `alsa_card` object outlives its node.
 - Acceptance: counts equal baseline after the last cycle; the built-in tone still plays.
 - Evidence: per-cycle counter table; `pw-cli ls Device` baseline vs final (EV-DIFF empty); EV-AUDIO.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug: five plug/unplug cycles leave no phantom devices": five `usb-audio` plug/unplug cycles, each card with an id of its own. Each plug-in raises the container's `controlC*` nodes and WirePlumber's `alsa_card` devices, and each removal brings the host's `/dev/snd` nodes, the container's and WirePlumber's devices back to the baseline (7, 1, 1). After the fifth, `pw-cli ls Device` is the baseline's byte for byte, and the built-in card plays a pulse client's 440 Hz tone, heard. `artifacts/S4.7.11/` (artifact `evidence-vm-core`) holds F4.7's common set before the first cycle and after the fifth with the diffs, the counter table (a row per plug-in and per removal), and the tone's capture with its verdict and level plot.
 
 **S4.7.12 Physical USB audio plug-in and plug-out**
 - Requirement: S8.3.1.
@@ -1660,52 +1663,52 @@ EV-VIDEO of the display across the event; plus the device-specific set from
 the referenced feature.
 
 **S7.7.1 A client window keeps receiving keystrokes across a keyboard remove/re-add**
-- Requirement: a client xterm that had focus before the KVM-style keyboard cycle receives text typed through the re-added keyboard afterwards; same pod, same app pid.
+- Requirement: a client xterm that had focus before the KVM-style keyboard cycle receives text typed through the re-added keyboard afterwards; the same client container, the same app pid.
 - Acceptance: focus a client xterm (sink); `device_del`/`device_add` the USB keyboard; type through `kvmkbd` (S3.9.5); the client's sink file has the text.
-- Evidence: common set; sink file from inside the pod; EV-SHOT of the text in the client's window.
-- Tier: T3 · Coverage: ❌.
+- Evidence: common set; sink file from inside the client; EV-SHOT of the text in the client's window.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_7_1`: a podman client's xterm (holding the CDI display device, as F7.7's common set allows) takes a line typed before the USB keyboard goes. The keyboard is removed and re-added bound to `vga0`, so keys sent to the display come through it alone, and `xinput` lists it again. With no click between, the still-focused client xterm takes the line typed through it (12 key presses on its own X device). Xorg, mwm and the three audio daemons keep their pids; the client is the same container and application (`RestartCount` 0, the application's host pid and start time unchanged), still running. `artifacts/S7.7.1/` (artifact `evidence-vm-operator`) holds the client before and after with the diff (empty), the desktop's processes, F3.9's common set before and after, a video of the cycle, the keyboard's `xinput test`, the client-side sink file with both lines, the screen with them, and the client's log.
 
 **S7.7.2 A client window is clickable with a hot-added pointer**
 - Requirement: a tablet added after the client started can click into the client's window and give it focus.
 - Acceptance: `device_add usb-tablet`; click via that device on the client window; frame turns active; typed text lands.
 - Evidence: common set; EV-SHOT pair (frame colour); sink file.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_7_2`: a tablet plugged in after a podman client started. What the screen shows just after the plug is recorded; then the session's xterm is clicked through the boot pointer, and the client's frame reads the inactive `#22262d`. A click on the client's window through the hot-added tablet (its own X device sees the press) turns the frame the focused `#41637f`, and the keys typed next land in the client's xterm. Xorg, mwm and the three audio daemons keep their pids; the client is the same container and application (`RestartCount` 0). `artifacts/S7.7.2/` (artifact `evidence-vm-operator`) holds the client before and after with the diff (empty), the desktop's processes, F3.9's common set before and with the tablet, the screen just after the plug, before the click and after it, a video, the tablet's `xinput test`, the client-side sink file and the client's log.
 
 **S7.7.3 Client windows stay put across a monitor plug-out and re-plug (layout declared)**
 - Requirement: a client window's geometry (`xwininfo`) is identical before the connector goes down, while it is down, and after it returns; the client is not restarted.
 - Acceptance: `xwininfo -id <client window>` at the three moments equal; `restartCount` 0.
 - Evidence: common set; the three `xwininfo` outputs (EV-DIFF empty); EV-SHOT-CLIENT at the three moments (the client's own view is unchanged); EV-VIDEO.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`, with the host comparing the client's own captures: a podman client's xterm (holding the display and tools devices) on Virtual-1's half of the declared layout lives through S3.4.10's force. Its window's `xwininfo` is the same before, while Virtual-1 is off and after the re-plug. The client's own capture (the toolkit's screenshot), compared on the host over its window (259x82+307+534), has 0 pixels changed during and after, and 0 over the whole screen. The client is the same container and process (`RestartCount` 0); Xorg, mwm and the three audio daemons kept their pids and start times. `artifacts/S7.7.3/` (artifact `evidence-vm-core`) holds the client and the daemons before and after with the diffs (empty), the window's `xwininfo` at the three moments with the diffs (empty), the client's three captures, and its log.
 
 **S7.7.4 A client already playing is heard on a hot-added audio device, without restarting**
 - Requirement: an application container playing a continuous tone to the default sink keeps playing while a USB sound card is added; once that card becomes the default sink (WirePlumber policy, or the test sets it), the client's **existing stream** is heard on the new device; the container and the player are the same process throughout.
-- Acceptance: pod plays a 60 s 1100 Hz tone; `device_add usb-audio`; `wpctl set-default <new sink>` (or observe policy move it); `pactl list short sink-inputs` shows the client's stream now on the USB sink; `wavcapture` on the shared backend carries 1100 Hz throughout with no gap; `restartCount` 0; app pid unchanged.
-- Evidence: common set; EV-AUDIO spanning the event with the `device_add` and default-change timestamps marked on the spectrogram; `pactl list short sink-inputs` at three moments (EV-STATE) showing the stream's sink id change; `wpctl status` pair; EV-QEMU.
-- Tier: T3 · Coverage: 🟡 `operator-e2e:s11_3_1` asserts it with a podman client container in place of the pod (E11's definition of a client); no kubernetes pod variant is run. Under `artifacts/S11.3.1/`: the capture with each mark on a level plot, `info usb`, `/dev/snd` on the host and in the container, `pw-cli ls Device` and `pactl list short` sinks, sources and sink-inputs at four moments with diffs (the stream's sink id moving), a video of the plug, `wpctl status` after every step, the player's inspect before and after, pid tables and the desktop's log.
+- Acceptance: the pod plays a 20 s 1100 Hz tone; about 4 s in, `device_add usb-audio`, and the test makes its sink the default (at full volume); `pactl list short sink-inputs` shows the client's stream now on the USB sink; `wavcapture` on the shared backend carries 1100 Hz throughout with no gap; `restartCount` 0; app pid unchanged.
+- Evidence: common set; EV-AUDIO spanning the event with the `device_add` and default-change times marked on a level plot (no spectrogram tool is installed); `pactl list short sink-inputs` before and on (EV-STATE) showing the stream's sink change; `wpctl status` pair; EV-QEMU.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": the journey pod, running since the journeys began, plays a 20 s 1100 Hz tone; about 4 s in a USB card arrives and its sink is made the default. The pod's existing sink-input moves onto the card's sink; one player process plays before and after and exits 0 after 20.11 s. The capture carries the tone across the arrival with no stretch below -40 dBFS longer than 0.1 s and its whole 20 s span present. Xorg, mwm and the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. `operator-e2e:s11_3_1` asserts the move for a podman client too: its stream follows `wpctl set-default` onto a hot-added USB card with no drop longer than 0.5 s, and the player is not restarted. `artifacts/S7.7.4/` (artifact `evidence-vm-k8s`) holds the pod, the player and the daemons before and after with the diffs, the streams before and on, F4.7's device set before and on with the diffs, QEMU's reply, a video of the arrival, the player's log, and the capture with its verdict and the level plot marking the plug.
 
 **S7.7.5 A client playing on the hot-added device survives its removal**
 - Requirement: with the client's stream on the USB sink, `device_del` moves the stream back to the built-in sink (or ends it cleanly); the client is not restarted; its next playback is heard.
 - Acceptance: continuation of S7.7.4: `device_del`; `pactl list short sink-inputs` shows the stream on the built-in sink or gone with a clean client error; capture continues or resumes; `restartCount` 0.
 - Evidence: common set; EV-AUDIO continuing from S7.7.4 with the removal timestamp marked; EV-LOG-CLIENT.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": the pod's 20 s 880 Hz tone plays on the USB card, and the card is removed about 4 s in. Within 10 s its sink-input moves to the built-in card's sink, and the same player plays on to its end and exits 0. The capture carries the tone through the removal with no quiet stretch longer than 1 s and at most 1.5 s of the 20 lost. The pod's next tone, 660 Hz, is heard, its player exiting 0. Xorg, mwm and the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. `artifacts/S7.7.5/` (artifact `evidence-vm-k8s`) holds the pod and the daemons before and after with the diffs, the streams and sinks before and after the removal, F4.7's device set plugged in and after with the diffs, QEMU's reply, a video, both players' logs, and both captures with their verdicts and level plots (the removal marked).
 
 **S7.7.6 A client started while the hot-added device is present can target it by name**
 - Requirement: a new client can `pw-play --target` / `PULSE_SINK=<usb sink>` and be heard on it.
 - Acceptance: as stated with a 990 Hz tone.
 - Evidence: EV-AUDIO; `pactl list short sink-inputs` naming the sink; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": with the USB card present, the default is the built-in card, muted, and the USB card is at full volume. A new player in the pod, `PULSE_SINK=<the USB card's sink> paplay`, plays 990 Hz: its sink-input sits on that sink and it exits 0, and the tone is heard, so the USB card rendered it. The pod is the same container, `restartCount` 0. `artifacts/S7.7.6/` (artifact `evidence-vm-k8s`) holds `wpctl status` (the default and its mute), the streams and sinks while it played, the player's log, the capture with its verdict and level plot, and the pod before and after with the diff (empty).
 
 **S7.7.7 A client records from a hot-added capture device without restarting**
 - Requirement: a running pod can open the new source and deliver frames.
 - Acceptance: S4.7.8/S4.7.9 from a pod that was running before the hot-add.
 - Evidence: common set; EV-AUDIO-REC.
-- Tier: T3/T4 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": an AC97 card is hot-added under the journey pod, which has run since before it arrived, and brings a capture source. The pod opens it with `parecord`, which exits 0 and delivers 2.90 s of frames at 44.1 kHz stereo (silence: QEMU's `none` audiodev captures nothing else); removed, the card's source leaves with it. Xorg, mwm and the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. What a real microphone records into a client is S8.3.1's, on hardware. `artifacts/S7.7.7/` (artifact `evidence-vm-k8s`) holds `modinfo`'s answer for the candidate drivers, the pod and the daemons before and after with the diffs, F4.7's device set before, plugged in and after with the diffs, QEMU's replies, a video, the recorder's log, the recording and its frames, duration, format and peak.
 
 **S7.7.8 A client survives the KVM composite event**
-- Requirement: a client xterm and a client audio stream both continue across S3.11.1; afterwards the xterm takes typed text through the re-added keyboard and the stream is still heard; `restartCount` 0 for both pods.
-- Acceptance: S3.11.1 with two client pods in play.
-- Evidence: common set for both pods; EV-AUDIO spanning the event; EV-SHOT of typed text.
-- Tier: T3 · Coverage: ❌.
+- Requirement: a client xterm and a client audio stream both continue across S3.11.1; afterwards the xterm takes typed text through the re-added keyboard and the stream is still heard; both clients unrestarted (`restartCount` 0).
+- Acceptance: S3.11.1 with two client containers in play.
+- Evidence: common set for both clients; EV-AUDIO spanning the event; EV-SHOT of typed text.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_7_8`: two podman clients, an xterm and a player of a 1100 Hz tone, through the KVM switch. The stream plays on the KVM's USB card before the switch; the keyboard, tablet and sound card leave together and come back, every count back to its value before. Afterwards the stream is still playing, on the returned card, and the capture's end carries it (median level 0.0301; -40 dBFS is 0.01). The xterm takes the line typed through the returned keyboard (12 key presses on its own X device). Xorg keeps its pid; both clients are the same containers and applications (`RestartCount` 0), still running. `artifacts/S7.7.8/` (artifact `evidence-vm-operator`) holds both clients before and after with the diffs (empty) and their logs, the desktop's processes, F3.9's and F4.7's common sets away, the counter tables, a video, the capture through the switch with its tail level, the streams after, the keyboard's `xinput test`, the client-side sink file and the screen with the typed line.
 
 **S7.7.9 A client that started on a soundless host plays once a card arrives, without restarting**
 - Requirement: on the no-`intel-hda` profile, a pod whose player loops until success starts before any card exists; after `usb-audio` is added and the stack re-aligns, the tone is heard; `restartCount` 0.
@@ -2214,7 +2217,7 @@ device nodes.
 | `verify-isolation-negatives` | S6.1.3, S6.1.5 (submounts), S6.2.1, S6.2.3 |
 | `verify-fixed-layout` (extend) | S3.4.10 (window tree + video), S3.4.11, S3.4.12 |
 | `verify-hotplug-input` (new; pointers, per-device proof, Xorg plug-out) | S3.9.2, S3.9.4, S3.9.5, S3.9.7–S3.9.12 |
-| `verify-hotplug-monitor` (new; DRM force on + firmware EDID) | S3.10.3–S3.10.7 |
+| `verify-hotplug-monitor` (new; the DRM force for plug-outs, QEMU plugging a monitor in through a VNC server on the head, an EDID through debugfs: F3.10's introduction) | S3.10.3–S3.10.7 |
 | `verify-hotplug-audio` (extend) | S4.7.3, S4.7.5 (default sink), S4.7.7, S4.7.8, S4.7.9, S4.7.11 |
 | `verify-kvm-composite` (new) | S3.11.1, S3.11.2 |
 | `verify-client-journeys` (new; display + audio journeys) | S7.5.1–S7.5.5, S7.6.3–S7.6.5, S7.6.6 (record) |
@@ -2300,14 +2303,14 @@ moves to ✅ only when a CI run has saved its evidence, which the
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 12 | 0 | 2 | 0 |
 | E2 Boot & supervision | 25 | 22 | 1 | 2 | 0 |
-| E3 Display & session | 62 | 47 | 1 | 11 | 3 |
-| E4 Audio | 23 | 16 | 0 | 6 | 1 |
+| E3 Display & session | 62 | 54 | 1 | 4 | 3 |
+| E4 Audio | 23 | 18 | 0 | 4 | 1 |
 | E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
-| E7 Client contract & journeys | 40 | 31 | 1 | 8 | 0 |
+| E7 Client contract & journeys | 40 | 39 | 0 | 1 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **167** | **4** | **74** | **6** |
+| **Total** | **251** | **184** | **3** | **58** | **6** |
 
 Regenerate after editing with:
 
