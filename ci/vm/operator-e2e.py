@@ -46,6 +46,9 @@ import traceback
 import wave
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import evlib  # noqa: E402  (ci/evlib.py: the evidence format every tier shares)
+
 DESKTOP_IMAGE = "localhost/desktop-container:latest"
 TESTCLIENT_IMAGE = "localhost/desktop-testclient:latest"
 OBSERVER = "op-observer"
@@ -131,80 +134,54 @@ class Run:
             print(f"== operator({sid}): {text}", flush=True)
 
 
-class Story:
+# What every operator story's evidence.md says about how it was driven.
+INTRO = ("Every pointer and key event went through QEMU's own input devices "
+         "(`qemu.log`); the harness only looked at X (xwininfo/xprop from the "
+         "observer container) and at QEMU screendumps.")
+
+
+class Story(evlib.StoryWriter):
+    """One story's evidence directory, in the format every tier shares
+    (ci/evlib.py), plus the operator phase's QMP transcript (qemu.log)."""
+
     def __init__(self, run, sid, title):
-        self.run, self.sid, self.title = run, sid, title
-        self.dir = os.path.join(run.art, sid)
-        os.makedirs(self.dir, exist_ok=True)
-        self.files = []      # (file, what the reviewer should see in it)
-        self.checks = []     # (passed, claim)
-        self.records = []    # observed and recorded, deliberately not asserted
-        self._n = 0
-        self._tl = open(os.path.join(self.dir, "timeline.log"), "w", buffering=1)
-        self._qemu = open(os.path.join(self.dir, "qemu.log"), "w", buffering=1)
+        self.run = run
+        self.sid = sid
+        d = os.path.join(run.art, sid)
+        os.makedirs(d, exist_ok=True)
+        # Opened first, so the story's own timeline has its "begin" line too.
+        self._tl = open(os.path.join(d, "timeline.log"), "w", buffering=1)
+        self._qemu = open(os.path.join(d, "qemu.log"), "w", buffering=1)
+        run.story = self
+        super().__init__(run.art, sid, title, tier="T3",
+                         source=os.environ.get("EV_SOURCE", "the VM e2e operator phase"),
+                         intro=INTRO)
+
+    def log(self, kind, text):
+        # evlib's own timeline writes go through the run, so the run-wide and
+        # the story's timeline get one line each, not two.
+        self.run.log(kind, text)
 
     def log_line(self, kind, line):
-        self._tl.write(line + "\n")
-        if kind == "qmp":
+        if self._tl:
+            self._tl.write(line + "\n")
+        if kind == "qmp" and self._qemu:
             self._qemu.write(line + "\n")
 
-    def name(self, moment, ext):
-        # Numbered, so a directory listing reads in the order things happened.
-        self._n += 1
-        return f"{self._n:02d}-{moment}.{ext}" if ext else f"{self._n:02d}-{moment}"
-
-    def path(self, name):
-        return os.path.join(self.dir, name)
-
-    def attach(self, name, what):
-        self.files.append((name, what))
-        self.run.log("file", f"{name}: {what}")
-
-    def write(self, moment, text, what, ext="txt"):
-        name = self.name(moment, ext)
-        with open(self.path(name), "w") as f:
-            f.write(text)
-        self.attach(name, what)
-        return name
-
     def check(self, ok, claim, detail=""):
-        ok = bool(ok)
-        self.checks.append((ok, claim + (f" ({detail})" if detail else "")))
-        self.run.log("check", ("PASS " if ok else "FAIL ") + claim
-                     + (f" ({detail})" if detail else ""), echo=True)
+        text = claim + (f" ({detail})" if detail else "")
+        ok = super().check(ok, text)
+        print(f"== operator({self.sid}): {'PASS' if ok else 'FAIL'} {text}", flush=True)
         if not ok:
             raise StoryFailed(claim + (f": {detail}" if detail else ""))
 
     def record(self, text):
-        self.records.append(text)
-        self.run.log("record", text, echo=True)
+        self.note(text)
+        print(f"== operator({self.sid}): {text}", flush=True)
 
     def finish(self, error=None, trace=None):
-        status = "PASS" if error is None else "FAIL"
+        status = super().finish(error, trace)
         self.run.story = None
-        out = [f"# {self.sid} — {self.title}", ""]
-        out.append(f"**{status}**" + (f" — {error}" if error else ""))
-        out += ["",
-                f"Spec: `Requirements.md`, {self.sid}. Every pointer and key event "
-                "went through QEMU's own input devices (`qemu.log`); the harness only "
-                "looked at X (xwininfo/xprop from the observer container) and at QEMU "
-                "screendumps.", "", "## Checks, in the order they ran", ""]
-        for i, (ok, claim) in enumerate(self.checks, 1):
-            out.append(f"{i}. {'✅' if ok else '❌'} {claim}")
-        if not self.checks:
-            out.append("(none ran)")
-        if self.records:
-            out += ["", "## Recorded (observed, not asserted)", ""]
-            out += [f"- {r}" for r in self.records]
-        out += ["", "## Files", "", "| File | What to look for |", "|---|---|"]
-        out += [f"| `{n}` | {w} |" for n, w in self.files]
-        out += ["| `timeline.log` | everything this story did, timestamped (EV-TIMELINE) |",
-                "| `qemu.log` | every QMP command sent: the input events, screendumps and "
-                "monitor commands (EV-QEMU) |"]
-        if trace:
-            out += ["", "## Failure trace", "", "```", trace.rstrip(), "```"]
-        with open(self.path("evidence.md"), "w") as f:
-            f.write("\n".join(out) + "\n")
         self._tl.close()
         self._qemu.close()
         return status
@@ -693,8 +670,11 @@ class Ctx:
         return self.st.write(moment, text, what)
 
     def diff(self, moment, before, after, what):
-        d = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
-                                         "before", "after"))
+        # Rule 1 (Requirements.md, evidence standard): before and after are
+        # kept as files beside the diff, never the diff alone.
+        b = self.st.write(f"{moment}-before", before, f"the 'before' side of {moment}")
+        a = self.st.write(f"{moment}-after", after, f"the 'after' side of {moment}")
+        d = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), b, a))
         return self.st.write(moment, d or "(no difference)\n", what, ext="diff")
 
     def pids(self, moment):

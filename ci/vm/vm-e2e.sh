@@ -15,11 +15,31 @@ QMP=qmp.sock
 SSHPORT=2222
 mkdir -p "$ART"
 
+# Which part of the suite this VM runs: ci.yml's vm job is a matrix over the
+# shards, each booting its own VM from the same images so they run in
+# parallel. "all" runs every part in one VM, in the order below (local runs).
+SHARD=${1:-all}
+case "$SHARD" in
+    all|core|operator|k8s) ;;
+    *) echo "usage: $0 [all|core|operator|k8s]" >&2; exit 2 ;;
+esac
+in_shard() { [ "$SHARD" = all ] || [ "$SHARD" = "$1" ]; }
+
+# Evidence (Requirements.md, "Evidence standard"). Host-side stories write
+# $ART/<story>/ directly. Guest phases write /var/tmp/ev/<story>/ in the VM,
+# which ev_pull copies here; they never collide, because the host adds to a
+# guest story only under h-prefixed names (ci/evlib.py).
+export EV_ROOT="$PWD/$ART" EV_SOURCE="${EV_SOURCE:-vm-e2e.sh $SHARD}"
+# shellcheck source=ci/evidence.sh
+. ../evidence.sh
+GUEST_EV=/var/tmp/ev
+VM_UP=0
+
 log()  { echo "== vm-e2e: $*"; }
 # Pitch each audio path plays (must match gen_tone in vm-guest.sh), so the
 # capture check can confirm the RIGHT tone came through, not just some sound.
 freq_for() { case "$1" in pulse) echo 440;; pipewire) echo 880;; alsa) echo 1320;; *) echo 0;; esac; }
-fail() { echo "FAIL: vm-e2e: $*" >&2; exit 1; }
+fail() { echo "FAIL: vm-e2e: $*" >&2; ev_abort "$*"; exit 1; }
 
 # ConnectTimeout only bounds the handshake, so a guest that accepts the
 # connection and then wedges would hang here indefinitely - and inside a
@@ -48,6 +68,40 @@ vm_ssh_quick() { VM_SSH_TIMEOUT=20 vm_ssh "$@"; }
 
 mon_cmd() {
     echo "$1" | socat - "UNIX-CONNECT:$MON" >/dev/null
+}
+
+# Copy the guest's evidence tree over the host's (see EV_ROOT above).
+ev_pull() {
+    [ "$VM_UP" = 1 ] || return 0
+    VM_SSH_TIMEOUT=120 vm_ssh "sudo tar -C $GUEST_EV -cf - . 2>/dev/null" 2>/dev/null \
+        | tar -C "$ART" -xf - 2>/dev/null || true
+}
+# Whatever happened, leave every story directory rendered and the guest's
+# half copied back: a red run must be as reviewable as a green one.
+ev_finish() {
+    ev_pull
+    python3 ../evlib.py render "$ART" >/dev/null 2>&1 || true
+}
+trap ev_finish EXIT
+
+# Run a vm-guest.sh phase with the guest's evidence switched on ($1 =
+# $GUEST_EV) or off ($1 empty), then copy what it wrote back.
+guest_ev() { # <ev-root or ""> <vm-guest.sh args...>
+    local root=$1 rc=0
+    shift
+    vm_ssh "sudo EV_ROOT=$root EV_SOURCE='$EV_SOURCE' repo/ci/vm/vm-guest.sh $*" || rc=$?
+    [ -z "$root" ] || ev_pull
+    return "$rc"
+}
+
+# EV-SHOT into the open story: a QEMU screendump, indexed with what to look for.
+ev_shot() { # <moment> <what>
+    [ -n "$EV_DIR" ] || return 0
+    local name
+    name=$(ev_name "$1" png)
+    mon_cmd "screendump $EV_DIR/$name -f png"
+    sleep 2
+    if [ -s "$EV_DIR/$name" ]; then ev_attach "$name" "$2"; else ev_note "screendump $1 was not produced"; fi
 }
 # hotplug_probe echoes "<container input nodes> <Xorg input adds>", always as
 # two integers. Defaults to "0 0" rather than letting an ssh hiccup produce an
@@ -303,6 +357,33 @@ for _ in $(seq 60); do
     sleep 5
 done
 vm_ssh_quick true || fail "VM never became reachable"
+VM_UP=1
+
+# The run's manifest (Requirements.md, report layout): what was tested, on
+# what, so evidence from different shards and runs can be compared.
+python3 - "$ART/run.json" "$SHARD" \
+    "$(vm_ssh_quick 'uname -r; cat /etc/rocky-release; getenforce; podman --version' 2>/dev/null | paste -sd'|')" <<'PY' || true
+import json, os, platform, subprocess, sys
+def out(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout.strip()
+    except Exception as e:  # recorded, not fatal: the manifest describes, it does not test
+        return f"unavailable: {e}"
+images = {}
+if os.path.exists("image-ids.txt"):
+    for line in open("image-ids.txt"):
+        name, _, ident = line.strip().partition(" ")
+        if name:
+            images[name] = ident
+guest = sys.argv[3].split("|") + ["", "", "", ""]
+json.dump({"shard": sys.argv[2], "source": os.environ.get("EV_SOURCE", ""),
+           "git": out("git", "-C", "../..", "rev-parse", "HEAD"),
+           "date": out("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
+           "qemu": (out("qemu-system-x86_64", "--version").splitlines() or [""])[0],
+           "runner_kernel": platform.release(),
+           "guest": {"kernel": guest[0], "release": guest[1], "selinux": guest[2], "podman": guest[3]},
+           "images": images}, open(sys.argv[1], "w"), indent=1)
+PY
 
 log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
@@ -322,14 +403,24 @@ log "phase deploy: the declarative tree on a stock host (SELinux enforcing)"
 # desktop-shell ssh trust under enforcing SELinux, the stub CDI path next
 # to a REAL KMS display, the podman client CDI contract, and
 # desktop-preflight fully green.
-vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo && sudo repo/ci/vm/vm-guest.sh phase-deploy' \
+#
+# Every shard deploys; only the shard that runs the rest of the deploy-tree
+# checks (core) records phase deploy's stories, so they are not filed three
+# times.
+vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo' || fail "could not unpack the repo in the VM"
+pd_ev=""
+in_shard core && pd_ev=$GUEST_EV
+guest_ev "$pd_ev" phase-deploy \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
          2>&1 | tee "$ART/guest-deploy-fail.log" || true; fail "guest phase-deploy failed"; }
 screendump desktop-deploy
 assert_nonblank desktop-deploy
 
+# ---- shard: core -------------------------------------------------------------
+if in_shard core; then
+
 log "privileges: the desktop container runs with less than --privileged"
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-privileges' \
+guest_ev "$GUEST_EV" verify-privileges \
     || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop sh -c "grep -E \"^(Cap|Seccomp)\" /proc/\$(cat /run/desktop-init.pid)/status"' \
          2>&1 | tee "$ART/privileges-fail.log" || true; fail "privilege assertions failed"; }
 
@@ -373,15 +464,22 @@ log "input: type into an xterm with the real virtual keyboard, verify the app go
 res=$(vm_ssh 'sudo podman exec -u desktop -e DISPLAY=:0 desktop \
     sh -c "xdpyinfo | awk \"/dimensions:/{print \\\$2; exit}\""')
 [ -n "$res" ] || fail "could not read display resolution for input injection"
+ev_begin S3.8.1 "Typed input reaches the focused application" T3
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
 sleep 2
 # Click + type at the centre of the sink window (geometry 100x30+250+200).
-python3 qmp-type.py "$QMP" "$res" 550 395 inputok
+qlog=$(ev_name qmp-input txt)
+QMP_TRANSCRIPT="$EV_DIR/$qlog" python3 qmp-type.py "$QMP" "$res" 550 395 inputok
+ev_attach "$qlog" "EV-QEMU: every QMP command sent - the pointer to the sink xterm's centre (550,395 on $res), a left click to focus it, then i n p u t o k Return as key events"
 sleep 2
-screendump input-typed
+ev_shot input-typed "EV-SHOT: the sink xterm (title inputtest) right after the keystrokes"
+ev_save sink-file "EV-LOG-CLIENT: what the sink xterm's shell read from the keyboard (/tmp/inputproof in the desktop container); must be exactly 'inputok'" \
+    vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null; echo' >/dev/null || true
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check inputok' \
     || { vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null' \
          2>&1 | tee "$ART/input-proof.txt" || true; fail "typed text did not reach the app"; }
+ev_pass "the focused xterm's shell read 'inputok', typed through QEMU's keyboard"
+ev_end
 
 log "input hotplug: add a virtio keyboard while X runs"
 # Three layers, measured separately, because they fail for different reasons:
@@ -557,6 +655,11 @@ printf 'snd-hotplug     host %s -> %s -> %s / container-nodes %s -> %s -> %s / w
     "$snd_base_nodes" "$snd_on_nodes" "$snd_off_nodes" \
     "$snd_base_devs" "$snd_on_devs" "$snd_off_devs" >> "$ART/xorg-input-count.txt"
 
+fi # ---- end shard: core ----------------------------------------------------------
+
+# ---- shard: operator ---------------------------------------------------------
+if in_shard operator; then
+
 log "operator: the person at the display, through QEMU's own input devices (E11)"
 # Requirements.md E11, and the parts of F3.3 and F3.5 only a screen can show:
 # the desktop as the operator finds it, windows arranged with the mouse and
@@ -576,6 +679,11 @@ python3 operator-e2e.py --qmp "$QMP" --ssh-port "$SSHPORT" --ssh-key id_ed25519 
     || op_rc=$?
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh operator-teardown' || true
 [ "$op_rc" = 0 ] || fail "operator stories failed: see $ART/operator-summary.md and $ART/S*/evidence.md"
+
+fi # ---- end shard: operator ------------------------------------------------------
+
+# ---- shard: k8s ----------------------------------------------------------------
+if in_shard k8s; then
 
 log "phase 2: k3s + a cdi-device-plugin release per capability, desktop still on the quadlet"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
@@ -710,8 +818,10 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          2>&1 | tee "$ART/teardown-fail.log" || true; fail "k8s teardown check failed"; }
 
+fi # ---- end shard: k8s -----------------------------------------------------------
+
 log "collect guest diagnostics"
-vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide' \
+vm_ssh 'sudo podman logs desktop 2>&1 | tail -60; echo ---; sudo /usr/local/bin/k3s kubectl get pods -A -o wide 2>/dev/null' \
     > "$ART/guest-final-state.log" 2>&1 || true
 
-log "vm e2e passed"
+log "vm e2e passed (shard: $SHARD)"
