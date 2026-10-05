@@ -1447,6 +1447,14 @@ grep -q "^host-shell-setup: host shell configured: 'ssh host' connects to 127.0.
 ev_pass "with the quadlet put back, the next start makes a fresh key and host-shell-setup configures the host shell"
 ev_end
 
+# --- every FAIL/WARN row of desktop-preflight, staged (S5.10.3) ----------------
+# ci/preflight-rows.py reads the rows from the script itself and stages each
+# in a private mount namespace (paths hidden or replaced, a fake systemctl or
+# podman first on PATH), so a row added later fails this until it is staged.
+log "desktop-preflight: every FAIL/WARN row fires when its condition is staged"
+python3 ci/preflight-rows.py host \
+    || fail "S5.10.3: a desktop-preflight row did not fire when staged (artifacts/S5.10.3 has each case)"
+
 # --- a scratch desktop container: no host mounts, no host session, no VT ------
 # Plain `podman run` of the image with none of the quadlet's mounts or
 # devices: desktop-init's fallbacks are all that stands between it and a

@@ -108,7 +108,7 @@ jobs:
         # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/script-list.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/script-list.py ci/preflight-rows.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the
@@ -457,6 +457,15 @@ jobs:
           EV_ROOT: ${{ github.workspace }}/artifacts
           EV_SOURCE: "ci.yml build-smoke (ci/host-shell-setup-tests.sh)"
         run: ci/host-shell-setup-tests.sh
+      - name: every row of the container preflight fires (S5.11.2)
+        # preflight-check.sh in scratch containers of the image: the image
+        # alone (none of the quadlet's devices or mounts), then one case per
+        # remaining row. The rows are read from the script, so one added
+        # later fails this until a case stages it.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/preflight-rows.py container)"
+        run: python3 ci/preflight-rows.py container
       - name: deploy tree quadlet dry-run + CDI spec checks
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts
