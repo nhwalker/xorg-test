@@ -534,10 +534,7 @@ xterm's shell leads another — so everything the X session starts also carries
 a `DESKTOP_SESSION_TAG` environment variable, new for each run of it, and
 stopping the X tree also takes every desktop-user process that carries that
 run's tag. A process that starts itself with a scrubbed environment (`env -i`)
-outside the server's session is the one way out. The clients get their SIGTERM
-first and the server's session only once they are gone, because mwm, signalled
-along with its server and then by xinit, hangs in Xlib until the SIGKILL 5 s
-later.
+outside the server's session is the one way out.
 
 They used to be one tree, and it cost availability in both directions:
 
