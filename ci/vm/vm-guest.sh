@@ -2342,7 +2342,14 @@ journey_apps() { # [pod]
     k3s kubectl exec "${1:-$JPOD}" -- pgrep -a -f 'xterm|paplay|shot-loop|screenshot' || true
 }
 # Whether a window with that title is on the display, seen from the desktop.
-win_up() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree 2>/dev/null | grep -qF "\"$1\""; }
+# The tree is read whole before it is searched: piped into grep -q under
+# pipefail, xwininfo dies of SIGPIPE once grep has its match, and the found
+# window reads as missing (run 37327333528's journey-1).
+win_up() {
+    local tree
+    tree=$(podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree 2>/dev/null) || return 1
+    grep -qF "\"$1\"" <<<"$tree"
+}
 win_wait() { wait_for "${2:-30}" 1 "a window titled $1 on the display" win_up "$1"; }
 # The display's windows, from the desktop (F7.5's xwininfo -root -tree).
 win_tree() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree; }
