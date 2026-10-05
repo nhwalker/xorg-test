@@ -439,6 +439,16 @@ jobs:
           check "every one of them is mode 0755" test -z "$odd"
           ev_end
           [ "$f" = 0 ]
+      - name: align-device-groups' branches (S3.2.2's T1 half)
+        # Each branch in a scratch container of the image just built, with
+        # its own /etc/group and a node fabricated for it: renumber, a gid
+        # another group holds (and 60000 too), a missing group, a root-group
+        # node, no node, the boot path already aligned, the narrow form and
+        # an unknown name.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/align-groups-tests.sh)"
+        run: ci/align-groups-tests.sh
       - name: deploy tree quadlet dry-run + CDI spec checks
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts
