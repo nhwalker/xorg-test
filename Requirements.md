@@ -320,7 +320,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: when `/run/user/61000` appears within 15 s, desktop-init uses it and logs `runtime dir /run/user/61000 provided by the host login session`.
 - Acceptance: a file created on the host under it is visible in the container; the log line appears (polled).
 - Evidence: EV-LOG-DESKTOP line; host `findmnt /run/user/61000` and container `ls /run/user/61000` showing the probe file (EV-STATE); `loginctl list-sessions` (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted by `guest:phase_deploy` (`smoke` checks only the host side).
+- Tier: T3 · Coverage: ✅ `guest:phase_deploy` saves `loginctl list-sessions`, the host's `findmnt /run/user/61000`, the container's `ls -la` of it with the host's probe file listed, and the adoption log line, under `artifacts/S2.2.1/` (artifact `evidence-vm-core`); `smoke` checks only the host side.
 
 **S2.2.2 Standalone fallback fabricates the runtime dir**
 - Requirement: with no host session unit, desktop-init creates `/run/user/61000` (0700, desktop) after the wait, logs `no host login session appeared; creating ... standalone`, and the desktop works.
@@ -367,8 +367,8 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T2 · Coverage: ❌.
 
 **S2.3.5 Postmortem runs on abnormal exit only**
-- Requirement: `session-postmortem` runs on nonzero exit, never on exit 0; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists.
-- Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL, and none after a clean end (Quit session, `rc=0`). "Never on exit 0" is `desktop-init`'s doing (it calls the script only for a nonzero exit), so only T2/T3 can prove it.
+- Requirement: `session-postmortem` runs after every abnormal end of the X session and never after a clean one; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists. Abnormal is a nonzero session exit, or an X server that did not shut down cleanly: xinit exits 0 whenever the server goes away, killed or crashed included, so `desktop-init` reads the server's log, which says `Server terminated successfully` only after a clean shutdown, and logs `the X server did not shut down cleanly` before the postmortem.
+- Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL (the session still exits `rc=0`; `desktop-init`'s `did not shut down cleanly` line comes first), and none after a clean end (Quit session, `rc=0`). Which ends get a postmortem is `desktop-init`'s doing, so only T2/T3 can prove it.
 - Evidence: T1 the script's stdout per case (EV-STATE); T2 EV-LOG-DESKTOP slice containing `postmortem:` lines.
 - Tier: T1/T2 · Coverage: ❌.
 
@@ -396,7 +396,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the socket and lock files are removed before each start so PipeWire can re-bind.
 - Acceptance: after a PipeWire restart, `pactl info` over the export succeeds.
 - Evidence: `ls -li /run/desktop-audio` before/after (inodes changed) (EV-STATE); `pactl info` output.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; asserted by `guest:verify_audio_lifecycle` (`smoke` asserts only that the socket exists; a stale one passes).
+- Tier: T2/T3 · Coverage: ✅ `guest:verify_audio_lifecycle` saves `ls -li /run/desktop-audio` before PipeWire is killed and after it is back, with the diff (every socket and lock file has a new inode), and `pactl info` over the export afterwards, under `artifacts/S2.4.3/` (artifact `evidence-vm-core`); `smoke` asserts only that the socket exists.
 
 **S2.4.4 WirePlumber waits for PipeWire's socket**
 - Requirement: `start-audio` waits up to 10 s for `$XDG_RUNTIME_DIR/pipewire-0` before launching wireplumber.
@@ -492,7 +492,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `needs_root_rights = no`; the running Xorg's uid is `desktop`.
 - Acceptance: `ps -o user= -C Xorg` is `desktop`.
 - Evidence: EV-PIDS; `cat /etc/X11/Xwrapper.config` (EV-CONFIG).
-- Tier: T3 · Coverage: ❌ evidence incomplete (`/etc/X11/Xwrapper.config` is not saved; Xorg's `desktop` user shows only in operator-e2e's pid tables); asserted by `guest:phase_deploy`.
+- Tier: T3 · Coverage: ✅ `guest:phase_deploy` saves the running Xorg's process line (user `desktop`) and `/etc/X11/Xwrapper.config` (`needs_root_rights = no`), and checks both, under `artifacts/S3.2.1/` (artifact `evidence-vm-core`).
 
 **S3.2.2 Group gids are aligned to the host's device nodes**
 - Requirement: for video/render/input/audio, the container group is renumbered to the host node's gid; collisions move the other group to a free gid ≥ 60000; missing groups are created; root-group and absent nodes are skipped with a log line; the final-state table and `id desktop` are logged; the narrow form touches only the named groups.
@@ -522,7 +522,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: Xorg's socket appears at the host's `/tmp/.X11-unix/X0`; a host process can render/capture.
 - Acceptance: `test -S` on the host; the published `screenshot` captures `:0` from the host.
 - Evidence: `ls -l /tmp/.X11-unix` (EV-STATE); the host capture PNG (EV-SHOT-CLIENT, host variant).
-- Tier: T3 · Coverage: ❌ evidence not saved (the host's capture is deleted after its PNG check and `/tmp/.X11-unix` is not listed); asserted by `guest:phase_deploy`.
+- Tier: T3 · Coverage: ✅ `guest:phase_deploy` saves `ls -l /tmp/.X11-unix` on the host and the host's own capture of `:0` (a PNG, kept now) under `artifacts/S3.2.6/` (artifact `evidence-vm-core`).
 
 ### F3.3 Session startup (`xinitrc.desktop`)
 
@@ -624,7 +624,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: a screendump of the live display has grayscale stddev > 0.02.
 - Acceptance: `e2e:assert_nonblank` on the three QEMU screendumps (`desktop-deploy`, `desktop-k3s-client`, `cdi-verify-window`) and on the client's capture `screenshot-full.png`.
 - Evidence: the EV-SHOTs themselves with the measured stddev in the index.
-- Tier: T3 · Coverage: ❌ evidence incomplete (the four captures are saved, the measured stddev only in the job log); asserted by `e2e:assert_nonblank`.
+- Tier: T3 · Coverage: ✅ `e2e` records every `assert_nonblank` measurement; the k8s shard saves the four captures with their grayscale stddev, one check each, under `artifacts/S3.5.1/` (artifact `evidence-vm-k8s`).
 
 **S3.5.2 `~/.Xdefaults` is honoured because nothing sets `RESOURCE_MANAGER`**
 - Requirement: no `RESOURCE_MANAGER` on the root; the operator sees the dark xterm, not a white one. That holds for the desktop's own applications only: a client container's Xt applications read the resources in their own home, so they are not themed (a client's xterm is the stock white one).
@@ -676,13 +676,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: X-Resource returns a nonzero pid for every client.
 - Acceptance: `screenshot --list-clients` lists ≥ 3 clients, none `pid=0`.
 - Evidence: the listing (EV-STATE); `ps -p <pids> -o pid,user,comm,cgroup` (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved (the listing goes only to the job log, and no `ps` is taken); asserted by `guest:verify_pod_identity`.
+- Tier: T3 · Coverage: ✅ `guest:verify_pod_identity` saves `screenshot --list-clients` (none `pid=0`) and `ps -p <pids> -o pid,user,comm,cgroup` under `artifacts/S3.7.1/` (artifact `evidence-vm-k8s`); the newest pid listed is usually the listing tool itself, gone by the time `ps` runs.
 
 **S3.7.2 A client pid resolves to its pod from inside the container**
 - Requirement: `/proc/<pid>/cgroup` read in the container carries the pod UID.
 - Acceptance: the testpattern pod's UID is found for one listed client, host-side and in-container.
 - Evidence: the cgroup line and the pod UID side by side (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved (the job log names the pid and pod UID, not the cgroup line); asserted by `guest:verify_pod_identity`.
+- Tier: T3 · Coverage: ✅ `guest:verify_pod_identity` saves the testpattern pod's UID and the matching client's `/proc/<pid>/cgroup`, read on the host and from inside the desktop container, under `artifacts/S3.7.2/` (artifact `evidence-vm-k8s`).
 
 **S3.7.3 Loss of `--pid=host` is detected at boot**
 - Requirement: if desktop-init is pid 1, preflight reports `FAIL: container init is PID 1`.
@@ -887,13 +887,13 @@ event, EV-TIMELINE.
 - Requirement: `/run/desktop-audio/pipewire-0` and `/run/desktop-audio/pulse` exist on the host while the desktop runs.
 - Acceptance: both are sockets; `pactl info` over the pulse one succeeds from the host.
 - Evidence: `ls -l /run/desktop-audio` and `pactl info` output (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; asserted by `guest:phase_deploy` (host `pactl info` over the pulse socket) and `guest:verify_cdi` (both sockets, from inside a pod); the `desktop-preflight` row only warns, and `smoke` checks only that the pulse socket exists.
+- Tier: T2/T3 · Coverage: ✅ `guest:phase_deploy` saves `ls -l /run/desktop-audio` on the host (both sockets) and `pactl info` over the pulse one, and checks each, under `artifacts/S4.1.1/` (artifact `evidence-vm-core`); `guest:verify_cdi` also reaches both sockets from a pod.
 
 **S4.1.2 In-container clients use the per-user sockets, and the operator hears them**
 - Requirement: apps in the desktop session reach PipeWire via `$XDG_RUNTIME_DIR`, pulse via `unix:native`, ALSA via `pipewire-alsa`.
 - Acceptance: `paplay`, `pw-play`, `aplay` from an xterm on `:0` each play their tone and it is captured at the right frequency.
 - Evidence: three EV-AUDIO captures (440/880/1320 Hz) with spectrograms; EV-SHOT of the playing xterm.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no spectrogram or saved analyser output, no screendump of the playing xterm); asserted by `guest:play_audio` × 3 + `check-audio.py`, whose WAVs are saved as `artifacts/audio-deploy-*.wav`.
+- Tier: T3 · Coverage: ✅ `e2e` "audio: record each client path" saves, under `artifacts/S4.1.2/` (artifact `evidence-vm-core`), each path's capture with `check-audio.py`'s verdict and a level plot at its pitch (the evidence standard's stand-in for a spectrogram where none is installed), and a screendump of the xterm that ran each player, taken as it reports the player's exit status.
 
 ### F4.2 Host clients
 
@@ -927,7 +927,7 @@ event, EV-TIMELINE.
 - Requirement: no `rtkit-daemon`; ≥ 1 PipeWire thread is `FF` with rtprio > 1.
 - Acceptance: `ps -L` on the daemon.
 - Evidence: `ps -L -p <pid> -o pid,tid,cls,rtprio,comm` (EV-STATE); `pgrep rtkit-daemon` (empty).
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted by `guest:verify_privileges`.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges` saves `pgrep -a rtkit-daemon` (none) and `ps -L` of the PipeWire daemon (its `data-loop` thread `FF` at priority 60) under `artifacts/S4.3.2/` (artifact `evidence-vm-core`).
 
 ### F4.4 Soundless host
 
@@ -960,7 +960,7 @@ event, EV-TIMELINE.
 - Requirement: a pod with `desktop.local/audio` records the sink monitor and the recording carries the played tone.
 - Acceptance: `guest:verify_record` (660 Hz).
 - Evidence: EV-AUDIO-REC (the pulled WAV, spectrogram, analyser verdict).
-- Tier: T3 · Coverage: ❌ evidence not saved: the recording stays in the VM and is never copied to the artifacts; asserted by `guest:verify_record` (660 Hz).
+- Tier: T3 · Coverage: ✅ `guest:verify_record` asserts the pod's recording carries 660 Hz; `e2e` copies the recording out of the VM and saves it with `check-audio.py`'s verdict and a level plot under `artifacts/S4.6.1/` (artifact `evidence-vm-k8s`).
 
 ### F4.7 HMI hotplug: audio
 
@@ -1147,7 +1147,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: no toolkit/hardware → stub spec; `--device nvidia.com/gpu=all` resolves and the marker lands on the init's environment.
 - Acceptance: `dryrun` + `smoke` + `guest:phase_deploy`.
 - Evidence: the spec (EV-CONFIG); `/proc/<init>/environ` grep (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; asserted by `dryrun`, `smoke` and `guest:phase_deploy`.
+- Tier: T2/T3 · Coverage: ✅ `guest:phase_deploy` saves the stub spec `desktop-cdi-refresh` wrote and the NVIDIA lines of the container init's environment (`NVIDIA_CDI_STUB=1`) under `artifacts/S5.4.1/` (artifact `evidence-vm-core`); `dryrun` and `smoke` assert the same on the runner (job log only).
 
 **S5.4.2 Real generation, transient failure, no-downgrade, recovery to stub**
 - Requirement: with `nvidia-ctk` and `/dev/nvidiactl` the real spec is written; a failing `nvidia-ctk` keeps an existing real spec; without a toolkit an existing real spec is kept while `/dev/nvidiactl` exists or the `nvidia` module is loaded (`/proc/modules`); with neither, the stub returns.
@@ -1167,7 +1167,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: as stated; legacy spec removed.
 - Acceptance: `smoke` + `dryrun` runtime probes.
 - Evidence: both specs (EV-CONFIG); the probe containers' `env` and `/proc/self/mountinfo` (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved; asserted by `smoke`, the `dryrun` runtime probes and the confined podman clients in `guest:phase_deploy`.
+- Tier: T2 · Coverage: ✅ `guest:phase_deploy` saves both specs, copies of S7.1.1's four probes, and `desktop-client-cdi` removing a superseded combined spec, under `artifacts/S5.5.1/` (artifact `evidence-vm-core`), and checks kinds, disjointness and rbind rw directory mounts; `smoke` and the `dryrun` probes assert the same on the runner (job log only).
 
 **S5.5.2 Overrides and validation**
 - Requirement: `DISPLAY_VALUE` and `X11_DIR` apply to the display spec and `AUDIO_DIR` to the audio spec; malformed `DISPLAY_VALUE` is rejected before any write; no temp files remain; defaults return when the file is removed.
@@ -1241,7 +1241,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: an unconfined host process can connect to the X and audio sockets and execute the toolkit.
 - Acceptance: `guest:phase_deploy` host `pactl`, host `screenshot --help`, host capture of `:0`.
 - Evidence: the host capture PNG (EV-SHOT-CLIENT host variant); `pactl info`; `ausearch -m avc -ts recent` (empty) (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved (the host capture is deleted, the `pactl info` output discarded, and `ausearch` runs only on failure); asserted by `guest:phase_deploy`.
+- Tier: T3 · Coverage: ✅ `guest:phase_deploy` saves an unconfined host process running the relabeled `screenshot --help`, its capture of `:0`, `pactl info` over the relabeled socket, and `ausearch -m avc -ts <the start of these checks>` (`<no matches>`), and asserts that last one empty, under `artifacts/S5.6.7/` (artifact `evidence-vm-core`).
 
 ### F5.7 Host Terminal
 
@@ -1255,7 +1255,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `ssh -i <key> desktop-shell@127.0.0.1 whoami` from the host and `ssh host whoami` from the container return `desktop-shell`; the "Host Terminal" menu entry shows a prompt on the host.
 - Acceptance: `smoke`, `guest:phase_deploy`; T3 launch `host-terminal` in an xterm and screendump.
 - Evidence: both `whoami` transcripts (EV-STATE); EV-SHOT of the host-terminal xterm showing `desktop-shell@<host>`; EV-LOG-JOURNAL of `sshd` (the accepted publickey line).
-- Tier: T2/T3 · Coverage: ❌ evidence incomplete: no transcript of the host-side `ssh -i <key> desktop-shell@127.0.0.1 whoami` is saved (`smoke` and `guest:phase_deploy` assert both directions but keep the output in variables). The menu half is evidenced in `artifacts/S11.1.1/` by `operator-e2e:menu_host_terminal`: a shot of the `desktop-shell@` prompt with `whoami` typed and answered, and sshd's accepted-publickey line.
+- Tier: T2/T3 · Coverage: ✅ `guest:phase_deploy` saves both `whoami` transcripts (from the host with the key, and `ssh host` from the container) under `artifacts/S5.7.2/` (artifact `evidence-vm-core`). The menu half is evidenced in `artifacts/S11.1.1/` by `operator-e2e:menu_host_terminal`: a shot of the `desktop-shell@` prompt with `whoami` typed and answered, and sshd's accepted-publickey line.
 
 **S5.7.3 Restrictions are enforced**
 - Requirement: the key is refused from a non-loopback source; port forwarding is refused.
@@ -1382,7 +1382,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `Privileged=false`; init `Seccomp: 2`.
 - Acceptance: `smoke`, `guest:verify_privileges`.
 - Evidence: `podman inspect` field; `/proc/<init>/status` Seccomp line (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved (the values reach only the job log); asserted by `smoke` and `guest:verify_privileges`.
+- Tier: T2/T3 · Coverage: ✅ `guest:verify_privileges` saves `podman inspect`'s `Privileged` (`false`) and the Seccomp lines of the container init's `/proc/<pid>/status` (`Seccomp: 2`) under `artifacts/S6.1.1/` (artifact `evidence-vm-core`); `smoke` asserts the same on the runner.
 
 **S6.1.2 Forbidden capabilities absent**
 - Requirement: none of these 13 capabilities is in init's `CapEff`: `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_BOOT`, `SYS_TIME`, `NET_ADMIN`, `NET_RAW`, `DAC_READ_SEARCH`, `SYSLOG`, `BPF`, `PERFMON`, `SYS_ADMIN`, `KILL` (the list `guest:verify_privileges` checks; `README.md` names a different 13).
@@ -1453,7 +1453,7 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: display alone → `DISPLAY` + X socket, no audio; audio alone → both audio env vars + audio dir, no display; both → union; none → nothing.
 - Acceptance: `dryrun`, `guest:phase_deploy` (confined, real `xdpyinfo`).
 - Evidence: per probe: `env`, `/proc/self/mountinfo`, `xdpyinfo` exit (EV-STATE); `ps -Z` of the probe (confined).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; asserted by `dryrun` (all four device combinations, unconfined) and `guest:phase_deploy` (display, audio and both, confined, with `xdpyinfo`).
+- Tier: T2/T3 · Coverage: ✅ `guest:phase_deploy` runs four confined podman probes (display alone, audio alone, both, none) and saves each one's markers, full `env`, the two mounts in its `/proc/self/mountinfo` and its SELinux label (`container_t`, read from `/proc/self/attr/current` rather than `ps -Z`) under `artifacts/S7.1.1/` (artifact `evidence-vm-core`); `xdpyinfo`'s exit shows as `XDPYINFO_OK`. `dryrun` runs the same four combinations unconfined (job log only).
 
 **S7.1.2 Confined clients work under enforcing**
 - Requirement: no `label=disable`, no `--privileged` on any client; a static guard keeps it that way.
@@ -1494,13 +1494,13 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: the device injects the env and an `ro` mount; the binary executes; not writable; a pod without the request has neither.
 - Acceptance: `smoke`, `guest:verify_screenshot`, `guest:verify_split`.
 - Evidence: `env`, `mountinfo`, `touch` failure transcript (EV-STATE); the binary's `--help` output.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; asserted by `smoke` (podman client), `guest:verify_screenshot` (pod) and `guest:verify_split` (a pod without the request has neither).
+- Tier: T2/T3 · Coverage: ✅ `guest:verify_split` and `guest:verify_screenshot` save, under `artifacts/S7.2.4/` (artifact `evidence-vm-k8s`): a display-only pod's `env` and `mountinfo` (no toolkit), the tools spec, the requesting pod's `env`, its toolkit mount line (`ro`), the binary's `--help`, and `touch` refused (`Read-only file system`). `smoke` asserts the podman-client half (job log only).
 
 **S7.2.5 Advertised only after provisioning**
 - Requirement: no spec before the desktop's first start; present after.
 - Acceptance: `smoke`.
 - Evidence: `ls -l /etc/cdi` before and after the first start (EV-DIFF).
-- Tier: T2 · Coverage: ❌ evidence not saved; asserted by `smoke`.
+- Tier: T2 · Coverage: ✅ `guest:phase_deploy` saves `ls -l --full-time /etc/cdi` right after the tree is applied (no `desktop-tools.yaml`; on the VM no `/etc/cdi` at all yet) and after the desktop has published, with the diff, under `artifacts/S7.2.5/` (artifact `evidence-vm-core`); `smoke` asserts the same on the runner (job log only).
 
 ### F7.3 Kubernetes clients
 
@@ -1526,13 +1526,13 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: an image with no X server and no window manager, running no audio daemon of its own (no `pipewire`, `wireplumber` or `pipewire-pulse` process), opens the display and plays all three paths with injected env only. (The lean image does carry the daemon packages, pulled in as dependencies of `pipewire-utils` and `pipewire-alsa`; nothing starts them.)
 - Acceptance: `guest:verify_testclient`, `e2e` lean-client tone loop.
 - Evidence: `rpm -qa` of the lean image (no Xorg server, no WM) and a `ps` of the pod (no audio daemon) (EV-STATE); `xdpyinfo` output; three EV-AUDIO captures.
-- Tier: T3 · Coverage: ❌ evidence incomplete: the three tone WAVs are saved, but no spectrograms, no `rpm -qa` of the image and no `xdpyinfo` output; asserted by `guest:verify_testclient` and the `e2e` "cdi: a LEAN non-desktop image" tone loop.
+- Tier: T3 · Coverage: ✅ `guest:verify_testclient` saves `rpm -qa` of the lean image (no `xorg-x11-server-*`, no `motif`; `pipewire` and `wireplumber` are there as dependencies), the pod's processes read from `/proc` (only `sleep` and the probe), its `env` and `xdpyinfo`; the `e2e` lean-client loop adds the three tones with `check-audio.py`'s verdict and a level plot each; all under `artifacts/S7.3.4/` (artifact `evidence-vm-k8s`).
 
 **S7.3.5 Concurrency**
 - Requirement: three pods hold live X connections at once.
 - Acceptance: `guest:verify_concurrency`, with each pod's window at its own position (today all three reuse the example's `-geometry 80x24+200+200` and stack, so the shot cannot show three).
 - Evidence: EV-SHOT `concurrent-clients.png` with three windows; `screenshot --list-clients` showing three pod pids (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence incomplete: `concurrent-clients.png` shows only one of the three pods' windows (they share the example's geometry) and no `screenshot --list-clients` output is saved; asserted by `guest:verify_concurrency`.
+- Tier: T3 · Coverage: ✅ `guest:verify_concurrency` places the three pods' xterms one above the other and saves `screenshot --list-clients` while they hold the display, with each pod's UID matched to the listed client whose cgroup carries it; `e2e` adds the screendump showing all three; under `artifacts/S7.3.5/` (artifact `evidence-vm-k8s`).
 
 **S7.3.6 Teardown seam**
 - Requirement: `helm uninstall` withdraws the resources; host specs and the desktop survive; existing client pods that were already running keep their windows (they hold their mounts).
@@ -1552,7 +1552,7 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: the injected binary's capture matches the painted pattern, regions equal crops, stdout equals file, orientation beats flipped variants, `-h` is height, oversize → exit 2, no `DISPLAY` → exit 1.
 - Acceptance: `guest:verify_screenshot` + `e2e` pixel assertions.
 - Evidence: all seven PNGs (EV-SHOT-CLIENT), the QEMU reference (EV-SHOT), the per-assertion pixel values and RMSE scores in the index.
-- Tier: T3 · Coverage: ❌ evidence incomplete: the seven client PNGs and the QEMU reference are saved, but the per-assertion pixel values and RMSE scores are not (the scores reach only the job log); asserted by `guest:verify_screenshot` and the `e2e` "screenshot: the injected binary captures the live display" pixel assertions.
+- Tier: T3 · Coverage: ✅ under `artifacts/S7.4.1/` (artifact `evidence-vm-k8s`): `guest:verify_screenshot` saves the display size, the oversized-region (exit 2) and no-`DISPLAY` (exit 1) transcripts and a check per capture size; `e2e` adds the seven captures, the QEMU reference, every pixel value read (one check each), the five region comparisons and the four RMSE scores. The orientation cross-check now fails, rather than warning, when the reference is missing or of another size.
 
 ### F7.5 Client application journeys: display
 
@@ -1593,10 +1593,10 @@ the client window; EV-SHOT-CLIENT from inside the client; EV-LOG-CLIENT;
 - Tier: T3 · Coverage: ❌ evidence not saved; asserted only in part, as a side effect: after `operator-e2e:s11_1_1`'s Quit session the long-running `op-observer` client container must reach the new X server, but no window from it appears and its container id is not recorded.
 
 **S7.5.6 A client's capture matches what the operator sees**
-- Requirement: EV-SHOT-CLIENT from a client matches the QEMU screendump of the same moment far better than any flipped, mirrored or rotated version of it; the cursor keeps the two from being equal.
-- Acceptance: `e2e` "screenshot" orientation/margin test (`assert_orientation_vs_reference`); today it passes with a warning when the reference is missing or the sizes differ, which the test should fail instead.
+- Requirement: EV-SHOT-CLIENT from a client matches the QEMU screendump of the same moment far better than any flipped, mirrored or rotated version of it. They may legitimately differ (a pointer drawn into one capture and not the other), so the comparison is a margin, not equality.
+- Acceptance: `e2e` "screenshot" orientation/margin test (`orientation_scores`, `orientation_ok`); a missing reference or one of another size fails.
 - Evidence: both images and the RMSE scores; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence incomplete (the RMSE scores are only in the job log); asserted by `e2e` "screenshot" (`assert_orientation_vs_reference`), not by `guest:verify_screenshot`.
+- Tier: T3 · Coverage: ✅ `e2e` "screenshot" saves the client's capture, QEMU's screendump of the same moment, the four RMSE scores, and the capturing pod's restart count, container id, start time and main pid before and after, under `artifacts/S7.5.6/` (artifact `evidence-vm-k8s`); a missing or mis-sized reference fails. On the e2e VM the two images were identical (RMSE 0): virtio-vga's pointer is a hardware cursor, which neither capture includes.
 
 **S7.5.7 Many clients share one desktop**
 - Requirement: three client pods hold live connections and all three windows are on screen.
@@ -1680,7 +1680,7 @@ the referenced feature.
 - Requirement: an application container playing a continuous tone to the default sink keeps playing while a USB sound card is added; once that card becomes the default sink (WirePlumber policy, or the test sets it), the client's **existing stream** is heard on the new device; the container and the player are the same process throughout.
 - Acceptance: pod plays a 60 s 1100 Hz tone; `device_add usb-audio`; `wpctl set-default <new sink>` (or observe policy move it); `pactl list short sink-inputs` shows the client's stream now on the USB sink; `wavcapture` on the shared backend carries 1100 Hz throughout with no gap; `restartCount` 0; app pid unchanged.
 - Evidence: common set; EV-AUDIO spanning the event with the `device_add` and default-change timestamps marked on the spectrogram; `pactl list short sink-inputs` at three moments (EV-STATE) showing the stream's sink id change; `wpctl status` pair; EV-QEMU.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no video, no `pactl list short sink-inputs` or `pw-cli ls Device` snapshots, no `/dev/snd` listings); asserted by `operator-e2e:s11_3_1` with a podman client in place of the pod. Its capture, level plot, `info usb`, `wpctl status` and pid tables are saved in `artifacts/S11.3.1/`.
+- Tier: T3 · Coverage: 🟡 `operator-e2e:s11_3_1` asserts it with a podman client container in place of the pod (E11's definition of a client); no kubernetes pod variant is run. Under `artifacts/S11.3.1/`: the capture with each mark on a level plot, `info usb`, `/dev/snd` on the host and in the container, `pw-cli ls Device` and `pactl list short` sinks, sources and sink-inputs at four moments with diffs (the stream's sink id moving), a video of the plug, `wpctl status` after every step, the player's inspect before and after, pid tables and the desktop's log.
 
 **S7.7.5 A client playing on the hot-added device survives its removal**
 - Requirement: with the client's stream on the USB sink, `device_del` moves the stream back to the built-in sink (or ends it cleanly); the client is not restarted; its next playback is heard.
@@ -2130,13 +2130,13 @@ EV-PIDS for Xorg, mwm and any client application involved; EV-TIMELINE.
 - Requirement: the operator arranges windows with the controls mwm draws on every frame and with the `.mwmrc` button bindings, and a client application's window behaves exactly like the desktop's own xterm. Dragging the title bar moves the window; dragging the border resizes it; the minimize button iconifies it, and its icon (double-click, or Restore from the icon's window menu) brings it back where it was; the maximize button enlarges it and a second press restores it; button 3 on a frame posts the window menu (`<Btn3Down> icon|frame f.post_wmenu`), whose Close closes the window; button 1 on a frame raises the window (`<Btn1Down> icon|frame f.raise`). mwm posts the window menu on the button-3 press and takes it down on a release anywhere but an entry, so Close is chosen by dragging to it with the button held. A single click on an icon posts the icon's window menu and leaves it posted (mwm's `iconClick` default). In a normal window's menu Restore is insensitive.
 - Acceptance: the desktop's xterm and a client pod's xterm, overlapping; QMP pointer events only; per action, `xwininfo -id` of the window before and after matches the drag, resize, iconify, restore or maximize; `xwininfo -root -tree` shows the stacking change after a raise; on a two-output layout, whether maximize fills one output or the whole screen is recorded; Close ends the client's xterm (its pid exits) and leaves the desktop's xterm untouched. A corner drag puts the frame's corner where the pointer stops, not where in the handle it was grabbed, and xterm's size snaps down to its character grid: a drag ending n columns and m rows of that grid beyond the frame's corner resizes it by exactly n by m. A raised window can bury the other completely, so the order of the actions keeps a stretch of each frame visible.
 - Evidence: common set; per action an EV-SHOT pair and the `xwininfo` output before and after (EV-DIFF); EV-VIDEO of the drags.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no EV-SHOT of either window after the icon-menu Restore); every action is asserted by `operator-e2e:s11_1_2`, both windows taken through each. The e2e VM has one output; maximize gives a `1275x789+5+11` frame on its 1280x800 screen, the character grid keeping it short of the edges.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_2`, both windows taken through every action, now with a shot after the icon-menu Restore too. The e2e VM has one output; maximize gives a `1275x789+5+11` frame on its 1280x800 screen, the character grid keeping it short of the edges.
 
 **S11.1.3 Windows can be managed from the keyboard alone**
 - Requirement: an operator whose pointer is gone (a KVM that dropped the mouse) can still manage windows through the `.mwmrc` bindings: `Alt+Tab` and `Alt+Shift+Tab` move keyboard focus between windows, `Shift+Escape` and `Alt+Space` post the window menu, and the window menu's accelerators act on the focused window (`Alt+F9` minimize, `Alt+F4` close). `Alt+Tab` cycles icons as well as windows. A window menu posted from the keyboard appears at the top-left corner of the focused window's client area, or just above a focused icon, and its entries can also be chosen by mnemonic (R for Restore).
 - Acceptance: two xterms on screen, one of them from a client pod, and no pointer events after setup; `Alt+Tab` moves focus (the frame colours swap, by S3.5.3's samples, and typed text lands in the newly focused window); `Shift+Escape` shows the window menu (EV-SHOT); `Alt+F9` iconifies the focused window and the window menu's Restore brings it back (`Alt+Tab` to the icon, `Shift+Escape`, R); `Alt+F4` closes the local xterm (its pid exits), and focus can then be moved to the remaining window by keyboard. The local xterm is the session's own: nothing starts another, and the session carries on without a terminal until the operator opens one.
 - Evidence: EV-SHOT per step with sampled frame colours; the sink files; the EV-QEMU transcript of the key events; EV-PIDS.
-- Tier: T3 · Coverage: 🟡 `operator-e2e:s11_1_3` asserts every key step but not the last clause, that after `Alt+F4` no new xterm starts and the session carries on (only its `alt-f4` shot and `pids-end` table show it). Recorded on the e2e VM: after `Alt+F9`, and again after `Alt+F4`, mwm put the keyboard focus on the remaining window, and one `Alt+Tab` then reached the icon.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_3`, the last clause included: 5 s after `Alt+F4` no xterm has taken the session's place (the window tree is saved), and Xorg and mwm keep their pids from `pids-start` to `pids-end`. Recorded on the e2e VM: after `Alt+F9`, and again after `Alt+F4`, mwm put the keyboard focus on the remaining window, and one `Alt+Tab` then reached the icon.
 
 ### F11.2 Working across applications
 
@@ -2152,7 +2152,7 @@ EV-PIDS for Xorg, mwm and any client application involved; EV-TIMELINE.
 - Requirement: the session has no graphical mixer and no volume keys (`.mwmrc` binds none), so the operator's sound controls are commands in a desktop terminal ("New Terminal"), whose environment already carries the session's runtime directory: `wpctl` (the image also carries `pactl` and `alsamixer`). From there, changing the default output's volume, muting and unmuting, and choosing the output device (`wpctl set-default`, for example a headset just plugged in, S4.7.3) take effect on what is already playing, a client pod's stream included, with no restart of anything. What survives an audio-stack restart and a `systemctl restart desktop.service` is recorded: WirePlumber keeps such choices in state files under the session user's home (`/home/desktop`), which does not survive the container being recreated (`README.md` "Look and feel" says the same of the dotfiles), so a reset at that point is expected. Two things the operator should know, seen on the e2e VM: WirePlumber starts an output it has not seen before at 0.40 on wpctl's scale, not 100%; and a USB card plugged in becomes the default output, WirePlumber moving what is playing onto it by itself.
 - Acceptance: a client pod plays a continuous 1100 Hz tone; in a "New Terminal" xterm, typed through QMP: with a USB card hot-added (S4.7.1), `wpctl set-default <sink id>` moves the client's stream from the card to the built-in output and back (`pactl list sink-inputs`), with no gap in the capture; then on the card, `wpctl set-volume @DEFAULT_AUDIO_SINK@ 100%` and then `50%` lowers the captured level (by 18 dB on wpctl's cubic scale), and `wpctl set-mute @DEFAULT_AUDIO_SINK@ 1` silences it and `0` restores it; the client pod's `restartCount` and the player's pid are unchanged throughout. Then the volume, mute state and default output are read after killing `pipewire`, and again after restarting the desktop. pactl's sink indexes are not the PipeWire ids wpctl prints, so the stream's sink is compared by name. The volume and mute steps are made on the USB card because QEMU's emulated HDA output does not follow the volume it is set to: on the e2e VM it played the tone 0.8 dB down at WirePlumber's 0.40, at full level at 100% and 2.5 dB down at 50%, while the emulated card followed the cubic scale to within half a decibel. The built-in output's own response is still captured and recorded each run. A gap with no sound device running at all would be missing from the capture rather than silent in it, so the capture's length is checked against the wall clock (EV-AUDIO).
 - Evidence: common set; EV-AUDIO across the sequence, with each command's timestamp marked on a level plot of the 1100 Hz tone (the runner has no spectrogram tool); `wpctl status` after each step (EV-STATE); EV-LOG-CLIENT of the player.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no `wpctl status` after each step); asserted by `operator-e2e:s11_3_1`, except that the 50% step is held only to a drop of more than 6 dB, not the stated 18 dB. Recorded on the e2e VM: after `pipewire` was killed the card stayed the default at 50%; after `systemctl restart desktop.service` the card was the default again (also WirePlumber's own pick for a present USB card, so this cannot tell whether the choice survived) and its volume was back at 0.40.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_3_1`, with `wpctl status` and a shot after every command, and the 50% step on the USB card held to -16..-20 dB (measured -18.1 dB). Recorded on the e2e VM: after `pipewire` was killed the card stayed the default at 50%; after `systemctl restart desktop.service` the card was the default again (also WirePlumber's own pick for a present USB card, so this cannot tell whether the choice survived) and its volume was back at 0.40.
 
 ---
 
@@ -2295,15 +2295,15 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 1 | 0 | 13 | 0 |
-| E2 Boot & supervision | 25 | 1 | 1 | 23 | 0 |
-| E3 Display & session | 62 | 8 | 1 | 50 | 3 |
-| E4 Audio | 23 | 0 | 0 | 22 | 1 |
-| E5 Deploy tree | 50 | 2 | 0 | 47 | 1 |
-| E6 Privileges | 9 | 1 | 0 | 8 | 0 |
-| E7 Client contract & journeys | 40 | 0 | 0 | 40 | 0 |
+| E2 Boot & supervision | 25 | 3 | 1 | 21 | 0 |
+| E3 Display & session | 62 | 13 | 1 | 45 | 3 |
+| E4 Audio | 23 | 4 | 0 | 18 | 1 |
+| E5 Deploy tree | 50 | 6 | 0 | 43 | 1 |
+| E6 Privileges | 9 | 2 | 0 | 7 | 0 |
+| E7 Client contract & journeys | 40 | 7 | 1 | 32 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
-| E11 Operator experience | 5 | 2 | 1 | 2 | 0 |
-| **Total** | **251** | **15** | **3** | **227** | **6** |
+| E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
+| **Total** | **251** | **41** | **3** | **201** | **6** |
 
 Regenerate after editing with:
 
@@ -2327,13 +2327,14 @@ reused by every story. Each story's directory is written in one format
 | `ev_begin <story> <title> [tier]` / `ev_end [reason]` / `ev_abort <reason>` | `ci/evidence.sh`, any shell tier | opens `artifacts/<story>/` and its `meta.tsv`; settles PASS/FAIL and renders `evidence.md`; `ev_abort` is what `fail()` calls, so a red story is still written |
 | `ev_check <claim> <cmd…>` / `ev_pass` / `ev_fail` | `ci/evidence.sh` | one line in `checks.tsv` per assertion, in order |
 | `ev_note <text>` | `ci/evidence.sh` | observed and recorded, deliberately not asserted (`notes.tsv`) |
-| `ev_save <moment> <what> <cmd…>` | `ci/evidence.sh` | runs the command and keeps the command line, its output and its exit status as the next numbered file (EV-STATE, EV-LOG-*) |
+| `ev_save <moment> <what> <cmd…>` | `ci/evidence.sh` | runs the command and keeps the command line, its output (stderr included) and its exit status as the next numbered file (EV-STATE, EV-LOG-*); `$EV_LAST` names the file for a later `ev_diff` |
 | `ev_text`, `ev_copy`, `ev_diff`, `ev_attach` | `ci/evidence.sh` | text already in hand, a copied file (EV-CONFIG), `diff -u` of two kept files (EV-DIFF), a file already written |
 | `EV_SIDE=h-` | `ci/evidence.sh` | a VM story written from the guest and the host at once; the host's files carry an `h` prefix |
 | `StoryWriter` | `ci/evlib.py` | the same, from Python; the operator phase's `Story` builds on it and adds `qemu.log`, its QMP transcript |
 | `Ctx.shot`, `Ctx.video`, `Ctx.pids`, `Ctx.diff`, `Ctx.save_cmd`, `Ctx.diagnostics` | `ci/vm/operator-e2e.py` | EV-SHOT, EV-VIDEO (frames, index, gif), EV-PIDS, EV-DIFF with both sides kept, command output, and the failure shot, tree, process table and desktop log |
 | `ev_shot <moment> <what>` | `ci/vm/vm-e2e.sh` (host) | QEMU screendump into the open story |
 | `guest_ev <root\|""> <phase…>`, `ev_pull` | `ci/vm/vm-e2e.sh` (host) | runs a `vm-guest.sh` phase with evidence on and copies the guest's story directories back |
+| `ev_audio_start <moment> <hz>` / `ev_audio_stop <what> <secs> <peak> <hz>`, `ev_audio_check` | `ci/vm/vm-e2e.sh` (host) | `wavcapture` straight into the open story; on stop the WAV is indexed and `check-audio.py --report --plot` keeps its verdict and a level plot at the story's pitch beside it |
 | `QMP_TRANSCRIPT=<file>` | `ci/vm/qmp-type.py` | writes every QMP command it sends, timestamped (EV-QEMU) |
 | `write_manifest` | `ci/vm/vm-e2e.sh` (host) | `run.json`: image ids, QEMU, guest kernel and podman versions, git sha, date |
 | `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance); holds the ✅ marks in this document to the run's evidence |
@@ -2343,7 +2344,6 @@ reused by every story. Each story's directory is written in one format
 | Helper | Side | Does |
 |---|---|---|
 | `ev_video_start <fps>` / `ev_video_stop` | host | the shell phases' EV-VIDEO: a background screendump loop; on stop the gif and the frame list |
-| `ev_audio_start <label>` / `ev_audio_stop <label> <hz>` | host | `wavcapture`/`stopcapture`, then `check-audio.py`'s verdict and a level plot or spectrogram into the story |
 | `ev_pids <moment> [pod…]` | guest | the shell phases' EV-PIDS table, plus any pods' `restartCount`/container id |
 | `ev_desktop_log` | guest | `podman logs desktop` from the story's start marker |
 | `ev_client_log <pod\|ctr>` | guest | `kubectl logs` / `podman logs` plus any sink file |
