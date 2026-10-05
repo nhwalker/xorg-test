@@ -1472,7 +1472,11 @@ left=$(pgrep -l -u 61000 -x 'Xorg|mwm|xterm|pipewire|wireplumber|pipewire-pulse'
 ev_pass "no Xorg, mwm, xterm, pipewire, wireplumber or pipewire-pulse is left on the host"
 sleep 1
 kill "$follower" 2>/dev/null || true
-follow=$(sed -E 's/^[^ ]+ (stdout|stderr) [FP] //' "$tmp/follow" | tr -d '\r')
+# k8s-file splits a long write into P (partial) records ended by an F one:
+# rejoin them, so each line reads as the desktop wrote it.
+follow=$(awk '{ t = $0; sub(/^[^ ]+ (stdout|stderr) [FP] ?/, "", t); buf = buf t
+                if ($3 == "F") { print buf; buf = "" } }
+              END { if (buf != "") print buf }' "$tmp/follow" | tr -d '\r')
 rm -r "$tmp"
 n_term=$(line_in "$follow" '^desktop-init: SIGTERM:')
 [ -n "$n_term" ] || { ev_text follow "EV-LOG-DESKTOP: the desktop's log, followed from before the stop" "$follow"
