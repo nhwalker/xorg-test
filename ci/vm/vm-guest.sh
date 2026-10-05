@@ -3731,9 +3731,15 @@ verify_record() {
         < /tmp/rectone.wav || fail "could not copy record tone into $pod"
 
     log rec "record the sink monitor while playing a ${freq}Hz tone"
+    # --latency-msec=50: unless asked for less, pipewire-pulse hands a
+    # recorder its audio in 64 KiB fragments (0.37 s at 44.1 kHz stereo), and
+    # the SIGINT that ends parec drops whatever has not arrived. This
+    # recording held two fragments, 0.74 s of its 2.5 s, in every run until
+    # run 37345104044's held one, 0.37 s, and failed. With 50 ms fragments it
+    # holds the whole window (2.6 s, measured in the desktop image).
     timeout 30 k3s kubectl exec "$pod" -- sh -c '
         sink=$(pactl get-default-sink) || exit 3
-        parec -d "${sink}.monitor" --file-format=wav \
+        parec --latency-msec=50 -d "${sink}.monitor" --file-format=wav \
             --rate=44100 --format=s16le --channels=2 /tmp/rec.wav &
         rpid=$!
         sleep 0.5
