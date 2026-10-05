@@ -121,10 +121,12 @@ Seat handover — the host must stop claiming the devices the container needs:
 2. `desktop-seat-prep.service` makes that baseline true again at every boot,
    whatever the host has drifted to: it deletes
    `/etc/udev/rules.d/72-seat-*.rules` (created by `loginctl attach`) and
-   re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems so all
-   devices fall back to default `seat0` tagging (custom multi-seat splits
-   would otherwise hide devices from the container's libinput, which reads
-   the host udev database's seat tags); disables and
+   re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems, then
+   for every device still tagged for a seat (a keyboard's LEDs copy their
+   parent's tag), so all devices fall back to default `seat0` tagging
+   (custom multi-seat splits would otherwise hide devices from the
+   container's libinput, which reads the host udev database's seat tags);
+   disables and
    stops whatever `display-manager.service` resolves to; re-asserts the
    default target and the getty mask; then verifies nothing still holds the
    VT or DRM master before `desktop.service` starts.
