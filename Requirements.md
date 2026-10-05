@@ -303,7 +303,7 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T2 · Coverage: ❌.
 
 **S2.1.3 Boot markers**
-- Requirement: `/run/desktop-init.pid` holds desktop-init's own host pid; `/run/desktop-init-ready` is written after the oneshots and the runtime-dir wait, just before the first X session starts, so it never depends on the session (`desktop-init` writes it before its session loop; its header comment's "after the session launch" is off by that much).
+- Requirement: `/run/desktop-init.pid` holds desktop-init's own host pid; `/run/desktop-init-ready` is written after the oneshots and the runtime-dir wait, just before the first X session starts, so it never depends on the session (`desktop-init` writes it before its session loop).
 - Acceptance: the pid resolves on the host to `desktop-init`; the ready marker's mtime precedes the first Xorg's start time.
 - Evidence: `cat /run/desktop-init.pid`, host `cat /proc/<pid>/comm`, `ls -l /run/desktop-init-ready` (EV-STATE).
 - Tier: T2 · Coverage: ❌ evidence not saved; `smoke` and `guest:verify_privileges` check that the pid file names `desktop-init` on the host, but no test makes the X session fail before looking for the ready marker.

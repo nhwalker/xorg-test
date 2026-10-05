@@ -57,11 +57,13 @@
 # Test contract (ci/smoke-deploy.sh, ci/vm/vm-guest.sh):
 #   /run/desktop-init.pid    this process's pid, which IS a host pid -
 #                            the replacement for every /proc/1/... probe
-#   /run/desktop-init-ready  written once the oneshots have run and the
-#                            session has been launched (the replacement for
-#                            `systemctl is-system-running`); the session
-#                            itself may still fail on a GPU-less host, which
-#                            the ready file deliberately does not gate on
+#   /run/desktop-init-ready  written once the oneshots have run, the
+#                            runtime dir is in place and the audio
+#                            supervisor has started: just BEFORE the first
+#                            X session is launched, not after (the
+#                            replacement for `systemctl is-system-running`).
+#                            So it never depends on the session, which may
+#                            still fail on a GPU-less host
 set -u
 
 log() { echo "desktop-init: $*"; }
