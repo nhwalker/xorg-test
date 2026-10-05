@@ -1097,7 +1097,7 @@ ev_pass "after the recovery a pulse client's $hz Hz tone came out of the machine
 ev_end
 EV_SIDE=
 
-log "audio daemons: wireplumber alone, then pipewire-pulse alone, each restarts the whole stack"
+log "audio daemons: pipewire, wireplumber, then pipewire-pulse, each alone restarts the whole stack"
 guest_ev "$GUEST_EV" verify-audio-restarts \
     || fail "a single audio daemon's exit did not restart the whole stack"
 EV_SIDE=h-
@@ -1106,9 +1106,9 @@ hz=$(freq_for pulse)
 ev_audio_start after-restarts "$hz"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio pulse' \
     || { audio_capture_stop; fail "a pulse client could not play after the stack's restarts"; }
-ev_audio_stop "EV-AUDIO: the machine's output after the two restarts, while a pulse client played its $hz Hz tone - listen for one beep" 1 0.05 "$hz" \
+ev_audio_stop "EV-AUDIO: the machine's output after the three restarts, while a pulse client played its $hz Hz tone - listen for one beep" 1 0.05 "$hz" \
     || fail "audio is silent after the stack's restarts"
-ev_pass "after both restarts a pulse client's $hz Hz tone came out of the machine"
+ev_pass "after the three restarts a pulse client's $hz Hz tone came out of the machine"
 ev_end
 EV_SIDE=
 
