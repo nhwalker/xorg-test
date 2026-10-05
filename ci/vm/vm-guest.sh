@@ -279,6 +279,27 @@ phase_deploy() {
     ev_end
     session_up || fail "mwm not running as the session user"
 
+    # S3.1.3 on real KMS: virtio-gpu's card0 has the connected connector, so
+    # xorg-gpu-conf must have chosen it, said so, and written it.
+    ev_begin S3.1.3 "modesetting picks the first connected connector's card" T3
+    ev_save sysfs "EV-STATE: the VM's DRM connectors (cat /sys/class/drm/card*-*/status), which the container's sysfs shows too" \
+        sh -c 'for f in /sys/class/drm/card*-*/status; do echo "$f: $(cat "$f")"; done' >/dev/null || true
+    first=$(sh -c 'for f in /sys/class/drm/card*-*/status; do [ "$(cat "$f")" = connected ] && { basename "$(dirname "$f")"; break; }; done' || true)
+    [ -n "$first" ] || fail "no DRM connector reads connected on the VM"
+    card=/dev/dri/${first%%-*}
+    ev_pass "the first connected connector is $first, so the card is $card"
+    decision=$(podman logs desktop 2>/dev/null | tr -d '\r' | grep '^xorg-gpu-conf: ' \
+        | awk '{print} /^xorg-gpu-conf: decision:/{exit}' || true)
+    ev_text log "EV-LOG-DESKTOP: xorg-gpu-conf's lines in the desktop's log this boot, up to its decision" "${decision:-(none)}"
+    grep -qx "xorg-gpu-conf: decision: modesetting driver on $card" <<<"$decision" \
+        || fail "xorg-gpu-conf did not log 'decision: modesetting driver on $card'"
+    ev_pass "xorg-gpu-conf logged 'decision: modesetting driver on $card'"
+    gpuconf=$(ev_save config "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf in the running container" \
+        podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || fail "no 20-gpu.conf in the container"
+    grep -qF "Option     \"kmsdev\" \"$card\"" <<<"$gpuconf" || fail "20-gpu.conf does not name $card as kmsdev"
+    ev_pass "20-gpu.conf names $card as kmsdev, with the modesetting driver"
+    ev_end
+
     log pd "the HOST owns the seat: a real logind session for the desktop user on seat0"
     # The seat0 assertion the container's logind used to answer, back where
     # it truthfully lives: desktop-session.service (this tree) opens a
@@ -823,6 +844,19 @@ EOF
     [ "$dims" != 2048x768 ] \
         || fail "the screen is still the declared two-monitor size after the layout was withdrawn"
     log pd "fixed monitor layout: back to autodetection at $dims (was $before on entry)"
+    ev_begin S3.4.1 "Opt-in: absent or output-less config generates nothing" T3
+    ev_copy /etc/desktop-container/monitors.conf shipped-monitors "EV-CONFIG: the shipped monitors.conf, restored after the fixed-layout test: comments only"
+    ev_save xorg-conf-d "EV-STATE: ls /etc/X11/xorg.conf.d in the container after the restore: no 30-monitors.conf" \
+        podman exec desktop ls -l /etc/X11/xorg.conf.d >/dev/null || true
+    ev_pass "after the restore the container has no 30-monitors.conf (asserted above)"
+    noop=$(podman logs desktop 2>/dev/null | tr -d '\r' | grep '^xorg-monitor-conf: ' || true)
+    ev_text generator-log "EV-LOG-DESKTOP: the generator's lines in the desktop's log at this start" "${noop:-(none)}"
+    grep -q 'no fixed layout' <<<"$noop" || fail "the generator did not log its no-op after the restore"
+    ev_pass "the generator logged its no-op"
+    ev_save xrandr "EV-STATE: xrandr --query after the restore: Virtual-2 disconnected, the screen sized by autodetection" \
+        xr >/dev/null || true
+    ev_pass "xrandr: Virtual-2 disconnected and the screen autodetected at $dims, not the declared 2048x768 (asserted above)"
+    ev_end
 }
 
 phase2() {
@@ -1594,6 +1628,13 @@ verify_audio_lifecycle() {
     log al "  pipewire pid $pw_before unchanged, export still reachable"
 
     log al "audio recovers from its own crash"
+    ev_begin S2.4.4 "WirePlumber waits for PipeWire's socket" T3
+    ev_save pids-boot "EV-PIDS: the audio daemons as booted (pid, ppid, session, user, start time)" \
+        podman exec desktop ps -o pid,ppid,sess,user,lstart,comm -C pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    wp_boot=$(podman exec desktop pgrep -x wireplumber 2>/dev/null | head -1 || true)
+    [ -n "$wp_boot" ] || fail "no wireplumber after boot"
+    ev_pass "wireplumber is alive after boot (pid $wp_boot)"
+    ev_end
     ev_begin S2.4.3 "Stale export sockets are cleared before every audio start" T3
     ev_save export-before "EV-STATE: ls -li /run/desktop-audio before pipewire is killed (the first column is each file's inode)" \
         ls -li /run/desktop-audio >/dev/null || true
@@ -1632,12 +1673,44 @@ verify_audio_lifecycle() {
         || fail "pactl info over the export failed after the restart"
     ev_pass "pactl info over the export succeeds after the restart (pipewire $pw_before -> $recovered)"
     ev_end
+    ev_begin S2.4.4 "WirePlumber waits for PipeWire's socket" T3
+    wp_new() { local p; p=$(podman exec desktop pgrep -x wireplumber 2>/dev/null | head -1); [ -n "$p" ] && [ "$p" != "$wp_boot" ]; }
+    wait_for 30 2 "a new wireplumber after the audio stack restarted" wp_new
+    ev_save pids-restart "EV-PIDS: the audio daemons after pipewire was killed and the stack restarted" \
+        podman exec desktop ps -o pid,ppid,sess,user,lstart,comm -C pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    ev_pass "wireplumber is alive after the stack restart (pid $wp_boot -> $(podman exec desktop pgrep -x wireplumber | head -1))"
+    ev_end
 
     # And the session must not have been collateral damage in the other
     # direction either - killing audio must not disturb X.
     session_up \
         || fail "the X session died when the audio stack was killed: the two are still coupled, in the other direction"
     log al "  the X session was undisturbed"
+
+    # S2.3.5: an abnormal end leaves a postmortem in the desktop's log. Kill
+    # the server outright (SIGKILL: no chance to tidy up), as the desktop uid
+    # for the reason above, and read the log from just before the kill.
+    log al "a killed X server leaves a postmortem"
+    ev_begin S2.3.5 "Postmortem runs on abnormal exit only" T3
+    x_before=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1 || true)
+    [ -n "$x_before" ] || fail "no Xorg to kill"
+    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    sleep 1
+    podman exec -u desktop desktop pkill -KILL -u desktop -x Xorg || true
+    ev_note "Xorg (pid $x_before) killed with SIGKILL just after $since"
+    x_new() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1); [ -n "$p" ] && [ "$p" != "$x_before" ] && session_up; }
+    wait_for 60 2 "a new X session after Xorg was killed with SIGKILL" x_new
+    pm=$(ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log from just before the kill (podman logs --since $since): the session's exit, the postmortem, the new session" \
+        podman logs --since "$since" desktop) || true
+    pm=$(tr -d '\r' <<<"$pm")
+    rc=$(sed -n 's/^desktop-init: session exited (rc=\([0-9]*\)).*/\1/p' <<<"$pm" | head -1)
+    [ -n "$rc" ] && [ "$rc" != 0 ] || fail "desktop-init did not log a nonzero session exit after the SIGKILL (rc='$rc')"
+    ev_pass "desktop-init logged the session's abnormal exit (rc=$rc)"
+    grep -q '^postmortem: X session ended abnormally' <<<"$pm" || fail "no postmortem header after the SIGKILL"
+    grep -q '^postmortem: ---- tail of ' <<<"$pm" && grep -q '^postmortem: ---- end of Xorg log ----' <<<"$pm" \
+        || fail "the postmortem did not print the Xorg log's tail"
+    ev_pass "the postmortem ran: its header and the tail of the killed server's log"
+    ev_end
 
     log al "verify-audio-lifecycle passed"
 }

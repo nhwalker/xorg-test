@@ -12,8 +12,17 @@
 # the chooser saw, not just its conclusion.
 set -u
 
-OUT=/etc/X11/xorg.conf.d/20-gpu.conf
-mkdir -p /etc/X11/xorg.conf.d
+# Test overrides (Requirements.md, Appendix A); all unset in the image, where
+# these are exactly the paths below:
+#   GPU_DEV_DIR    where the DRM and NVIDIA device nodes are looked for
+#   GPU_SYS_DRM    the sysfs DRM class directory (connector status)
+#   GPU_LIB_DIRS   where an injected nvidia_drv.so is searched for
+#   GPU_OUT        the config this writes
+DEV=${GPU_DEV_DIR:-/dev}
+SYS_DRM=${GPU_SYS_DRM:-/sys/class/drm}
+LIB_DIRS=${GPU_LIB_DIRS:-/usr/lib64 /usr/lib}
+OUT=${GPU_OUT:-/etc/X11/xorg.conf.d/20-gpu.conf}
+mkdir -p "$(dirname "$OUT")"
 
 log() { echo "xorg-gpu-conf: $*"; }
 
@@ -23,20 +32,22 @@ emit_conf() {
 }
 
 # --- evidence ----------------------------------------------------------------
-log "DRM nodes: $(ls -m /dev/dri 2>/dev/null || echo '(none)')"
+log "DRM nodes: $(ls -m "$DEV/dri" 2>/dev/null || echo '(none)')"
 shopt -s nullglob
-for status in /sys/class/drm/card*-*/status; do
+for status in "$SYS_DRM"/card*-*/status; do
     log "connector $(basename "$(dirname "$status")"): $(cat "$status")"
 done
 shopt -u nullglob
-log "NVIDIA nodes: $(ls -m /dev/nvidia* 2>/dev/null || echo '(none)')"
+log "NVIDIA nodes: $(ls -m "$DEV"/nvidia* 2>/dev/null || echo '(none)')"
 
 nvidia_drv=""
-if [ -e /dev/nvidiactl ] || [ -e /dev/nvidia0 ]; then
-    log "searching /usr/lib64 and /usr/lib for injected nvidia_drv.so"
-    nvidia_drv=$(find /usr/lib64 /usr/lib -name nvidia_drv.so 2>/dev/null | head -n1)
+if [ -e "$DEV/nvidiactl" ] || [ -e "$DEV/nvidia0" ]; then
+    log "searching ${LIB_DIRS// / and } for injected nvidia_drv.so"
+    # shellcheck disable=SC2086 # a list of directories
+    nvidia_drv=$(find $LIB_DIRS -name nvidia_drv.so 2>/dev/null | head -n1)
     log "nvidia_drv.so: ${nvidia_drv:-NOT FOUND}"
-    glxserver=$(find /usr/lib64 /usr/lib -name 'libglxserver_nvidia.so*' 2>/dev/null | head -n1)
+    # shellcheck disable=SC2086
+    glxserver=$(find $LIB_DIRS -name 'libglxserver_nvidia.so*' 2>/dev/null | head -n1)
     log "libglxserver_nvidia: ${glxserver:-NOT FOUND}"
     if [ -z "$nvidia_drv" ]; then
         log "warning: NVIDIA device nodes present but no nvidia_drv.so was injected;"
@@ -66,17 +77,17 @@ EOF
 fi
 
 card=""
-for status in /sys/class/drm/card*-*/status; do
+for status in "$SYS_DRM"/card*-*/status; do
     [ -e "$status" ] || continue
     if [ "$(cat "$status")" = "connected" ]; then
         card=$(basename "$(dirname "$status")")
-        card=/dev/dri/${card%%-*}
+        card=$DEV/dri/${card%%-*}
         log "first connected connector belongs to $card"
         break
     fi
 done
 if [ -z "$card" ]; then
-    card=/dev/dri/card0
+    card=$DEV/dri/card0
     log "no connected connector found in sysfs; defaulting to $card"
 fi
 
