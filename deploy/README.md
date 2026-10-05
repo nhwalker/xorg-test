@@ -418,6 +418,14 @@ sshd itself: the unit `Wants=sshd.service` (started each boot while the
 desktop is deployed), but whether sshd is *enabled* on the host stays the
 admin's/provisioning's call.
 
+Turning it on while the desktop runs: `systemctl start
+desktop-host-shell.service` (what the menu entry's failure screen says to
+run; `restart` rotates a key the unit already made this boot) makes a fresh
+key and hands it to the running desktop as well (`podman exec` of the
+image's `host-shell-setup.sh`), so the next Host Terminal works without
+restarting the desktop. At boot the unit runs before the desktop and has
+nothing to hand over.
+
 ## Input and audio hotplug, and KVM switches
 
 `Volume=/dev/input:/dev/input` and `Volume=/dev/snd:/dev/snd` give the

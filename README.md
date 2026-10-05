@@ -823,9 +823,10 @@ What that sets up:
 
 - a per-boot ed25519 keypair in `/etc/desktop-container/` — **root-only
   on the host** (no non-root host user can read it) and mounted read-only
-  into the container, where a boot script installs a `desktop`-owned copy
+  into the container, where a script installs a `desktop`-owned copy
   and generates the `ssh host` client config (loopback, fixed user,
-  `NoHostAuthenticationForLocalhost`);
+  `NoHostAuthenticationForLocalhost`) at every container start, and again
+  when the host makes a key while the desktop runs;
 - a restricted `authorized_keys` entry for `desktop-shell`, root-owned under
   `/etc/ssh/authorized_keys.d` (not in the account's home):
   `from="127.0.0.1,::1"`, no port/agent/X11 forwarding;
