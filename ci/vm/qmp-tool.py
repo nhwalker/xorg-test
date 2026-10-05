@@ -11,12 +11,6 @@
       One PNG screendump (EV-SHOT); with DEVICE and HEAD, of that head of
       that display device (`vga0 1` is the virtio-vga's second output).
 
-  qmp-tool.py qmp SOCKET JSON
-      Send one QMP command (a JSON object with "execute" and, if any,
-      "arguments") and print QEMU's reply as JSON, an error reply included,
-      so a refusal can be kept as evidence. Exits 1 when the reply is an
-      error.
-
   qmp-tool.py video SOCKET DIR [FPS]
       Screendump the display into DIR/frame-NNNN.png at FPS (default 2)
       until SIGTERM or SIGINT, with DIR/index.txt naming each frame and its
@@ -76,12 +70,6 @@ def hmp(sock, command):
     return 1 if out.lstrip().startswith("Error") else 0
 
 
-def qmp(sock, command):
-    reply = Qmp(sock).raw(json.loads(command))
-    print(json.dumps(reply))
-    return 1 if "error" in reply else 0
-
-
 def shot(sock, filename, device=None, head=None):
     args = {"filename": os.path.abspath(filename), "format": "png"}
     if device:
@@ -117,8 +105,6 @@ def video(sock, out_dir, fps):
 def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "hmp":
         return hmp(sys.argv[2], sys.argv[3])
-    if len(sys.argv) >= 4 and sys.argv[1] == "qmp":
-        return qmp(sys.argv[2], sys.argv[3])
     if len(sys.argv) >= 4 and sys.argv[1] == "shot":
         return shot(sys.argv[2], sys.argv[3], *sys.argv[4:6])
     if len(sys.argv) >= 4 and sys.argv[1] == "video":

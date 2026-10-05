@@ -1094,6 +1094,13 @@ log "input routing: keys sent to the display reach the keyboard bound to it"
 # display=vga0, the USB keyboard is bound to the virtio-vga's console, and the
 # key events sent to that console go to it alone: `xinput test` on its own X
 # device sees them while the sink xterm reads the text.
+#
+# The events name the display (vga0, head 0), never the keyboard. QMP's
+# device is a display device, and this QEMU (8.2.2) aborts on a lookup that
+# matches no display head: the search reaches a text console without a
+# "device" property and dies on error_abort ("Property
+# 'qemu-fixed-text-console.device' not found"). Run 37318468363 lost its VM
+# that way, to an input-send-event naming kvmkbd.
 ev_begin S3.9.5 "A hot-added keyboard delivers keystrokes" T3
 kb_n=$(gq desk xinput list 2>/dev/null | xi_names | grep -cxF "QEMU QEMU USB Keyboard" || true)
 ev_qemu device-del "EV-QEMU: device_del kvmkbd, to bring it back bound to the display, and QEMU's reply (empty: accepted)" \
@@ -1110,13 +1117,6 @@ done
 ev_save xinput "EV-STATE: xinput list with the bound keyboard back" gq desk xinput list >/dev/null || true
 [ -n "$kid" ] || fail "xinput never listed 'QEMU QEMU USB Keyboard' after it was re-added bound to vga0"
 ev_note "the bound keyboard's X device: id $kid"
-# QMP takes a display as the event's device, never the keyboard itself.
-refusal=$(ev_save qmp-refusal "EV-QEMU: input-send-event naming the keyboard (kvmkbd) as its device, and QEMU's reply" \
-    python3 qmp-tool.py qmp "$QMP" '{"execute":"input-send-event","arguments":{"device":"kvmkbd","events":[{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"shift"}}},{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"shift"}}}]}}') \
-    && refused=no || refused=yes
-[ "$refused" = yes ] && grep -q 'not bound to a QemuConsole' <<<"$refusal" \
-    || fail "QEMU did not refuse an input-send-event naming the keyboard as its device: $(echo $refusal)"
-ev_pass "QEMU refuses the keyboard as an event's device: $(grep -o '"desc": "[^"]*"' <<<"$refusal")"
 gq xi-test-start "$kid" >/dev/null || fail "could not start xinput test on id $kid"
 sleep 1
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
