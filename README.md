@@ -996,13 +996,15 @@ the container" and "reached the process that needs it" have disagreed
 before.
 
 **And the rlimit alone is still not enough.** With the hard limit at 95,
-`module-rt` *still* went to RTKit and settled for priority 1: when PipeWire is
-built with D-Bus support it prefers RTKit rather than falling back to it only
-when direct scheduling fails. So the Containerfile patches `module-rt`'s stock
-args with `rlimits.enabled = true`, `rtkit.enabled = false` and
-`rtportal.enabled = false`, for the daemon and for RT clients. (A `conf.d`
-drop-in does *not* override module args — one was tried, and `module-rt` went
-on querying RTKit regardless.)
+`module-rt` *still* went to RTKit and settled for priority 1: built with D-Bus
+support, it turns to RTKit as soon as either direct scheduling or its nice
+level cannot be had (upstream `module-rt.c`, 1.4.11). So the Containerfile
+patches `module-rt`'s stock args with `rlimits.enabled = true`,
+`rtkit.enabled = false` and `rtportal.enabled = false`: in `pipewire.conf` for
+the daemon, and in `pipewire-pulse.conf` and `client.conf` for its clients.
+PipeWire 1.4 has no `client-rt.conf`, and a file missing from that list fails
+the build. (A `conf.d` drop-in does *not* override module args — one was
+tried, and `module-rt` went on querying RTKit regardless.)
 
 None of this is visible in any audio test: a non-realtime stream produces
 exactly the same tone at exactly the same frequency. Only the realtime

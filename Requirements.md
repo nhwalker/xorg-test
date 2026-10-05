@@ -241,9 +241,9 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T2 · Coverage: ❌ evidence not saved: the gate prints nothing on pass, so the patched block is never recorded; asserted by the build-time `grep -q` gate, outcome by S4.1.1.
 
 **S1.2.4 module-rt takes the rlimit path**
-- Requirement: `rlimits.enabled = true`, `rtportal.enabled = false`, `rtkit.enabled = false` appear exactly once in the `module-rt` block of `pipewire.conf` and `client-rt.conf`.
-- Acceptance: in both `pipewire.conf` and `client-rt.conf` (a missing file fails), the `module-rt` block holds each of the three settings exactly once (the build's gate counts only `rtkit.enabled`, over the whole file, and skips a missing file); runtime outcome S4.3.2.
-- Evidence: the two patched blocks (EV-CONFIG).
+- Requirement: `rlimits.enabled = true`, `rtportal.enabled = false`, `rtkit.enabled = false` appear exactly once in the `module-rt` block of `pipewire.conf` (the daemon), `pipewire-pulse.conf` and `client.conf` (its clients). PipeWire 1.4 ships no `client-rt.conf`.
+- Acceptance: in each of the three files (a missing file fails), the `module-rt` block holds each of the three settings exactly once (the build's gate counts only `rtkit.enabled`, over the whole file, and fails on a missing file); runtime outcome S4.3.2, for the daemon (no story checks a client's threads).
+- Evidence: the three patched blocks (EV-CONFIG).
 - Tier: T2 · Coverage: ❌ evidence not saved: the patched blocks are printed only when the gate fails; asserted by the build's "exactly once" gate, outcome by `guest:verify_privileges`.
 
 **S1.2.5 pipewire-pulse export drop-in installed**
