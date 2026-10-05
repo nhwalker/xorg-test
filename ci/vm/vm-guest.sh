@@ -1316,7 +1316,7 @@ verify_pod_identity() {
     fi
     ev_pass "none reports pid=0"
     pids=$(echo "$clients" | sed -n 's/.* pid=//p' | paste -sd, -)
-    ev_save client-processes "EV-STATE: ps -p <every listed pid> -o pid,user,comm,cgroup on the host: each pid is a live process (the pod's cgroup shows which belong to pods)" \
+    ev_save client-processes "EV-STATE: ps -p <every listed pid> -o pid,user,comm,cgroup on the host: the listed pids as host processes, the pods' by their kubepods cgroup (the newest pid is usually the listing tool itself, gone by the time ps runs)" \
         ps -p "$pids" -o pid,user,comm,cgroup >/dev/null || true
     ev_end
 

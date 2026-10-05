@@ -106,7 +106,8 @@ ev_audio_start() { # <moment> <hz>
 ev_audio_stop() { # <what> <min seconds> <min peak> <hz>
     audio_capture_stop
     if [ -s "$EV_DIR/$EV_WAV" ]; then ev_attach "$EV_WAV" "$1"; else ev_note "no capture was written for: $1"; fi
-    ev_audio_check "${EV_WAV%.wav}" "$EV_WAV" "$2" "$3" "$4"
+    local moment=${EV_WAV%.wav}
+    ev_audio_check "${moment#*-}" "$EV_WAV" "$2" "$3" "$4"
 }
 
 # EV-AUDIO's verdict and picture for a WAV already in the open story:
@@ -288,12 +289,15 @@ assert_same() { # $1: full capture; $2: region capture; $3: WxH+X+Y
 # the four RMSE scores: upright, flipped, mirrored, rotated 180 degrees. (Not
 # printed: called as $(...), its fail() would end only the subshell.)
 #
-# Scored by margin, not by an absolute threshold: QEMU composites the pointer
-# cursor, which GetImage never returns, so the upright comparison is close to
-# but not exactly zero. What must hold is that it beats every flipped,
-# mirrored and rotated variant by a wide margin (S7.5.6). A missing reference
-# or one of another size fails: it used to skip with a warning, which let the
-# check pass without ever running.
+# Scored by margin, not by demanding identity: a pointer drawn into one
+# capture and not the other, or any pixel the emulator and X disagree on,
+# would fail an exact comparison without the capture being wrong. What must
+# hold is that the upright comparison beats every flipped, mirrored and
+# rotated variant by a wide margin (S7.5.6). On the e2e VM the two are in
+# fact identical (RMSE 0): virtio-vga's pointer is a hardware cursor, which
+# neither capture includes. A missing reference or one of another size
+# fails: it used to skip with a warning, which let the check pass without
+# ever running.
 orientation_scores() { # $1: capture; $2: reference screendump
     local ref="$2" cap_geom ref_geom
     [ -s "$ref" ] || fail "no reference screendump at $ref to cross-check the capture against"
@@ -886,7 +890,7 @@ for f in full full-stdout region tl straddle odd hw; do
     ev_attach "${SS[$f]}" "EV-SHOT-CLIENT: $(ss_what "$f")"
     SS[$f]=$EV_DIR/${SS[$f]}
 done
-ev_copy "$ART/screenshot-reference.png" screenshot-reference "EV-SHOT: QEMU's own screendump of the same moment, the independent view the capture is scored against (it also shows the pointer, which a capture does not)"
+ev_copy "$ART/screenshot-reference.png" screenshot-reference "EV-SHOT: QEMU's own screendump of the same moment, the independent view the capture is scored against"
 SS_GEOM=$(cat "$ART/geometry.txt")
 rm -f "$ART/geometry.txt"
 SS_W=${SS_GEOM%x*}
@@ -934,7 +938,7 @@ EV_SIDE=
 
 ev_begin S7.5.6 "A client's capture matches what the operator sees" T3
 ev_copy "${SS[full]}" client-capture "EV-SHOT-CLIENT: the lean client pod's capture of the display, the test pattern up"
-ev_copy "$ART/screenshot-reference.png" qemu-screendump "EV-SHOT: QEMU's screendump of the same moment: what the operator sees (with the pointer, which the capture lacks)"
+ev_copy "$ART/screenshot-reference.png" qemu-screendump "EV-SHOT: QEMU's screendump of the same moment: what the operator sees"
 ev_text orientation-scores "the four RMSE scores (the same cross-check S7.4.1 records)" "$ss_scores"
 orientation_ok "$ss_s0" "$ss_s1" "$ss_s2" "$ss_s3" \
     || fail "the client's capture is no closer to the operator's view than a flipped version of it"
@@ -957,7 +961,7 @@ guest_ev "$GUEST_EV" verify-concurrency \
          2>&1 | tee "$ART/verify-concurrency-fail.log" || true; fail "concurrency check failed"; }
 EV_SIDE=h-
 ev_begin S7.3.5 "Concurrency" T3
-ev_shot concurrent-clients "EV-SHOT: the three pods' xterms, titled x11-client-a, -b and -c, one above the other on the right of the screen, each its pod's live X connection; bottom left, pod a's second xterm (hold-a), if it has not exited yet"
+ev_shot concurrent-clients "EV-SHOT: the three pods' xterms one above the other on the right of the screen, each title bar naming its pod (x11-client-a, -b, -c), each its pod's live X connection; bottom left, pod a's second xterm (the hold), if it has not exited yet"
 ev_end
 EV_SIDE=
 
