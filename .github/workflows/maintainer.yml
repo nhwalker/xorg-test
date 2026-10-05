@@ -54,8 +54,10 @@ on:
       - deploy/HOST-REQUIRES.md
       - ci/doc-blocks.py
       - ci/vm/maint-*.sh
-      # maint-session's menu steps (--maint)
+      # maint-session's menu steps (--maint), and the terminal the
+      # documented commands run at
       - ci/vm/operator-e2e.py
+      - ci/vm/pty-answer.py
       - .github/workflows/maintainer.yml
 permissions:
   contents: read

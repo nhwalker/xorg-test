@@ -131,9 +131,11 @@ mt_packages() {
         || fail "deploy/HOST-REQUIRES.md's \"Every host\" block is no longer one dnf install: $raw"
     ev_note "the block's one command, its continuation joined: $line"
     # dnf asks before it installs anything, and again before it trusts a
-    # repository key it has not seen. A maintainer answers y; so does this.
-    out=$(ev_save dnf-documented "EV-PROCEDURE: the block's command, run unmodified as root in the repository, each of dnf's questions answered y: its transcript and exit status" \
-        sh -c "yes | $line") || rc=$?
+    # repository key it has not seen. A maintainer answers y at a terminal;
+    # so does this (pty-answer.py: without a terminal, dnf refuses the key
+    # outright, which a piped `yes` cannot answer).
+    out=$(ev_save dnf-documented "EV-PROCEDURE: the block's command, run unmodified as root in the repository, at a terminal (ci/vm/pty-answer.py), each of dnf's questions answered y: its transcript and exit status" \
+        python3 ci/vm/pty-answer.py "$line") || rc=$?
     [ "$rc" = 0 ] || fail "the documented package line exited $rc: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
     ev_pass "the documented line, run as written, exited 0"
     pkgs=$(sed 's/^dnf install //' <<<"$line" | tr ' ' '\n' | grep -v '^-' | grep . | paste -sd' ')
