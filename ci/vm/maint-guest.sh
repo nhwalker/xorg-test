@@ -1244,6 +1244,371 @@ mt_lf_image() { # <the built image's id>
     ev_end
 }
 
+# --- F10.5: documented faults, staged on a working host -----------------------------
+# Each fault is one README.md "Troubleshooting" entry. Entries are prose, so
+# the entry is quoted into the evidence and the commands it gives are its
+# inline code spans, each run as written (ci/doc-blocks.py --entry --spans).
+# Staging and restoring are the harness's, and say so.
+mt_entry() { # <lead>: quote the entry
+    local text
+    text=$(python3 ci/doc-blocks.py README.md Troubleshooting --entry "$1") \
+        || fail "README.md's Troubleshooting has no entry starting '$1': $text"
+    ev_text entry "EV-PROCEDURE: README.md \"Troubleshooting\", the entry for this fault, quoted as this run read it" "$text"
+}
+mt_span() { # <lead> <ERE>: the entry's inline command matching it, as written
+    local s
+    s=$(python3 ci/doc-blocks.py README.md Troubleshooting --entry "$1" --spans | grep -E -m1 -- "$2") \
+        || fail "README.md's '$1' entry no longer gives a command matching /$2/"
+    printf '%s\n' "$s"
+}
+# The first stops F10.5 names, in order.
+mt_first_stops() { # <moment>
+    ev_save "first-stop-preflight-$1" "EV-PROCEDURE: the first stop, desktop-preflight ($1): its report and exit status" \
+        desktop-preflight >/dev/null || true
+    mt_put "$EV_STORY-preflight-$1" "$EV_LAST"
+    ev_save "first-stop-log-$1" "EV-PROCEDURE: the second, podman logs desktop | grep -E 'preflight:|postmortem:' ($1)" \
+        sh -c "podman logs desktop 2>&1 | grep -E 'preflight:|postmortem:'" >/dev/null || true
+    mt_put "$EV_STORY-log-$1" "$EV_LAST"
+}
+# The common set's "after" for a remedy that must not restart anything: the
+# same pids as before, said either way (EV-PIDS).
+mt_after_kept() { # <story> <moment before> <moment after>
+    local since c a b moved=""
+    mt_begin "$1"
+    since=$(mt_get "since-$1")
+    desk_back
+    mt_pids "$3" "after the remedy"
+    for c in ${S737_COMMS//,/ } container; do
+        a=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$1-$2")
+        b=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$1-$3")
+        [ "$a" = "$b" ] || moved="$moved $c ($a -> $b)"
+    done
+    if [ -z "$moved" ]; then
+        ev_pass "nothing restarted: every desktop process ($S737_COMMS) and the container are the ones from before the fault"
+    else
+        ev_fail "restarted along the way:$moved"
+    fi
+    mt_no_getty "$since" "between the fault and now"
+    mt_state "$3" "after the remedy"
+    mt_state_diff "$2" "$3" "the fault and its remedy"
+    mt_logs "$since" "from the fault to its remedy"
+    ev_end
+}
+
+# S10.5.1: a host process holds DRM master.
+MT_DRM_LEAD='Xorg: "cannot become DRM master"'
+mt_drm_stage() {
+    mt_begin S10.5.1
+    mt_entry "$MT_DRM_LEAD"
+    ev_save stop "EV-PROCEDURE: harness-only staging: systemctl stop desktop.service" \
+        systemctl stop desktop.service >/dev/null || fail "could not stop the desktop"
+    ev_save holder "EV-PROCEDURE: harness-only staging: a root process opens /dev/dri/card0 first and keeps it, S5.3.3's sleep, as a transient unit (systemd-run --unit=mt-drm-holder sh -c 'exec sleep 3600 < /dev/dri/card0')" \
+        systemd-run --unit=mt-drm-holder --collect sh -c 'exec sleep 3600 < /dev/dri/card0' >/dev/null \
+        || fail "could not start the holder"
+    sleep 1
+    mt_put drm-holder "$(systemctl show -p MainPID --value mt-drm-holder.service)"
+    ev_save fuser-staged "EV-PIDS: fuser -v /dev/dri/card0, the holder in place (pid $(mt_get drm-holder))" \
+        sh -c 'fuser -v /dev/dri/card0 2>&1; true' >/dev/null || true
+    mt_put since-start "$(date +%s)"
+    ev_save start "EV-PROCEDURE: harness-only staging: systemctl start desktop.service, the holder in place" \
+        systemctl start desktop.service >/dev/null || ev_note "systemctl start desktop.service exited nonzero"
+    ev_end
+}
+mt_drm_diagnose() {
+    local holder out pf fu line
+    mt_begin S10.5.1
+    holder=$(mt_get drm-holder)
+    ev_save status-desktop "EV-STATE: systemctl status desktop.service, the holder in place" \
+        systemctl --no-pager status desktop.service >/dev/null || true
+    mt_first_stops held
+    pf=$(mt_saved "$(mt_get S10.5.1-preflight-held)")
+    if grep -q 'FAIL: .*\/dev\/dri\/card0' <<<"$pf"; then
+        ev_pass "desktop-preflight FAILs on the held card: $(grep -m1 'FAIL: .*/dev/dri/card0' <<<"$pf" | sed 's/^host-preflight: //')"
+    else
+        ev_fail "desktop-preflight reports no FAIL on the held card; it says: $(grep -m1 -E 'DRM/VT|holder' <<<"$pf" | sed 's/^host-preflight: //')"
+    fi
+    out=$(mt_saved "$(mt_get S10.5.1-log-held)")
+    if grep -q 'postmortem: LIKELY CAUSE: another process holds DRM master' <<<"$out"; then
+        ev_pass "the postmortem names the cause: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+    else
+        ev_fail "the desktop's log has no postmortem naming another DRM master"
+    fi
+    out=$(ev_save seat-prep-status "EV-STATE: systemctl status desktop-seat-prep, the holder in place" \
+        systemctl --no-pager status desktop-seat-prep.service) || true
+    if grep -Eq "ERROR: devices still held.*\\(([0-9 ]* )?$holder( [0-9 ]*)?\\)" <<<"$out"; then
+        ev_pass "systemctl status desktop-seat-prep shows its ERROR naming pid $holder"
+    else
+        ev_fail "systemctl status desktop-seat-prep shows no ERROR naming pid $holder: $(grep -m1 -E 'Active:' <<<"$out" | sed 's/^ *//')"
+    fi
+    line=$(mt_span "$MT_DRM_LEAD" '^fuser ')
+    fu=$(ev_save fuser "EV-PROCEDURE: \`$line\`, as the entry writes it, on the host" sh -c "$line 2>&1; true") || true
+    if grep -Eq "(^|[^0-9])$holder([^0-9]|\$)" <<<"$fu"; then
+        ev_pass "\`$line\` names the holder, pid $holder: $(grep -m1 -E "(^|[^0-9])$holder([^0-9]|\$)" <<<"$fu" | sed 's/  */ /g')"
+    else
+        ev_fail "\`$line\` does not name the holder, pid $holder"
+    fi
+    ev_end
+}
+mt_drm_remedy() {
+    local holder
+    mt_begin S10.5.1
+    holder=$(mt_get drm-holder)
+    mt_put since-remedy "$(date +%s)"
+    ev_save kill "EV-PROCEDURE: the holder fuser named, killed: kill $holder" kill "$holder" >/dev/null || fail "could not kill pid $holder"
+    ev_end
+}
+mt_drm_after() {
+    local out n
+    mt_begin S10.5.1
+    out=$(ev_save remedy-log "EV-LOG-DESKTOP: podman logs desktop since the kill: the session's next start" \
+        podman logs --since "$(mt_get since-remedy)" desktop) || true
+    n=$(grep -c 'session exited' <<<"$out" || true)
+    if [ "$n" -le 1 ]; then
+        ev_pass "the desktop came back on the first session start after the kill: $n session end logged since (the attempt under way when the holder went)"
+    else
+        ev_fail "$n session ends were logged after the kill before the desktop came back: more than one session-restart cycle"
+    fi
+    ev_save status-after "EV-STATE: systemctl status desktop-seat-prep desktop after the kill, no other command run" \
+        systemctl --no-pager status desktop-seat-prep.service desktop.service >/dev/null || true
+    systemctl reset-failed mt-drm-holder.service 2>/dev/null || true
+    ev_end
+}
+
+# S10.5.2: the session's input devices attached to another seat.
+MT_SEAT_LEAD='No input devices'
+mt_input_devs() { # every input device with an event node: QMP's events reach X through whichever QEMU routes them to
+    local d
+    for d in /sys/class/input/input*; do
+        if ls -d "$d"/event* >/dev/null 2>&1; then readlink -f "$d"; fi
+    done
+}
+mt_input_events() { local d e; while read -r d; do e=$(ls -d "$d"/event* | head -n 1); echo "/dev/input/${e##*/}"; done < "$MT/seat-devs"; }
+mt_seat_stage() {
+    local d n=0
+    mt_begin S10.5.2
+    mt_entry "$MT_SEAT_LEAD"
+    mt_input_devs > "$MT/seat-devs"
+    [ -s "$MT/seat-devs" ] || fail "no input devices with event nodes"
+    ev_save devices "EV-STATE: the input devices staged: every one with an event node, name and node (QMP's typing and clicking reach X through whichever of them QEMU routes it to)" \
+        sh -c 'while read -r d; do printf "%s %s %s\n" "$d" "$(cat "$d/name")" "$(ls -d "$d"/event* | head -n 1)"; done < '"$MT"'/seat-devs' >/dev/null || true
+    mt_input_events > "$MT/seat-events"
+    ev_save udev-before "EV-STATE: udevadm info -q property of each staged event node, before" \
+        sh -c 'for e in $(cat '"$MT"'/seat-events); do echo "== $e"; udevadm info -q property -n "$e"; done' >/dev/null || true
+    mt_put S10.5.2-udev-before "$EV_LAST"
+    mt_put since-stage "$(date +%s)"
+    while read -r d; do
+        n=$((n + 1))
+        loginctl attach seat1 "$d" || fail "loginctl attach seat1 $d failed"
+    done < "$MT/seat-devs"
+    udevadm settle || true
+    ev_note "harness-only staging: loginctl attach seat1 for each of the $n devices (S3.8.6's staging, applied to every input device)"
+    ev_save rules "EV-CONFIG: the rules loginctl attach wrote" sh -c 'cat /etc/udev/rules.d/72-seat-*.rules' >/dev/null || true
+    ev_end
+}
+# Harness-only, after a remedy that did not bring input back: what it should
+# have done, so the journey's later stories have a keyboard.
+mt_seat_restore() {
+    mt_begin S10.5.2
+    ev_save restore "EV-PROCEDURE: harness-only restore: rm -f /etc/udev/rules.d/72-seat-*.rules, then udev reloaded and re-triggered" \
+        sh -c 'rm -f /etc/udev/rules.d/72-seat-*.rules; udevadm control --reload; udevadm trigger; udevadm settle' >/dev/null || true
+    ev_end
+}
+mt_seat_diagnose() {
+    local line e out rc=0 bad=""
+    mt_begin S10.5.2
+    mt_first_stops seat
+    line=$(mt_span "$MT_SEAT_LEAD" '^udevadm info ')
+    ev_save check-written "EV-PROCEDURE: \`$line\`, as the entry writes it" sh -c "$line; true" >/dev/null || true
+    while read -r e; do
+        out=$(ev_save "check-${e##*/}" "EV-PROCEDURE: \`${line/\/dev\/input\/event0/$e}\`: the entry's check against a staged node" \
+            sh -c "${line/\/dev\/input\/event0/$e}; true") || true
+        grep -qi 'ID_SEAT=seat1' <<<"$out" || bad="$bad $e"
+    done < "$MT/seat-events"
+    if [ -z "$bad" ]; then
+        ev_pass "the entry's check, against each staged node, shows the foreign seat: ID_SEAT=seat1"
+    else
+        ev_fail "the entry's check does not show ID_SEAT=seat1 for:$bad"
+    fi
+    line=$(mt_span "$MT_SEAT_LEAD" '^systemctl restart desktop-seat-prep')
+    mt_put since-remedy "$(date +%s)"
+    ev_save remedy "EV-PROCEDURE: \`$line\`, the entry's remedy, run verbatim" sh -c "$line" >/dev/null || rc=$?
+    if [ "$rc" = 0 ]; then ev_pass "\`$line\` exited 0"; else ev_fail "\`$line\` exited $rc"; fi
+    udevadm settle || true
+    sleep 3
+    ev_save udev-after "EV-STATE: udevadm info -q property of each staged event node, after the remedy" \
+        sh -c 'for e in $(cat '"$MT"'/seat-events); do echo "== $e"; udevadm info -q property -n "$e"; done' >/dev/null || true
+    ev_diff udev "EV-DIFF: udevadm info of the staged nodes, staged (-) and after the remedy (+)" "$(mt_get S10.5.2-udev-before)" "$EV_LAST"
+    if grep -q 'ID_SEAT=seat1' "$EV_DIR/$EV_LAST"; then ev_fail "a staged node is still tagged ID_SEAT=seat1"; else ev_pass "no staged node is tagged for seat1 any more"; fi
+    ev_save xorg-lines "EV-LOG-XORG: the Xorg log's device removal and addition lines" \
+        podman exec desktop grep -E 'config/udev: (Adding|removing) input device|Device removed|Adding input device' "$XORG_LOG" >/dev/null || true
+    ev_end
+}
+
+# S10.5.3: a client-facing directory relabelled; a confined client's display
+# loop fails and recovers.
+MT_SEL_LEAD='SELinux denials from a client container'
+MT_SELC=mt-selclient
+mt_sel_client() {
+    local i
+    mt_begin S10.5.3
+    mt_entry "$MT_SEL_LEAD"
+    podman rm -f "$MT_SELC" >/dev/null 2>&1 || true
+    ev_save client "EV-PROCEDURE: the client: a confined container (container_t) given the display device, opening the display every 2 s (xdpyinfo) and logging each result; a podman client stands in for a pod (F7.7's common set)" \
+        podman run -d --name "$MT_SELC" --device desktop.local/display=all localhost/desktop-container:latest \
+        sh -c 'while :; do if xdpyinfo >/dev/null 2>&1; then echo "$(date -u +%H:%M:%S) ok"; else echo "$(date -u +%H:%M:%S) FAIL"; fi; sleep 2; done' >/dev/null \
+        || fail "the client did not start"
+    for i in $(seq 15); do podman logs "$MT_SELC" 2>/dev/null | grep -q ' ok$' && break; sleep 1; done
+    podman logs "$MT_SELC" 2>/dev/null | grep -q ' ok$' || fail "the client's loop never opened the display"
+    ev_save client-id "EV-PIDS: the client: id, pid, restart count, started" \
+        podman inspect --format '{{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}} label={{.ProcessLabel}}' "$MT_SELC" >/dev/null || true
+    mt_put selc "$(podman inspect --format '{{.Id}}' "$MT_SELC")"
+    ev_pass "the client's loop opens the display"
+    ev_end
+}
+mt_sel_labels() { # <moment> <when>
+    ev_save "labels-$1" "EV-STATE: ls -Zd /tmp/.X11-unix and ls -Z /tmp/.X11-unix/X0 ($2)" \
+        sh -c 'ls -Zd /tmp/.X11-unix; ls -Z /tmp/.X11-unix/X0' >/dev/null || true
+}
+mt_sel_break() {
+    local i
+    mt_begin S10.5.3
+    mt_sel_labels before "before the relabel"
+    mt_put since-break "$(date +%s)"
+    ev_save relabel "EV-PROCEDURE: harness-only staging: chcon -R -t tmp_t /tmp/.X11-unix, a host type the policy denies container_t" \
+        chcon -R -t tmp_t /tmp/.X11-unix >/dev/null || fail "chcon failed"
+    for i in $(seq 15); do podman logs --since "$(mt_get since-break)" "$MT_SELC" 2>/dev/null | grep -q ' FAIL$' && break; sleep 1; done
+    mt_sel_labels during "relabelled"
+    if podman logs --since "$(mt_get since-break)" "$MT_SELC" 2>/dev/null | grep -q ' FAIL$'; then
+        ev_pass "the client's loop fails with the directory relabelled"
+    else
+        ev_fail "the client's loop kept opening the display with /tmp/.X11-unix relabelled tmp_t"
+    fi
+    ev_save avc "EV-STATE: ausearch -m avc -ts recent, raw: the denial" sh -c 'ausearch -m avc -ts recent 2>&1; true' >/dev/null || true
+    grep -q 'avc: *denied' "$EV_DIR/$EV_LAST" && ev_pass "an AVC denial is logged" || ev_fail "no AVC denial is logged"
+    ev_end
+}
+mt_sel_diagnose() {
+    local line out rc i xorg0 xorg1
+    mt_begin S10.5.3
+    mt_first_stops relabelled
+    for line in "$(mt_span "$MT_SEL_LEAD" '^systemctl status desktop-selinux')" \
+                "$(mt_span "$MT_SEL_LEAD" '^ls -Zd ')" \
+                "$(mt_span "$MT_SEL_LEAD" '^ausearch ')"; do
+        rc=0
+        out=$(ev_save "check-${line%% *}" "EV-PROCEDURE: \`$line\`, as the entry writes it: its output and exit status" sh -c "$line") || rc=$?
+        case "$line" in
+            ls\ *) grep -q 'tmp_t.*/tmp/\.X11-unix' <<<"$out" && ev_pass "\`$line\` shows /tmp/.X11-unix's wrong label, tmp_t" \
+                       || ev_fail "\`$line\` does not show the wrong label" ;;
+            ausearch\ *) if [ "$rc" = 0 ] && grep -qi 'denied\|was caused by' <<<"$out"; then ev_pass "\`$line\` names the denial"; else ev_fail "\`$line\` exited $rc without naming the denial: $(head -n 2 <<<"$out" | tr '\n' ' ')"; fi ;;
+        esac
+    done
+    xorg0=$(podman exec desktop pgrep -u desktop -x Xorg || true)
+    line=$(mt_span "$MT_SEL_LEAD" '^systemctl restart desktop-selinux')
+    mt_put since-remedy "$(date +%s)"
+    rc=0
+    ev_save remedy "EV-PROCEDURE: \`$line\`, the entry's remedy, run verbatim" sh -c "$line" >/dev/null || rc=$?
+    [ "$rc" = 0 ] && ev_pass "\`$line\` exited 0" || ev_fail "\`$line\` exited $rc"
+    for i in $(seq 15); do podman logs --since "$(mt_get since-remedy)" "$MT_SELC" 2>/dev/null | grep -q ' ok$' && break; sleep 1; done
+    mt_sel_labels after "after the remedy"
+    if podman logs --since "$(mt_get since-remedy)" "$MT_SELC" 2>/dev/null | grep -q ' ok$'; then
+        ev_pass "the client's loop opens the display again, the client never restarted"
+    else
+        ev_fail "the client's loop still fails after \`$line\`"
+    fi
+    out=$(podman inspect --format '{{.Id}} {{.RestartCount}}' "$MT_SELC" 2>/dev/null || true)
+    [ "$out" = "$(mt_get selc) 0" ] && ev_pass "the client is the same container, restart count 0" || ev_fail "the client is not the same container, or it restarted: $out"
+    xorg1=$(podman exec desktop pgrep -u desktop -x Xorg || true)
+    [ -n "$xorg0" ] && [ "$xorg0" = "$xorg1" ] && ev_pass "the X server is the same, pid $xorg0" || ev_fail "the X server changed: pid ${xorg0:-none} -> ${xorg1:-none}"
+    ev_save client-log "EV-LOG-CLIENT: the client's loop, every result with its time: the failure and the recovery" \
+        podman logs "$MT_SELC" >/dev/null || true
+    podman rm -f "$MT_SELC" >/dev/null 2>&1 || true
+    ev_note "the client removed"
+    ev_end
+}
+
+# S10.5.4: the session user's device group out of step with the host's.
+MT_GID_LEAD='Keyboard/mouse/GPU dead'
+MT_GID_FRESH=64999
+mt_gid_view() { # <moment> <when>
+    ev_save "gids-$1" "EV-STATE: getent group video, id desktop and ls -ln /dev/dri /dev/input in the container, and ls -ln /dev/dri on the host ($2)" \
+        sh -c 'echo "== container"; podman exec desktop getent group video; podman exec desktop id desktop; podman exec desktop ls -ln /dev/dri /dev/input; echo "== host"; ls -ln /dev/dri' >/dev/null || true
+}
+mt_gid_stage() { # <round>
+    local x
+    mt_begin S10.5.4
+    [ "$1" = b ] || mt_entry "$MT_GID_LEAD"
+    mt_gid_view "aligned-$1" "aligned, before the staging"
+    podman exec desktop getent group "$MT_GID_FRESH" >/dev/null && fail "gid $MT_GID_FRESH is in use in the container"
+    mt_put since-stage "$(date +%s)"
+    ev_save groupmod "EV-PROCEDURE: harness-only staging: groupmod -g $MT_GID_FRESH video in the container, the misalignment align-device-groups.sh exists to prevent" \
+        podman exec desktop groupmod -g "$MT_GID_FRESH" video >/dev/null || fail "groupmod failed"
+    x=$(podman exec desktop pgrep -u desktop -x Xorg || true)
+    ev_save kill-x "EV-PROCEDURE: harness-only staging: Xorg (pid ${x:-none}) killed, as the session user (container root holds no CAP_KILL)" \
+        podman exec -u desktop desktop pkill -x Xorg >/dev/null || ev_note "no Xorg to kill"
+    mt_gid_view "staged-$1" "staged"
+    ev_end
+}
+mt_gid_diagnose() {
+    local out
+    mt_begin S10.5.4
+    mt_first_stops staged
+    out=$(ev_save align-lines "EV-PROCEDURE: the entry's check, as it writes it: \`podman logs desktop\` for \`align-device-groups\` lines" \
+        sh -c 'podman logs desktop 2>&1 | grep align-device-groups') || true
+    out=$(mt_saved "$(mt_get S10.5.4-log-staged)")
+    if grep -q 'postmortem: LIKELY CAUSE: device group permissions' <<<"$out"; then
+        ev_pass "the postmortem names the cause: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+    else
+        ev_fail "the desktop's log has no postmortem naming device group permissions: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+    fi
+    out=$(ev_save named "EV-PROCEDURE: the commands the postmortem names, in the container: id desktop; ls -ln /dev/dri /dev/input" \
+        sh -c 'podman exec desktop id desktop; podman exec desktop ls -ln /dev/dri /dev/input') || true
+    if grep -q "$MT_GID_FRESH" <<<"$out" && ! grep -Eq "^c[^ ]+ +[0-9]+ +[0-9]+ +$MT_GID_FRESH " <<<"$out"; then
+        ev_pass "they show the mismatch: desktop's video group is $MT_GID_FRESH, and no device under /dev/dri or /dev/input has that group"
+    else
+        ev_fail "they do not show the mismatch"
+    fi
+    ev_end
+}
+mt_gid_check() { # <path>: the session after a recovery path
+    local u
+    mt_begin S10.5.4
+    desk_back
+    mt_gid_view "recovered-$1" "after path $1"
+    u=$(ev_save "xorg-user-$1" "EV-PIDS: ps -o user=,pid=,args= -C Xorg in the container (path $1)" podman exec desktop ps -o user=,pid=,args= -C Xorg) || true
+    case "$1" in
+        a) [ "$(awk 'NR == 1 {print $1}' <<<"$u")" = desktop ] && ev_pass "path A: the session is back, Xorg rootless (user desktop)" \
+               || ev_fail "path A: Xorg runs as $(awk 'NR == 1 {print $1}' <<<"$u")" ;;
+        b) [ "$(awk 'NR == 1 {print $1}' <<<"$u")" = root ] && ev_pass "path B: the escape hatch gives a session, Xorg as root" \
+               || ev_fail "path B: Xorg runs as '$(awk 'NR == 1 {print $1}' <<<"$u")', not root" ;;
+        final)
+            [ "$(awk 'NR == 1 {print $1}' <<<"$u")" = desktop ] && ev_pass "after the final restart Xorg is rootless again" \
+                || ev_fail "after the final restart Xorg runs as $(awk 'NR == 1 {print $1}' <<<"$u")"
+            ev_save xwrapper-final "EV-CONFIG: /etc/X11/Xwrapper.config in the container after the final restart" \
+                podman exec desktop cat /etc/X11/Xwrapper.config >/dev/null || true
+            if podman exec desktop cat /etc/X11/Xwrapper.config | cmp -s - image/xorg/Xwrapper.config; then
+                ev_pass "the shipped Xwrapper.config is back"
+            else
+                ev_fail "Xwrapper.config is not the shipped one (image/xorg/Xwrapper.config)"
+            fi ;;
+    esac
+    ev_end
+}
+mt_gid_hatch() {
+    local line x
+    mt_begin S10.5.4
+    line=$(mt_span "$MT_GID_LEAD" '^needs_root_rights')
+    ev_save xwrapper-before "EV-CONFIG: /etc/X11/Xwrapper.config in the running container, before the escape hatch" \
+        podman exec desktop cat /etc/X11/Xwrapper.config >/dev/null || true
+    ev_save hatch "EV-PROCEDURE: the entry's escape hatch, \`$line\` in /etc/X11/Xwrapper.config, applied in the running container (sed: the line replaced, or added)" \
+        podman exec desktop sh -c "if grep -q '^needs_root_rights' /etc/X11/Xwrapper.config; then sed -i 's/^needs_root_rights.*/$line/' /etc/X11/Xwrapper.config; else echo '$line' >> /etc/X11/Xwrapper.config; fi" >/dev/null \
+        || fail "the escape hatch could not be applied"
+    ev_save xwrapper-after "EV-CONFIG: /etc/X11/Xwrapper.config with the escape hatch" podman exec desktop cat /etc/X11/Xwrapper.config >/dev/null || true
+    x=$(podman exec desktop pgrep -x Xorg || true)
+    ev_save kill-x "EV-PROCEDURE: Xorg (pid ${x:-none, the session is between attempts}) killed, so the next session starts under the escape hatch" \
+        podman exec -u desktop desktop pkill -x Xorg >/dev/null || ev_note "no Xorg was running to kill"
+    ev_end
+}
+
 # --- F10.4: routine operations ---------------------------------------------------
 
 # The common set and the pids, before a step that changes the desktop.
@@ -1400,6 +1765,21 @@ maint() { # <step> [args]
         lf-mwmrc) mt_lf_mwmrc ;;
         lf-xdefaults) mt_lf_xdefaults "${2:?XTerm background, hex}" "${3:?Mwm menu background, hex}" ;;
         lf-image) mt_lf_image "${2:?the id of the image built}" ;;
+        drm-stage) mt_drm_stage ;;
+        drm-diagnose) mt_drm_diagnose ;;
+        drm-remedy) mt_drm_remedy ;;
+        drm-after) mt_drm_after ;;
+        seat-stage) mt_seat_stage ;;
+        seat-diagnose) mt_seat_diagnose ;;
+        seat-restore) mt_seat_restore ;;
+        sel-client) mt_sel_client ;;
+        sel-break) mt_sel_break ;;
+        sel-diagnose) mt_sel_diagnose ;;
+        gid-stage) mt_gid_stage "${2:?the round, a or b}" ;;
+        gid-diagnose) mt_gid_diagnose ;;
+        gid-hatch) mt_gid_hatch ;;
+        gid-check) mt_gid_check "${2:?a, b or final}" ;;
+        after-kept) mt_after_kept "${2:?story}" "${3:?moment before}" "${4:?moment after}" ;;
         before) mt_before "${2:?story}" "${3:?moment}" ;;
         after) mt_after "${2:?story}" "${3:?moment before}" "${4:?moment after}" ;;
         restart) mt_restart ;;

@@ -10,9 +10,17 @@ the maintainer journeys (Requirements.md E10) to run verbatim.
                                     blank lines dropped, a trailing "# ..."
                                     comment kept apart after a tab
 
-Exits 1, saying why, when the heading or the block is not there, so a
-document reorganised under a journey fails the journey rather than running
-something else.
+  doc-blocks.py FILE HEADING --entry LEAD [--spans]
+                                    the list entry under HEADING whose bold
+                                    lead starts with LEAD ("- **LEAD..."), as
+                                    one line; --spans: its inline code spans,
+                                    one per line (the commands a prose entry
+                                    such as README.md's "Troubleshooting"
+                                    gives)
+
+Exits 1, saying why, when the heading, the block or the entry is not there,
+so a document reorganised under a journey fails the journey rather than
+running something else.
 """
 import re
 import sys
@@ -45,6 +53,39 @@ def block(path, heading, n=1):
         if inside:
             cur.append(l)
     raise SystemExit(f"{path}: under {heading!r} there are {found} command blocks, not {n}")
+
+
+def section(path, heading):
+    """The lines under the first heading starting with HEADING, to the next
+    heading of the same or a higher level."""
+    lines = open(path, encoding="utf-8").read().split("\n")
+    for i, l in enumerate(lines):
+        m = re.match(r"^(#+)\s+(.*)$", l)
+        if m and m.group(2).startswith(heading):
+            level, out = len(m.group(1)), []
+            for l2 in lines[i + 1:]:
+                m2 = re.match(r"^(#+)\s", l2)
+                if m2 and len(m2.group(1)) <= level:
+                    break
+                out.append(l2)
+            return out
+    raise SystemExit(f"{path}: no heading starting {heading!r}")
+
+
+def entry(path, heading, lead):
+    """The list entry whose bold lead starts with LEAD, its lines joined."""
+    lines, out = section(path, heading), None
+    for l in lines:
+        if out is None:
+            if re.match(r"^- \*\*" + re.escape(lead), l):
+                out = [l[2:].strip()]
+            continue
+        if not l.strip() or re.match(r"^\s*- ", l) or l.startswith("#"):
+            break
+        out.append(l.strip())
+    if out is None:
+        raise SystemExit(f"{path}: under {heading!r} no entry starts **{lead}")
+    return " ".join(out)
 
 
 def commands(text_lines):
@@ -84,6 +125,10 @@ def main():
     if len(a) < 2:
         raise SystemExit(__doc__)
     path, heading = a[0], a[1]
+    if "--entry" in a:
+        text = entry(path, heading, a[a.index("--entry") + 1])
+        print("\n".join(re.findall(r"`([^`]+)`", text)) if "--spans" in a else text)
+        return
     n = int(a[2]) if len(a) > 2 and a[2].isdigit() else 1
     b = block(path, heading, n)
     print("\n".join(commands(b) if "--commands" in a else b))

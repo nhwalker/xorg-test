@@ -48,8 +48,8 @@ mt_is_desktop() { # <image>
 # the screen: nothing logs in to the guest meanwhile. Sets MT_BACK to the
 # first frame showing the desktop again and its UTC time.
 MT_BACK=""
-mt_wait_screen() { # <video dir> <seconds>
-    local end=$((SECONDS + $2)) n=0 m name t gone=0
+mt_wait_screen() { # <video dir> <seconds> [index lines to skip: the frames from before a moment]
+    local end=$((SECONDS + $2)) n=${3:-0} m name t gone=0
     MT_BACK=""
     while [ "$SECONDS" -lt "$end" ]; do
         m=$(cat "$1/index.txt" 2>/dev/null | wc -l)
@@ -85,7 +85,7 @@ mt_screen_check() { # <moment> <what>
 # --- typing and sound ------------------------------------------------------------
 # S3.8.1's probe: a sink xterm, a click into it and a word typed, all through
 # QEMU's own devices.
-mt_typing() { # <story> <word>
+mt_typing() { # <story> <word> [absent]: typed text lands; "absent", that it does not (a fault's symptom)
     local res qlog
     res=$(gq desk xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}')
     [ -n "$res" ] || return 1
@@ -98,7 +98,17 @@ mt_typing() { # <story> <word>
     sleep 2
     ev_shot typed "EV-SHOT: the sink xterm (title inputtest) right after the keystrokes"
     if vm_ssh "sudo repo/ci/vm/vm-guest.sh input-sink-check $2"; then
+        if [ "${3:-}" = absent ]; then
+            ev_fail "typed text still lands: the focused xterm's shell read '$2'"
+            mt_close
+            return 1
+        fi
         ev_pass "the focused xterm's shell read '$2', typed through QEMU's keyboard (S3.8.1)"
+        mt_close
+        return 0
+    fi
+    if [ "${3:-}" = absent ]; then
+        ev_pass "the symptom: the click and the keys of '$2' did not land, no shell read it"
         mt_close
         return 0
     fi
@@ -613,6 +623,144 @@ maint_session() {
     mt_look || true
 }
 
+# --- F10.5: documented faults, staged on a working host -----------------------------
+# The symptom at the screen: <seconds> after the fault, no desktop.
+mt_no_desktop() { # <story> <moment> <seconds>
+    local f
+    sleep "$3"
+    mt_open "$1"
+    f=$(ev_name "$2" png)
+    if python3 qmp-tool.py shot "$QMP" "$EV_DIR/$f" >/dev/null && [ -s "$EV_DIR/$f" ]; then
+        ev_attach "$f" "EV-SHOT: the screen $3 s after the fault: what the operator sees"
+        if mt_is_desktop "$EV_DIR/$f"; then
+            ev_fail "$3 s after the fault the desktop is still on the screen: the fault did not take"
+        else
+            ev_pass "the symptom: $3 s after the fault there is no desktop on the screen"
+        fi
+    else
+        ev_fail "no screendump of the symptom"
+    fi
+    mt_close
+}
+mt_shot() { # <story> <moment> <what>
+    mt_open "$1"
+    ev_shot "$2" "$3"
+    mt_close
+}
+
+mt_fault_drm() {
+    local vid n0 t0
+    log "S10.5.1: a host process holding DRM master"
+    mg before S10.5.1 running || { mt_failed S10.5.1 "could not record the state before the fault"; return 1; }
+    mt_open S10.5.1
+    ev_shot before "EV-SHOT: the screen before the fault"
+    EV_VID_FPS=1 ev_video_start drm
+    vid="$EV_DIR/$EV_VID"
+    mt_close
+    if ! mg drm-stage; then
+        mt_open S10.5.1
+        ev_video_stop "EV-VIDEO: the screen while the staging failed"
+        mt_failed S10.5.1 "the fault could not be staged"
+        return 1
+    fi
+    mt_no_desktop S10.5.1 symptom 30
+    mg drm-diagnose || mt_failed S10.5.1 "the documented first stops and checks could not run"
+    n0=$(wc -l < "$vid/index.txt" 2>/dev/null || echo 0)
+    t0=$(date +%s.%N)
+    mg drm-remedy || { mt_failed S10.5.1 "the holder could not be killed"; return 1; }
+    if mt_wait_screen "$vid" 60 "$n0"; then
+        sleep 2
+        mt_open S10.5.1
+        ev_video_stop "EV-VIDEO: the screen at 1 fps from before the fault until the desktop was back; index.txt gives each frame's UTC time"
+        ev_note "the desktop was back $(mt_elapsed "$t0") s after the kill, with no other command (${MT_BACK%% *} at ${MT_BACK#* })"
+        ev_pass "with the holder gone, the desktop came back by itself: no reboot, no service restart"
+        mt_screen_check recovered "EV-SHOT: the screen once the desktop was back" || ev_fail "the screen does not show the desktop"
+        mt_close
+    else
+        mt_open S10.5.1
+        ev_video_stop "EV-VIDEO: the screen at 1 fps from before the fault until 60 s after the kill: the desktop did not come back"
+        mt_failed S10.5.1 "60 s after the kill the desktop is not back on the screen"
+    fi
+    mg drm-after || true
+    mg after S10.5.1 running recovered || mt_failed S10.5.1 "the desktop came back other than whole"
+}
+
+mt_fault_seat() {
+    log "S10.5.2: the session's input devices attached to another seat"
+    mg before S10.5.2 running || { mt_failed S10.5.2 "could not record the state before the fault"; return 1; }
+    mt_shot S10.5.2 before "EV-SHOT: the screen before the fault"
+    mg seat-stage || { mt_failed S10.5.2 "the fault could not be staged"; mg seat-restore || true; return 1; }
+    mt_typing S10.5.2 seatgone absent || mt_failed S10.5.2 "typed text still landed with the devices on seat1: the fault did not take"
+    mg seat-diagnose || mt_failed S10.5.2 "the entry's check and remedy could not run"
+    if ! mt_typing S10.5.2 seatback; then
+        mt_failed S10.5.2 "typed text and a click do not land after the entry's remedy"
+        mg seat-restore || true
+    fi
+    mg after-kept S10.5.2 running recovered || mt_failed S10.5.2 "the state after the remedy could not be recorded"
+    mt_shot S10.5.2 after "EV-SHOT: the screen after the remedy"
+}
+
+mt_fault_selinux() {
+    log "S10.5.3: a client-facing directory relabelled under a running client"
+    mg before S10.5.3 running || { mt_failed S10.5.3 "could not record the state before the fault"; return 1; }
+    mt_shot S10.5.3 before "EV-SHOT: the screen before the fault"
+    mg sel-client || { mt_failed S10.5.3 "the client could not be started"; return 1; }
+    mg sel-break || mt_failed S10.5.3 "the relabel could not be staged"
+    mg sel-diagnose || mt_failed S10.5.3 "the entry's checks and remedy could not run"
+    mg after-kept S10.5.3 running recovered || mt_failed S10.5.3 "the state after the remedy could not be recorded"
+    mt_shot S10.5.3 after "EV-SHOT: the screen after the remedy: the desktop as it was"
+}
+
+mt_fault_gid() {
+    local vid t0
+    log "S10.5.4: the session user's device group out of step with the host's"
+    mg before S10.5.4 running || { mt_failed S10.5.4 "could not record the state before the fault"; return 1; }
+    mt_shot S10.5.4 before "EV-SHOT: the screen before the fault"
+    mg gid-stage a || { mt_failed S10.5.4 "the fault could not be staged"; return 1; }
+    mt_no_desktop S10.5.4 symptom-a 20
+    mg gid-diagnose || mt_failed S10.5.4 "the entry's checks could not run"
+    log "S10.5.4, path A: systemctl restart desktop.service"
+    mt_watch S10.5.4 path-a svc S10.5.4 restart || true
+    mg gid-check a || mt_failed S10.5.4 "path A did not give the session back"
+    log "S10.5.4, path B: staged again, then the entry's escape hatch"
+    mg gid-stage b || { mt_failed S10.5.4 "the fault could not be staged again"; return 1; }
+    mt_no_desktop S10.5.4 symptom-b 20
+    mt_open S10.5.4
+    EV_VID_FPS=1 ev_video_start path-b
+    vid="$EV_DIR/$EV_VID"
+    mt_close
+    t0=$(date +%s.%N)
+    mg gid-hatch || mt_failed S10.5.4 "the escape hatch could not be applied"
+    if mt_wait_screen "$vid" 90; then
+        sleep 2
+        mt_open S10.5.4
+        ev_video_stop "EV-VIDEO: the screen at 1 fps from the escape hatch until the desktop was back"
+        ev_note "the desktop was back $(mt_elapsed "$t0") s after the escape hatch (${MT_BACK%% *} at ${MT_BACK#* })"
+        ev_pass "path B: under the escape hatch the next session came up"
+        mt_close
+    else
+        mt_open S10.5.4
+        ev_video_stop "EV-VIDEO: the screen at 1 fps for 90 s from the escape hatch: no desktop"
+        mt_failed S10.5.4 "path B: 90 s after the escape hatch the desktop is not on the screen"
+    fi
+    mg gid-check b || mt_failed S10.5.4 "path B: the session is not the escape hatch's"
+    log "S10.5.4: the final restart puts the shipped configuration back"
+    mt_watch S10.5.4 final svc S10.5.4 restart || true
+    mg gid-check final || mt_failed S10.5.4 "the final restart did not put the shipped configuration back"
+    mg after S10.5.4 running final || mt_failed S10.5.4 "the desktop came back other than whole"
+}
+
+maint_faults() {
+    log "maintainer, host E: provisioned the documented way; four README.md Troubleshooting faults staged and recovered (S10.5.1-S10.5.4)"
+    mt_unpack
+    mt_provision_quiet
+    # The ones that should restart nothing first; each restores the host.
+    mt_fault_selinux || true
+    mt_fault_seat || true
+    mt_fault_drm || true
+    mt_fault_gid || true
+}
+
 # --- F10.4: a restart, and a maintenance stop and start ---------------------------
 # What the operator gets back after <command>: the screen recorded from the
 # command until the desktop shows, the time it took, the typing and the
@@ -725,6 +873,7 @@ maint_main() { # <journey>
         docpath) maint_docpath ;;
         config) maint_config ;;
         session) maint_session ;;
+        faults) maint_faults ;;
         *) fail "no maintainer journey named '$1'" ;;
     esac
     write_manifest
