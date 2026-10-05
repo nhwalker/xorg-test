@@ -874,6 +874,12 @@ s773_after() {
     [ -n "$db" ] && [ "$db" = "$da" ] || fail "Xorg, mwm or an audio daemon changed across the unplug and re-plug"
     ev_pass "Xorg, mwm and the three audio daemons kept their pids and start times"
     ev_end
+}
+# The client goes only once layout_unplug is done: S3.10.4 takes S3.10.3's
+# snapshot as its "before", so the window must still be there for its
+# "after" (run 37352221011 removed it in between, and S3.10.4 failed).
+s773_cleanup() {
+    [ -n "$S773_ON" ] || return 0
     podman rm -f "$S773" >/dev/null 2>&1 || true
     S773_ON=""
 }
@@ -1136,6 +1142,7 @@ layout_unplug() {
     layout_set v2-detect "after Virtual-2 was set back to detect"
     ev_pass "set back to detect, Virtual-2 reads disconnected again, still at 1024x768+1024+0"
     ev_end
+    s773_cleanup
 }
 
 layout_restore() {
