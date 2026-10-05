@@ -16,7 +16,8 @@
 !   base    #101216   root window, behind everything
 !   surface #22262d   unfocused frames, menus, icons
 !   raised  #2c3138   icon images
-!   accent  #41637f   focused frame, selected menu entry
+!   accent  #41637f   focused frame (mwm draws an armed menu entry with the
+!                     menu's bevel colours, not this; README.md, palette)
 !   accent+ #6b8ba6   accent bevel highlight, terminal cursor
 !   text    #d7dae0   foreground on surfaces
 !   dim     #9aa1ab   foreground on unfocused frames

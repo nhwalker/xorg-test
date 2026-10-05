@@ -411,7 +411,7 @@ The palette, shared by all three:
 |---|---|---|
 | base | `#101216` | root window |
 | surface | `#22262d` | unfocused frames, menus, icons |
-| accent | `#41637f` | focused frame, selected menu entry |
+| accent | `#41637f` | focused frame |
 | accent+ | `#6b8ba6` | accent bevel highlight, terminal cursor |
 | text | `#d7dae0` | foreground on surfaces |
 | dim | `#9aa1ab` | foreground on unfocused frames |
@@ -420,6 +420,13 @@ The accent is deliberately desaturated: mwm paints the **whole frame** with
 the active color, not just the title bar, so a saturated accent dominates the
 screen. With a muted fill the bevel highlight does most of the focus
 signalling.
+
+Two things the palette does not reach, as the e2e operator phase's
+screendumps show: mwm marks the armed entry of a menu with the menu's own
+bevel colors rather than a fill (so `Mwm*menu*activeBackground` shows
+nowhere), and it draws a focused icon in its built-in active color,
+CadetBlue `#5f9ea0` with white text, because `~/.Xdefaults` sets no
+`Mwm*icon*active*` resources.
 
 xterm gets a matching background, a themed scrollbar, and a desaturated
 16-color ANSI palette. Only colors are set: the e2e input test computes a
@@ -431,6 +438,12 @@ would break it.
 `RESOURCE_MANAGER` property — the image needs no `xrdb`. **If an `xrdb` call
 is ever added to `xinitrc.desktop`, that property starts existing and this
 file is silently ignored**; load it explicitly (`xrdb -merge`) at that point.
+
+The same choice keeps the theme to the desktop's own applications. A client
+container's X applications never read this file: Xt looks in the client's
+own home, so they draw with their own defaults (a client's xterm is the stock
+white one in the e2e screendumps). Resources loaded into the server with
+`xrdb` would reach every client, whatever its container.
 
 One constraint when retuning the palette: `ci/vm/vm-e2e.sh` proves the X
 server is actually drawing by asserting the screendump's grayscale stddev is
@@ -666,6 +679,13 @@ podman run --rm --device desktop.local/audio=all   <image> paplay sound.wav
 podman run --rm --device desktop.local/display=all --device desktop.local/audio=all <image>
 ```
 
+podman applies a device's edits to the process the container starts with,
+and its children. A later `podman exec` into the container sees the mounted
+sockets but **not** `DISPLAY`, `PULSE_SERVER` or `PIPEWIRE_REMOTE`: start
+the application as the container's command, as above, or pass the variable
+(`podman exec -e DISPLAY=:0 <ctr> xterm`). `kubectl exec` into a pod does get
+them.
+
 ### Kubernetes: a device plugin per capability
 
 Kubernetes has no pod field that names a CDI device, so
@@ -864,10 +884,20 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   `desktop-preflight` is asserted fully green. The podman clients run
   **confined** — no `label=disable` anywhere in the suite — against the
   `container_file_t` labels `desktop-selinux.service` applied, which are
-  themselves asserted directly beforehand. Then k3s + CRI-O join the
-  same machine **with the desktop still running on its quadlet and SELinux
-  still enforcing**, and one `cdi-device-plugin` release per capability makes
-  each resource allocatable — confined client pods (asserted to be
+  themselves asserted directly beforehand. Before kubernetes arrives, an
+  operator phase (`ci/vm/operator-e2e.py`) works the desktop the way the
+  person at the display does, through QEMU's own tablet and keyboard and
+  never by injecting into X: windows moved, resized, iconified, maximized,
+  raised and closed with the mouse and again from the keyboard alone, text
+  carried by PRIMARY and CLIPBOARD between the desktop's xterm and two
+  client containers', every root-menu entry chosen, and volume, mute and
+  output changed from a desktop terminal while a client container plays a
+  tone. Each story leaves an evidence directory in the artifacts:
+  screendumps, video frames, window-tree diffs, pid tables, the audio
+  capture, and an `evidence.md` saying what to look for in each. Then k3s +
+  CRI-O join the same machine **with the desktop still running on its
+  quadlet and SELinux still enforcing**, and one `cdi-device-plugin`
+  release per capability makes each resource allocatable — confined client pods (asserted to be
   `container_t`, declaring no `securityContext`) then draw on the display and
   play/record audio
   purely through CDI injection, checked against a control pod that

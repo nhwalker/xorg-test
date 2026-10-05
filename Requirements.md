@@ -98,8 +98,8 @@ helpers still to build.
 |---|---|---|---|
 | **EV-SHOT** | a still of the virtual display at a named moment | QEMU monitor `screendump <file>.png -f png` (PPM fallback) | taken at the moments the story names (before / after / on failure), file named `<story>-<moment>.png`, and the index says what should be visible (a window at a position, a colour, a cursor) |
 | **EV-SHOT-CLIENT** | a still captured **by a client container** of its own view of the display | the injected `screenshot` tool run inside the client (`"$DESKTOP_TOOLS_BIN"/screenshot`) | proves what the *client* could see, independently of QEMU's framebuffer; paired with an EV-SHOT of the same moment |
-| **EV-VIDEO** | a recording of the display across a dynamic step (hotplug, restart, window movement) | a screendump loop at ≥ 2 fps for the step's duration, assembled with `ffmpeg -framerate 2 -i frame-%04d.png` into an mp4 (or an animated gif via imagemagick); raw frames kept | the index names the frames / timestamps where the event happens ("device removed at frame 12, text appears at frame 31"); an EV-TIMELINE correlates |
-| **EV-AUDIO** | what the machine's audio output actually carried | QEMU monitor `wavcapture <file>.wav <audiodev> 44100 16 2` … `stopcapture 0`; then `ci/vm/check-audio.py` output and a spectrogram PNG (`sox <wav> -n spectrogram` or `ffmpeg -lavfi showspectrumpic`) | a reviewer can *listen*, see the tone at the expected frequency and time in the spectrogram, and read the analyser's verdict; each path uses a distinct pitch (pulse 440, pipewire 880, ALSA 1320, record 660, hot-added device 990 Hz, client-continuity 1100 Hz) so overlapping sources are distinguishable |
+| **EV-VIDEO** | a recording of the display across a dynamic step (hotplug, restart, window movement) | a screendump loop at ≥ 2 fps for the step's duration, assembled with `ffmpeg -framerate 2 -i frame-%04d.png` into an mp4, or into an animated gif with imagemagick's `convert` where ffmpeg is not installed (the e2e runner installs imagemagick only); raw frames kept | the index names the frames / timestamps where the event happens ("device removed at frame 12, text appears at frame 31"); an EV-TIMELINE correlates |
+| **EV-AUDIO** | what the machine's audio output actually carried | QEMU monitor `wavcapture <file>.wav <audiodev> 44100 16 2` … `stopcapture 0`; then `ci/vm/check-audio.py` output and a spectrogram PNG (`sox <wav> -n spectrogram` or `ffmpeg -lavfi showspectrumpic`), or, where neither tool is installed, a plot of the level at the story's pitch over time with each event marked, drawn by the harness (`ci/vm/operator-e2e.py` does this). `wavcapture` writes only while one of the guest's sound devices is running: a stretch with none running is missing from the file, not silent in it, so a story about gaps also compares the capture's length with the wall-clock time it ran | a reviewer can *listen*, see the tone at the expected frequency and time in the spectrogram, and read the analyser's verdict; each path uses a distinct pitch (pulse 440, pipewire 880, ALSA 1320, record 660, hot-added device 990 Hz, client-continuity 1100 Hz) so overlapping sources are distinguishable |
 | **EV-AUDIO-REC** | a recording made **by a client** (capture direction) | `parec`/`arecord` inside the client, file pulled out via `kubectl exec … cat` / `podman cp`; spectrogram + analyser as above | proves the client's microphone/monitor path, not the machine output |
 | **EV-STATE** | a command's output at a named moment, kept as text | `xrandr --query --verbose`, `xinput list`, `xwininfo -root -tree`, `wpctl status`, `pw-cli ls Device`, `pactl list short sinks/sources/sink-inputs`, `ls -l /dev/input /dev/snd` (host and container), `podman inspect`, `loginctl`, `systemctl status`, `ls -Z`, `cat /proc/<pid>/status`, `kubectl get pod -o wide` | always captured as **before / after pairs** for a change, with `diff -u` attached (**EV-DIFF**); the index says which lines must differ and which must not |
 | **EV-PIDS** | the process table that proves what did and did not restart | `pid, ppid, sid, user, comm, start time` for desktop-init, Xorg, mwm, pipewire, wireplumber, pipewire-pulse, the client's processes; for pods `restartCount` and `containerID`; for podman clients `podman inspect … StartedAt` | before / after; the index states which pids must be unchanged (no restart) and which must have changed (a restart that was supposed to happen) |
@@ -160,7 +160,9 @@ the same directory also receives the diagnostics the harness already prints
    its view (EV-SHOT-CLIENT, EV-LOG-CLIENT, `restartCount`) alongside the
    machine's view.
 6. **Audio is heard, not inferred.** Any story about sound attaches an
-   EV-AUDIO or EV-AUDIO-REC; a socket being connectable is not sound.
+   EV-AUDIO or EV-AUDIO-REC; a socket being connectable is not sound. "No
+   gap" is measured twice: as quiet inside the capture, and as capture time
+   missing against the wall clock (EV-AUDIO above).
 7. **"Without restarting" is a measurement.** It means the same container id,
    `restartCount` 0 (or unchanged), and the same application pid, captured
    before and after.
@@ -354,7 +356,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
 - Acceptance: kill mwm as uid desktop; Xorg pid changes; new mwm; display answers.
 - Evidence: EV-VIDEO; EV-PIDS before/after; EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: 🟡 "Quit session" ✅ `operator-e2e:menu_quit_session` (S11.1.1: new Xorg and mwm pids, the session's xterm and root colour back, with the video, pid tables and desktop log); mwm dying (killed) ❌.
 
 ### F2.4 Audio supervision
 
@@ -514,13 +516,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `xset s off` and `xset -dpms` took effect.
 - Acceptance: `xset q` shows `timeout:  0` and `DPMS is Disabled`.
 - Evidence: `xset q` (EV-STATE); optionally an EV-SHOT after 11 idle minutes, non-blank.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_3_2` (the optional idle-minutes shot is not taken).
 
 **S3.3.3 Root window colour and initial xterm**
 - Requirement: the operator sees a `#101216` root, one xterm at `100x30+60+60`, and mwm frames.
 - Acceptance: screendump pixel at an uncovered root coordinate is `16,18,22`; an xterm window exists; mwm running.
 - Evidence: EV-SHOT at boot with the sampled coordinate and value in the index; `xwininfo -root -tree` (EV-STATE).
-- Tier: T3 · Coverage: 🟡 mwm ✅; colour and xterm ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_3_3` (the sampled root pixel, `xwininfo -geometry 100x30+60+60`, the mwm frame, mwm's pid as `desktop`).
 
 ### F3.4 Fixed monitor layout
 
@@ -605,16 +607,16 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T3 · Coverage: ✅.
 
 **S3.5.2 `~/.Xdefaults` is honoured because nothing sets `RESOURCE_MANAGER`**
-- Requirement: no `RESOURCE_MANAGER` on the root; the operator sees the dark xterm, not a white one.
+- Requirement: no `RESOURCE_MANAGER` on the root; the operator sees the dark xterm, not a white one. That holds for the desktop's own applications only: a client container's Xt applications read the resources in their own home, so they are not themed (a client's xterm is the stock white one).
 - Acceptance: `xprop -root RESOURCE_MANAGER` → no such atom; xterm background pixel `22,25,29`.
 - Evidence: `xprop` output (EV-STATE); EV-SHOT with the sampled coordinate.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_5_2`.
 
 **S3.5.3 mwm frame colours are applied**
-- Requirement: focused frame `#41637f`, unfocused `#22262d`, menus `#22262d`.
-- Acceptance: sample title-bar pixels of a focused and an unfocused window.
+- Requirement: focused frame `#41637f`, unfocused `#22262d`, menus `#22262d`. Those are all the palette reaches: mwm marks an armed (selected) menu entry with the menu's own shadow colours, not `#41637f`, and draws a focused icon in its built-in default, CadetBlue `#5f9ea0` with white text, because `Xdefaults` sets no `Mwm*icon*active*` resources.
+- Acceptance: sample a flat stretch of each frame - the middle of the left border, clear of the title text and the bevels; mwm paints the whole frame in the frame's colour - for a focused and an unfocused window, and the menu's background between two entries.
 - Evidence: EV-SHOT with two windows, sampled coordinates and values in the index.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_5_3`.
 
 **S3.5.4 Palette keeps the render test's margin**
 - Requirement: the theme's screendump stddev stays ≥ 2× the 0.02 threshold.
@@ -628,7 +630,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `mwm` runs as `desktop` with `~/.mwmrc` loaded; the root menu has "Desktop", "New Terminal", "Host Terminal", "Refresh", "Pack Icons", "Restart mwm", "Quit session".
 - Acceptance: `pgrep -u desktop -x mwm`; a synthetic root click (QMP button on bare root) shows the menu in a screendump.
 - Evidence: EV-PIDS; EV-SHOT of the open root menu with the seven entries legible.
-- Tier: T3 · Coverage: ✅ process; ❌ menu.
+- Tier: T3 · Coverage: ✅ process; ✅ menu (`operator-e2e`, every S11.1.1 entry: the menu posts at the pointer with seven legible rows, an EV-SHOT each time).
 
 **S3.6.2 Click-to-focus and keyboard delivery**
 - Requirement: a left click focuses a window and subsequent keys reach it.
@@ -638,15 +640,15 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.6.3 "Restart mwm" re-reads `.mwmrc` without a new X session**
 - Requirement: `f.restart` replaces mwm in place; Xorg pid unchanged; windows stay.
-- Acceptance: trigger via menu (synthetic click path) or T4; new mwm pid, same Xorg pid, same window tree.
-- Evidence: EV-PIDS; EV-DIFF of the window tree; EV-SHOT.
-- Tier: T3/T4 · Coverage: ❌.
+- Acceptance: trigger via the menu (S11.1.1) or T4; mwm's connection to the X server is a new one (the socket inode in `/proc/<mwm>/fd` changes), the Xorg pid is the same, and every client window is still there in the state it was in, normal or iconic. Not "a new mwm pid": `f.restart` re-executes mwm in place, so its pid stays. Not new frame window ids either: the server hands the new connection the slot the old one freed, so the frames mwm makes again can carry the old ids.
+- Evidence: EV-PIDS; EV-DIFF of the window tree; EV-SHOT; EV-VIDEO.
+- Tier: T3/T4 · Coverage: ✅ `operator-e2e:menu_restart_mwm` (S11.1.1).
 
 **S3.6.4 Host Terminal menu entry**
 - Requirement: the entry opens an xterm whose shell is on the host as `desktop-shell`.
 - Acceptance: `ssh host whoami` from the container returns `desktop-shell` (✅); the failure path keeps the window open with the hint (S5.7.8).
 - Evidence: EV-SHOT of the host-terminal xterm showing `whoami` output; `ssh` transcript (EV-STATE).
-- Tier: T2/T3 · Coverage: 🟡.
+- Tier: T2/T3 · Coverage: 🟡 the entry's success path ✅ `operator-e2e:menu_host_terminal` (`whoami` typed into the window, its answer on screen and on the host); the failure path's hint is not asserted (S5.7.8 tracks it).
 
 ### F3.7 Window-to-pod identity
 
@@ -1227,7 +1229,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `ssh -i <key> desktop-shell@127.0.0.1 whoami` from the host and `ssh host whoami` from the container return `desktop-shell`; the "Host Terminal" menu entry shows a prompt on the host.
 - Acceptance: `smoke`, `guest:phase_deploy`; T3 launch `host-terminal` in an xterm and screendump.
 - Evidence: both `whoami` transcripts (EV-STATE); EV-SHOT of the host-terminal xterm showing `desktop-shell@<host>`; EV-LOG-JOURNAL of `sshd` (the accepted publickey line).
-- Tier: T2/T3 · Coverage: ✅ ssh; ❌ the menu-launched xterm shot.
+- Tier: T2/T3 · Coverage: ✅ ssh; ✅ the menu-launched xterm: its shot, the `whoami` typed into it and sshd's accepted-publickey line (`operator-e2e:menu_host_terminal`).
 
 **S5.7.3 Restrictions are enforced**
 - Requirement: the key is refused from a non-loopback source; port forwarding is refused.
@@ -1432,6 +1434,15 @@ because "it works" without "and nothing restarted" is not the claim.
 - Acceptance: `guest:phase_deploy` probes; a grep over `ci/` matches only comments.
 - Evidence: `getenforce`; `ps -Z` of a probe; `ausearch -m avc -ts recent` (empty) (EV-STATE); the grep output.
 - Tier: T3/T0 · Coverage: ✅ / ❌ guard.
+
+> **`podman exec` does not get a device's env.** podman applies the edits
+> when the container starts, to the process it starts with: an exec session
+> sees the mounts but not `DISPLAY`, `PULSE_SERVER` or `PIPEWIRE_REMOTE`.
+> Found by the operator phase, whose observer runs its probes with `podman
+> exec` and so passes `DISPLAY` itself (after checking the observer's own
+> process got `:0` from the spec); seen with the podman the e2e VM installs
+> and with podman 4.9. `kubectl exec` into a pod does get them
+> (`guest:assert_pod_env`). The README's client sections say so.
 
 ### F7.2 Published toolkit
 
@@ -2041,6 +2052,30 @@ other epic owns. The session is mwm alone, with no panel and no desktop
 environment (`README.md` "Look and feel (dark theme)"), so the root menu, the
 window frames, the key bindings, the X selections and a terminal are the
 operator's whole toolset.
+
+How these stories are run (`ci/vm/operator-e2e.py`, a phase of its own
+between the hotplug checks and phase 2), and what that takes for granted:
+
+- The input is QEMU's: pointer and key events go over QMP to the virtio
+  tablet and keyboard. The harness only looks at X, with `xwininfo` and
+  `xprop` in an observer container of the lean client image that holds
+  `desktop.local/display` and nothing else (the host has no X tools), and
+  at QEMU's screendumps. The observer sends no input; its one write is
+  S11.2.1's cut-buffer control.
+- "A client pod" is a podman client container (F7.1): the desktop image
+  holding only `desktop.local/display`, or for S11.3.1's player the lean
+  image holding only `desktop.local/audio`. It is the same CDI contract
+  and the same SELinux confinement as a pod, without kubernetes, which
+  nothing in E11 looks at. A pod's `restartCount` reads as the
+  container's `RestartCount`, start time and pid.
+- "The desktop's xterm" is the session's own (`xinitrc.desktop`) where a
+  story moves, closes or types into it; where a story needs one that
+  records its input, it runs in the desktop container as the session user.
+- Order matters: S11.1.1's last entry ends the X session and S11.3.1 ends
+  by restarting `desktop.service`, so those two run last, in that order.
+  The operator-facing F3.3 and F3.5 checks (S3.3.2, S3.3.3, S3.5.2,
+  S3.5.3) run first, on the desktop as the session leaves it.
+
 **Common set**: EV-SHOT before and after each action, and EV-VIDEO across any
 action with movement; the EV-QEMU transcript of every pointer and key event
 sent, because these stories drive the machine only through QEMU's input
@@ -2050,38 +2085,38 @@ EV-PIDS for Xorg, mwm and any client application involved; EV-TIMELINE.
 ### F11.1 Working the desktop
 
 **S11.1.1 Every root-menu action does what its label says when chosen with the mouse**
-- Requirement: the operator opens the root menu by pressing a button on the bare root window (left or right, per `.mwmrc`), and each action works. "New Terminal" opens an xterm. "Host Terminal" opens a window titled `host` showing a `desktop-shell` prompt on the host (S5.7.2). "Refresh" and "Pack Icons" leave every window and process in place ("Pack Icons", with two windows iconified and their icons moved apart, packs the icons). "Restart mwm" replaces mwm with no new X session (S3.6.3). "Quit session" ends the session, and the desktop comes back (S2.3.6). A confirmation dialog mwm posts is part of the journey and is answered through the dialog; the image sets no `showFeedback`, so mwm's default decides whether one appears.
-- Acceptance: per entry: QMP pointer to an uncovered root coordinate, button press, EV-SHOT of the open menu, pointer to the entry, release; then the entry's observable; the Xorg pid unchanged except for "Quit session".
+- Requirement: the operator opens the root menu by pressing a button on the bare root window (left or right, per `.mwmrc`): mwm posts it on the press, with its top-left corner at the pointer, and an entry is chosen by letting go on it. Each action works. "New Terminal" opens an xterm. "Host Terminal" opens an xterm showing a `desktop-shell` prompt on the host (S5.7.2); xterm titles it `host`, but the host shell's prompt retitles it at once (`desktop-shell@<host>:~`), so the title does not identify it. "Refresh" and "Pack Icons" leave every window and process in place ("Pack Icons", with two windows iconified and their icons moved apart, puts the icons back in the places mwm first gave them). "Restart mwm" replaces mwm with no new X session (S3.6.3). "Quit session" ends the session, and the desktop comes back (S2.3.6). Both of those last two ask first: with mwm's defaults (the image sets no `showFeedback`) each posts a confirmation dialog centred on the screen, OK the default button, and the journey answers it through the dialog.
+- Acceptance: per entry: QMP pointer to a point on bare root with room for the menu below and to the right, button press, EV-SHOT of the open menu (its seven rows legible, S3.6.1), pointer to the entry with the button held, release; then the entry's observable; the Xorg pid unchanged except for "Quit session". For "Host Terminal", `whoami` typed into the window answers `desktop-shell` on the host, and sshd logs the key login.
 - Evidence: per entry an EV-SHOT pair (menu open, result) and EV-PIDS; EV-VIDEO for "Restart mwm" and "Quit session"; `xwininfo -root -tree` before and after (EV-DIFF).
-- Tier: T3 · Coverage: ❌. S3.6.1 asserts only that the menu shows its entries; S2.3.6 and S3.6.3 reach their outcomes without the menu.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_1`, one `menu_*` step per entry.
 
 **S11.1.2 Windows can be arranged with the mouse**
-- Requirement: the operator arranges windows with the controls mwm draws on every frame and with the `.mwmrc` button bindings, and a client application's window behaves exactly like the desktop's own xterm. Dragging the title bar moves the window; dragging the border resizes it; the minimize button iconifies it, and its icon (double-click, or Restore from the icon's window menu) brings it back where it was; the maximize button enlarges it and a second press restores it; button 3 on a frame posts the window menu (`<Btn3Down> icon|frame f.post_wmenu`), whose Close closes the window; button 1 on a frame raises the window (`<Btn1Down> icon|frame f.raise`).
-- Acceptance: the desktop's xterm and a client pod's xterm, overlapping; QMP pointer events only; per action, `xwininfo -id` of the window before and after matches the drag, resize, iconify, restore or maximize; `xwininfo -root -tree` shows the stacking change after a raise; on a two-output layout, whether maximize fills one output or the whole screen is recorded; Close ends the client's xterm (its pid exits) and leaves the desktop's xterm untouched.
+- Requirement: the operator arranges windows with the controls mwm draws on every frame and with the `.mwmrc` button bindings, and a client application's window behaves exactly like the desktop's own xterm. Dragging the title bar moves the window; dragging the border resizes it; the minimize button iconifies it, and its icon (double-click, or Restore from the icon's window menu) brings it back where it was; the maximize button enlarges it and a second press restores it; button 3 on a frame posts the window menu (`<Btn3Down> icon|frame f.post_wmenu`), whose Close closes the window; button 1 on a frame raises the window (`<Btn1Down> icon|frame f.raise`). mwm posts the window menu on the button-3 press and takes it down on a release anywhere but an entry, so Close is chosen by dragging to it with the button held. A single click on an icon posts the icon's window menu and leaves it posted (mwm's `iconClick` default). In a normal window's menu Restore is insensitive.
+- Acceptance: the desktop's xterm and a client pod's xterm, overlapping; QMP pointer events only; per action, `xwininfo -id` of the window before and after matches the drag, resize, iconify, restore or maximize; `xwininfo -root -tree` shows the stacking change after a raise; on a two-output layout, whether maximize fills one output or the whole screen is recorded; Close ends the client's xterm (its pid exits) and leaves the desktop's xterm untouched. A corner drag puts the frame's corner where the pointer stops, not where in the handle it was grabbed, and xterm's size snaps down to its character grid: a drag ending n columns and m rows of that grid beyond the frame's corner resizes it by exactly n by m. A raised window can bury the other completely, so the order of the actions keeps a stretch of each frame visible.
 - Evidence: common set; per action an EV-SHOT pair and the `xwininfo` output before and after (EV-DIFF); EV-VIDEO of the drags.
-- Tier: T3 · Coverage: ❌. S3.6.2 asserts click-to-focus and typing only; no test moves, resizes, iconifies, maximizes or closes a window.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_2`, both windows taken through every action. The e2e VM has one output; maximize gives a `1275x789+5+11` frame on its 1280x800 screen, the character grid keeping it short of the edges.
 
 **S11.1.3 Windows can be managed from the keyboard alone**
-- Requirement: an operator whose pointer is gone (a KVM that dropped the mouse) can still manage windows through the `.mwmrc` bindings: `Alt+Tab` and `Alt+Shift+Tab` move keyboard focus between windows, `Shift+Escape` and `Alt+Space` post the window menu, and the window menu's accelerators act on the focused window (`Alt+F9` minimize, `Alt+F4` close).
-- Acceptance: two xterms on screen, one of them from a client pod, and no pointer events after setup; `Alt+Tab` moves focus (the frame colours swap, by S3.5.3's samples, and typed text lands in the newly focused window); `Shift+Escape` shows the window menu (EV-SHOT); `Alt+F9` iconifies the focused window and the window menu's Restore brings it back; `Alt+F4` closes the local xterm (its pid exits), and focus can then be moved to the remaining window by keyboard.
+- Requirement: an operator whose pointer is gone (a KVM that dropped the mouse) can still manage windows through the `.mwmrc` bindings: `Alt+Tab` and `Alt+Shift+Tab` move keyboard focus between windows, `Shift+Escape` and `Alt+Space` post the window menu, and the window menu's accelerators act on the focused window (`Alt+F9` minimize, `Alt+F4` close). `Alt+Tab` cycles icons as well as windows. A window menu posted from the keyboard appears at the top-left corner of the focused window's client area, or just above a focused icon, and its entries can also be chosen by mnemonic (R for Restore).
+- Acceptance: two xterms on screen, one of them from a client pod, and no pointer events after setup; `Alt+Tab` moves focus (the frame colours swap, by S3.5.3's samples, and typed text lands in the newly focused window); `Shift+Escape` shows the window menu (EV-SHOT); `Alt+F9` iconifies the focused window and the window menu's Restore brings it back (`Alt+Tab` to the icon, `Shift+Escape`, R); `Alt+F4` closes the local xterm (its pid exits), and focus can then be moved to the remaining window by keyboard. The local xterm is the session's own: nothing starts another, and the session carries on without a terminal until the operator opens one.
 - Evidence: EV-SHOT per step with sampled frame colours; the sink files; the EV-QEMU transcript of the key events; EV-PIDS.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_3`. Recorded on the e2e VM: after `Alt+F9`, and again after `Alt+F4`, mwm put the keyboard focus on the remaining window, and one `Alt+Tab` then reached the icon.
 
 ### F11.2 Working across applications
 
 **S11.2.1 Text moves between applications by selection and paste, across containers**
 - Requirement: text the operator selects in one window can be pasted into another. The applications share one X server whichever containers they run in, so the X selections work between the desktop's own xterm and a client pod's window, and between two client pods' windows, in both directions. That holds for PRIMARY (select, then middle-click; xterm's default) and for CLIPBOARD (xterm with its `selectToClipboard` resource set; the selection toolkit applications use for copy and paste).
-- Acceptance: three xterms (the desktop's, pod A's, pod B's), each showing a word of its own and reading its input into a sink file; for each pair, in both directions and for both selections: QMP double-click on the source's word, middle-click in the target, Enter; the target's sink records the word. Then pod A's xterm exits, and what a paste into pod B yields is recorded: the session runs no clipboard manager, and xterm also writes the X cut buffer, which outlives it.
+- Acceptance: three xterms (the desktop's, pod A's, pod B's), each showing a word of its own and reading its input into a sink file; for each pair, in both directions and for both selections: QMP double-click on the source's word, middle-click in the target, Enter; the target's sink records the word. Before each paste the harness overwrites the root's cut buffer with a decoy word, so a word that arrives can only have come through the selection. Then pod A's xterm exits, and what a paste into pod B yields is recorded: the session runs no clipboard manager, and xterm also writes the X cut buffer, which outlives it.
 - Evidence: common set; per pair an EV-SHOT of the selected word and of the pasted text; the sink files (EV-LOG-CLIENT).
-- Tier: T3 · Coverage: ❌. No test moves text between applications.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_2_1`, all twelve transfers. Recorded on the e2e VM: with pod A's xterm gone, a paste into pod B gave pod A's word, from the cut buffer (`CUT_BUFFER0`) xterm had written.
 
 ### F11.3 Sound under the operator's control
 
 **S11.3.1 The operator can set the volume, mute, and choose the output from the desktop**
-- Requirement: the session has no graphical mixer and no volume keys (`.mwmrc` binds none), so the operator's sound controls are commands in a desktop terminal ("New Terminal"), whose environment already carries the session's runtime directory: `wpctl` (the image also carries `pactl` and `alsamixer`). From there, changing the default output's volume, muting and unmuting, and choosing the output device (`wpctl set-default`, for example a headset just plugged in, S4.7.3) take effect on what is already playing, a client pod's stream included, with no restart of anything. What survives an audio-stack restart and a `systemctl restart desktop.service` is recorded: WirePlumber keeps such choices in state files under the session user's home (`/home/desktop`), which does not survive the container being recreated (`README.md` "Look and feel" says the same of the dotfiles), so a reset at that point is expected.
-- Acceptance: a client pod plays a continuous 1100 Hz tone; in a "New Terminal" xterm, typed through QMP: `wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%` lowers the captured level; `wpctl set-mute @DEFAULT_AUDIO_SINK@ 1` silences it and `0` restores it; with a USB card hot-added (S4.7.1), `wpctl set-default <its sink id>` moves the client's stream to it (`pactl list short sink-inputs`) with no gap in the capture; the client pod's `restartCount` and the player's pid are unchanged throughout. Then the volume, mute state and default output are read after killing `pipewire`, and again after restarting the desktop.
-- Evidence: common set; EV-AUDIO across the sequence, with each command's timestamp marked on the spectrogram; `wpctl status` after each step (EV-STATE); EV-LOG-CLIENT of the player.
-- Tier: T3 · Coverage: ❌. S4.7.3 sets the default output from the harness to prove the new card plays; nothing exercises the operator's own controls, or records what they keep across restarts.
+- Requirement: the session has no graphical mixer and no volume keys (`.mwmrc` binds none), so the operator's sound controls are commands in a desktop terminal ("New Terminal"), whose environment already carries the session's runtime directory: `wpctl` (the image also carries `pactl` and `alsamixer`). From there, changing the default output's volume, muting and unmuting, and choosing the output device (`wpctl set-default`, for example a headset just plugged in, S4.7.3) take effect on what is already playing, a client pod's stream included, with no restart of anything. What survives an audio-stack restart and a `systemctl restart desktop.service` is recorded: WirePlumber keeps such choices in state files under the session user's home (`/home/desktop`), which does not survive the container being recreated (`README.md` "Look and feel" says the same of the dotfiles), so a reset at that point is expected. Two things the operator should know, seen on the e2e VM: WirePlumber starts an output it has not seen before at 0.40 on wpctl's scale, not 100%; and a USB card plugged in becomes the default output, WirePlumber moving what is playing onto it by itself.
+- Acceptance: a client pod plays a continuous 1100 Hz tone; in a "New Terminal" xterm, typed through QMP: with a USB card hot-added (S4.7.1), `wpctl set-default <sink id>` moves the client's stream from the card to the built-in output and back (`pactl list sink-inputs`), with no gap in the capture; then on the card, `wpctl set-volume @DEFAULT_AUDIO_SINK@ 100%` and then `50%` lowers the captured level (by 18 dB on wpctl's cubic scale), and `wpctl set-mute @DEFAULT_AUDIO_SINK@ 1` silences it and `0` restores it; the client pod's `restartCount` and the player's pid are unchanged throughout. Then the volume, mute state and default output are read after killing `pipewire`, and again after restarting the desktop. pactl's sink indexes are not the PipeWire ids wpctl prints, so the stream's sink is compared by name. The volume and mute steps are made on the USB card because QEMU's emulated HDA output does not follow the volume it is set to: on the e2e VM it played the tone 0.8 dB down at WirePlumber's 0.40, at full level at 100% and 2.5 dB down at 50%, while the emulated card followed the cubic scale to within half a decibel. The built-in output's own response is still captured and recorded each run. A gap with no sound device running at all would be missing from the capture rather than silent in it, so the capture's length is checked against the wall clock (EV-AUDIO).
+- Evidence: common set; EV-AUDIO across the sequence, with each command's timestamp marked on a level plot of the 1100 Hz tone (the runner has no spectrogram tool); `wpctl status` after each step (EV-STATE); EV-LOG-CLIENT of the player.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_3_1`. Recorded on the e2e VM: after `pipewire` was killed, the default output (the card) and its 50% were kept; after `systemctl restart desktop.service` the card was the default again, which is also WirePlumber's own pick for a present USB card, so this cannot tell whether the choice itself survived, and its volume was back at 0.40.
 
 ---
 
@@ -2108,15 +2143,14 @@ them without root or a container. Defaults must remain the production paths.
 | `deploy/host/usr/local/libexec/desktop-selinux` | takes paths as args already | — | S5.6.4–S5.6.6 |
 | `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | also honour an env override | S5.5.4 |
 
-Probe tooling the client-side and hotplug stories need, none of it shipped
-today:
+Probe tooling the client-side and hotplug stories need, and where it stands:
 
 | Tool | Needed by | Where |
 |---|---|---|
 | `xinput` | S3.9.2, S3.9.4, S3.9.5, S3.9.8, S3.9.10, S3.9.11, S3.9.12 | `Containerfile.testclient` (CI-only); run as a podman client in phase-deploy or from `x11-testclient` in phase 2 |
-| `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S10.2.2, S11.1.1, S11.1.2 | same; on a T4 host, built and loaded there too (Appendix C) |
-| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | runner (`e2e-vm.yml` apt line) |
-| `sox` or `ffmpeg` | spectrograms for EV-AUDIO | runner |
+| `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.5.3, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S10.2.2, S11.1.1–S11.1.3, S11.2.1 | **shipped**: `Containerfile.testclient` carries both, and the operator phase runs them in its observer container; on a T4 host, built and loaded there too (Appendix C) |
+| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | **shipped**: imagemagick is on the `e2e-vm.yml` apt line and makes the gifs; ffmpeg is not installed |
+| `sox` or `ffmpeg` | spectrograms for EV-AUDIO | not installed; the operator phase draws a level plot at the story's pitch instead (EV-AUDIO) |
 | `inotify-tools` | S7.2.3 | VM guest |
 | `alsa-utils` + `alsa-plugins-pulseaudio` | S4.2.2 | VM guest |
 | `pipewire-utils`, `pulseaudio-utils`, `alsa-utils` as declared host probes | S10.1.1, S10.2.1 | VM guest, installed after the documented package line, so S10.1.1 can tell the two apart |
@@ -2130,7 +2164,7 @@ S1.1.3, S2.3.5, S2.4.4, S2.4.5, S3.1.x, S3.4.12, S5.7.5, S5.7.7, S5.7.8.
 
 | New phase | Stories |
 |---|---|
-| `verify-session-tree` | S2.3.1, S2.3.3 (host-process half), S2.3.4, S2.3.6, S2.4.2 (wireplumber / pipewire-pulse), S2.4.7, S3.2.4, S3.2.5, S3.3.2, S3.5.2 |
+| `verify-session-tree` | S2.3.1, S2.3.3 (host-process half), S2.3.4, S2.3.6 (mwm killed; Quit session is the operator phase's), S2.4.2 (wireplumber / pipewire-pulse), S2.4.7, S3.2.4, S3.2.5 |
 | `verify-shutdown` | S2.5.1 |
 | `verify-host-audio-clients` | S4.2.1, S4.2.2 |
 | `verify-host-shell-hardening` | S5.7.3, S5.7.4 |
@@ -2154,7 +2188,7 @@ S1.1.3, S2.3.5, S2.4.4, S2.4.5, S3.1.x, S3.4.12, S5.7.5, S5.7.7, S5.7.8.
 | `verify-maintainer-routine` (new) | S10.4.1, S10.4.2 |
 | `verify-maintainer-troubleshooting` (new; one documented fault per story, staged and restored) | S10.5.1–S10.5.4 |
 | `verify-maintainer-onboarding` (extend phase 2; the README's steps verbatim) | S10.6.1, S10.6.2 |
-| `verify-operator-desktop` (new; QMP pointer and key events only) | S11.1.1–S11.1.3, S11.2.1, S11.3.1 |
+| operator phase (**exists**: `ci/vm/operator-e2e.py`, between the hotplug checks and phase 2; QMP pointer and key events only) | S3.3.2, S3.3.3, S3.5.2, S3.5.3, S11.1.1–S11.1.3, S11.2.1, S11.3.1; with them S2.3.6 (Quit session), S3.6.1 (menu), S3.6.3, S5.7.2 (menu-launched shell) |
 
 ## Appendix C — Hardware acceptance checklist (T4)
 
@@ -2164,8 +2198,9 @@ row record the command output **and** the photo/video named in the story.
 The host has no X client tools (`deploy/HOST-REQUIRES.md`), so X queries run
 inside the desktop image, which carries `xrandr`, `xdpyinfo` and `glxinfo`
 (`xq` below). `xinput` and `xwininfo` are in neither the image nor the host:
-the lines using them need the Appendix A probe image (`Containerfile.testclient`
-with those tools added), built and loaded onto the T4 host first (`probe`
+the lines using them need the Appendix A probe image
+(`Containerfile.testclient`, which carries `xwininfo` and `xprop`; `xinput`
+is still to be added), built and loaded onto the T4 host first (`probe`
 below).
 
 ```sh
@@ -2220,14 +2255,14 @@ gap by this document's definition.
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 4 | 3 | 7 | 0 |
 | E2 Boot & supervision | 25 | 3 | 7 | 15 | 0 |
-| E3 Display & session | 62 | 17 | 11 | 33 | 1 |
+| E3 Display & session | 62 | 23 | 11 | 27 | 1 |
 | E4 Audio | 23 | 6 | 2 | 14 | 1 |
-| E5 Deploy tree | 50 | 13 | 9 | 27 | 1 |
+| E5 Deploy tree | 50 | 14 | 9 | 26 | 1 |
 | E6 Privileges | 9 | 2 | 2 | 5 | 0 |
 | E7 Client contract & journeys | 40 | 12 | 5 | 23 | 0 |
 | E10 Maintainer experience | 23 | 0 | 3 | 19 | 1 |
-| E11 Operator experience | 5 | 0 | 0 | 5 | 0 |
-| **Total** | **251** | **57** | **42** | **148** | **4** |
+| E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
+| **Total** | **251** | **69** | **42** | **136** | **4** |
 
 Regenerate after editing with:
 
@@ -2240,9 +2275,17 @@ done
 
 ## Appendix E — Evidence capture helpers to build
 
-The evidence standard needs a handful of harness functions that do not exist
-yet. All of them belong in `ci/vm/vm-e2e.sh` (host side) or `vm-guest.sh`
-(guest side) and should be written once and reused by every story.
+The evidence standard needs a handful of harness functions. All of them
+belong in `ci/vm/vm-e2e.sh` (host side) or `vm-guest.sh` (guest side) and
+should be written once and reused by every story.
+
+The operator phase has its own, in Python (`ci/vm/operator-e2e.py`): `Story`
+covers `ev_begin`/`ev_end`/`ev_note` and writes each story's `evidence.md`,
+`timeline.log` and `qemu.log` (its QMP transcript); `Ctx.shot`, `Ctx.video`,
+`Ctx.pids` and `Ctx.diff` cover `ev_shot`, `ev_video_*`, `ev_pids` and
+`ev_diff`; S11.3.1 captures and analyses its own audio. The shell phases
+still have none of these, and `artifacts/timeline.log` holds the operator
+phase alone until they do.
 
 | Helper | Side | Does |
 |---|---|---|
