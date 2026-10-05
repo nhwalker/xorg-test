@@ -845,8 +845,11 @@ class Ctx:
         raise StoryFailed(f"no room on the screen for a {size[0]}x{size[1]} window")
 
     # -- the operator's applications --
-    def sink_argv(self, instance, geometry, word, sinkfile, xrm=None):
+    def sink_argv(self, instance, geometry, word, sinkfile, xrm=None, title=None):
         argv = ["xterm", "-name", instance, "-geometry", geometry]
+        # Without -T, xterm titles its window after the program -e runs ("sh").
+        if title:
+            argv += ["-T", title]
         if xrm:
             argv += ["-xrm", xrm]
         return argv + ["-e", "sh", "-c", SINK, word, sinkfile]
@@ -856,10 +859,10 @@ class Ctx:
         self.g.desk(self.sink_argv(instance, geometry, word, f"/tmp/op-sink-{instance}", xrm),
                     detach=True)
 
-    def client_sink(self, name, instance, geometry, word, xrm=None, devices=("display",)):
+    def client_sink(self, name, instance, geometry, word, xrm=None, devices=("display",), title=None):
         """A sink xterm in a client container of its own."""
-        self.g.client_run(name, self.sink_argv(instance, geometry, word, f"/tmp/op-sink-{instance}", xrm),
-                          devices=devices)
+        self.g.client_run(name, self.sink_argv(instance, geometry, word, f"/tmp/op-sink-{instance}", xrm,
+                                               title), devices=devices)
 
     def desk_lines(self, path):
         return self.g.desk(["sh", "-c", f"cat {shlex.quote(path)} 2>/dev/null; true"],
@@ -1180,9 +1183,10 @@ def s7_5_1(ctx, st):
     term = ctx.session_xterm(xs)
     st.check(term is not None, "the session's xterm is on the screen, to hold the keyboard focus first")
     fx, fy = ctx.free_spot(xs, (300, 200))
-    ctx.client_sink("s751", "s751app", f"40x10+{fx}+{fy}", "s751", devices=("display", "tools"))
+    ctx.client_sink("s751", "s751app", f"40x10+{fx}+{fy}", "s751", devices=("display", "tools"),
+                    title="s751app")
     st.record(f"the client: podman run --device desktop.local/display=all --device desktop.local/tools=all "
-              f"{DESKTOP_IMAGE} xterm -name s751app, a sink: every line typed into it is appended to "
+              f"{DESKTOP_IMAGE} xterm -name s751app -T s751app, a sink: every line typed into it is appended to "
               "/tmp/op-sink-s751app inside the client's own container. The tools device is there only "
               "for the client's own screenshot.")
     xs, cli = ctx.wait_client("s751app")

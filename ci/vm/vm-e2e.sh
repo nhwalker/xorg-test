@@ -1835,29 +1835,37 @@ A_POD_B=$EV_LAST
 ev_save daemons-before "EV-PIDS: the desktop's three audio daemons before the pod plays" \
     gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
 A_DMN_B=$EV_LAST
+# Each player's stream is found by its client's executable: paplay and
+# pw-play are links to pacat and pw-cat, which is what their clients run
+# (stream_apps says more).
 for path in pulse pipewire alsa; do
     hz=$(freq_for "$path")
-    case $path in pulse) pbin=paplay ;; pipewire) pbin='pw-(play|cat)' ;; alsa) pbin=aplay ;; esac
+    case $path in pulse) pbin=pacat ;; pipewire) pbin=pw-cat ;; alsa) pbin=aplay ;; esac
     ev_save "streams-before-$path" "EV-STATE: the streams playing before the pod's $path tone" gq stream-apps >/dev/null || true
     ev_audio_start "cdi-$path" "$hz"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path cdi-verify 3" > "$ART/.player-$path.out" 2>&1 &
     pl=$!
-    during="" s=""
+    during="" s="" polls=""
     for _ in $(seq 16); do
         sleep 0.5
         s=$(gq stream-apps 2>/dev/null || true)
-        if grep -Eq "application\.process\.binary = \"$pbin\"" <<<"$s"; then during=$s; break; fi
+        polls+="--- $(date -u +%H:%M:%S.%3N)"$'\n'"$s"$'\n'
+        if grep -Eq "binary \"$pbin\"" <<<"$s"; then during=$s; break; fi
     done
     pl_rc=0
     wait "$pl" || pl_rc=$?
-    ev_text "streams-during-$path" "EV-STATE: the streams while the pod's $path player played (polled every 0.5 s until its stream showed): its stream, with the player's binary and pid" "${during:-${s:-(no listing)}}"
+    if [ -n "$during" ]; then
+        ev_text "streams-during-$path" "EV-STATE: the streams while the pod's $path player played (polled every 0.5 s until its stream showed): its stream, its client's executable $pbin and pid" "$during"
+    else
+        ev_text "streams-during-$path" "EV-STATE: every listing taken while the pod's $path player played, each with its time (UTC): none shows a stream whose client runs $pbin" "${polls:-(no listing)}"
+    fi
     ev_audio_stop "EV-AUDIO: the machine's output while the cdi-verify pod played its $hz Hz tone over the $path path, with only the injected env - listen for one beep" 1 0.05 "$hz" \
         || fail "client pod $path audio capture is empty or silent"
     ev_copy "$ART/.player-$path.out" "player-$path" "EV-LOG-CLIENT: the pod's $path player: its command, its own output and its exit status"
     ev_save "streams-after-$path" "EV-STATE: the streams after the $path player ended" gq stream-apps >/dev/null || true
     [ "$pl_rc" = 0 ] || fail "client pod $path playback failed (see the player's log)"
     [ -n "$during" ] || fail "no stream of the pod's $path player was listed while it played"
-    ev_pass "over $path the pod's player ($(grep -Eo 'application\.process\.binary = "[^"]*"' <<<"$during" | sed -n 1p | cut -d'"' -f2)) played: its stream was listed while it played, and the machine's output carried its $hz Hz tone"
+    ev_pass "over $path the pod's player played: its stream was listed while it played ($(grep -E "binary \"$pbin\"" <<<"$during" | sed -n 1p)), and the machine's output carried its $hz Hz tone"
 done
 ev_save pod-after "EV-PIDS: the cdi-verify pod after the three paths played" gq pod-state cdi-verify >/dev/null || true
 ev_diff pod "EV-DIFF: the cdi-verify pod before and after (empty: the same container)" "$A_POD_B" "$EV_LAST"

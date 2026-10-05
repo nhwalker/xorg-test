@@ -3467,15 +3467,43 @@ viewable_rect() {
     sed -nE 's/^(0x[0-9a-f]+) .* ([0-9]+)x([0-9]+)\+-?[0-9]+\+-?[0-9]+ +\+(-?[0-9]+)\+(-?[0-9]+) map=IsViewable$/\1 \2 \3 \4 \5/p' | sed -n 1p
 }
 
-# What pipewire-pulse knows of each stream playing now: its sink and its
-# client's application name, binary and pid (in the client's own pid
-# namespace). F7.6's "during" listing.
+# F7.6's stream listing: pactl's short lists of the streams playing and
+# recording now, then each playing stream's client, by pipewire-pulse's
+# `pactl list clients`: its application name, executable and pid (in the
+# client's own pid namespace). The client is where the executable is: a
+# stream itself names it only for pulse clients, and then as the file it
+# runs, so paplay's stream says pacat (paplay is a link to it), pw-play's
+# client is pw-cat, and aplay's stream reaches PipeWire through
+# pipewire-alsa as "PipeWire ALSA [aplay]".
 stream_apps() {
-    local out
-    out=$(PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 10 pactl list sink-inputs 2>&1) \
-        || { echo "(no answer: the export is down) $out"; return 0; }
-    out=$(grep -E '^Sink Input #|^[[:space:]]+Sink:|application\.(name|process\.binary|process\.id) =' <<<"$out" || true)
-    echo "${out:-(no stream playing)}"
+    local short clients
+    short=$(PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 10 pactl list short sink-inputs 2>&1) \
+        || { echo "(no answer: the export is down) $short"; return 0; }
+    echo "== pactl list short sink-inputs (index, sink, client, driver, format)"
+    echo "${short:-(no stream playing)}"
+    echo "== pactl list short source-outputs"
+    PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 10 pactl list short source-outputs 2>&1 || true
+    [ -n "$short" ] || return 0
+    clients=$(PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 10 pactl list clients 2>&1) || true
+    echo "== each playing stream's client (pactl list clients): its application name, executable and pid"
+    python3 -c '
+import re, sys
+info, cur = {}, None
+for line in sys.argv[2].splitlines():
+    m = re.match(r"Client #(\d+)", line)
+    if m:
+        cur = info.setdefault(m.group(1), {})
+        continue
+    m = re.match(r"\s+application\.(name|process\.binary|process\.id) = \"(.*)\"$", line)
+    if m and cur is not None:
+        cur[m.group(1)] = m.group(2)
+for line in sys.argv[1].splitlines():
+    f = line.split("\t")
+    if len(f) >= 3:
+        c = info.get(f[2], {})
+        print("sink-input %s: client %s, application.name \"%s\", binary \"%s\", pid %s" % (
+            f[0], f[2], c.get("name", "?"), c.get("process.binary", "?"), c.get("process.id", "?")))
+' "$short" "$clients"
 }
 pod_logs() { k3s kubectl logs "$1" --tail="${2:-100}" 2>&1 || true; }
 
