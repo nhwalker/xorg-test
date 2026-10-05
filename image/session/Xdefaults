@@ -68,6 +68,16 @@ Mwm*iconImageBackground:                #2c3138
 Mwm*feedback*background:                #22262d
 Mwm*feedback*foreground:                #d7dae0
 
+! --- Confirmations ----------------------------------------------------------
+! mwm's default showFeedback is "all", and its "kill" member means: on SIGTERM,
+! post a "QUIT Mwm?" dialog and keep running. Nobody answers that here.
+! desktop-init stops a session by signalling its whole tree, so mwm outlived
+! Xorg until desktop-init's KILL five seconds later (systemctl stop
+! desktop.service took 5 s instead of 1), and a plain `kill` of mwm left the
+! session up instead of ending it (S2.3.6). Dropping only "kill" keeps the
+! rest: "Restart mwm" and "Quit session" still ask first (S11.1.1).
+Mwm*showFeedback:                       -kill
+
 ! --- xterm ------------------------------------------------------------------
 ! This is the session's whole resource database, so app resources live here
 ! too. Terminals are the only app the image ships; left stock they are a
