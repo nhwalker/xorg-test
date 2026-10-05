@@ -36,6 +36,14 @@ if [ "$changed" = 1 ]; then
     udevadm trigger --subsystem-match=drm --subsystem-match=input \
         --subsystem-match=sound --subsystem-match=graphics || true
     udevadm settle --timeout=15 || true
+    # A re-seated device's children in other subsystems copied its ID_SEAT
+    # (73-seat-late.rules imports it from the parent) and keep it until udev
+    # processes them again: a USB keyboard's LEDs (subsystem leds) stayed on
+    # seat1 after the trigger above, and the container preflight still
+    # warned. Re-trigger whatever still carries a seat; the parents are
+    # clean by now.
+    udevadm trigger --property-match='ID_SEAT=?*' || true
+    udevadm settle --timeout=15 || true
 fi
 
 # --- 2. display manager: not running, not enabled ---------------------------
