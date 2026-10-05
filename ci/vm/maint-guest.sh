@@ -1795,6 +1795,293 @@ mt_start() { # S10.4.2's start
     ev_end
 }
 
+# --- F10.1: the live paths (S10.1.4), and a graphical host converted live (S10.1.5) ---
+# deploy/README.md gives its live sequence in prose, in the Apply section's
+# paragraph that starts "A reboot is the clean path".
+MT_LIVE_PHRASE='To apply live on a host that was'
+
+# One live path's commands, as the documents write them, one per line:
+# README.md's "Install" block (it says sudo), or deploy/README.md's: the
+# Apply block's rsync line, the paragraph's sequence, and the paragraph's
+# `systemctl reload sshd`, for an sshd that was already running.
+mt_live_cmds() { # readme|deploy
+    local block para c
+    case "$1" in
+        readme)
+            block=$(python3 ci/doc-blocks.py README.md Install 1 --commands) || return 1
+            cut -f1 <<<"$block" ;;
+        deploy)
+            block=$(python3 ci/doc-blocks.py deploy/README.md Apply 1 --commands) || return 1
+            para=$(python3 ci/doc-blocks.py deploy/README.md Apply --para "$MT_LIVE_PHRASE" --spans) || return 1
+            c=$(cut -f1 <<<"$block")
+            grep -m1 '^rsync ' <<<"$c" || return 1
+            grep -m1 '^systemctl daemon-reload && ' <<<"$para" || return 1
+            grep -m1 -x 'systemctl reload sshd' <<<"$para" || return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The documents' text for a path, quoted into the open story.
+mt_live_doc() { # readme|deploy
+    local out
+    case "$1" in
+        readme)
+            out=$(python3 ci/doc-blocks.py README.md Install) || fail "README.md has no \"Install\" command block: $out"
+            ev_text install-block "EV-PROCEDURE: README.md's \"Install\" block, as this run read it" "$out" ;;
+        deploy)
+            out=$(python3 ci/doc-blocks.py deploy/README.md Apply 1) || fail "deploy/README.md has no \"Apply\" command block: $out"
+            ev_text apply-block "EV-PROCEDURE: deploy/README.md's \"Apply\" block, as this run read it: its rsync line is the path's first command" "$out"
+            out=$(python3 ci/doc-blocks.py deploy/README.md Apply --para "$MT_LIVE_PHRASE") \
+                || fail "deploy/README.md's Apply section no longer has the live paragraph: $out"
+            ev_text live-paragraph "EV-PROCEDURE: deploy/README.md's \"Apply\" paragraph giving the live sequence, as this run read it: its sequence, then its \`systemctl reload sshd\` for an sshd already running" "$out" ;;
+    esac
+}
+
+# Every command of a path, as written, in order, in the open story. README.md's
+# block says sudo, so it runs as rocky, an admin with sudo; deploy/README.md's
+# as root, as its Apply section says. A command that fails is a FAIL and the
+# path goes on, as a maintainer's paste would.
+mt_live_run() { # readme|deploy
+    local cmds line rc n=0 out
+    local -a lines
+    cmds=$(mt_live_cmds "$1") || fail "the $1 path's commands could not be read out of the documents"
+    mapfile -t lines <<<"$cmds"
+    case "$1" in
+        readme) [ "${lines[-1]}" = "sudo systemctl start desktop.service" ] \
+                    || fail "README.md's Install block no longer ends in sudo systemctl start desktop.service: $cmds" ;;
+        deploy) [ "${#lines[@]}" = 3 ] || fail "the deploy path is not three commands: $cmds" ;;
+    esac
+    ev_text commands "EV-PROCEDURE: the $1 path's commands, in order, each run as written ($([ "$1" = readme ] && echo "as rocky, in the repository" || echo "as root, in the repository"))" "$cmds"
+    for line in "${lines[@]}"; do
+        n=$((n + 1)) rc=0
+        if [ "$1" = readme ]; then
+            out=$(ev_save "live-$n" "EV-PROCEDURE: \`$line\`, as written, as rocky (an admin with sudo) in the repository: its output and exit status" \
+                runuser -u rocky -- sh -c "$line" </dev/null) || rc=$?
+        else
+            out=$(ev_save "live-$n" "EV-PROCEDURE: \`$line\`, as written, as root in the repository: its output and exit status" \
+                sh -c "$line" </dev/null) || rc=$?
+        fi
+        if [ "$rc" = 0 ]; then
+            ev_pass "\`$line\` exited 0"
+        else
+            ev_fail "\`$line\` exited $rc: $(grep -m1 . <<<"$out")"
+        fi
+    done
+}
+
+# S10.1.4: one live path on a stock host whose sshd has run since boot.
+mt_live() { # readme|deploy
+    mt_begin S10.1.4
+    systemctl is-active --quiet sshd || fail "sshd is not running on the stock host"
+    ev_save sshd-before "EV-STATE: sshd on the stock host before the tree: running since boot, the stock case" \
+        systemctl show -p ActiveState -p ActiveEnterTimestamp -p MainPID sshd >/dev/null || true
+    ev_save stock-seat "EV-STATE: the stock host before the tree: its getty on tty1, no desktop accounts, no desktop units" \
+        sh -c 'systemctl is-active getty@tty1.service; id desktop; id desktop-shell; systemctl list-units --all --no-pager --no-legend "desktop*"' >/dev/null || true
+    mt_state stock "on the stock host, before the tree"
+    mt_live_doc "$1"
+    mt_put since-live "$(date +%s)"
+    mt_live_run "$1"
+    mt_state applied "after the $1 path's commands, no reboot"
+    mt_state_diff stock applied "what the $1 path did"
+    ev_end
+}
+
+# Every process with a DRM card or tty1 open, in any mount namespace: each
+# /proc/<pid>/fd link names the path as that process sees it. The host's
+# fuser cannot list the container's Xorg (the container has device nodes of
+# its own, and fuser matches by node), and the container shares the host's
+# pid namespace, so /proc shows both.
+mt_drm_holders() {
+    local p f l
+    for p in /proc/[0-9]*; do
+        for f in "$p"/fd/*; do
+            l=$(readlink "$f" 2>/dev/null) || continue
+            case "$l" in
+                /dev/dri/card[0-9]*|/dev/tty1) printf '%s %s %s %s\n' "${p#/proc/}" "$(stat -c %U "$p" 2>/dev/null)" "$(cat "$p/comm" 2>/dev/null)" "$l" ;;
+            esac
+        done
+    done | sort -u -k1,1n -k4
+}
+mt_holders_state() { # <moment> <when>
+    ev_save "fuser-$1" "EV-STATE: fuser -v /dev/dri/card* /dev/tty1 on the host ($2)" \
+        sh -c 'fuser -v /dev/dri/card* /dev/tty1 2>&1; true' >/dev/null || true
+    ev_save "holders-$1" "EV-STATE: every process with a DRM card or tty1 open, any mount namespace, from /proc/<pid>/fd: pid, user, command, the path it opened ($2)" \
+        mt_drm_holders >/dev/null || true
+}
+
+# S10.1.4: S10.1.2's end state, no reboot, read-only probes only; the VM host
+# has seen the desktop on the screen.
+mt_live_state() { # readme|deploy
+    local u st out who line indent since
+    mt_begin S10.1.4
+    wait_for 30 2 "desktop.service active" systemctl is-active --quiet desktop.service
+    wait_for 30 2 "the session's mwm" session_up
+    for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell desktop-selinux; do
+        st="$(systemctl show -p ActiveState --value "$u.service")/$(systemctl show -p Result --value "$u.service")"
+        [ "$st" = active/success ] || ev_fail "$u.service is $st after the $1 path"
+    done
+    ev_pass "desktop.service is active and mwm runs, after the $1 path with no reboot"
+    out=$(ev_save accounts "EV-STATE: id desktop and id desktop-shell after the $1 path" sh -c 'id desktop; id desktop-shell') \
+        || ev_fail "the $1 path did not create both accounts: $out"
+    grep -q '^uid=61000(desktop) ' <<<"$out" && ev_pass "desktop (uid 61000) and desktop-shell exist" \
+        || ev_fail "desktop is not uid 61000: $(head -n1 <<<"$out")"
+    out=$(ev_save tree "EV-STATE: xwininfo -root -tree after the $1 path: the session's xterm, inside mwm's frame" xtree) || true
+    line=$(grep -m1 '"XTerm")' <<<"$out" || true)
+    indent=${line%%[! ]*}
+    if [ -n "$line" ] && [ "${#indent}" -gt 5 ]; then
+        ev_pass "the session's xterm is on the screen inside mwm's frame: ${line#"$indent"}"
+    else
+        ev_fail "there is no xterm inside a window manager's frame: ${line:-no xterm}"
+    fi
+    mt_state live "after the $1 path, the desktop up, no reboot"
+    out=$(mt_saved "$(mt_get S10.1.4-live-preflight)")
+    if [ "$(mt_saved_rc "$(mt_get S10.1.4-live-preflight)")" = 0 ] && grep -q 'done: 0 FAIL' <<<"$out"; then
+        ev_pass "desktop-preflight exits 0: 0 FAILs"
+    else
+        ev_fail "desktop-preflight reported FAILs: $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+    fi
+    mt_state_diff applied live "what came up after the path's commands"
+    since=$(date +%s)
+    who=$(ev_save ssh-host "EV-STATE: ssh host whoami, run in the desktop container as the session user (S5.7.2): Host Terminal's path" \
+        podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) || true
+    sleep 1
+    ev_save sshd-journal "EV-LOG-JOURNAL: journalctl -u sshd for the container's ssh host attempt: accepted, or the failure and its reason" \
+        journalctl --no-pager -o short-precise -u sshd --since "@$since" >/dev/null || true
+    if [ "$(tail -n1 <<<"$who")" = desktop-shell ]; then
+        ev_pass "from the container, ssh host logs in as desktop-shell: Host Terminal works after the $1 path"
+    else
+        ev_fail "from the container, ssh host answered '$(tail -n1 <<<"$who")', not desktop-shell: Host Terminal does not work after the $1 path"
+    fi
+    ev_save sshd-config "EV-STATE: the AuthorizedKeysFile sshd's configuration files give now (sshd -T reads them anew), and when the running sshd last started or re-read them (its start time and its SIGHUP lines)" \
+        sh -c 'sshd -T 2>/dev/null | grep -i "^authorizedkeysfile"; systemctl show -p ActiveEnterTimestamp -p ExecMainStartTimestamp sshd; journalctl --no-pager -o short-precise -u sshd -b | grep -iE "reload|Server listening|Received SIGHUP" | tail -n 5' >/dev/null || true
+    mt_logs "$(mt_get since-live)" "from the $1 path's first command until now"
+    ev_end
+}
+
+# S10.1.5's host: gdm from AppStream and graphical.target the default, a
+# harness profile, then a reboot to the greeter.
+mt_gdm_profile() {
+    mt_begin S10.1.5
+    ev_save gdm-install "EV-PROCEDURE: harness-only profile: dnf -y install gdm (AppStream), the graphical host this story converts" \
+        dnf -y install gdm >/dev/null || fail "could not install gdm"
+    ev_save set-default "EV-PROCEDURE: harness-only profile: systemctl set-default graphical.target" \
+        systemctl set-default graphical.target >/dev/null || fail "could not set graphical.target as the default"
+    ev_save profile "EV-STATE: the profile: rpm -q gdm, the default target, whether gdm is enabled, and the display-manager.service alias" \
+        sh -c 'rpm -q gdm; systemctl get-default; systemctl is-enabled gdm; ls -l /etc/systemd/system/display-manager.service' >/dev/null || true
+    mt_put boot-before "$(cat /proc/sys/kernel/random/boot_id)"
+    ev_note "harness-only: a reboot to the greeter follows"
+    ev_end
+    sync
+    systemctl reboot
+}
+
+# The greeter, before the tree: gdm active, its greeter session on seat0
+# holding the card.
+mt_gdm_greeter() {
+    local b0 b1
+    mt_begin S10.1.5
+    b0=$(mt_get boot-before) b1=$(cat /proc/sys/kernel/random/boot_id)
+    [ -n "$b0" ] && [ "$b1" != "$b0" ] || fail "this is not a new boot: boot id $b1, before ${b0:-unknown}"
+    wait_for 60 2 "gdm active" systemctl is-active --quiet gdm
+    ev_save greeter "EV-STATE: the graphical host before the tree: gdm, the default target, logind's sessions and seat0" \
+        sh -c 'systemctl status gdm --no-pager | head -n 12; systemctl get-default; loginctl list-sessions --no-pager; loginctl seat-status seat0 --no-pager | head -n 20' >/dev/null || true
+    mt_holders_state before "the greeter on the screen, before the tree"
+    if [ -n "$(mt_drm_holders | awk '$4 ~ /^\/dev\/dri\/card/')" ]; then
+        ev_pass "the greeter holds the card: $(mt_drm_holders | awk '$4 ~ /^\/dev\/dri\/card/ {print $3 "(" $1 ")"}' | sort -u | paste -sd' ')"
+    else
+        ev_fail "no process holds a DRM card with the greeter up"
+    fi
+    mt_state greeter "the greeter on the screen, before the tree"
+    ev_end
+}
+
+# S10.1.5: the rsync and deploy/README.md's live sequence, as written, on the
+# host showing its greeter.
+mt_gdm_live() {
+    mt_begin S10.1.5
+    mt_live_doc deploy
+    mt_put since-live "$(date +%s)"
+    mt_live_run deploy
+    ev_end
+}
+
+# Which of deploy/README.md's two outcomes the live sequence ended in, with
+# the screen's verdict from the VM host ("desktop" if it showed the desktop);
+# the outcome (converted, held or neither) goes to $MT/gdm-outcome.
+mt_gdm_classify() { # desktop|dark
+    local sp log en act outcome
+    mt_begin S10.1.5
+    mt_holders_state between "after the live sequence, the screen $([ "$1" = desktop ] && echo showing the desktop || echo not showing it)"
+    ev_save journal-seat-prep "EV-LOG-JOURNAL: journalctl -u desktop-seat-prep since the live sequence" \
+        journalctl --no-pager -o short-precise -u desktop-seat-prep --since "@$(mt_get since-live)" >/dev/null || true
+    log=$(mt_saved "$EV_LAST")
+    ev_save journal-logind "EV-LOG-JOURNAL: journalctl -u systemd-logind since the live sequence" \
+        journalctl --no-pager -o short-precise -u systemd-logind --since "@$(mt_get since-live)" >/dev/null || true
+    sp="$(systemctl show -p ActiveState --value desktop-seat-prep.service)/$(systemctl show -p Result --value desktop-seat-prep.service)"
+    en=$(systemctl is-enabled gdm 2>&1 || true) act=$(systemctl is-active gdm 2>&1 || true)
+    ev_save units "EV-STATE: desktop-seat-prep, desktop.service and gdm after the live sequence" \
+        sh -c 'systemctl status desktop-seat-prep desktop.service --no-pager | head -n 40; echo "== gdm"; systemctl is-enabled gdm; systemctl is-active gdm; systemctl get-default' >/dev/null || true
+    if [ "$1" = desktop ] && [ "$en" = disabled ] && [ "$act" != active ]; then
+        outcome=converted
+        ev_pass "the first outcome: the desktop on the screen, gdm $en and $act (desktop-seat-prep $sp)"
+    elif [ "$sp" = failed/exit-code ] && grep -q 'ERROR: devices still held after convergence: .*([0-9]' <<<"$log"; then
+        outcome=held
+        ev_pass "the second outcome: desktop-seat-prep failed and named the holder: $(grep -m1 'ERROR: devices still held' <<<"$log" | sed 's/.*seat-prep: //')"
+    else
+        outcome=neither
+        ev_fail "neither outcome: the screen $([ "$1" = desktop ] && echo shows the desktop || echo does not show the desktop), gdm $en and $act, desktop-seat-prep $sp$(grep -q 'ERROR' <<<"$log" || echo ', no culprit named')"
+    fi
+    mt_put gdm-outcome "$outcome"
+    ev_note "outcome: $outcome"
+    ev_end
+}
+
+# The second outcome's remedy, as deploy/README.md gives it: reboot.
+mt_gdm_reboot() {
+    mt_begin S10.1.5
+    mt_put boot-before "$(cat /proc/sys/kernel/random/boot_id)"
+    ev_note "the second outcome: the paragraph's remedy, \`reboot\`, runs as written; nothing else is done"
+    ev_end
+    sync
+    reboot
+}
+
+# S10.1.5's end state: multi-user.target, gdm disabled, nothing but the
+# desktop's Xorg holding a card, S10.1.2's screen and input checks (the VM
+# host's).
+mt_gdm_after() {
+    local out x holders others
+    mt_begin S10.1.5
+    wait_for 30 2 "desktop.service active" systemctl is-active --quiet desktop.service
+    wait_for 30 2 "the session's mwm" session_up
+    out=$(systemctl get-default)
+    [ "$out" = multi-user.target ] && ev_pass "systemctl get-default is multi-user.target" \
+        || ev_fail "systemctl get-default is $out, not multi-user.target"
+    out=$(systemctl is-enabled gdm 2>&1 || true)
+    [ "$out" = disabled ] && ev_pass "systemctl is-enabled gdm is disabled" || ev_fail "systemctl is-enabled gdm is $out, not disabled"
+    out=$(systemctl is-active gdm 2>&1 || true)
+    [ "$out" != active ] && ev_pass "gdm is not running ($out)" || ev_fail "gdm is running again"
+    mt_holders_state after "the end state"
+    x=$(podman exec desktop pgrep -u desktop -x Xorg 2>/dev/null || true)
+    x=${x%%$'\n'*}
+    holders=$(mt_drm_holders | awk '$4 ~ /^\/dev\/dri\/card/ {print $1}' | sort -u | paste -sd' ')
+    others=$(mt_drm_holders | awk -v x="$x" '$4 ~ /^\/dev\/dri\/card/ && $1 != x {print $3 "(" $1 ")"}' | sort -u | paste -sd' ')
+    if [ -n "$x" ] && [ "$holders" = "$x" ]; then
+        ev_pass "only the desktop's Xorg (pid $x) holds a DRM card; the host's fuser cannot show it (the container's nodes are its own), /proc/<pid>/fd does"
+    else
+        ev_fail "the DRM card holders are '${holders:-none}', not the desktop's Xorg alone (pid ${x:-none}); others: ${others:-none}"
+    fi
+    ev_save journal-boot "EV-LOG-JOURNAL: journalctl -b -u desktop-seat-prep -u systemd-logind -u gdm: this boot" \
+        journalctl --no-pager -o short-precise -b -u desktop-seat-prep -u systemd-logind -u gdm >/dev/null || true
+    if [ "$(mt_get gdm-outcome)" = held ]; then
+        ev_save journal-boot-before "EV-LOG-JOURNAL: journalctl -b -1 -u desktop-seat-prep -u systemd-logind -u gdm: the boot the live sequence ran in" \
+            journalctl --no-pager -o short-precise -b -1 -u desktop-seat-prep -u systemd-logind -u gdm >/dev/null || true
+    fi
+    mt_state after "the end state"
+    mt_state_diff greeter after "the greeter's host against the end state"
+    ev_end
+}
+
 maint() { # <step> [args]
     case "${1:-}" in
         packages) mt_packages ;;
@@ -1821,6 +2108,14 @@ maint() { # <step> [args]
         upgrade-done) mt_upgrade_done ;;
         upc-tone) mt_upc_tone "${2:?hz}" ;;
         audio-diag) mt_audio_diag "${2:?story}" ;;
+        live) mt_live "${2:?readme|deploy}" ;;
+        live-state) mt_live_state "${2:?readme|deploy}" ;;
+        gdm-profile) mt_gdm_profile ;;
+        gdm-greeter) mt_gdm_greeter ;;
+        gdm-live) mt_gdm_live ;;
+        gdm-classify) mt_gdm_classify "${2:?desktop|dark}" ;;
+        gdm-reboot) mt_gdm_reboot ;;
+        gdm-after) mt_gdm_after ;;
         hostterm-before) mt_hostterm_before ;;
         hostterm-switch) mt_hostterm_switch ;;
         hostterm-after) mt_hostterm_after ;;

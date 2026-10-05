@@ -29,6 +29,16 @@
 #                  under a running client, input devices on another seat, a
 #                  process holding DRM master, a device group out of step
 #                  (S10.5.1-S10.5.4)
+#   maint-live     the two live paths, each on its own stock host whose sshd
+#                  runs from boot: README.md's Install block, and
+#                  deploy/README.md's rsync and live sequence with its
+#                  `systemctl reload sshd`; then S10.1.2's end state with no
+#                  reboot (S10.1.4)
+#   maint-gdm      a host with gdm installed and graphical.target the default
+#                  (a profile the harness applies), booted to the greeter,
+#                  converted with deploy/README.md's live sequence; the
+#                  outcome classified against the document's two, and its
+#                  reboot taken if the second (S10.1.5)
 # The gate then holds this workflow's stories (their Coverage lines name
 # it: "(workflow `maintainer.yml`)") to the evidence the run left.
 #
@@ -147,7 +157,9 @@ jobs:
     # maint-docpath: two stock hosts provisioned from nothing, each with a
     # reboot, and a maintenance stop held for two minutes. maint-config: one
     # host, and about fifteen desktop restarts. maint-session: one host, a
-    # reboot, three desktop restarts and an image build.
+    # reboot, three desktop restarts and an image build. maint-live: two
+    # stock hosts provisioned from nothing, no reboot. maint-gdm: one host,
+    # gdm and its desktop installed, and up to two reboots.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -162,6 +174,10 @@ jobs:
           - shard: maint-session
             extra: vm-images-bases
           - shard: maint-faults
+            extra: ""
+          - shard: maint-live
+            extra: ""
+          - shard: maint-gdm
             extra: ""
     steps:
       - uses: actions/checkout@v4

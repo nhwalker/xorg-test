@@ -10,6 +10,11 @@ the maintainer journeys (Requirements.md E10) to run verbatim.
                                     blank lines dropped, a trailing "# ..."
                                     comment kept apart after a tab
 
+  doc-blocks.py FILE HEADING --para PHRASE [--spans]
+                                    the paragraph under HEADING that contains
+                                    PHRASE, as one line; --spans: its inline
+                                    code spans, one per line (a sequence the
+                                    document gives in prose)
   doc-blocks.py FILE HEADING --entry LEAD [--spans]
                                     the list entry under HEADING whose bold
                                     lead starts with LEAD ("- **LEAD..."), as
@@ -57,15 +62,18 @@ def block(path, heading, n=1):
 
 def section(path, heading):
     """The lines under the first heading starting with HEADING, to the next
-    heading of the same or a higher level."""
+    heading of the same or a higher level (a "# comment" in a code block is
+    not one)."""
     lines = open(path, encoding="utf-8").read().split("\n")
     for i, l in enumerate(lines):
         m = re.match(r"^(#+)\s+(.*)$", l)
         if m and m.group(2).startswith(heading):
-            level, out = len(m.group(1)), []
+            level, out, inside = len(m.group(1)), [], False
             for l2 in lines[i + 1:]:
+                if l2.startswith("```"):
+                    inside = not inside
                 m2 = re.match(r"^(#+)\s", l2)
-                if m2 and len(m2.group(1)) <= level:
+                if not inside and m2 and len(m2.group(1)) <= level:
                     break
                 out.append(l2)
             return out
@@ -86,6 +94,27 @@ def entry(path, heading, lead):
     if out is None:
         raise SystemExit(f"{path}: under {heading!r} no entry starts **{lead}")
     return " ".join(out)
+
+
+def para(path, heading, phrase):
+    """The paragraph (blank-line separated, outside code blocks) containing
+    PHRASE, its lines joined; PHRASE is matched with the lines joined too."""
+    paras, cur, inside = [], [], False
+    for l in section(path, heading) + [""]:
+        if l.startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        if l.strip():
+            cur.append(l.strip())
+        elif cur:
+            paras.append(" ".join(cur))
+            cur = []
+    hits = [p for p in paras if phrase in p]
+    if not hits:
+        raise SystemExit(f"{path}: under {heading!r} no paragraph contains {phrase!r}")
+    return hits[0]
 
 
 def commands(text_lines):
@@ -125,6 +154,10 @@ def main():
     if len(a) < 2:
         raise SystemExit(__doc__)
     path, heading = a[0], a[1]
+    if "--para" in a:
+        text = para(path, heading, a[a.index("--para") + 1])
+        print("\n".join(re.findall(r"`([^`]+)`", text)) if "--spans" in a else text)
+        return
     if "--entry" in a:
         text = entry(path, heading, a[a.index("--entry") + 1])
         print("\n".join(re.findall(r"`([^`]+)`", text)) if "--spans" in a else text)

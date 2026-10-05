@@ -853,6 +853,127 @@ maint_docpath() {
     mt_close
 }
 
+# --- F10.1: the live paths (S10.1.4), and a graphical host converted (S10.1.5) ----
+# After a reboot to a screen that is not the desktop (a greeter), ssh tells
+# when the host is back.
+mt_wait_boot() { # <boot id before the reboot>
+    local b
+    sleep 15
+    for _ in $(seq 60); do
+        b=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | tail -n1 || true)
+        [ -n "$b" ] && [ "$b" != "$1" ] && return 0
+        sleep 5
+    done
+    return 1
+}
+
+# S10.1.4: one live path on a stock host. The documents' packages and the
+# image first (S10.1.1's and S10.1.2's steps; the docpath journey keeps
+# their evidence), then the path, watched from QEMU's side until the
+# desktop shows, then S10.1.2's end state with no reboot: the read-only
+# probes, the typing and a tone.
+mt_live_host() { # readme|deploy <word> <hz>
+    local vid t0
+    guest_ev "" maint packages || fail "S10.1.4: the documented package line did not provision the host"
+    guest_ev "" maint image || fail "S10.1.4: the desktop image could not be loaded"
+    mt_open S10.1.4
+    ev_note "the $1 path's host: provisioned with deploy/HOST-REQUIRES.md's package line and the image loaded (S10.1.1's and S10.1.2's steps; the docpath journey keeps their evidence)"
+    ev_shot "stock-$1" "EV-SHOT: the stock host's screen before the $1 path: the image's own login prompt on tty1"
+    EV_VID_FPS=1 ev_video_start "live-$1"
+    vid="$EV_DIR/$EV_VID"
+    mt_close
+    t0=$(date +%s.%N)
+    mg live "$1" || mt_failed S10.1.4 "the $1 path's step did not run through"
+    if ! mt_wait_screen "$vid" 180; then
+        mt_open S10.1.4
+        ev_video_stop "EV-VIDEO: the screen from the $1 path's first command for 180 s: the desktop never appeared"
+        mt_failed S10.1.4 "180 s after the $1 path began the desktop is not on the screen"
+        mg live-state "$1" || true
+        return 1
+    fi
+    sleep 3
+    mt_open S10.1.4
+    ev_video_stop "EV-VIDEO: the screen at 1 fps from the $1 path's first command until the desktop was on it; index.txt gives each frame's UTC time"
+    ev_note "the $1 path: the desktop was on the screen $(mt_elapsed "$t0") s after the step began (${MT_BACK%% *} at ${MT_BACK#* }), with no reboot"
+    if ! mt_screen_check "live-$1" "EV-SHOT: the screen after the $1 path: the #101216 root, the session's xterm in mwm's frame"; then
+        mt_failed S10.1.4 "the screen does not show the desktop after the $1 path"
+        return 1
+    fi
+    mt_close
+    mg live-state "$1" || mt_failed S10.1.4 "after the $1 path, the end state could not be checked through"
+    mt_typing S10.1.4 "$2" || mt_failed S10.1.4 "after the $1 path, typed text did not reach the focused xterm"
+    mt_tone S10.1.4 "mt-live-$1" "$3" || mt_failed S10.1.4 "after the $1 path, the session's pulse tone was not heard"
+}
+maint_live() {
+    log "maintainer, host A: README.md's Install block as written, on a stock host whose sshd is running (S10.1.4)"
+    mt_unpack
+    mt_live_host readme livereadme 550
+    log "maintainer, host B: deploy/README.md's live sequence as written, on another stock host (S10.1.4)"
+    vm_fresh_host host-b
+    mt_unpack
+    mt_live_host deploy livedeploy 770
+}
+
+# S10.1.5: a host showing gdm's greeter on tty1, converted live with
+# deploy/README.md's sequence; the outcome classified against the two the
+# document describes, and the second one's remedy, a reboot, taken if it
+# is the one.
+maint_gdm() {
+    local vid t0 b0 rc outcome shown skip
+    log "maintainer: a graphical host, gdm's greeter on tty1, converted live with deploy/README.md's sequence (S10.1.5)"
+    mt_unpack
+    guest_ev "" maint packages || fail "S10.1.5: the documented package line did not provision the host"
+    guest_ev "" maint image || fail "S10.1.5: the desktop image could not be loaded"
+    b0=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | tail -n1)
+    mg_reboot gdm-profile && rc=0 || rc=$?
+    [ "$rc" != 1 ] || { ev_pull; fail "S10.1.5: the gdm profile could not be applied"; }
+    mt_wait_boot "$b0" || fail "S10.1.5: the host did not come back from the profile's reboot"
+    mg gdm-greeter || fail "S10.1.5: the host does not show gdm's greeter"
+    mt_open S10.1.5
+    ev_shot greeter "EV-SHOT: the graphical host's screen before the tree: gdm's greeter"
+    EV_VID_FPS=1 ev_video_start greeter-to-desktop
+    vid="$EV_DIR/$EV_VID"
+    mt_close
+    t0=$(date +%s.%N)
+    mg gdm-live || mt_failed S10.1.5 "the live sequence's step did not run through"
+    if mt_wait_screen "$vid" 150; then shown=desktop; else shown=dark; fi
+    mg gdm-classify "$shown" || mt_failed S10.1.5 "the outcome could not be classified"
+    outcome=$(vm_ssh_quick 'sudo cat /var/tmp/maint/gdm-outcome' 2>/dev/null | tail -n1 || true)
+    log "S10.1.5: the screen ${shown}; the outcome: ${outcome:-unknown}"
+    case "$outcome" in
+        converted) ;;
+        held)
+            b0=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | tail -n1)
+            skip=$(wc -l < "$vid/index.txt")
+            mg_reboot gdm-reboot && rc=0 || rc=$?
+            [ "$rc" != 1 ] || { ev_pull; fail "S10.1.5: the reboot could not be started"; }
+            if ! mt_wait_screen "$vid" 300 "$skip"; then
+                mt_open S10.1.5
+                ev_video_stop "EV-VIDEO: the screen from the greeter, through the live sequence and the reboot, for 300 s after it: no desktop"
+                mt_failed S10.1.5 "300 s after the second outcome's reboot the desktop is not on the screen"
+                return 0
+            fi
+            ;;
+        *)
+            mt_open S10.1.5
+            ev_video_stop "EV-VIDEO: the screen from the greeter through the live sequence: neither of the document's outcomes"
+            mt_failed S10.1.5 "the live sequence ended in neither outcome deploy/README.md describes"
+            return 0
+            ;;
+    esac
+    sleep 3
+    mt_open S10.1.5
+    ev_video_stop "EV-VIDEO: the screen at 1 fps from the greeter to the desktop$([ "$outcome" = held ] && echo ', across the reboot'); index.txt gives each frame's UTC time"
+    ev_note "outcome '$outcome': the desktop on the screen $(mt_elapsed "$t0") s after the live sequence began (${MT_BACK%% *} at ${MT_BACK#* })"
+    if ! mt_screen_check end "EV-SHOT: the end state's screen: the #101216 root, the session's xterm in mwm's frame"; then
+        mt_failed S10.1.5 "the screen does not show the desktop in the end state"
+        return 0
+    fi
+    mt_close
+    mg gdm-after || mt_failed S10.1.5 "the end state is not the one deploy/README.md describes"
+    mt_typing S10.1.5 gdmconverted || mt_failed S10.1.5 "in the end state, typed text did not reach the focused xterm"
+}
+
 # Every story the journey wrote, as the gate will read it: a story can fail
 # a check without failing the step that ran it (a checklist's line, say).
 mt_verdict() {
@@ -875,6 +996,8 @@ maint_main() { # <journey>
         config) maint_config ;;
         session) maint_session ;;
         faults) maint_faults ;;
+        live) maint_live ;;
+        gdm) maint_gdm ;;
         *) fail "no maintainer journey named '$1'" ;;
     esac
     write_manifest
