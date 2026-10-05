@@ -198,7 +198,7 @@ done
 [ -f /etc/pulse/client.conf.d/50-desktop-container.conf ] \
     && pass "host Pulse client config present" \
     || warn "host Pulse client config missing: host pulse clients won't reach the container"
-[ -f /etc/alsa/conf.d/60-desktop-container.conf ] \
+[ -f /etc/alsa/conf.d/99-zz-desktop-container.conf ] \
     && pass "host ALSA client config present" \
     || warn "host ALSA client config missing: host alsa clients won't reach the container"
 if [ ! -e /usr/lib64/alsa-lib/libasound_module_pcm_pulse.so ] \
