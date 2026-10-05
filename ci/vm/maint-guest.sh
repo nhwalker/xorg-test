@@ -750,6 +750,7 @@ mt_stop() {
         sh -c 'ps -u 61000 -o pid,ppid,lstart,comm,args || echo "(none)"' >/dev/null || true
     ev_save fuser "EV-STATE: fuser -v /dev/dri/card* /dev/tty1 after the stop: nobody holds them" \
         sh -c 'fuser -v /dev/dri/card* /dev/tty1 2>&1; true' >/dev/null || true
+    ev_note "the host's fuser cannot see a container's open device nodes (podman gives the container nodes of its own; S5.3.3), so an empty fuser alone would not rule out the desktop's Xorg: the check that does is pgrep -u desktop, every process of the desktop's user on the host, the container's included"
     [ "$quiet" != 0 ] || fail "30 s after the stop the host is not quiet: desktop processes [$(pgrep -u desktop | paste -sd' ')], holders [$held], gettys [$(systemctl list-units --no-pager --no-legend 'getty@tty*' 'autovt@*' | paste -sd' ')]"
     ev_pass "within $quiet s of the stop no desktop process is left on the host (pgrep -u desktop), nobody holds /dev/dri/card* or /dev/tty1, and no getty runs on any VT"
     mt_put stop-show "$(systemctl show -p ActiveState -p ActiveEnterTimestampMonotonic -p InactiveEnterTimestampMonotonic -p NRestarts desktop.service)"
