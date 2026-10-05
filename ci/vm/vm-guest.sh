@@ -1760,18 +1760,19 @@ deploy_tail() {
         || { kill "$holder" 2>/dev/null || true; fail "seat-prep's ERROR line does not name pid $holder on /dev/dri/card0"; }
     ev_pass "systemctl restart desktop-seat-prep failed (exit $rc), its journal naming /dev/dri/card0 held by pid $holder, with fuser's table"
     systemctl start desktop.service || { kill "$holder" 2>/dev/null || true; fail "desktop.service did not start with seat-prep failed"; }
-    desk_back
-    ev_save status "EV-STATE: systemctl status desktop-seat-prep desktop with seat-prep failed and the desktop up" \
+    wait_for 40 3 "desktop-init ready in container" container_running
+    [ "$(systemctl is-active desktop.service)" = active ] || { kill "$holder" 2>/dev/null || true; fail "desktop.service is not active with seat-prep failed"; }
+    ev_pass "desktop.service still starts with seat-prep failed: the quadlet only Wants= it"
+    # Its Xorg then meets what the gate named. The first process to open a
+    # DRM primary node is its master, so the sleep is, and the rootless
+    # Xorg cannot take master from it (run 37356857793 waited for X).
+    xconflict() { podman exec desktop grep -q 'drmSetMaster failed' "$XORG_LOG" 2>/dev/null; }
+    wait_for 60 2 "Xorg's drmSetMaster failure, the sleep holding card0" xconflict
+    ev_save x-conflict "EV-LOG-XORG: the Xorg log's DRM-master lines and its fatal error, the sleep holding card0" \
+        podman exec desktop grep -A3 'drmSetMaster\|Fatal server error' "$XORG_LOG" >/dev/null || true
+    ev_save status "EV-STATE: systemctl status desktop-seat-prep desktop with seat-prep failed and the desktop's unit started" \
         systemctl --no-pager status desktop-seat-prep.service desktop.service >/dev/null || true
-    ev_pass "desktop.service still starts with seat-prep failed: the quadlet only Wants= it, and X came up"
-    running=$(ev_save running-view "EV-STATE: fuser -v /dev/dri/card* /dev/tty1 on the host with the desktop running: what seat-prep's gate can see of the container's own Xorg" \
-        sh -c 'fuser -v /dev/dri/card* /dev/tty1 2>&1; true') || true
-    xpid=$(pgrep -x Xorg | sed -n 1p || true)
-    if [ -n "$xpid" ] && grep -qw "$xpid" <<<"$running"; then
-        ev_note "the host's fuser lists the container's Xorg (pid $xpid) on the DRM or VT devices"
-    else
-        ev_note "the host's fuser does not list the container's Xorg (pid ${xpid:-?}): podman gives the container device nodes of its own, and fuser matches an open file by its node"
-    fi
+    ev_pass "its Xorg met the conflict the gate named: drmSetMaster failed (the sleep, card0's first opener, is DRM master), as seat-prep's unit says it will"
     desk_down
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
@@ -1781,6 +1782,15 @@ deploy_tail() {
     ev_pass "with the sleep gone, desktop-seat-prep succeeds again"
     systemctl start desktop.service || fail "desktop.service did not start again"
     desk_back
+    ev_pass "the desktop comes up again, X answering"
+    running=$(ev_save running-view "EV-STATE: fuser -v /dev/dri/card* /dev/tty1 on the host with the desktop running: what seat-prep's gate can see of the container's own Xorg" \
+        sh -c 'fuser -v /dev/dri/card* /dev/tty1 2>&1; true') || true
+    xpid=$(pgrep -x Xorg | sed -n 1p || true)
+    if [ -n "$xpid" ] && grep -qw "$xpid" <<<"$running"; then
+        ev_note "the host's fuser lists the container's Xorg (pid $xpid) on the DRM or VT devices"
+    else
+        ev_note "the host's fuser does not list the container's Xorg (pid ${xpid:-?}): podman gives the container device nodes of its own, and fuser matches an open file by its node"
+    fi
     ev_end
 
     # S5.5.5
