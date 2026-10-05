@@ -191,6 +191,95 @@ mt_host_clients() {
     done
 }
 
+# --- F10.2: the documents' checklists, on a host in use ---------------------------
+# A screendump QEMU writes raw (PPM) and this side converts: a PNG one is
+# compressed in QEMU's main loop, where the sound card runs, and costs a
+# capture running across it 46 ms of sound (qmp-tool.py).
+mt_shot_quiet() { # <moment> <what>
+    local png ppm
+    png=$(ev_name "$1" png)
+    ppm="${EV_DIR:?}/.${png%.png}.ppm"
+    if python3 qmp-tool.py hmp "$QMP" "screendump $ppm" >/dev/null && convert "$ppm" "$EV_DIR/$png" 2>/dev/null; then
+        ev_attach "$png" "$2"
+    else
+        ev_note "the screendump $1 was not produced"
+    fi
+    rm -f "$ppm"
+}
+# A capture with no pitch to check (the checklist's audio lines play a voice
+# sample): check-audio.py's duration and level alone. 0 when it was heard.
+mt_heard() { # <wav name in the open story> <what>
+    local rep rc=0
+    audio_capture_stop
+    [ -s "$EV_DIR/$1" ] || { ev_note "no capture was written for: $2"; return 1; }
+    ev_attach "$1" "$2"
+    rep=$(ev_name "${1%.wav}-verdict" txt)
+    python3 check-audio.py --report "$EV_DIR/$rep" "$EV_DIR/$1" 0.8 0.02 || rc=$?
+    [ -s "$EV_DIR/$rep" ] && ev_attach "$rep" "check-audio.py's verdict on $1: its duration and peak level (no pitch: the line plays a voice sample)"
+    return "$rc"
+}
+
+# S10.2.1 and S10.2.2: both checklists, every line as written, on the
+# provisioned host, with a client of the desktop's running throughout: its
+# xterm on the screen and a tone that must not stop. Then each audio line of
+# the README checklist again, alone, so it can be heard.
+mt_verify() {
+    local tone=90 tool v wav probe judged
+    log "S10.2.1, S10.2.2: the two verification checklists as written, on the provisioned host, with a client running"
+    mg checklist-tools || fail "S10.2.1: could not install the checklist's own probe"
+    mt_open S10.2.2
+    ev_shot before "EV-SHOT: the screen before the client and the checklists"
+    ev_audio_start client 330
+    mt_close
+    mg quiet start "$tone" || { audio_capture_stop; fail "S10.2.2: the client did not start"; }
+    mt_open S10.2.2
+    mt_shot_quiet client-up "EV-SHOT (raw, so the capture runs on undisturbed): the client's xterm (mt-client) on the screen, before the checklists"
+    mt_close
+    mg quiet state before || { audio_capture_stop; fail "S10.2.2: could not record the state before the checklists"; }
+    mg checklist readme || mt_failed S10.2.1 "README.md's checklist did not run through"
+    mg checklist deploy || mt_failed S10.2.1 "deploy/README.md's checklist did not run through"
+    mg quiet state after || mt_failed S10.2.2 "the state after the checklists differs, or could not be recorded"
+    mt_open S10.2.2
+    mt_shot_quiet client-after "EV-SHOT (raw): the screen after the checklists, the client's xterm still on it"
+    mt_close
+    mg quiet ended || mt_failed S10.2.2 "the client's player did not play its tone through"
+    mt_open S10.2.2
+    if ev_audio_stop "EV-AUDIO: the machine's output from before the client's ${tone} s 330 Hz tone began until it ended, both checklists run meanwhile: it must not stop" \
+        $((tone - 10)) 0.05 330 --max-gap 0.3 --span $((tone - 2)) $((tone + 2)); then
+        ev_pass "the client's 330 Hz tone played through both checklists for its whole ${tone} s, with no gap longer than 0.3 s"
+        ev_shot after "EV-SHOT: the screen once the client's tone ended"
+        mt_close
+    else
+        mt_failed S10.2.2 "the client's tone was interrupted while the checklists ran"
+    fi
+    mg quiet remove || true
+    for tool in pw-play paplay aplay; do
+        for v in written met container; do
+            # aplay's comment names no condition to meet.
+            [ "$tool:$v" != aplay:met ] || continue
+            judged=no
+            case "$tool:$v" in pw-play:met|paplay:met|aplay:written) judged=yes ;; esac
+            mt_open S10.2.1
+            wav=$(ev_name "$tool-$v" wav)
+            mon_cmd "wavcapture $EV_DIR/$wav snd0 44100 16 2"
+            sleep 1
+            ev_save "$tool-$v" "EV-STATE: the README checklist's $tool line ($v): what it printed and its exit status" \
+                vm_ssh "sudo repo/ci/vm/vm-guest.sh maint checklist-play $tool $v" >/dev/null || true
+            probe=$(ev_payload "$EV_DIR/$EV_LAST")
+            if mt_heard "$wav" "EV-AUDIO: the machine's output while the README checklist's $tool line ran ($v)" \
+                && grep -q '^exited 0$' <<<"$probe"; then
+                if [ "$judged" = yes ]; then ev_pass "README checklist, $tool ($v): it exited 0 and was heard"
+                else ev_note "README checklist, $tool ($v), recorded and not judged: it exited 0 and was heard"; fi
+            elif [ "$judged" = yes ]; then
+                ev_fail "README checklist, $tool ($v): not heard, or it failed ($(grep '^exited' <<<"$probe"))"
+            else
+                ev_note "README checklist, $tool ($v), recorded and not judged: not heard, or it failed ($(grep '^exited' <<<"$probe"))"
+            fi
+            mt_close
+        done
+    done
+}
+
 # --- F10.4: a restart, and a maintenance stop and start ---------------------------
 # What the operator gets back after <command>: the screen recorded from the
 # command until the desktop shows, the time it took, the typing and the
@@ -260,6 +349,7 @@ maint_docpath() {
     mt_provision skipped
     mt_host_clients
     mg selinux skipped || mt_failed S10.1.3 "on the host that skipped the restorecon line, a check failed"
+    mt_verify
     mt_routine
     log "maintainer, host B: a second stock host, the same path with the restorecon line taken (S10.1.2, S10.1.3)"
     vm_fresh_host host-b
@@ -281,11 +371,28 @@ maint_docpath() {
     mt_close
 }
 
+# Every story the journey wrote, as the gate will read it: a story can fail
+# a check without failing the step that ran it (a checklist's line, say).
+mt_verdict() {
+    ev_pull
+    python3 - "$ART" <<'PY'
+import sys
+sys.path.insert(0, "..")
+import evlib
+bad = [f"{d}: {st}: {why}" for d in evlib.story_dirs(sys.argv[1])
+       for st, why in [evlib.read_result(d)] if st != "PASS"]
+print("\n".join(bad))
+sys.exit(1 if bad else 0)
+PY
+}
+
 maint_main() { # <journey>
+    local bad
     case "$1" in
         docpath) maint_docpath ;;
         *) fail "no maintainer journey named '$1'" ;;
     esac
     write_manifest
     [ -z "$MT_FAILED" ] || fail "maintainer stories failed:$MT_FAILED (each story's evidence.md says why)"
+    bad=$(mt_verdict) || fail "maintainer stories did not pass: $bad"
 }

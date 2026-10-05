@@ -401,6 +401,294 @@ mt_selinux() { # took|skipped
     ev_end
 }
 
+# --- F10.2: verifying a host the way the documents say to ------------------------
+
+# The audio export, as README.md's table gives it to clients.
+MT_PIPEWIRE=/run/desktop-audio/pipewire-0
+MT_PULSE=unix:/run/desktop-audio/pulse
+
+# Output that matches every <ERE> shows what it should: echoes
+# "PASS<tab>shows ..." or "FAIL<tab>does not show ...".
+mt_shows() { # <output file> <ERE> <what> [<ERE> <what>]...
+    local f=$1 bad="" good=""
+    shift
+    while [ $# -ge 2 ]; do
+        if grep -qE -- "$1" "$f"; then good="${good:+$good; }$2"; else bad="${bad:+$bad; }$2"; fi
+        shift 2
+    done
+    if [ -z "$bad" ]; then printf 'PASS\tshows %s\n' "$good"; else printf 'FAIL\tdoes not show %s\n' "$bad"; fi
+}
+
+# A layout is declared when monitors.conf names an output, as the
+# container's preflight reads it.
+mt_layout_declared() {
+    [ -n "$(grep -vE '^[[:space:]]*(#|$)' /etc/desktop-container/monitors.conf 2>/dev/null \
+        | grep -vE '^[[:space:]]*(virtual|nvidia-connected|nvidia-edid)[[:space:]]')" ]
+}
+
+# What a documented verification line must show, as its comment says, by the
+# line as the document writes it (spaces squeezed). A line not listed here
+# fails: a new or changed line needs a decision about what it should show.
+mt_judge() { # <command> <comment> <exit status> <output file>
+    local c=$1 k=$2 rc=$3 f=$4
+    case "$c" in
+        "systemctl status desktop.service")
+            if [ "$k" = "generated from the quadlet" ]; then
+                mt_shows "$f" 'Active: active \(running\)' "desktop.service active (running)" \
+                    'desktop\.container; generated' "a unit generated from the quadlet"
+            else
+                mt_shows "$f" 'Active: active \(running\)' "desktop.service active (running)"
+            fi ;;
+        "podman exec desktop test -f /run/desktop-init-ready && echo booted")
+            mt_shows "$f" '^booted$' "booted" ;;
+        "podman exec desktop pgrep -u desktop -x mwm")
+            mt_shows "$f" '^[0-9]+$' "mwm's pid: the session runs" ;;
+        "loginctl list-sessions")
+            mt_shows "$f" 'desktop[[:space:]]+seat0[[:space:]]+tty1' "desktop's session on seat0, tty1" ;;
+        "podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf")
+            mt_shows "$f" 'Driver[[:space:]]+"(modesetting|nvidia)"' "the X driver chosen, modesetting or nvidia" ;;
+        "podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf")
+            if mt_layout_declared; then
+                mt_shows "$f" 'Section "Monitor"' "the declared layout's Monitor sections"
+            elif [ "$rc" != 0 ] && grep -q 'No such file' "$f"; then
+                printf 'PASS\tno layout is declared, and the file is not there (the comment: "if declared")\n'
+            else
+                printf 'FAIL\tno layout is declared, yet the line did not say the file is missing\n'
+            fi ;;
+        "DISPLAY=:0 xrandr")
+            mt_shows "$f" ' connected' "a connected output" '^ +[0-9]+x[0-9]+' "its modes" ;;
+        "DISPLAY=:0 glxinfo -B")
+            mt_shows "$f" 'OpenGL renderer string: .*(NVIDIA|llvmpipe)' "the renderer, NVIDIA or llvmpipe" ;;
+        "fgconsole")
+            mt_shows "$f" '^1$' "VT 1" ;;
+        "podman exec desktop ps -o user= -C Xorg")
+            mt_shows "$f" '^desktop$' "desktop, not root" ;;
+        "podman logs desktop | grep align")
+            mt_shows "$f" 'align' "the gid alignment lines" ;;
+        "podman exec -u desktop desktop wpctl status")
+            mt_shows "$f" '\[alsa\]' "a sound device (an ALSA device in PipeWire's list)" ;;
+        "pw-play /usr/share/sounds/alsa/Front_Center.wav"|"paplay /usr/share/sounds/alsa/Front_Center.wav"|"aplay /usr/share/sounds/alsa/Front_Center.wav")
+            if [ "$rc" = 0 ]; then printf 'PASS\texited 0 (whether it was heard is the VM host'"'"'s check, made afterwards)\n'
+            else printf 'FAIL\texited %s\n' "$rc"; fi ;;
+        "desktop-preflight")
+            if [ "$rc" = 0 ]; then mt_shows "$f" 'done: 0 FAIL' "0 FAILs"; else printf 'FAIL\texited %s: a FAIL\n' "$rc"; fi ;;
+        "systemctl cat desktop.service")
+            mt_shows "$f" '^# /run/systemd/generator/desktop\.service' "the unit as quadlet generated it, from /run/systemd/generator" \
+                'ExecStart=/usr/bin/podman run' "its podman run" ;;
+        "systemctl is-enabled getty@tty1.service")
+            mt_shows "$f" '^masked$' "masked" ;;
+        "systemctl get-default")
+            mt_shows "$f" '^multi-user\.target$' "multi-user.target" ;;
+        "systemctl status desktop-seat-prep")
+            mt_shows "$f" 'Active: active \(exited\)' "seat-prep ran" 'status=0/SUCCESS' "and succeeded: the seat converged" ;;
+        "systemctl status desktop-cdi-refresh")
+            mt_shows "$f" 'Active: active \(exited\)' "it ran" \
+                '(wrote stub CDI spec|generated real CDI spec|keeping existing real CDI spec)' "its log line naming the spec it left" ;;
+        "head -5 /etc/cdi/nvidia.yaml")
+            mt_shows "$f" '(^# Stub CDI spec|^cdiVersion:)' "the stub's marker comment, or a real spec's start" ;;
+        "systemctl status desktop-host-shell")
+            mt_shows "$f" 'Active: active \(exited\)' "it ran" 'host shell converged: fresh key' "its log line about the fresh key" ;;
+        "ls -l /etc/ssh/authorized_keys.d/")
+            mt_shows "$f" '^-[-rwxs]+[.+]? +[0-9]+ +root +root .* desktop-shell$' "a desktop-shell entry owned by root" ;;
+        "podman logs desktop | grep preflight:")
+            if grep -q 'preflight: FAIL' "$f"; then printf 'FAIL\tthe container preflight reports a FAIL\n'
+            else mt_shows "$f" 'preflight: PASS' "the container preflight's lines, none of them a FAIL"; fi ;;
+        "desktop-monitors-capture")
+            mt_shows "$f" '^# Captured from the running desktop' "the capture's header" \
+                '^[A-Za-z][A-Za-z0-9._-]* +[0-9]+x[0-9]+@' "an output, as monitors.conf takes one" ;;
+        "podman logs desktop | grep xorg-monitor-conf")
+            mt_shows "$f" 'xorg-monitor-conf: .*(fixed layout|autodetect)' "the layout applied, or that Xorg autodetects" ;;
+        *)
+            printf 'FAIL\tthis line is new to the test: decide what it should show (mt_judge, ci/vm/maint-guest.sh)\n' ;;
+    esac
+}
+
+# The condition a line's comment puts on it, as the environment that meets
+# it (README.md's audio table); nothing for a line that runs as written alone.
+mt_condition() { # <comment>
+    case "$1" in
+        "PIPEWIRE_REMOTE set") echo "PIPEWIRE_REMOTE=$MT_PIPEWIRE" ;;
+        "PULSE_SERVER set") echo "PULSE_SERVER=$MT_PULSE" ;;
+    esac
+}
+mt_checklist_doc() { # readme|deploy: "<file> <heading>"
+    case "$1" in
+        readme) echo "README.md|Verification checklist" ;;
+        deploy) echo "deploy/README.md|Verify" ;;
+        *) fail "no checklist named '$1'" ;;
+    esac
+}
+
+# The players the README checklist presupposes, installed as declared probes:
+# pipewire-utils for pw-play (paplay and aplay came with S10.1.1's probes).
+mt_checklist_tools() {
+    local before
+    mt_begin S10.2.1
+    ev_save rpm-before "EV-STATE: rpm -qa | sort before the checklist's own probe" sh -c 'rpm -qa | sort' >/dev/null || true
+    before=$EV_LAST
+    ev_save dnf-probes "EV-PROCEDURE: pipewire-utils (pw-play), which the README checklist's first audio line uses, installed as a declared probe: not a host requirement" \
+        dnf -y install pipewire-utils >/dev/null || fail "could not install pipewire-utils"
+    ev_save rpm-after "EV-STATE: rpm -qa | sort after it" sh -c 'rpm -qa | sort' >/dev/null || true
+    ev_diff rpm-probe "EV-DIFF: what installing pipewire-utils added: whether it brought PipeWire's daemon (HOST-REQUIRES.md: no PipeWire daemon on the host)" "$before" "$EV_LAST"
+    if rpm -q pipewire >/dev/null 2>&1; then
+        ev_note "pipewire-utils brought the pipewire package (PipeWire's daemon) onto the host, which deploy/HOST-REQUIRES.md says the host does not have"
+    else
+        ev_note "pipewire-utils brought no PipeWire daemon (the pipewire package is not installed)"
+    fi
+    ev_save sounds "EV-STATE: the sample the audio lines play, and the package that owns it" \
+        sh -c 'ls -l /usr/share/sounds/alsa/Front_Center.wav; rpm -qf /usr/share/sounds/alsa/Front_Center.wav' >/dev/null || true
+    ev_end
+}
+
+# S10.2.1: one documented checklist, every line run as written, as root, and
+# judged by what its comment says it shows. A line whose comment names a
+# condition also runs with the condition met, and that run is judged.
+mt_checklist() { # readme|deploy
+    local doc heading raw n=0 cmd key k rc out cond verdict why table
+    IFS='|' read -r doc heading <<<"$(mt_checklist_doc "$1")"
+    mt_begin S10.2.1
+    raw=$(python3 ci/doc-blocks.py "$doc" "$heading") || fail "$doc has no \"$heading\" command block"
+    ev_text "block-$1" "EV-PROCEDURE: $doc's \"$heading\" block, as this run read it" "$raw"
+    table="| # | command | comment | exit | verdict | output |
+|---|---|---|---|---|---|"
+    while IFS=$'\t' read -r cmd k; do
+        n=$((n + 1)) rc=0
+        key=$(tr -s ' ' <<<"$cmd")
+        ev_save "$1-$n" "EV-STATE: $doc line $n run as written, as root: \`$key\` (its comment: ${k:-none})" \
+            timeout 60 sh -c "$cmd" >/dev/null || rc=$?
+        out=$EV_LAST
+        cond=$(mt_condition "$k")
+        if [ -n "$cond" ]; then
+            ev_note "$doc line $n as written exited $rc; its comment's condition ($cond) is met for the run judged"
+            rc=0
+            ev_save "$1-$n-met" "EV-STATE: $doc line $n with the condition its comment names met ($cond): the run judged" \
+                timeout 60 env "$cond" sh -c "$cmd" >/dev/null || rc=$?
+            out=$EV_LAST
+        fi
+        verdict=$(mt_judge "$key" "$k" "$rc" "$EV_DIR/$out")
+        why=${verdict#*$'\t'}
+        table+=$'\n'"| $n | \`${key//|/\\|}\` | ${k//|/\\|} | $rc | ${verdict%%$'\t'*}: ${why//|/\\|} | $out |"
+        if [ "${verdict%%$'\t'*}" = PASS ]; then
+            ev_pass "$doc line $n, \`$key\`: $why"
+        else
+            ev_fail "$doc line $n, \`$key\`: $why (exit $rc)"
+        fi
+    done < <(python3 ci/doc-blocks.py "$doc" "$heading" 1 --commands)
+    ev_text "table-$1" "EV-STATE: $doc's checklist, one row per line: the command, its comment, the exit status of the run judged, the verdict, and the file with its output" "$table"
+    ev_end
+}
+
+# One audio line of the README checklist, printed for the VM host, which
+# captures the sound card around it: as written, with its comment's
+# condition met, or in a scratch container the way README.md's "Other
+# containers" does it.
+mt_checklist_play() { # pw-play|paplay|aplay written|met|container
+    local cmd k rc=0 cond
+    while IFS=$'\t' read -r cmd k; do
+        case "$cmd" in "$1 "*) break ;; esac
+        cmd=""
+    done < <(python3 ci/doc-blocks.py README.md "Verification checklist" 1 --commands)
+    [ -n "$cmd" ] || fail "the README checklist has no $1 line"
+    cmd=$(tr -s ' ' <<<"$cmd")
+    case "$2" in
+        written)
+            echo "== as written, as root: $cmd"
+            timeout 60 sh -c "$cmd" || rc=$? ;;
+        met)
+            cond=$(mt_condition "$k")
+            echo "== with its comment's condition met (${cond:-it names none}): $cmd"
+            timeout 60 env ${cond:+"$cond"} sh -c "$cmd" || rc=$? ;;
+        container)
+            # README.md, "Other containers": mount the socket dir and set the
+            # variable, or for ALSA add the deploy tree's two stanzas (a copy,
+            # so the container's label goes on the copy and not on the host's).
+            local -a o=(-v /run/desktop-audio:/run/desktop-audio)
+            case "$1" in
+                pw-play) o+=(-e "PIPEWIRE_REMOTE=$MT_PIPEWIRE") ;;
+                paplay) o+=(-e "PULSE_SERVER=$MT_PULSE") ;;
+                aplay)
+                    cp /etc/alsa/conf.d/99-zz-desktop-container.conf /tmp/mt-alsa.conf
+                    o+=(-v "/tmp/mt-alsa.conf:/etc/alsa/conf.d/99-zz-desktop-container.conf:ro,z") ;;
+            esac
+            echo "== in a scratch container of the desktop image: podman run --rm ${o[*]} localhost/desktop-container:latest $cmd"
+            timeout 60 podman run --rm "${o[@]}" localhost/desktop-container:latest sh -c "$cmd" || rc=$? ;;
+        *) fail "checklist-play: written, met or container" ;;
+    esac
+    echo "exited $rc"
+}
+
+# S10.2.2: a client of the desktop's running through the checklists - an
+# xterm on the screen, and a tone the VM host listens to - and the state
+# that must not change while they run.
+MT_CLIENT=mt-client
+mt_quiet() { # start <seconds>|state <moment>|ended|remove
+    local f i
+    mt_begin S10.2.2
+    case "$1" in
+        start)
+            mkdir -p "$MT"
+            # Nothing of the harness's own may come or go meanwhile: the sink
+            # xterm of an earlier typing check retires now, not mid-run.
+            podman exec desktop pkill -f 'xterm -T inputtest' 2>/dev/null || true
+            gen_tone 330 /tmp/mt-client.wav "${2:?seconds}"
+            podman rm -f "$MT_CLIENT" >/dev/null 2>&1 || true
+            ev_save client "EV-PROCEDURE: the client: a confined container given the display and audio devices, an xterm (mt-client) on the screen and a ${2} s 330 Hz tone through PipeWire's pulse server" \
+                podman create --name "$MT_CLIENT" --device desktop.local/display=all --device desktop.local/audio=all \
+                localhost/desktop-container:latest \
+                sh -c 'xterm -T mt-client -geometry 40x6+700+420 & paplay /tmp/mt-client.wav; echo "paplay exited $?"; wait' >/dev/null \
+                || fail "could not create the client"
+            podman cp /tmp/mt-client.wav "$MT_CLIENT:/tmp/mt-client.wav" || fail "could not give the client its tone"
+            podman start "$MT_CLIENT" >/dev/null || fail "the client did not start"
+            for i in $(seq 20); do
+                f=$(xtree 2>/dev/null || true)
+                grep -q '"mt-client"' <<<"$f" && break
+                sleep 1
+            done
+            grep -q '"mt-client"' <<<"$f" || fail "the client's xterm did not appear"
+            ev_pass "the client runs: its xterm is on the screen and its tone plays"
+            ;;
+        state)
+            : "${2:?moment}"
+            ev_save "pids-$2" "EV-PIDS, $2 the checklists: the desktop's processes (ps in the container) and the client's (podman top: their host pids), the client's container pid and restart count" \
+                sh -c 'podman exec desktop ps -o pid,lstart,comm -C desktop-init,Xorg,mwm,pipewire,wireplumber,pipewire-pulse
+                       podman inspect --format "client pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}}" '"$MT_CLIENT"'
+                       podman top '"$MT_CLIENT"' hpid comm' >/dev/null || true
+            mt_put "quiet-$2-pids" "$EV_LAST"
+            ev_save "xrandr-$2" "EV-STATE: xrandr --query --verbose, $2 the checklists" xrv >/dev/null || true
+            mt_put "quiet-$2-xrandr" "$EV_LAST"
+            ev_save "tree-$2" "EV-STATE: xwininfo -root -tree, $2 the checklists" xtree >/dev/null || true
+            mt_put "quiet-$2-tree" "$EV_LAST"
+            ev_save "files-$2" "EV-STATE: ls -l --time-style=full-iso of /etc/cdi and /etc/desktop-container on the host and of /etc/X11/xorg.conf.d in the container, $2 the checklists" \
+                sh -c 'ls -l --time-style=full-iso /etc/cdi /etc/desktop-container; echo "== in the container"; podman exec desktop ls -l --time-style=full-iso /etc/X11/xorg.conf.d' >/dev/null || true
+            mt_put "quiet-$2-files" "$EV_LAST"
+            if [ "$2" = after ]; then
+                for i in pids xrandr tree files; do
+                    ev_diff "$i" "EV-DIFF: $i before (-) and after (+) the checklists: empty" "$(mt_get "quiet-before-$i")" "$(mt_get "quiet-after-$i")"
+                    if diff -q "$EV_DIR/$(mt_get "quiet-before-$i")" "$EV_DIR/$(mt_get "quiet-after-$i")" >/dev/null 2>&1; then
+                        ev_pass "the checklists changed nothing in the $i"
+                    else
+                        ev_fail "the checklists changed the $i (see its diff)"
+                    fi
+                done
+            fi
+            ;;
+        ended)
+            for i in $(seq 120); do
+                f=$(podman logs "$MT_CLIENT" 2>/dev/null || true)
+                grep -q '^paplay exited' <<<"$f" && break
+                sleep 1
+            done
+            f=$(ev_save client-log "EV-LOG-CLIENT: the client's own log: its player's exit status" podman logs "$MT_CLIENT") || true
+            grep -qx 'paplay exited 0' <<<"$f" || fail "the client's player did not play its tone through: $(tail -n 3 <<<"$f")"
+            ev_pass "the client's player played its whole tone and exited 0"
+            ;;
+        remove)
+            podman rm -f "$MT_CLIENT" >/dev/null 2>&1 || true
+            ;;
+    esac
+    ev_end
+}
+
 # --- F10.4: routine operations ---------------------------------------------------
 
 # The common set and the pids, before a step that changes the desktop.
@@ -529,12 +817,16 @@ maint() { # <step> [args]
         firstboot) mt_firstboot ;;
         host-play) mt_host_play "${2:?paplay|aplay}" ;;
         selinux) mt_selinux "${2:?took|skipped}" ;;
+        checklist-tools) mt_checklist_tools ;;
+        checklist) mt_checklist "${2:?readme|deploy}" ;;
+        checklist-play) mt_checklist_play "${2:?pw-play|paplay|aplay}" "${3:?written|met|container}" ;;
+        quiet) mt_quiet "${2:?start|state|ended|remove}" "${3:-}" ;;
         before) mt_before "${2:?story}" "${3:?moment}" ;;
         after) mt_after "${2:?story}" "${3:?moment before}" "${4:?moment after}" ;;
         restart) mt_restart ;;
         stop) mt_stop ;;
         held) mt_held ;;
         start) mt_start ;;
-        *) fail "maint: packages, image, apply, firstboot, host-play, selinux, before, after, restart, stop, held or start" ;;
+        *) fail "maint: packages, image, apply, firstboot, host-play, selinux, checklist-tools, checklist, checklist-play, quiet, before, after, restart, stop, held or start" ;;
     esac
 }
