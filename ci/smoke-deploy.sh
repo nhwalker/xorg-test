@@ -1271,6 +1271,23 @@ ev_text generator-log "EV-LOG-DESKTOP: the generator's 'fixed layout' lines in t
 [ -n "$layout_log" ] || fail "the generator did not log the fixed layout it applied"
 ev_pass "the desktop's log has the generator's 'fixed layout' line"
 ev_end
+# S3.4.11's T2 half: names with no connector draw the preflight's WARN. The
+# runner has no DP-1 or DP-2 (the VM's core shard shows the PASS for names
+# that exist).
+ev_begin S3.4.11 "Preflight warns about unknown output names" T2
+ev_save drm "EV-STATE: ls /sys/class/drm on the runner: the connectors the declared names are matched against" \
+    sh -c 'ls /sys/class/drm 2>&1' >/dev/null || true
+if ls -d /sys/class/drm/card*-DP-1 /sys/class/drm/card*-DP-2 >/dev/null 2>&1; then
+    fail "the runner has a DP-1 or DP-2 connector, so the WARN cannot show here"
+fi
+pf=$(podman logs desktop 2>/dev/null | tr -d '\r' | grep '^preflight: .*monitor layout' | tail -n1 || true)
+ev_text preflight "EV-LOG-DESKTOP: the container preflight's monitor-layout line at this start, DP-1 and DP-2 declared" "${pf:-(none)}"
+case "$pf" in
+    "preflight: WARN: fixed monitor layout names output(s) DP-1 DP-2 with no matching DRM connector"*) ;;
+    *) fail "the preflight did not warn about DP-1 and DP-2: ${pf:-no monitor-layout line}" ;;
+esac
+ev_pass "the preflight warns about both names: $pf"
+ev_end
 # Put the shipped default back, so nothing after this point sees a layout the
 # tree does not actually ship.
 install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf

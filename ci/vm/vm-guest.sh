@@ -887,7 +887,7 @@ s773_cleanup() {
 }
 
 layout_declare() {
-    local dims out before
+    local dims out before pf
 
     log pd "fixed monitor layout: the VM has a second connector, and it is disconnected"
     layout_connectors
@@ -971,6 +971,16 @@ EOF
         || fail "Virtual-2 is not enabled on a disconnected connector: $(xr_line Virtual-2)"
     ev_pass "Virtual-2 reads disconnected and scans out 1024x768+1024+0 with nothing plugged into it"
     log pd "  Virtual-2 scans out 1024x768+1024+0 with nothing plugged into it"
+    ev_end
+
+    # S3.4.11's T3 half: names that exist pass the preflight.
+    ev_begin S3.4.11 "Preflight warns about unknown output names" T3
+    pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*monitor layout' | tail -n1 || true)
+    ev_text preflight "EV-LOG-DESKTOP: the container preflight's monitor-layout line, Virtual-1 and Virtual-2 declared" "${pf:-(none)}"
+    ev_save drm "EV-STATE: ls /sys/class/drm: the connectors the declared names are matched against" ls /sys/class/drm >/dev/null || true
+    [ "$pf" = "preflight: PASS: fixed monitor layout declares Virtual-1 Virtual-2, all present as DRM connectors" ] \
+        || fail "the preflight did not pass the declared names: ${pf:-no monitor-layout line}"
+    ev_pass "the preflight passes the declared names: $pf"
     ev_end
 }
 
@@ -2012,6 +2022,435 @@ after:  $fp1"
         || fail "after the reboot the authorized_keys entry does not carry the new key"
     ev_pass "the reboot made a new key ($fp0 -> $fp1), and the authorized_keys entry carries it"
     ev_end
+}
+
+# --- the session's tail (E2, E3, E4, E5) ---------------------------------------
+# Late in the core shard, before the deploy tail and its reboot: the device
+# groups as the session sees them, mwm's own exit, a desktop with no host
+# login session, a device tagged for another seat, and the host's own Pulse
+# and ALSA clients. Each step leaves the desktop up.
+
+# S3.2.2's T3 half: the container's device groups carry the host nodes' gids,
+# so the session user opens DRM, evdev and ALSA. The table is the first one
+# in this container's log, written at its start; an audio restart's narrow
+# run (the audio group alone) comes after it.
+session_groups() {
+    local dlog table g line cg node hg pf k
+    ev_begin S3.2.2 "Group gids are aligned to the host's device nodes" T3
+    dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+    ev_text align "EV-LOG-DESKTOP: align-device-groups' lines in this container's log (its start runs every group; an audio restart runs the audio group alone)" \
+        "$(grep '^align-device-groups:' <<<"$dlog" || echo '(none)')"
+    table=$(awk '/^align-device-groups: final state:/ {f = 1; next}
+                 f && /^align-device-groups: desktop user:/ {print; exit}
+                 f {print}' <<<"$dlog")
+    [ -n "$table" ] || fail "align-device-groups logged no final-state table"
+    for g in video render input audio; do
+        line=$(grep -E "^align-device-groups: +$g: " <<<"$table" | head -n1 || true)
+        [ -n "$line" ] || fail "align-device-groups' final state has no $g line"
+        cg=$(sed -n 's/.*container gid \([0-9]*\),.*/\1/p' <<<"$line")
+        node=$(sed -n 's/.*, device \(\/dev\/[^ ]*\) has gid.*/\1/p' <<<"$line")
+        hg=$(stat -c %g "$node" 2>/dev/null || true)
+        [ -n "$cg" ] && [ -n "$hg" ] && [ "$cg" = "$hg" ] \
+            || fail "the container's $g group is gid ${cg:-?}, the host's ${node:-node} gid ${hg:-?}"
+        ev_pass "$g: the container's group is gid $cg, as the host's $node"
+    done
+    grep -q '^align-device-groups: desktop user: uid=61000(desktop)' <<<"$table" \
+        || fail "align-device-groups' final state does not end with id desktop"
+    ev_pass "the table ends with id desktop: $(sed -n 's/^align-device-groups: desktop user: //p' <<<"$table")"
+    pf=$(grep '^preflight: .*desktop user' <<<"$dlog" || true)
+    ev_text preflight "EV-LOG-DESKTOP: the container preflight's lines on what the desktop user can open" "${pf:-(none)}"
+    for k in /dev/dri/card /dev/input/event /dev/snd/controlC; do
+        grep -q "^preflight: PASS: desktop user can read ${k}[0-9]" <<<"$pf" \
+            || fail "the preflight has no PASS for the desktop user reading a $k node"
+    done
+    ev_pass "the preflight passes all three: $(grep -o 'can read /dev/[^ ]*' <<<"$pf" | sed 's/can read //' | paste -sd' ' -)"
+    ev_save nodes-host "EV-STATE: ls -ln /dev/dri /dev/input /dev/snd on the host" \
+        ls -ln /dev/dri /dev/input /dev/snd >/dev/null || true
+    ev_save nodes-container "EV-STATE: ls -ln /dev/dri /dev/input /dev/snd in the container" \
+        podman exec desktop ls -ln /dev/dri /dev/input /dev/snd >/dev/null || true
+    ev_save groups "EV-STATE: getent group video render input audio and id desktop in the container" \
+        podman exec desktop sh -c 'getent group video render input audio; id desktop' >/dev/null || true
+    ev_end
+}
+
+# S2.3.6: mwm's own exit ends the session, and a new one starts. A plain
+# kill's SIGTERM, as the session user: the image drops `kill` from mwm's
+# showFeedback, so mwm quits without asking. The host records the display.
+verify_mwm_exit() {
+    local init xorg mwm n_lines since xorg2 mwm2 p_before
+    wait_for 30 2 "an X session" session_up
+    ev_begin S2.3.6 "mwm exit ends the session and it restarts" T3
+    init=$(podman exec desktop cat /run/desktop-init.pid)
+    xorg=$(podman exec desktop pgrep -x Xorg | sed -n 1p || true)
+    mwm=$(podman exec desktop pgrep -u desktop -x mwm | sed -n 1p || true)
+    [ -n "$xorg" ] && [ -n "$mwm" ] || fail "no Xorg or mwm in the session"
+    ev_save pids-before "EV-PIDS: desktop-init, Xorg and mwm before mwm gets a SIGTERM" \
+        ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg,$mwm" >/dev/null || true
+    p_before=$EV_LAST
+    n_lines=$(podman logs desktop 2>&1 | wc -l)
+    podman exec -u desktop desktop pkill -TERM -u desktop -x mwm || fail "no mwm to send SIGTERM to"
+    ev_note "mwm (pid $mwm) sent SIGTERM, kill's default, as the session user at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    xn() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null | sed -n 1p || true); [ -n "$p" ] && [ "$p" != "$xorg" ] && session_up; }
+    wait_for 45 1 "a new X session (a new Xorg and mwm)" xn
+    wait_for 15 1 "the display to answer" x_answers
+    ev_note "a new Xorg and mwm up, the display answering, at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    xorg2=$(podman exec desktop pgrep -x Xorg | sed -n 1p || true)
+    mwm2=$(podman exec desktop pgrep -u desktop -x mwm | sed -n 1p || true)
+    ev_save pids-after "EV-PIDS: desktop-init, Xorg and mwm after the new session came up" \
+        ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg2,$mwm2" >/dev/null || true
+    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across mwm's exit (Xorg and mwm new, desktop-init the same)" "$p_before" "$EV_LAST"
+    ev_save log "EV-LOG-DESKTOP: podman logs desktop from mwm's SIGTERM on" \
+        sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
+    since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) | tr -d '\r' || true)
+    grep -q '^desktop-init: session exited (rc=0); restarting in 3s' <<<"$since" \
+        || fail "desktop-init did not log a clean end after mwm's exit: no 'session exited (rc=0); restarting in 3s'"
+    ! grep -q '^postmortem:' <<<"$since" || fail "a postmortem ran for mwm's clean exit"
+    ev_pass "desktop-init logged 'session exited (rc=0); restarting in 3s', a clean end, and ran no postmortem"
+    [ -n "$xorg2" ] && [ "$xorg2" != "$xorg" ] && [ -n "$mwm2" ] && [ "$mwm2" != "$mwm" ] \
+        || fail "Xorg and mwm are not new: Xorg $xorg -> $xorg2, mwm $mwm -> $mwm2"
+    [ "$(podman exec desktop cat /run/desktop-init.pid)" = "$init" ] || fail "desktop-init changed across mwm's exit"
+    ev_pass "a new session: Xorg $xorg -> $xorg2, mwm $mwm -> $mwm2, under the same desktop-init ($init); the display answers"
+    ev_end
+}
+
+# S2.2.2 and S5.8.4: the desktop with no host session unit. Neither of
+# systemctl's ways of switching a unit off does it here. disable is not
+# enough: desktop.container's Wants= starts desktop-session with the
+# desktop, and S5.8.4 shows that first. mask is refused: the unit file is the
+# tree's own, at /etc/systemd/system/desktop-session.service, where mask
+# would have to put its /dev/null link. So the unit file is moved aside, as
+# on a host without it. logind then takes /run/user/61000 away once the user
+# has no session, and desktop-init, after waiting for it, makes it itself.
+# "off" puts the unit back as the tree ships it, its multi-user.target.wants
+# link relative, as rsync left it.
+SESSION_UNIT=/etc/systemd/system/desktop-session.service
+SESSION_AWAY=/etc/systemd/ev-desktop-session.service.away
+SESSION_WANTS=/etc/systemd/system/multi-user.target.wants/desktop-session.service
+standalone_desktop() { # on|off
+    local st dlog ln out rc
+    case "${1:-}" in
+        on)
+            ev_begin S5.8.4 "The desktop runs with the unit disabled" T3
+            desk_down
+            systemctl disable desktop-session.service >/dev/null 2>&1 || fail "systemctl disable desktop-session failed"
+            ev_text disabled "EV-STATE: desktop-session after systemctl disable, the desktop stopped" \
+                "is-enabled: $(systemctl is-enabled desktop-session.service 2>&1 || true)
+is-active: $(systemctl is-active desktop-session.service 2>&1 || true)
+$SESSION_WANTS: $(ls -l "$SESSION_WANTS" 2>&1 || true)"
+            systemctl start desktop.service
+            desk_back
+            st=$(systemctl is-active desktop-session.service || true)
+            dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+            ln=$(grep '^desktop-init: .*runtime dir\|^desktop-init: no host login session' <<<"$dlog" || true)
+            ev_text disabled-started "EV-STATE: desktop-session and desktop-init's runtime-dir line after the desktop started with the unit disabled" \
+                "is-enabled: $(systemctl is-enabled desktop-session.service 2>&1 || true)
+is-active: $st
+$ln"
+            [ "$st" = active ] || fail "disabled, desktop-session stayed down when the desktop started: disabling would be enough"
+            grep -q 'runtime dir /run/user/61000 provided by the host login session' <<<"$ln" \
+                || fail "with desktop-session disabled, desktop-init did not get the host's runtime dir: $ln"
+            ev_pass "disabled, desktop-session still came up with the desktop (desktop.container's Wants=), and the runtime dir was the host's: disabling is not enough"
+            desk_down
+            rc=0
+            out=$(systemctl mask desktop-session.service 2>&1) || rc=$?
+            ev_text mask "EV-STATE: systemctl mask desktop-session, the unit file being the tree's own in /etc/systemd/system" \
+                "$ ls -l $SESSION_UNIT
+$(ls -l "$SESSION_UNIT" 2>&1)
+$ systemctl mask desktop-session.service
+$out
+[exit $rc]"
+            if [ "$rc" = 0 ]; then
+                systemctl unmask desktop-session.service >/dev/null 2>&1 || true
+                ev_note "systemctl mask succeeded and was undone; the unit file is moved aside below all the same"
+            else
+                ev_pass "systemctl mask is refused (exit $rc): the unit file is the tree's own, at the path mask's /dev/null link would take"
+            fi
+            [ -f "$SESSION_UNIT" ] || fail "$SESSION_UNIT is not a regular file"
+            mv "$SESSION_UNIT" "$SESSION_AWAY"
+            systemctl daemon-reload
+            wait_for 40 1 "logind to take /run/user/61000 away" sh -c '! test -d /run/user/61000'
+            ev_text away "EV-STATE: the unit file moved aside, the desktop stopped, and the host's runtime dir gone" \
+                "$(ls -l "$SESSION_AWAY" 2>&1)
+systemctl status desktop-session: $(systemctl show -p LoadState,ActiveState desktop-session.service 2>&1 | paste -sd' ' -)
+loginctl list-sessions:
+$(loginctl list-sessions --no-pager 2>&1)
+/run/user/61000: $(ls -ld /run/user/61000 2>&1 || true)"
+            ev_end
+
+            ev_begin S2.2.2 "Standalone fallback fabricates the runtime dir" T3
+            systemctl start desktop.service
+            desk_back
+            st=$(systemctl show -p LoadState --value desktop-session.service)
+            [ "$st" = not-found ] || fail "desktop-session is still known to systemd: LoadState $st"
+            dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+            ev_text log "EV-LOG-DESKTOP: desktop-init's lines and the audio stack's start, with no desktop-session unit" \
+                "$(grep '^desktop-init: \|^start-audio: ' <<<"$dlog" | head -20)"
+            grep -q '^desktop-init: no host login session appeared; creating /run/user/61000 standalone' <<<"$dlog" \
+                || fail "desktop-init did not log 'no host login session appeared; creating /run/user/61000 standalone'"
+            ev_pass "desktop-init logged 'no host login session appeared; creating /run/user/61000 standalone'"
+            ev_save runtime-dir "EV-STATE: /run/user/61000 in the container (made by desktop-init) and on the host (no logind mount)" \
+                sh -c 'podman exec desktop stat -c "container: %n %A %U:%G" /run/user/61000; findmnt /run/user/61000 || echo "host: no mount at /run/user/61000"' >/dev/null || true
+            [ "$(podman exec desktop stat -c '%a %U:%G' /run/user/61000)" = "700 desktop:desktop" ] \
+                || fail "/run/user/61000 is $(podman exec desktop stat -c '%a %U:%G' /run/user/61000), not 700 desktop:desktop"
+            ! mountpoint -q /run/user/61000 || fail "/run/user/61000 is a mount point: logind's, not desktop-init's"
+            ev_pass "/run/user/61000 is 0700 desktop:desktop and no mount: desktop-init made it"
+            wait_for 30 2 "the audio export" audio_reachable
+            ev_save export "EV-STATE: the exported sockets and pactl info over them, from the host" \
+                sh -c 'ls -l /run/desktop-audio; PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info' >/dev/null || true
+            ev_pass "the audio export answers: $(PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info 2>/dev/null | sed -n 's/^Server Name: //p')"
+            x_answers || fail "the display does not answer"
+            ev_pass "X answers and the session's mwm runs, with no host login session"
+            ev_end
+
+            ev_begin S5.8.4 "The desktop runs with the unit disabled" T3
+            ev_text running "EV-STATE: the desktop with no desktop-session unit" \
+                "desktop-session: $(systemctl show -p LoadState,ActiveState desktop-session.service 2>&1 | paste -sd' ' -)
+desktop.service: $(systemctl is-active desktop.service 2>&1 || true)"
+            [ "$(systemctl is-active desktop.service)" = active ] || fail "desktop.service is not active"
+            ev_pass "without the session unit the desktop runs: X answers and the audio export answers (S2.2.2 has the runtime dir)"
+            ev_end
+            ;;
+        off)
+            ev_begin S2.2.2 "Standalone fallback fabricates the runtime dir" T3
+            desk_down
+            # desktop-init's directory, not logind's: a desktop starting with
+            # it there would take it for the host's before logind mounted
+            # the real one over it.
+            mountpoint -q /run/user/61000 || rm -rf /run/user/61000
+            [ -f "$SESSION_AWAY" ] && mv "$SESSION_AWAY" "$SESSION_UNIT"
+            [ -L "$SESSION_WANTS" ] || ln -s ../desktop-session.service "$SESSION_WANTS"
+            systemctl daemon-reload
+            systemctl start desktop.service
+            desk_back
+            wait_for 30 1 "desktop-session active again" systemctl is-active --quiet desktop-session.service
+            dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+            grep -q 'runtime dir /run/user/61000 provided by the host login session' <<<"$dlog" \
+                || fail "back with desktop-session, desktop-init did not get the host's runtime dir"
+            [ "$(systemctl is-enabled desktop-session.service)" = enabled ] || fail "desktop-session is not enabled again"
+            mountpoint -q /run/user/61000 || fail "/run/user/61000 is not logind's mount again"
+            ev_text restored "EV-STATE: desktop-session back as the tree ships it" \
+                "is-enabled: $(systemctl is-enabled desktop-session.service 2>&1), is-active: $(systemctl is-active desktop-session.service 2>&1)
+$(ls -l "$SESSION_UNIT" "$SESSION_WANTS" 2>&1)
+$(findmnt /run/user/61000 2>&1)
+$(grep 'runtime dir' <<<"$dlog")"
+            ev_pass "the unit back, desktop-session runs again and /run/user/61000 is logind's again"
+            ev_end
+            ;;
+        *) fail "standalone: on or off" ;;
+    esac
+}
+
+# S3.8.6: a device attached to another seat. The USB keyboard (kvmkbd, which
+# the host types through) goes to seat1 with loginctl attach, as an operator
+# splitting seats would; a desktop started then warns. seat-prep runs with
+# the desktop stopped, as at boot (Before=desktop.service); its gate would
+# otherwise see the desktop's own hold on card0 and the VT.
+kbd_sys() { # the USB keyboard's inputN directory
+    local d
+    for d in /sys/class/input/input*; do
+        [ "$(cat "$d/name" 2>/dev/null)" = "QEMU QEMU USB Keyboard" ] && { readlink -f "$d"; return 0; }
+    done
+    return 1
+}
+kbd_event() { local e; e=$(ls -d "$1"/event* 2>/dev/null | head -n1); [ -n "$e" ] && echo "/dev/input/${e##*/}"; }
+kbd_udev() { udevadm info "$1"; echo; udevadm info "$(kbd_event "$1")"; }
+foreign_tags() { grep -hE '^E:ID_SEAT=' /run/udev/data/* 2>/dev/null | grep -v '=seat0$' | sort -u || true; }
+seat_tags() { # attach|fix
+    local sys ev b j0 j pf
+    sys=$(kbd_sys) || fail "no 'QEMU QEMU USB Keyboard' input device on the VM host"
+    ev=$(kbd_event "$sys")
+    [ -n "$ev" ] || fail "the USB keyboard ($sys) has no event node"
+    ev_begin S3.8.6 "Foreign seat tags are detected and undone" T3
+    case "${1:-}" in
+        attach)
+            [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is already there"
+            ev_save rules-before "EV-STATE: ls -l /etc/udev/rules.d before: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
+            ev_save udev-before "EV-STATE: udevadm info of the USB keyboard ($sys) and its event node ($ev) before" kbd_udev "$sys" >/dev/null || true
+            b=$EV_LAST
+            loginctl attach seat1 "$sys" || fail "loginctl attach seat1 $sys failed"
+            udevadm settle --timeout=15 || true
+            ev_save rule "EV-CONFIG: the rule loginctl attach wrote" \
+                sh -c 'for f in /etc/udev/rules.d/72-seat-*.rules; do echo "== $f"; cat "$f"; done' >/dev/null || true
+            ev_save udev-attached "EV-STATE: udevadm info of the keyboard after loginctl attach seat1" kbd_udev "$sys" >/dev/null || true
+            ev_diff udev-attach "EV-DIFF: udevadm info across loginctl attach seat1 (ID_SEAT=seat1 appears)" "$b" "$EV_LAST"
+            udevadm info -q property -n "$ev" | grep -qx 'ID_SEAT=seat1' || fail "$ev is not tagged ID_SEAT=seat1 after loginctl attach"
+            ev_pass "loginctl attach seat1 tagged the keyboard: $ev reads ID_SEAT=seat1 ($(foreign_tags | paste -sd' ' -) in the udev database)"
+            systemctl restart desktop.service
+            desk_back
+            pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
+            ev_text preflight "EV-LOG-DESKTOP: the container preflight's seat line, the desktop restarted with the keyboard on seat1" "${pf:-(none)}"
+            grep -q '^preflight: WARN: devices tagged for a non-default seat (E:ID_SEAT=seat1' <<<"$pf" \
+                || fail "the preflight did not warn about the seat1 tag: ${pf:-no seat line}"
+            ev_pass "the preflight warns: $pf"
+            ;;
+        fix)
+            desk_down
+            j0=$(ev_since)
+            systemctl restart desktop-seat-prep.service \
+                || fail "desktop-seat-prep failed: $(journalctl --no-pager -o cat -u desktop-seat-prep.service --since "$j0" | tail -5)"
+            j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -u desktop-seat-prep from its restart, the desktop stopped" \
+                journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$j0") || true
+            grep -q 'seat-prep: removing custom seat attachment rule /etc/udev/rules.d/72-seat-' <<<"$j" \
+                || fail "seat-prep did not log removing the 72-seat-* rule"
+            ev_pass "seat-prep logged: $(grep -o 'seat-prep: removing custom seat attachment rule [^ ]*' <<<"$j" | head -n1)"
+            ev_save rules-after "EV-STATE: ls -l /etc/udev/rules.d after seat-prep: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
+            [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is still there after seat-prep"
+            ev_save udev-after "EV-STATE: udevadm info of the keyboard after seat-prep" kbd_udev "$sys" >/dev/null || true
+            ! udevadm info -q property -n "$ev" | grep -q '^ID_SEAT=' || fail "$ev still carries $(udevadm info -q property -n "$ev" | grep '^ID_SEAT=')"
+            [ -z "$(foreign_tags)" ] || fail "the udev database still has a foreign seat tag: $(foreign_tags | paste -sd' ' -)"
+            ev_pass "the rule is gone and udev re-read the keyboard: $ev has no ID_SEAT, and no device in the udev database is tagged for another seat"
+            systemctl start desktop.service
+            desk_back
+            pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
+            ev_text preflight-after "EV-LOG-DESKTOP: the container preflight's seat line after seat-prep, the desktop started again" "${pf:-(none)}"
+            grep -qx 'preflight: PASS: no foreign seat tags in the udev database' <<<"$pf" \
+                || fail "the preflight does not pass the seat check after seat-prep: ${pf:-no seat line}"
+            ev_pass "the preflight passes: $pf"
+            ;;
+        *) fail "seat-tags: attach or fix" ;;
+    esac
+    ev_end
+}
+
+# S4.2.1-S4.2.3: the host's own clients, as the unprivileged rocky user with
+# a clean environment. EL9's libpulse does not autospawn unless asked
+# (autospawn = yes): S4.2.1's autospawn check asks for it in a private mount
+# namespace, the export hidden, so that the drop-in's autospawn = no is what
+# stands between a client and a spawned daemon; a stub /usr/bin/pulseaudio
+# records every start. alsa-plugins-pulseaudio ships its own
+# 99-pulseaudio-default.conf, a server-less pcm.!default, so the ALSA checks
+# keep libpulse's own default server out (an empty client config) and show
+# that the deploy tree's drop-in alone routes ALSA to the export.
+# runuser first: it is in /usr/sbin, outside the clean PATH.
+ROCKY="runuser -u rocky -- env -i HOME=/home/rocky USER=rocky PATH=/usr/bin:/bin"
+PA_STUB=/usr/bin/pulseaudio
+pa_stub_install() {
+    if [ -e "$PA_STUB" ] && ! grep -q 'ev-stub' "$PA_STUB" 2>/dev/null; then
+        mv "$PA_STUB" "$PA_STUB.ev-real"
+    fi
+    printf '#!/bin/sh\n# ev-stub: records a start and refuses it (Requirements.md S4.2.1)\necho "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) uid=$(id -u) $0 $*" >> "${EV_PA_LOG:-/run/ev-pulseaudio-starts.log}"\nexit 1\n' > "$PA_STUB"
+    chmod 755 "$PA_STUB"
+    : > /run/ev-pulseaudio-starts.log
+    chmod 666 /run/ev-pulseaudio-starts.log
+}
+pa_stub_remove() {
+    if grep -q 'ev-stub' "$PA_STUB" 2>/dev/null; then rm -f "$PA_STUB"; fi
+    [ -e "$PA_STUB.ev-real" ] && mv "$PA_STUB.ev-real" "$PA_STUB"
+    return 0
+}
+ALSA_DROPIN=/etc/alsa/conf.d/99-zz-desktop-container.conf
+host_audio() { # pulse-play|autospawn|alsa-setup|alsa-play|alsa-control|null-on|null-play|null-off|cleanup
+    local out pkgs
+    case "${1:-}" in
+        pulse-play) # S4.2.1, printed for the host, which captures around it
+            gen_tone 440 /tmp/s421.wav 3
+            chmod 644 /tmp/s421.wav
+            pa_stub_install
+            echo "== the drop-in, /etc/pulse/client.conf.d/50-desktop-container.conf"
+            cat /etc/pulse/client.conf.d/50-desktop-container.conf
+            echo "== env | grep PULSE, as rocky"
+            $ROCKY env | grep '^PULSE' || echo "(none)"
+            echo "== paplay of a 440 Hz tone, as rocky, no PULSE_SERVER"
+            $ROCKY paplay /tmp/s421.wav; echo "paplay exited $?"
+            echo "== pgrep -a pulseaudio"
+            pgrep -a pulseaudio || echo "(none)"
+            echo "== the stub's record of starts"
+            cat /run/ev-pulseaudio-starts.log
+            echo "(end of record)"
+            ;;
+        autospawn) # S4.2.1's guest half
+            ev_begin S4.2.1 "Host Pulse clients are routed to the container" T3
+            pa_stub_install
+            cp /etc/pulse/client.conf /run/ev-s421-client.conf
+            echo 'autospawn = yes' >> /run/ev-s421-client.conf
+            # rocky's stub writes these: /run is root's.
+            : > /run/ev-pa-dropin.log
+            : > /run/ev-pa-control.log
+            chmod 666 /run/ev-pa-dropin.log /run/ev-pa-control.log
+            out=$(ev_save autospawn "EV-STATE: rocky's pactl info (PULSE_LOG=4) in a private mount namespace: the export hidden under an empty tmpfs, /etc/pulse/client.conf with autospawn = yes appended; first with the deploy tree's drop-in, then with /etc/pulse/client.conf.d hidden too. Each run's stub record follows it" \
+                unshare -m --propagation private sh -c '
+                    mount -t tmpfs -o mode=755 ev-s421 /run/desktop-audio
+                    mount --bind /run/ev-s421-client.conf /etc/pulse/client.conf
+                    echo "== with the drop-in"
+                    '"$ROCKY"' EV_PA_LOG=/run/ev-pa-dropin.log PULSE_LOG=4 pactl info; echo "pactl exited $?"
+                    echo "== starts recorded with the drop-in:"; cat /run/ev-pa-dropin.log 2>/dev/null; echo "(end of record)"
+                    mount -t tmpfs -o mode=755 ev-s421-hidden /etc/pulse/client.conf.d
+                    echo "== control, the drop-in hidden"
+                    '"$ROCKY"' EV_PA_LOG=/run/ev-pa-control.log PULSE_LOG=4 pactl info; echo "pactl exited $?"
+                    echo "== starts recorded without the drop-in:"; cat /run/ev-pa-control.log 2>/dev/null; echo "(end of record)"') || true
+            [ -s /run/ev-pa-control.log ] \
+                || fail "the control did not autospawn: with autospawn = yes and no drop-in, libpulse never ran the stub, so this check could not fail"
+            ev_pass "control: with autospawn = yes, the export hidden and no drop-in, rocky's pactl ran the stub: $(head -n1 /run/ev-pa-control.log)"
+            [ ! -s /run/ev-pa-dropin.log ] || fail "with the drop-in, libpulse still autospawned: $(head -n1 /run/ev-pa-dropin.log)"
+            grep -q 'Trying to connect to unix:/run/desktop-audio/pulse' <<<"$out" || fail "with the drop-in, libpulse did not try the export first"
+            ev_pass "with the deploy tree's drop-in, the same client tried only unix:/run/desktop-audio/pulse and spawned nothing: its autospawn = no wins over client.conf's yes"
+            rm -f /run/ev-pa-dropin.log /run/ev-pa-control.log /run/ev-s421-client.conf
+            ev_end
+            ;;
+        alsa-setup) # S4.2.2's packages and drop-ins, guest half
+            ev_begin S4.2.2 "Host ALSA clients are routed through the pulse plugin" T3
+            pkgs="alsa-utils alsa-plugins-pulseaudio"
+            # shellcheck disable=SC2086
+            rpm -q $pkgs >/dev/null 2>&1 || dnf -y -q install $pkgs >/dev/null 2>&1 || dnf -y -q install $pkgs >/dev/null \
+                || fail "could not install $pkgs on the VM host"
+            # shellcheck disable=SC2086
+            ev_save packages "EV-STATE: the probe's packages on the VM host" rpm -q $pkgs >/dev/null || true
+            ev_save conf-d "EV-CONFIG: /etc/alsa/conf.d, in the order alsa-lib loads it (the last pcm.!default wins), and each file" \
+                sh -c 'ls -l /etc/alsa/conf.d; for f in /etc/alsa/conf.d/*.conf; do echo "== $f"; grep -v "^#" "$f" | grep .; done' >/dev/null || true
+            [ -f "$ALSA_DROPIN" ] || fail "$ALSA_DROPIN is not installed"
+            [ "$(ls /etc/alsa/conf.d/*.conf | tail -n1)" = "$ALSA_DROPIN" ] \
+                || fail "$ALSA_DROPIN does not load last in /etc/alsa/conf.d: $(ls /etc/alsa/conf.d/*.conf | tail -n1) does"
+            ev_pass "the deploy tree's drop-in loads last in /etc/alsa/conf.d, after alsa-plugins-pulseaudio's own 99-pulseaudio-default.conf"
+            gen_tone 1320 /tmp/s422.wav 3
+            chmod 644 /tmp/s422.wav
+            : > /run/ev-empty-client.conf
+            chmod 644 /run/ev-empty-client.conf
+            ev_end
+            ;;
+        alsa-play) # S4.2.2, printed for the host, which captures around it
+            echo "== aplay of a 1320 Hz tone, as rocky, libpulse with no default server of its own (PULSE_CLIENTCONFIG=/run/ev-empty-client.conf)"
+            $ROCKY PULSE_CLIENTCONFIG=/run/ev-empty-client.conf aplay /tmp/s422.wav; echo "aplay exited $?"
+            echo "== amixer info, the same way"
+            $ROCKY PULSE_CLIENTCONFIG=/run/ev-empty-client.conf amixer info; echo "amixer exited $?"
+            echo "== amixer, the same way"
+            $ROCKY PULSE_CLIENTCONFIG=/run/ev-empty-client.conf amixer; echo "amixer exited $?"
+            ;;
+        alsa-control) # S4.2.2's control, guest half
+            ev_begin S4.2.2 "Host ALSA clients are routed through the pulse plugin" T3
+            out=$(ev_save control "EV-STATE: control: the same aplay with the deploy tree's drop-in hidden (/dev/null bound over it in a private mount namespace), alsa-plugins-pulseaudio's default left" \
+                unshare -m --propagation private sh -c '
+                    mount --bind /dev/null '"$ALSA_DROPIN"'
+                    '"$ROCKY"' PULSE_CLIENTCONFIG=/run/ev-empty-client.conf aplay /tmp/s422.wav; echo "aplay exited $?"') || true
+            if grep -q '^aplay exited 0$' <<<"$out"; then
+                fail "with the drop-in hidden, aplay still played: the check above cannot tell the drop-in's routing from libpulse's"
+            fi
+            ev_pass "control: with the drop-in hidden, the same aplay fails ($(grep -m1 'error' <<<"$out" || grep '^aplay exited' <<<"$out")): the routing above is the drop-in's"
+            ev_end
+            ;;
+        null-on) # S4.2.3
+            ev_begin S4.2.3 "A host-local asound.conf still wins" T3
+            [ ! -e /etc/asound.conf ] || cp -a /etc/asound.conf /etc/asound.conf.ev-saved
+            printf 'pcm.!default {\n    type null\n}\n' > /etc/asound.conf
+            ev_copy /etc/asound.conf asound-conf "EV-CONFIG: the host-local /etc/asound.conf: default routed to null"
+            ev_end
+            ;;
+        null-play) # S4.2.3, printed for the host, which captures around it
+            echo "== aplay -D default of a 1320 Hz tone, as rocky; /etc/asound.conf: $(ls -l /etc/asound.conf 2>&1)"
+            $ROCKY PULSE_CLIENTCONFIG=/run/ev-empty-client.conf aplay -D default /tmp/s422.wav; echo "aplay exited $?"
+            ;;
+        null-off) # S4.2.3
+            ev_begin S4.2.3 "A host-local asound.conf still wins" T3
+            rm -f /etc/asound.conf
+            [ -e /etc/asound.conf.ev-saved ] && mv /etc/asound.conf.ev-saved /etc/asound.conf
+            ev_text removed "EV-STATE: /etc/asound.conf after the test" "$(ls -l /etc/asound.conf 2>&1 || true)"
+            ev_end
+            ;;
+        cleanup)
+            pa_stub_remove
+            rm -f /run/ev-pulseaudio-starts.log /run/ev-empty-client.conf /tmp/s421.wav /tmp/s422.wav
+            ;;
+        *) fail "host-audio: pulse-play, autospawn, alsa-setup, alsa-play, alsa-control, null-on, null-play, null-off or cleanup" ;;
+    esac
 }
 
 phase2() {
@@ -4708,7 +5147,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-checks|deploy-tail|deploy-reboot|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-checks|deploy-tail|deploy-reboot|deploy-proof|session-groups|mwm-exit|standalone|seat-tags|host-audio}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -4745,6 +5184,11 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     deploy-checks) deploy_checks ;;
     deploy-tail) deploy_tail ;;
     deploy-reboot) deploy_reboot ;;
+    session-groups) session_groups ;;
+    mwm-exit) verify_mwm_exit ;;
+    standalone) standalone_desktop "${2:-}" ;;
+    seat-tags) seat_tags "${2:-}" ;;
+    host-audio) host_audio "${2:-}" ;;
     deploy-proof) deploy_proof ;;
     hotplug-probe) hotplug_probe ;;
     snd-probe) snd_probe ;;
