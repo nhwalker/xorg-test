@@ -187,11 +187,21 @@ audio() { # <label> <bind> <pulse exit> [stubborn]: one start-audio run
         timeout 40 bash image/session/start-audio 2>&1 | stamp
     return "${PIPESTATUS[0]}"
 }
-fakes_alive() { # the pids of any fake daemon still running (found by FAKE_LOG)
+fakes_alive() { # the pids of anything a fake left running (found by FAKE_LOG)
     local p
     for p in $(pgrep -u "$(id -u)" .); do
-        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q "^FAKE_LOG=$A/" && echo "$p"
+        { tr '\0' '\n' < "/proc/$p/environ"; } 2>/dev/null | grep -q "^FAKE_LOG=$A/" && echo "$p"
     done
+}
+gone() { # <pid...>: true once none of them exists, waiting up to 2 s (KILL is async)
+    local p alive _
+    for _ in $(seq 20); do
+        alive=""
+        for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [ -z "$alive" ] && return 0
+        sleep 0.1
+    done
+    return 1
 }
 reap() { local p; for p in $(fakes_alive); do kill -9 "$p" 2>/dev/null; done; }
 at() { awk -v k="$2" 'index($0, k) {print $1; exit}' "$A/$1.log"; }   # <label> <event>
@@ -226,8 +236,12 @@ want "survivors get SIGTERM" grep -q 'wireplumber ignored SIGTERM' "$A/stubborn.
 want "the holdout is named and killed (\"ignored SIGTERM; killing\")" has "$out" "ignored SIGTERM; killing"
 want "start-audio returned $(since "$tx" "$tend") s after the first exit (5 s of grace, then KILL)" between "$(since "$tx" "$tend")" 4.5 7.5
 want "with the first exit's status (7)" [ "$rc" = 7 ]
-pids_left=$(fakes_alive)
-want "no fake daemon outlives start-audio" [ -z "$pids_left" ]
+# The three daemons start-audio launched, by the pids its "started" line names
+# (not anything carrying the fakes' environment: a KILLed fake's own short
+# sleep can outlive it by a moment, and is not a daemon).
+daemons=$(sed -n 's/.*started (pipewire=\([0-9]*\) wireplumber=\([0-9]*\) pipewire-pulse=\([0-9]*\)).*/\1 \2 \3/p' <<<"$out")
+# shellcheck disable=SC2086 # three pids
+ok_if "none of the three daemons ($daemons) outlives start-audio" '[ -n "$daemons" ] && gone $daemons'
 reap
 ev_end
 
