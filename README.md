@@ -528,7 +528,13 @@ independent trees, each the leader of its own process session:
 Neither can reap the other: `desktop-init` stops a tree by killing every pid
 in *that tree's* session id, and the two sessions are disjoint. (Never by uid
 — in the host pid namespace a uid-wide `pkill` reaches every same-uid process
-on the host, which once killed the e2e's own ssh session.)
+on the host, which once killed the e2e's own ssh session.) The X tree spans
+more than one session — xinit starts mwm in a session of its own, and each
+xterm's shell leads another — so everything the X session starts also carries
+a `DESKTOP_SESSION_TAG` environment variable, new for each run of it, and
+stopping the X tree also takes every desktop-user process that carries that
+run's tag. A process that starts itself with a scrubbed environment (`env -i`)
+outside the server's session is the one way out.
 
 They used to be one tree, and it cost availability in both directions:
 
