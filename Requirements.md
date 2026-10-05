@@ -59,7 +59,7 @@ renumbering.
 | Tier | Runs where | Can see | Today |
 |---|---|---|---|
 | **T0 static** | any machine, no root | files only | `ci.yml` `static`: go fmt/vet/test, shellcheck, `py_compile` of the VM harness, `ci/monitor-layout-tests.sh`, ARG-scoping check, helm/kubeconform |
-| **T1 script-unit** | any machine, no root, or a scratch container of the image | one script with fabricated inputs | *does not exist yet* — see Appendix A for the refactors it needs |
+| **T1 script-unit** | any machine, no root, or a scratch container of the image | one script with fabricated inputs | `ci.yml` `static`: `ci/script-unit-tests.sh`, for the scripts an Appendix A override or a fake on `PATH` already reaches; the scripts that need more (Appendix A) are still to come |
 | **T2 build-smoke** | ubuntu runner, root, podman, systemd, **no sound card, no SELinux**; KMS not guaranteed (the Azure runners usually expose a Hyper-V DRM device, and X then really runs, per `ci/smoke-deploy.sh`) | the deploy tree booting a real container | `ci.yml` `build-smoke` + `ci/smoke-deploy.sh` |
 | **T3 VM e2e** | Rocky 9 KVM guest, virtio GPU/input/HDA, **SELinux enforcing**, k3s + CRI-O | real Xorg on a real KMS device, hotplug via QEMU, confined clients, a capturable display and audio backend | `ci.yml` `images` → `vm` (shards `core`, `operator`, `k8s`, each its own VM) → `ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh` + `ci/vm/operator-e2e.py` |
 | **T4 hardware** | a provisioned physical host | NVIDIA, physical KVM switch, real monitors/EDID, USB audio, a person | manual checklist (Appendix C); to become a guided script that prompts the tester for each physical action and gathers the evidence itself |
@@ -90,7 +90,8 @@ that files its evidence under another story's directory names it as
 Reference shorthand: `smoke` = `ci/smoke-deploy.sh`; `guest:<fn>` =
 `ci/vm/vm-guest.sh` function; `e2e` = `ci/vm/vm-e2e.sh`; `dryrun` = the
 "deploy tree quadlet dry-run + CDI spec checks" step of `ci.yml`;
-`layout-tests` = `ci/monitor-layout-tests.sh`; `operator-e2e:<fn>` = a
+`layout-tests` = `ci/monitor-layout-tests.sh`; `script-unit` =
+`ci/script-unit-tests.sh`; `operator-e2e:<fn>` = a
 story function in `ci/vm/operator-e2e.py`, whose evidence is under
 `artifacts/<story>/`.
 
@@ -202,7 +203,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `Containerfile`, `Containerfile.plugin` and `Containerfile.screenshot` build with `--network=none` against their prebuilt bases.
 - Acceptance: all three builds succeed under `podman build --network=none --pull=never` (`--network=none` alone governs only `RUN` steps; podman would still fetch a missing `FROM` or `COPY --from` image).
 - Evidence: build output of each showing `--network=none` on the command line and the final image id; `podman image inspect` of each result (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved: the build output reaches only the job log and no `podman image inspect` is taken; asserted by `ci.yml` "application layers (offline gate)" (also `ci.yml` `images`, `base-rebuild.yml`).
+- Tier: T2 · Coverage: ✅ `ci.yml` "application layers (offline gate)" builds all three with `--network=none --pull=never` and saves each build's output (the command line, every step, the image id it ends with) and `podman image inspect` of the result under `artifacts/S1.1.1/` (artifact `evidence-smoke`). `ci.yml` `images` and `base-rebuild.yml` also build them with `--network=none` (job log only).
 
 **S1.1.2 Bases rebuild from current upstream**
 - Requirement: the three base images build from scratch against the live UBI image and Rocky repos, and the offline layers still build on the result.
@@ -214,7 +215,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `ci/build-bases.sh` reuses a GHCR base whose tag is the hash of its inputs and rebuilds only on a miss.
 - Acceptance: unchanged inputs → "reused cached base"; a changed input → a different tag and a rebuild; and the tag `base-rebuild.yml` pushes for the same inputs equals `content_tag`'s (it computes the hash with its own inline copy).
 - Evidence: the script's stdout for both cases; the two computed tags (EV-STATE).
-- Tier: T1 · Coverage: ❌ no test; `ci/build-bases.sh` runs in `ci.yml` "base images (content-addressed GHCR cache)" on every build, but nothing asserts the reuse or the rebuild on a changed input.
+- Tier: T1 · Coverage: ✅ `script-unit` runs `ci/build-bases.sh` in a copy of its inputs against a fake registry (a fake `podman` first on `PATH`): an empty registry gives three misses and three builds; with those refs in it all three are reused and nothing is built; a changed input (`Containerfile.base`) gets a new tag and a rebuild while the other two are reused. `base-rebuild.yml`'s own push step, run on the same inputs, pushes exactly the tags `build-bases.sh` pulls. Each run's stdout, the third run's `podman` calls and both tag lists are under `artifacts/S1.1.3/` (artifact `evidence-static`).
 
 **S1.1.4 Build ARGs are global**
 - Requirement: every `ARG` in every `Containerfile*` precedes the first `FROM`.
@@ -252,13 +253,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `/usr/share/pipewire/pipewire.conf` lists `/run/desktop-audio/pipewire-0` in the `protocol-native` sockets.
 - Acceptance: in the built image the `protocol-native` `sockets` entry lists `/run/desktop-audio/pipewire-0` (the build's `grep -q` gate only finds `desktop-audio` somewhere in the file); runtime proven by S4.1.1.
 - Evidence: the patched config block (EV-CONFIG).
-- Tier: T2 · Coverage: ❌ evidence not saved: the gate prints nothing on pass, so the patched block is never recorded; asserted by the build-time `grep -q` gate, outcome by S4.1.1.
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's PipeWire patches" reads the `protocol-native` entry out of the built image, checks that its uncommented `sockets` line lists `/run/desktop-audio/pipewire-0`, and saves the entry under `artifacts/S1.2.3/` (artifact `evidence-smoke`); outcome by S4.1.1.
 
 **S1.2.4 module-rt takes the rlimit path**
 - Requirement: `rlimits.enabled = true`, `rtportal.enabled = false`, `rtkit.enabled = false` appear exactly once in the `module-rt` block of `pipewire.conf` (the daemon), `pipewire-pulse.conf` and `client.conf` (its clients). PipeWire 1.4 ships no `client-rt.conf`.
 - Acceptance: in each of the three files (a missing file fails), the `module-rt` block holds each of the three settings exactly once (the build's gate counts only `rtkit.enabled`, over the whole file, and fails on a missing file); runtime outcome S4.3.2, for the daemon (no story checks a client's threads).
 - Evidence: the three patched blocks (EV-CONFIG).
-- Tier: T2 · Coverage: ❌ evidence not saved: the patched blocks are printed only when the gate fails; asserted by the build's "exactly once" gate, outcome by `guest:verify_privileges`.
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's PipeWire patches" saves the `module-rt` entry of `pipewire.conf`, `pipewire-pulse.conf` and `client.conf` from the built image, with its `ls /usr/share/pipewire`, and checks each of the three settings exactly once in each (nine checks), under `artifacts/S1.2.4/` (artifact `evidence-smoke`); the build itself fails on a missing file. Outcome, for the daemon, by `guest:verify_privileges` (S4.3.2).
 
 **S1.2.5 pipewire-pulse export drop-in installed**
 - Requirement: the drop-in serves `unix:native` and `unix:/run/desktop-audio/pulse`.
@@ -370,7 +371,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `session-postmortem` runs after every abnormal end of the X session and never after a clean one; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists. Abnormal is a nonzero session exit, or an X server that did not shut down cleanly: xinit exits 0 whenever the server goes away, killed or crashed included, so `desktop-init` reads the server's log, which says `Server terminated successfully` only after a clean shutdown, and logs `the X server did not shut down cleanly` before the postmortem.
 - Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL (the session still exits `rc=0`; `desktop-init`'s `did not shut down cleanly` line comes first), and none after a clean end (Quit session, `rc=0`). Which ends get a postmortem is `desktop-init`'s doing, so only T2/T3 can prove it.
 - Evidence: T1 the script's stdout per case (EV-STATE); T2 EV-LOG-DESKTOP slice containing `postmortem:` lines.
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: ❌ the T2/T3 half is not saved: the real `postmortem:` lines after Xorg is killed with SIGKILL, and none after a clean end. The T1 half is: `script-unit` runs the postmortem on fabricated Xorg logs, one per known signature (each gets the log's tail and its `LIKELY CAUSE`), one with no known signature (the tail, no verdict), none at all (its own line), and with `SERVICE_RESULT=success` (silent), under `artifacts/S2.3.5/` (artifact `evidence-static`).
 
 **S2.3.6 mwm exit ends the session and it restarts**
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
@@ -402,13 +403,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `start-audio` waits up to 10 s for `$XDG_RUNTIME_DIR/pipewire-0` before launching wireplumber.
 - Acceptance: T1 with a fake `pipewire` that binds after 2 s; T3 wireplumber alive after boot and after a stack restart.
 - Evidence: T1 stdout with timestamps; T3 EV-PIDS.
-- Tier: T1/T3 · Coverage: ❌ no T1 test and no evidence saved; wireplumber is shown alive after boot (`guest:phase_deploy`) and after a stack restart (`e2e` "audio hotplug") only as a side effect.
+- Tier: T1/T3 · Coverage: ❌ the T3 EV-PIDS is not saved: wireplumber is shown alive after boot (`guest:phase_deploy`) and after a stack restart (`e2e` "audio hotplug") only as a side effect. The T1 half is: `script-unit` runs `start-audio` with fake daemons first on `PATH`; with a `pipewire` that binds after 2 s, wireplumber starts once the socket exists, and with one that never binds it starts after the bounded wait (about 10 s). The timestamped stdout and each fake's own log are under `artifacts/S2.4.4/` (artifact `evidence-static`).
 
 **S2.4.5 A daemon ignoring SIGTERM is escalated**
 - Requirement: survivors not exited 5 s after TERM are KILLed; `start-audio` always returns.
 - Acceptance: T1 fake daemon trapping TERM: exit within ~6 s, `ignored SIGTERM; killing` logged.
 - Evidence: stdout with timestamps.
-- Tier: T1 · Coverage: ❌.
+- Tier: T1 · Coverage: ✅ `script-unit` runs `start-audio` with fake daemons: when pipewire-pulse exits (status 7) and wireplumber ignores SIGTERM, start-audio names the first exit, TERMs the survivors, logs `ignored SIGTERM; killing` and KILLs the holdout after its 5 s of grace, then returns the first exit's status; none of the three daemons outlives it. The timestamped stdout and each fake's log are under `artifacts/S2.4.5/` (artifact `evidence-static`).
 
 **S2.4.6 Audio gid is re-aligned before every audio start**
 - Requirement: `align-device-groups.sh audio` runs before each stack start, so a card that appears after a soundless boot is openable.
@@ -550,49 +551,49 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: no file, or comments/globals only → no `30-monitors.conf`, stale one removed, no-op logged.
 - Acceptance: as stated.
 - Evidence: `ls /etc/X11/xorg.conf.d/` (EV-STATE); EV-LOG-DESKTOP no-op line; T3 `xrandr` showing autodetected geometry.
-- Tier: T0/T2/T3 · Coverage: ❌ evidence not saved (`ci.yml` uploads nothing and `layout-tests` deletes its output); asserted by `layout-tests`, `smoke` and `guest:verify_fixed_layout` (restore), except for a globals-only file.
+- Tier: T0/T2/T3 · Coverage: ❌ the T3 `xrandr` after a restore is not saved (`guest:verify_fixed_layout` asserts the restore). Saved: `layout-tests` (no file, comments only, globals only: each removes a stale config and logs the no-op; `ls` of `xorg.conf.d` and the log per case) under `artifacts/S3.4.1/` (artifact `evidence-static`), and `smoke` (the shipped comments-only file, the generator's no-op line, `ls` in the container) under `artifacts/S3.4.1/` (artifact `evidence-smoke`).
 
 **S3.4.2 modesetting emission**
 - Requirement: per-output `Monitor` sections with the documented options, a `Screen` on `gpu0` with pinned `Virtual`, no `MetaModes`.
 - Acceptance: `layout-tests` "modesetting".
 - Evidence: the generated file (EV-CONFIG) per case.
-- Tier: T0 · Coverage: ❌ evidence not saved; asserted by `layout-tests` "modesetting", which does not check `PreferredMode`.
+- Tier: T0 · Coverage: ✅ `layout-tests` "modesetting" saves the input, the GPU config, the generated file, `ls` and the generator's log under `artifacts/S3.4.2/` (artifact `evidence-static`), and checks the outputs forced on, one `Monitor` section per output with wide sync ranges and its `PreferredMode`, the positions, exactly one primary, `Virtual` pinned to the layout's extents, the `Screen` on `gpu0`, and no `MetaModes`.
 
 **S3.4.3 CVT timings match `cvt(1)`**
 - Requirement: the integer derivation equals, field for field, the Modeline the image's own `cvt(1)` prints (xserver 1.20.11's `xf86CVTMode()`; libxcvt's newer cvt differs from it in hsync start and the back porch floor). The one exception is a value that lands exactly on a rounding step, where cvt's single-precision floats can round the other way: of 6884 modes compared, 3432x1931@60 (one more line of vertical total) and 3104x2328@60 (a clock 0.25 MHz higher). Open: a width that is not a multiple of 8, such as 1366x768: `cvt(1)` changes the mode itself to 1368 wide, while the generator keeps the declared width.
-- Acceptance: field-for-field equality for 1920x1080@60 and 1280x1024@60; 59.94 carried. ❌ a wider table exercising every aspect branch (2560x1440, 3840x2160, 1080x1920, 75 Hz, 4:3, 5:4, 16:10, 15:9, and 1280x768, which only the divisibility check keeps out of 15:9).
+- Acceptance: field-for-field equality for a table exercising every aspect branch: 1920x1080 at 50/60/75/85 Hz, 2560x1440, 3840x2160, 1080x1920, 1280x1024 (5:4, also with no refresh given), 1600x1200 and 1024x768 (4:3), 1920x1200 (16:10), 1800x1080 (15:9), and 1280x768, which only the divisibility check keeps out of 15:9; 59.94 carried.
 - Evidence: a table of declared mode → generated Modeline → `cvt` output (EV-STATE).
-- Tier: T0 · Coverage: ❌ no wider table, and nothing is saved; `layout-tests` pins 1920x1080@60 and 1280x1024@60 verbatim and checks that 59.94 is carried.
+- Tier: T0 · Coverage: ✅ `layout-tests` holds the Modeline generated for 14 modes (16:9 at 50/60/75/85 Hz and at 1440p and 2160p, 5:4 with and without a refresh, 4:3 twice, 16:10, 15:9, portrait, 1280x768) to the line the image's `cvt(1)` prints, field for field, and checks that 59.94 is carried; the table of declared mode, generated line and cvt's line verbatim is saved under `artifacts/S3.4.3/` (artifact `evidence-static`). cvt's lines are pinned in the script, the runner having no cvt.
 
 **S3.4.4 Rotation transposes extents**
 - Requirement: `rotate=left|right` swaps width/height in the framebuffer computation.
 - Acceptance: `layout-tests` "rotation".
 - Evidence: EV-CONFIG.
-- Tier: T0 · Coverage: ❌ evidence not saved; asserted by `layout-tests` "rotation".
+- Tier: T0 · Coverage: ✅ `layout-tests` saves each case's input, GPU config, generated file, `ls` and log under `artifacts/S3.4.4/` (artifact `evidence-static`): `rotate=left` and `rotate=right` measure the output transposed (framebuffer 3000x1920), `rotate=inverted` does not (3840x1080), and none transposes the mode itself.
 
 **S3.4.5 NVIDIA emission**
 - Requirement: one `MetaModes`, `ModeValidation AllowNonEdidModes`, opt-in `ConnectedMonitor`/`CustomEDID`, pinned `Virtual`, no `Monitor` sections.
 - Acceptance: `layout-tests` "nvidia"; T4 the layout survives a KVM switch.
 - Evidence: EV-CONFIG; T4 `xrandr` before/after the switch (EV-DIFF empty) and EV-PHONEVIDEO of the switch.
-- Tier: T0/T4 · Coverage: ❌ evidence not saved; asserted by `layout-tests` "nvidia". 🔧 the KVM-switch half: guided hardware script, not yet written.
+- Tier: T0/T4 · Coverage: ✅ the T0 half: `layout-tests` "nvidia" saves both cases' input, generated file and log under `artifacts/S3.4.5/` (artifact `evidence-static`) and checks one `MetaModes` carrying the whole layout, `ModeValidation AllowNonEdidModes`, `ConnectedMonitor` and `CustomEDID` only when asked for, the pinned `Virtual`, and no `Monitor` sections or invented timings. 🔧 the KVM-switch half: guided hardware script, not yet written.
 
 **S3.4.6 Degraded host: no Device section**
 - Requirement: without `gpu0`, Monitor sections only and a warning.
 - Acceptance: `layout-tests`.
 - Evidence: EV-CONFIG + the warning.
-- Tier: T0 · Coverage: ❌ evidence not saved; asserted by `layout-tests` "no GPU device section".
+- Tier: T0 · Coverage: ✅ `layout-tests` "no GPU device section" saves the input, the generated file and the generator's log under `artifacts/S3.4.6/` (artifact `evidence-static`): the `Monitor` sections are still written, no `Screen` names the missing Device, and the generator warns that the framebuffer is not pinned.
 
 **S3.4.7 A bad config is rejected whole**
 - Requirement: every validation failure logs `ERROR`, removes the output file, exits 0.
-- Acceptance: `layout-tests` rejection table; ❌ add bad `virtual`, `nvidia-connected` without list, `nvidia-edid` without `=`, digit-leading and illegal-character output names, and a `watch` line (a keyword that went with the session-side re-assert loop; the generator reads it as an output name and rejects the whole layout).
+- Acceptance: `layout-tests` rejection table: a mode without a height, an xrandr-style position, an unknown flag, two primaries, a duplicate output, a non-numeric refresh, an implausible mode, a `virtual` smaller than the layout or without a height, `nvidia-connected` without a list, `nvidia-edid` without `=`, digit-leading and illegal-character output names, and a `watch` line (a keyword that went with the session-side re-assert loop; the generator reads it as an output name and rejects the whole layout).
 - Evidence: per case: the input, the ERROR line, `ls` showing no output file.
-- Tier: T0 · Coverage: ❌ evidence not saved; the `layout-tests` rejection table lacks the five cases the Acceptance lists and never checks the exit status.
+- Tier: T0 · Coverage: ✅ `layout-tests` runs 14 rejections and saves each one's input, the `ls` showing no `30-monitors.conf`, and the generator's log with its `ERROR` line under `artifacts/S3.4.7/` (artifact `evidence-static`); the generator exits 0 in every case.
 
 **S3.4.8 The host file reaches the container and is acted on at start**
 - Requirement: `/etc/desktop-container/monitors.conf` is visible read-only in the container and consumed at every start.
 - Acceptance: write a layout, restart, generated config names the outputs.
 - Evidence: the host file and the generated file (EV-CONFIG); EV-LOG-DESKTOP `fixed layout` line.
-- Tier: T2 · Coverage: ❌ evidence not saved (`ci.yml` uploads nothing); asserted by `smoke`.
+- Tier: T2 · Coverage: ✅ `smoke` saves the host's `monitors.conf`, the same file read inside the container with its mount (`ro`), the generated `30-monitors.conf` and the generator's `fixed layout` line under `artifacts/S3.4.8/` (artifact `evidence-smoke`).
 
 **S3.4.9 A declared output comes up on a disconnected connector**
 - Requirement: with `Virtual-1`/`Virtual-2` declared, X starts at 2048x768; `xrandr` shows `Virtual-2 disconnected 1024x768+1024+0`; `Virtual-1` is primary.
@@ -616,7 +617,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: one line per enabled output; refuses non-root; fails cleanly when the desktop is down; its output through the generator reproduces the geometry.
 - Acceptance: T3 with the two-output layout live: the two expected lines; T1 canned `xrandr` text; T3 desktop stopped → exit 1 with the hint.
 - Evidence: the tool's stdout (EV-STATE); the generator's output from it (EV-CONFIG); `xrandr` after applying it (EV-DIFF vs the original).
-- Tier: T1/T3 · Coverage: ❌.
+- Tier: T1/T3 · Coverage: ❌ the T3 half is not saved (the live two-output layout, the desktop stopped, `xrandr` after applying the block). The T1 half is: `script-unit` runs `desktop-monitors-capture` on canned `xrandr` text (`DESKTOP_XRANDR_CMD`): a non-root caller is refused (exit 2); the capture prints one line per enabled output, the rotated output's panel size restored with `rotate=left`; a failing query exits 1 with the hint; and the block, through the generator, gives back xrandr's framebuffer and positions. The canned text, each run's output and the generated config are under `artifacts/S3.4.12/` (artifact `evidence-static`).
 
 ### F3.5 Rendering and theme
 
@@ -1083,7 +1084,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `--pid=host`, `--systemd=false`, `--tty`, `--security-opt apparmor=unconfined`, the three `--ulimit`s, and five `--device-cgroup-rule` arguments each arriving as **one** argument.
 - Acceptance: parse the generated `ExecStart` with shell word-splitting and assert each flag/value; exactly five cgroup rules.
 - Evidence: the generated unit (EV-CONFIG); the parsed argument list, one per line (EV-STATE).
-- Tier: T2 · Coverage: ❌ no test parses `ExecStart`; only the runtime effects of `--pid=host` (`smoke`, `guest:verify_privileges`) and `--ulimit rtprio=95` (`guest:verify_privileges`) are asserted.
+- Tier: T2 · Coverage: ✅ `dryrun` splits the generated `ExecStart` with shell word-splitting (Python's `shlex`) and saves the unit and the argument list, one per line, under `artifacts/S5.2.2/` (artifact `evidence-smoke`); it checks that each flag arrives whole and that there are exactly five `--device-cgroup-rule` arguments, none split.
 
 **S5.2.3 Every unit directive is emitted**
 - Requirement: `WantedBy`, both `Conflicts`, `Wants=`/`After=` for all six units, `Wants=desktop-session.service`, `Restart=always`, `TimeoutStartSec=300`.
@@ -1119,9 +1120,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.3.2 Steady state is silent and idempotent**
 - Requirement: a second run changes nothing and prints nothing.
-- Acceptance: `smoke` runs the second pass as `systemctl restart desktop-seat-prep` and asserts exit 0 and an empty journal slice (run directly, as now, there is no journal, and `|| true` hides the exit status).
+- Acceptance: `smoke` runs the second pass as `systemctl restart desktop-seat-prep` before the desktop starts (seat-prep's DRM/VT gate fails while Xorg holds the seat), and asserts exit 0, an empty journal slice and no logind restart.
 - Evidence: the (empty) stdout, EV-LOG-JOURNAL of the second run.
-- Tier: T2 · Coverage: ❌ evidence not saved (`smoke` runs the script directly, so no journal of the second run exists); asserted by `smoke` and `dryrun`.
+- Tier: T2 · Coverage: ✅ `smoke` runs the second pass as `systemctl restart desktop-seat-prep.service` before the desktop starts, and saves its output (none), the journal slice of the unit's own process for that run (empty) and systemd-logind's MainPID before and after (unchanged) under `artifacts/S5.3.2/` (artifact `evidence-smoke`).
 
 **S5.3.3 The gate names a culprit and fails**
 - Requirement: a process holding `/dev/dri/card*` or `/dev/tty1` after convergence → exit 1 naming it; `desktop.service` still starts.
@@ -1153,7 +1154,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: with `nvidia-ctk` and `/dev/nvidiactl` the real spec is written; a failing `nvidia-ctk` keeps an existing real spec; without a toolkit an existing real spec is kept while `/dev/nvidiactl` exists or the `nvidia` module is loaded (`/proc/modules`); with neither, the stub returns.
 - Acceptance: `smoke` with a fake `nvidia-ctk` and fake `/dev/nvidiactl`; the `/proc/modules` trigger needs an override (Appendix A).
 - Evidence: the spec after each step (EV-CONFIG × 4); the script's stdout.
-- Tier: T2 · Coverage: ❌ evidence not saved (the script's stdout is discarded and the specs are never printed); asserted by `smoke`.
+- Tier: T2 · Coverage: 🟡 the `/proc/modules` leg is not tested: the script reads `/proc/modules` itself, with no override a test could use (Appendix A). The other legs are asserted by `smoke`, which saves the converger's output and the spec after each of five legs (stub; generated; a failing `nvidia-ctk` keeps the real spec; no toolkit with the device node present keeps it; neither, back to the stub) under `artifacts/S5.4.2/` (artifact `evidence-smoke`).
 
 **S5.4.3 Stale real spec fails loudly, regenerates on restart**
 - Requirement: after a driver update the stale spec fails container creation; `systemctl restart desktop-cdi-refresh` fixes it.
@@ -1205,7 +1206,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: exit 0 with the no-op message, touching nothing.
 - Acceptance: `smoke`.
 - Evidence: stdout; `getenforce`/absence of `/sys/fs/selinux/enforce` (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved (`smoke` puts the labeler's message only in the job log and records nothing about SELinux being absent); asserted by `smoke`.
+- Tier: T2 · Coverage: ✅ `smoke` saves the runner's SELinux state (no `/sys/fs/selinux`, no `getenforce`), the labeler's output (`no SELinux on this host: nothing to label`, exit 0) and `ls -ld` of the three directories it would label, before and after, with their empty diff, under `artifacts/S5.6.1/` (artifact `evidence-smoke`).
 
 **S5.6.2 Three directories and the published binary are `container_file_t`**
 - Requirement: full context `system_u:object_r:container_file_t:s0` (no categories) on all three dirs and the binary, before any client runs.
@@ -1273,7 +1274,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: empty `shell-user` → exit 0, nothing written; missing `shell-user` → exit 1 with a hint (the tree ships the file: re-apply it, or use the quadlet's off-switch to turn the feature off), nothing written; account missing → exit 1 with the sysusers hint.
 - Acceptance: T1 with a temp `DIR` or T2 before the tree is applied.
 - Evidence: stdout and exit codes; `ls` of the dir after.
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: ✅ `script-unit` runs `desktop-host-shell-setup` against a scratch directory (`DESKTOP_CONTAINER_DIR`, `HOST_SHELL_AK_DIR`): a missing `shell-user` exits 1 with the hint, an empty one exits 0, an unknown account exits 1 with the sysusers hint, and no case writes anything. Each case's output and exit status, and `ls -laR` of its directory after, are under `artifacts/S5.7.5/` (artifact `evidence-static`).
 
 **S5.7.6 The sshd drop-in keeps stock key logins working**
 - Requirement: ordinary users' home-dir keys still work.
@@ -1291,7 +1292,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: on `ssh host` failure, `host-terminal` prints the exit code, the enablement command and the common causes, waits for Enter, exits with ssh's code; on success exits 0 at once.
 - Acceptance: T1 with a fake `ssh`.
 - Evidence: stdout and exit codes for both cases; T3 EV-SHOT (see S5.7.7).
-- Tier: T1 · Coverage: ❌.
+- Tier: T1 · Coverage: ❌ the T3 EV-SHOT the evidence names (the window showing the failure and "Press Enter to close", shared with S5.7.7) is not taken. The rest is asserted, its evidence saved: `script-unit` runs `host-terminal` with a fake `ssh`; on success it exits 0 at once with stdin held open; on failure it prints the exit code, the enablement command and the common causes, waits for Enter and exits with ssh's code (255). Output and exit codes are under `artifacts/S5.7.8/` (artifact `evidence-static`).
 
 ### F5.8 Host login session (`desktop-session.service`)
 
@@ -1350,7 +1351,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: on the dry-run's partially applied runner the report ends `done: N FAIL(s)` and shows `FAIL: quadlet unit missing`, `PASS: GPU-less host: stub CDI spec`, `PASS: desktop-shell account exists` and `PASS: default target is multi-user.target`.
 - Acceptance: `dryrun`, `smoke`.
 - Evidence: the full output.
-- Tier: T2 · Coverage: ❌ evidence not saved (the output reaches only the `ci.yml` job log); asserted by `dryrun`, which checks five rows of the staged runner's report.
+- Tier: T2 · Coverage: ✅ `dryrun` saves `desktop-preflight`'s full report on the partially applied runner under `artifacts/S5.10.2/` (artifact `evidence-smoke`) and checks the rows the requirement names: the closing FAIL count, `FAIL: quadlet unit missing`, `PASS: GPU-less host: stub CDI spec`, `PASS: desktop-shell account exists` and `PASS: default target is multi-user.target`.
 
 **S5.10.3 Each FAIL/WARN branch fires on its condition**
 - Requirement: every row listed in the script fires when its condition is staged.
@@ -2169,13 +2170,13 @@ them without root or a container. Defaults must remain the production paths.
 | `image/xorg/align-device-groups.sh` | node globs under `/dev` | `DEV_ROOT` prefix | S3.2.2 |
 | `image/xorg/ensure-vt-devices.sh` | `/dev` | `DEV_ROOT` | S3.2.3 |
 | `image/xorg/preflight-check.sh` | all of the above plus `/run/udev`, the pid file, `/proc/self/mounts`, `/etc/desktop-container` | one `PREFLIGHT_ROOT` prefix, or `podman run` with mounts omitted | S5.11.2 |
-| `image/session/session-postmortem` | Xorg log glob | `POSTMORTEM_XLOG_GLOB` | S2.3.5 |
-| `image/session/start-audio` | daemons by name | already PATH-overridable | S2.4.4, S2.4.5 |
+| `image/session/session-postmortem` | Xorg log glob | **built**: `POSTMORTEM_XLOG_GLOB` | S2.3.5 |
+| `image/session/start-audio` | daemons by name | `PATH` (used: fake daemons) | S2.4.4, S2.4.5 |
 | `image/session/host-shell-setup.sh` | `SRC`, `DHOME` | export the existing variables | S5.7.7 |
-| `image/session/host-terminal` | `ssh` by name | already PATH-overridable | S5.7.8 |
+| `image/session/host-terminal` | `ssh` by name | `PATH` (used: a fake `ssh`) | S5.7.8 |
 | `image/tools/publish-tools.sh` | `SRC`, `DEST` | export the existing variables | S7.2.2, S7.2.3 |
-| `deploy/host/usr/local/libexec/desktop-host-shell-setup` | `/etc/desktop-container`, `/etc/ssh/authorized_keys.d` | `DIR`, `AK_DIR` | S5.7.5 |
-| `deploy/host/usr/local/bin/desktop-monitors-capture` | `podman exec … xrandr --query` | `DESKTOP_XRANDR_CMD` | S3.4.12 |
+| `deploy/host/usr/local/libexec/desktop-host-shell-setup` | `/etc/desktop-container`, `/etc/ssh/authorized_keys.d` | **built**: `DESKTOP_CONTAINER_DIR`, `HOST_SHELL_AK_DIR` | S5.7.5 |
+| `deploy/host/usr/local/bin/desktop-monitors-capture` | `podman exec … xrandr --query` | **built**: `DESKTOP_XRANDR_CMD` | S3.4.12 |
 | `deploy/host/usr/local/libexec/desktop-selinux` | takes paths as args already | — | S5.6.4–S5.6.6 |
 | `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | also honour an env override | S5.5.4 |
 | `deploy/host/usr/local/libexec/desktop-cdi-refresh` | `/proc/modules` (the loaded-`nvidia` trigger of the no-downgrade rule) | `CDI_PROC_MODULES` | S5.4.2 (module half) |
@@ -2194,8 +2195,11 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 | `gdm` (AppStream) | S10.1.5 | a second VM profile, booted to `graphical.target` before the tree is applied |
 | `edid-decode` | S8.2.3 | T4 host |
 
-Proposed job: add `script-unit` to `ci.yml` `static` (no root), covering
-S1.1.3, S2.3.5, S2.4.4, S2.4.5, S3.1.x, S3.4.12, S5.7.5, S5.7.7, S5.7.8.
+The `script-unit` step of `ci.yml` `static` covers S1.1.3, S2.3.5, S2.4.4,
+S2.4.5, S3.4.12, S5.7.5 and S5.7.8 so far. S3.1.x need the `xorg-gpu-conf.sh`
+overrides above; S5.7.7, S3.2.2 and S3.2.3 need root or a scratch container of
+the image, since they install files as the session user or create groups and
+device nodes.
 
 ## Appendix B — Suggested new VM e2e phases
 
@@ -2294,16 +2298,16 @@ moves to ✅ only when a CI run has saved its evidence, which the
 
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
-| E1 Image build | 14 | 1 | 0 | 13 | 0 |
-| E2 Boot & supervision | 25 | 3 | 1 | 21 | 0 |
-| E3 Display & session | 62 | 13 | 1 | 45 | 3 |
+| E1 Image build | 14 | 5 | 0 | 9 | 0 |
+| E2 Boot & supervision | 25 | 4 | 1 | 20 | 0 |
+| E3 Display & session | 62 | 20 | 1 | 38 | 3 |
 | E4 Audio | 23 | 4 | 0 | 18 | 1 |
-| E5 Deploy tree | 50 | 6 | 0 | 43 | 1 |
+| E5 Deploy tree | 50 | 11 | 1 | 37 | 1 |
 | E6 Privileges | 9 | 2 | 0 | 7 | 0 |
 | E7 Client contract & journeys | 40 | 7 | 1 | 32 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **41** | **3** | **201** | **6** |
+| **Total** | **251** | **58** | **4** | **183** | **6** |
 
 Regenerate after editing with:
 
