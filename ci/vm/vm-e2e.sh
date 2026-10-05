@@ -107,25 +107,25 @@ ev_audio_start() { # <moment> <hz>
     mon_cmd "wavcapture $EV_DIR/$EV_WAV snd0 44100 16 2"
     sleep 1
 }
-ev_audio_stop() { # <what> <min seconds> <min peak> <hz>
+ev_audio_stop() { # <what> <min seconds> <min peak> <hz> [check-audio options...]
     audio_capture_stop
     if [ -s "$EV_DIR/$EV_WAV" ]; then ev_attach "$EV_WAV" "$1"; else ev_note "no capture was written for: $1"; fi
     local moment=${EV_WAV%.wav}
-    ev_audio_check "${moment#*-}" "$EV_WAV" "$2" "$3" "$4"
+    ev_audio_check "${moment#*-}" "$EV_WAV" "$2" "$3" "$4" "${@:5}"
 }
 
 # EV-AUDIO's verdict and picture for a WAV already in the open story:
 # check-audio.py's report and a level plot at the story's pitch (no
 # spectrogram tool is installed). Returns check-audio's status.
-ev_audio_check() { # <moment> <wav name in the story dir> <min seconds> <min peak> <hz>
+ev_audio_check() { # <moment> <wav name in the story dir> <min seconds> <min peak> <hz> [check-audio options...]
     local rep plot rc=0
     if [ -z "$EV_DIR" ]; then
-        python3 check-audio.py "$2" "$3" "$4" "$5"
+        python3 check-audio.py "${@:6}" "$2" "$3" "$4" "$5"
         return
     fi
     rep=$(ev_name "$1-verdict" txt)
     plot=$(ev_name "$1-level" png)
-    python3 check-audio.py --report "$EV_DIR/$rep" --plot "$EV_DIR/$plot" "$EV_DIR/$2" "$3" "$4" "$5" || rc=$?
+    python3 check-audio.py --report "$EV_DIR/$rep" --plot "$EV_DIR/$plot" "${@:6}" "$EV_DIR/$2" "$3" "$4" "$5" || rc=$?
     [ -s "$EV_DIR/$rep" ] && ev_attach "$rep" "check-audio.py's verdict on $2: its duration, peak and dominant frequency (want $5 Hz)"
     [ -s "$EV_DIR/$plot" ] && ev_attach "$plot" "the level at $5 Hz across $2, one bar per 0.1 s on a -60..0 dBFS scale (the picture of the tone; no spectrogram tool is installed)"
     return "$rc"
@@ -848,6 +848,39 @@ log "audio lifecycle: independent of the X session, and recovers on its own"
 # stack works, and this one then kills things. It restarts the X session
 # and PipeWire, so anything ordered after it must not assume either kept
 # its pid - the input tests below re-establish their own state anyway.
+# S4.5.1: a 20 s tone from a pulse client outside the X session plays while
+# the guest kills Xorg and waits for the new session (verify-audio-x); it
+# must play on with no gap, no stall and none of it missing.
+EV_SIDE=h-
+ev_begin S4.5.1 "Audio survives an X session restart" T3
+ev_audio_start through-x 1100
+gq tone-start s451 1100 20 - >/dev/null || { audio_capture_stop; fail "could not start the 20 s tone for S4.5.1"; }
+ev_end
+EV_SIDE=
+sleep 3
+guest_ev "$GUEST_EV" verify-audio-x || { audio_capture_stop; fail "audio did not survive an X session restart"; }
+EV_SIDE=h-
+ev_begin S4.5.1 "Audio survives an X session restart" T3
+for _ in $(seq 40); do st=$(gq tone-status s451 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+ev_save player "EV-LOG-CLIENT: the pulse client's player (paplay, in the desktop container but outside the X session): its exit status, how long it played and from when to when, its pid, its output" \
+    gq tone-status s451 >/dev/null || true
+player=$(ev_payload "$EV_DIR/$EV_LAST")
+# The kill's time on the guest's clock, which the player's times share.
+t_kill=$(vm_ssh_quick 'cat /run/verify-audio-x.kill' 2>/dev/null || true)
+p_t0=$(awk '/^played/ {print $5}' <<<"$player")
+mark=$(awk -v k="$t_kill" -v s="$p_t0" 'BEGIN {if (k != "" && s != "") printf "%.2f", k - s}')
+heard=yes
+ev_audio_stop "EV-AUDIO: the machine's output while a pulse client played a 20 s 1100 Hz tone, the X server killed a few seconds in (the plot's red line, timed by the player's clock): it must play on with no gap and none of it missing" \
+    15 0.05 1100 --max-gap 0.1 --span 19.6 20.6 ${mark:+--mark "$mark"} || heard=no
+grep -q '^exited 0$' <<<"$player" || fail "the S4.5.1 player did not end cleanly: $(echo $player)"
+played=$(awk '/^played/ {print $2}' <<<"$player")
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 21.0 else 1)' "${played:-99}" \
+    || fail "the 20 s tone took ${played:-?} s to play: its stream stalled across the X restart"
+ev_pass "the player played its 20 s tone in ${played} s and exited 0: the stream never stalled"
+[ "$heard" = yes ] || fail "the tone did not play on whole across the X restart (check-audio's verdict says where)"
+ev_pass "the machine's output carried the tone across the X restart: no stretch below -40 dBFS longer than 0.1 s, and its 20 s span with nothing missing"
+ev_end
+EV_SIDE=
 guest_ev "$GUEST_EV" verify-audio-lifecycle \
     || fail "audio lifecycle assertions failed"
 # S4.5.2's EV-AUDIO: the recovered stack plays, heard at the machine's
@@ -1830,6 +1863,550 @@ ev_begin S7.3.5 "Concurrency" T3
 ev_shot concurrent-clients "EV-SHOT: the three pods' xterms one above the other on the right of the screen, each title bar naming its pod (x11-client-a, -b, -c), each its pod's live X connection; bottom left, pod a's second xterm (the hold), if it has not exited yet"
 ev_end
 EV_SIDE=
+
+log "client journeys: long-running pods through the desktop's own restarts"
+# Requirements.md F7.5, F7.6 and F7.8: what a client lives through. The
+# journey pod (ci/vm/journey-pod.yaml) holds the display, audio and the
+# toolkit, sleeps, and must come out of each event the same container (its
+# pod-state lines unchanged, restartCount 0), its applications reconnecting
+# or retrying on their own:
+#   - the X server killed while the pod shows an xterm and plays a 20 s tone
+#     (S7.5.5, S7.6.3, the display half of S7.8.3);
+#   - PipeWire killed while the pod plays (S7.6.4, the audio half of S7.8.3);
+#   - desktop.service restarted under an xterm, a tone, a screenshot loop and
+#     a screenshot held mid-write (S7.8.1, S7.8.2).
+# Then a second pod, started while the desktop is down, must work once it is
+# up (S7.5.4, S7.6.5). The times in the notes are the guest's clock, which
+# the pods share.
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh journey-start' || fail "the journey pod did not become Ready"
+gnow() { vm_ssh_quick 'date +%s.%N' 2>/dev/null | tail -1; }
+xorg_pid() { vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | head -1 || true; }
+# Until a new X session answers: an Xorg other than <old pid>, and mwm up.
+x_wait() { # <old Xorg pid>
+    local _ p
+    for _ in $(seq 60); do
+        p=$(xorg_pid)
+        if [ -n "$p" ] && [ "$p" != "$1" ] && gq x-up >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+tone_wait() { # <tag> [pod] [seconds]: until the pod's player has ended
+    local st _
+    for _ in $(seq "${3:-40}"); do
+        st=$(gq journey-tone-status "$1" "${2:-journey}" 2>/dev/null | head -1)
+        [ "${st%% *}" = exited ] && return 0
+        sleep 1
+    done
+    return 1
+}
+# The output of the command the last ev_save kept, without its "$ command"
+# and "[exit N]" lines.
+ev_out() { ev_payload "$EV_DIR/$EV_LAST"; }
+# The same container before and after: its pod-state lines unchanged and
+# restartCount 0. Both files are in the open story.
+pod_same() { # <before file> <after file>
+    local pb pa
+    pb=$(ev_payload "$EV_DIR/$1"); pa=$(ev_payload "$EV_DIR/$2")
+    grep -q 'restartCount=0 ' <<<"$pa" && [ -n "$pb" ] && [ "$pb" = "$pa" ]
+}
+# The sink-input indexes in a `streams` listing.
+sink_inputs() { awk '/^== pactl list short sink-inputs/ {s = 1; next} /^==/ {s = 0} s && /^[0-9]/ {print $1}' <<<"$1" | paste -sd' '; }
+# One field of a journey-stat line: inode or ctime.
+stat_field() { sed -n "s/.*$2=\([0-9]*\).*/\1/p" <<<"$1" | head -1; }
+# "comm=pid ..." for the named daemons in a ctr-pids listing.
+pids_of() { # <ctr-pids output> <comm...>
+    local out=$1
+    shift
+    awk -v want=" $* " '$1 ~ /^[0-9]+$/ && index(want, " " $NF " ") {print $NF "=" $1}' <<<"$out" | sort | paste -sd' '
+}
+# What a player or an xterm said last: the last two non-empty lines.
+said() { grep -v '^[[:space:]]*$' | tail -2 | paste -sd' '; }
+# EV-SHOT-CLIENT into the open story: the toolkit's screenshot run in a pod.
+ev_client_shot() { # <moment> <pod> <what>
+    local name
+    name=$(ev_name "$1" png)
+    vm_ssh_quick "sudo repo/ci/vm/vm-guest.sh client-shot $2" > "$EV_DIR/$name" 2>/dev/null || true
+    if [ -s "$EV_DIR/$name" ]; then ev_attach "$name" "$3"; return 0; fi
+    rm -f "$EV_DIR/$name"
+    ev_note "the pod's own screenshot ($1) was not produced"
+    return 1
+}
+
+# --- the X server killed under the pod (S7.5.5, S7.6.3, S7.8.3) --------------
+ev_begin S7.5.5 "After an X session restart, a client container reconnects without being recreated" T3
+ev_save pod-before "EV-PIDS: the journey pod's container (restartCount, id, start time) and its main process's host pid, before the X server is killed" \
+    gq pod-state journey >/dev/null || true
+J_POD_B=$EV_LAST
+gq journey-xterm journey-1 >/dev/null || fail "could not start the pod's first xterm"
+gq win-wait journey-1 30 >/dev/null || fail "the journey pod's first xterm never appeared"
+ev_save apps-before "EV-PIDS: the pod's applications before the kill: its first xterm" gq journey-apps >/dev/null || true
+grep -q -- '-T journey-1' <<<"$(ev_out)" || fail "the pod's first xterm is not running before the kill"
+ev_shot first-xterm "EV-SHOT: the desktop with the journey pod's first xterm (title journey-1), before the X server is killed"
+ev_client_shot first-xterm-own journey "EV-SHOT-CLIENT: the same moment as the pod sees it: the toolkit's screenshot run in the pod" \
+    || fail "the journey pod could not take its own screenshot before the kill"
+ev_save windows-before "EV-STATE: xwininfo -root -tree before the kill, journey-1 among the windows" gq win-tree >/dev/null || true
+ev_end
+
+ev_begin S7.8.3 "Socket recreation does not invalidate client mounts" T3
+ev_save pod-before-x "EV-PIDS: the journey pod's container before the X server is killed" gq pod-state journey >/dev/null || true
+K_POD_BX=$EV_LAST
+ev_save x11-before "EV-STATE: ls -li /tmp/.X11-unix inside the journey pod before the X server is killed (the first column is each file's inode)" \
+    gq jx ls -li /tmp/.X11-unix >/dev/null || true
+K_X11_B=$EV_LAST
+ev_save x0-before "EV-STATE: /tmp/.X11-unix/X0 in the pod before the kill: its inode and change time" \
+    gq journey-stat /tmp/.X11-unix/X0 >/dev/null || true
+x0_b=$(ev_out)
+ev_end
+
+ev_begin S7.6.3 "A client's playback continues through an X session restart, uninterrupted" T3
+ev_save pod-before "EV-PIDS: the journey pod's container before the X server is killed" gq pod-state journey >/dev/null || true
+T_POD_B=$EV_LAST
+ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the X server is killed" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+T_D_B=$EV_LAST
+aud_b=$(pids_of "$(ev_out)" pipewire wireplumber pipewire-pulse)
+x_old=$(xorg_pid)
+[ -n "$x_old" ] || fail "no Xorg to kill"
+ev_video_start x-restart
+ev_audio_start through-restart 1100
+gq journey-tone through 1100 20 >/dev/null || { audio_capture_stop; fail "could not start the pod's 20 s tone"; }
+sleep 3
+ev_save streams-before "EV-STATE: pactl list short sink-inputs and source-outputs over the export while the pod plays, before the kill" \
+    gq streams >/dev/null || true
+si_b=$(sink_inputs "$(ev_out)")
+ev_save player-before "EV-PIDS: the pod's applications before the kill: its player" gq journey-apps >/dev/null || true
+pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
+sleep 2
+t_kill=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x Xorg' 2>/dev/null | head -1 || true)
+ev_note "Xorg (pid $x_old) killed (SIGTERM, as the desktop user) at $t_kill, about 5 s into the pod's 20 s tone"
+ev_save streams-during "EV-STATE: the sink-inputs and source-outputs right after the kill, while the X session restarts" \
+    gq streams >/dev/null || true
+si_d=$(sink_inputs "$(ev_out)")
+x_wait "$x_old" || { audio_capture_stop; fail "no new X session within 60 s of the kill"; }
+ev_note "a new X session (Xorg $(xorg_pid)) answered at $(gnow)"
+ev_save streams-after "EV-STATE: the sink-inputs and source-outputs once the X session is back, the tone still playing" \
+    gq streams >/dev/null || true
+si_a=$(sink_inputs "$(ev_out)")
+ev_save player-after "EV-PIDS: the pod's applications once the X session is back: its player" gq journey-apps >/dev/null || true
+pl_a=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
+tone_wait through || ev_note "the pod's tone had not ended 40 s after the session came back"
+ev_save player "EV-LOG-CLIENT: the pod's player (paplay): its exit status, how long it played and from when to when, its pid, its output" \
+    gq journey-tone-status through >/dev/null || true
+player=$(ev_out)
+p_t0=$(awk '/^played/ {print $5}' <<<"$player")
+mark=$(awk -v k="$t_kill" -v s="$p_t0" 'BEGIN {if (k != "" && s != "") printf "%.2f", k - s}')
+heard=yes
+ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played a 20 s 1100 Hz tone, the X server killed about 5 s in (the plot's red line, timed by the player's clock): the tone must play on with no gap and none of it missing" \
+    15 0.05 1100 --max-gap 0.1 --span 19.6 20.6 ${mark:+--mark "$mark"} || heard=no
+ev_video_stop "EV-VIDEO: the display going down and coming back while the pod's tone plays (index.txt and the notes give the times)"
+T_VID=$EV_VID
+ev_save pod-after "EV-PIDS: the journey pod's container after the X session came back" gq pod-state journey >/dev/null || true
+T_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across the X restart (no differences: the same container, not restarted)" "$T_POD_B" "$T_POD_A"
+ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the X session came back" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+aud_a=$(pids_of "$(ev_out)" pipewire wireplumber pipewire-pulse)
+ev_diff daemons "EV-DIFF: the daemons across the X restart (Xorg and mwm new, the audio daemons not)" "$T_D_B" "$EV_LAST"
+grep -q '^exited 0$' <<<"$player" || fail "the pod's player did not end cleanly: $(echo $player)"
+played=$(awk '/^played/ {print $2}' <<<"$player")
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 21.0 else 1)' "${played:-99}" \
+    || fail "the pod's 20 s tone took ${played:-?} s to play: its stream stalled across the X restart"
+ev_pass "the pod's player played its 20 s tone in ${played} s and exited 0: the stream never stalled"
+p_f=$(awk '/^pid / {print $2}' <<<"$player")
+[ -n "$pl_b" ] && [ "$pl_b" = "$pl_a" ] && [ "$pl_b" = "$p_f" ] \
+    || fail "the pod's player is not one process across the restart: $pl_b before, $pl_a after, $p_f by its own record"
+ev_pass "one player process (pid $pl_b) played before and after the restart"
+[ -n "$si_b" ] && [ "$si_d" = "$si_b" ] && [ "$si_a" = "$si_b" ] \
+    || fail "the pod's stream did not keep its sink-input across the restart: '$si_b' before, '$si_d' during, '$si_a' after"
+ev_pass "its stream kept sink-input $si_b before, during and after the restart: it was never re-created"
+[ "$heard" = yes ] || fail "the tone did not play on whole across the X restart (check-audio's verdict says where)"
+ev_pass "the machine's output carried the tone across the restart: no stretch below -40 dBFS longer than 0.1 s, and its 20 s span with nothing missing"
+[ -n "$aud_b" ] && [ "$aud_b" = "$aud_a" ] || fail "the audio daemons changed across the X restart: $aud_b -> $aud_a"
+ev_pass "the three audio daemons kept their pids ($aud_b)"
+pod_same "$T_POD_B" "$T_POD_A" || fail "the journey pod's container changed across the X restart"
+ev_pass "the pod is the same container, restartCount 0"
+ev_end
+
+ev_begin S7.5.5 "After an X session restart, a client container reconnects without being recreated" T3
+ev_copy "$ART/S7.6.3/$T_POD_A" pod-after "EV-PIDS: the journey pod's container after the X session came back (taken in S7.6.3)"
+J_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across the X restart (no differences: the same container, not restarted)" "$J_POD_B" "$J_POD_A"
+ev_save xterm1-log "EV-LOG-CLIENT: the pod's first xterm's own output: it lost its X server with the kill (expected)" \
+    gq jx cat /tmp/journey-1.log >/dev/null || true
+x1_said=$(ev_out | said)
+ev_save apps-after "EV-PIDS: the pod's applications after the X session came back" gq journey-apps >/dev/null || true
+x1_left=$(grep -- '-T journey-1' <<<"$(ev_out)" || true)
+gq journey-xterm journey-2 >/dev/null || fail "could not start the pod's second xterm"
+gq win-wait journey-2 30 >/dev/null || fail "the pod's second xterm never appeared on the new X server"
+ev_shot second-xterm "EV-SHOT: the desktop after the X restart, with the journey pod's second xterm (title journey-2) on it"
+ev_client_shot second-xterm-own journey "EV-SHOT-CLIENT: the same moment as the pod sees it, through the new X server" \
+    || fail "the journey pod could not take its own screenshot of the new X server"
+ev_save windows-after "EV-STATE: xwininfo -root -tree after the restart: journey-2 among the windows, journey-1 gone" gq win-tree >/dev/null || true
+ev_copy "$ART/S7.6.3/$T_VID.gif" x-restart "EV-VIDEO: the display going down and coming back across the kill (S7.6.3's recording; its frames are in S7.6.3)"
+[ -z "$x1_left" ] || fail "the pod's first xterm is still running after its X server died: $x1_left"
+ev_pass "the pod's first xterm ended with its X server${x1_said:+, saying: $x1_said}"
+ev_pass "the pod's second xterm appeared on the new X server, and the pod's own screenshot reached it"
+pod_same "$J_POD_B" "$J_POD_A" || fail "the journey pod's container changed across the X restart"
+ev_pass "the pod is the same container, restartCount 0: it reconnected without being recreated"
+ev_end
+
+ev_begin S7.8.3 "Socket recreation does not invalidate client mounts" T3
+ev_copy "$ART/S7.6.3/$T_POD_A" pod-after-x "EV-PIDS: the journey pod's container after the X session came back (taken in S7.6.3)"
+K_POD_AX=$EV_LAST
+ev_diff pod-x "EV-DIFF: the journey pod across the X restart (no differences: the same container)" "$K_POD_BX" "$K_POD_AX"
+ev_save x11-after "EV-STATE: ls -li /tmp/.X11-unix inside the journey pod after the X session came back" \
+    gq jx ls -li /tmp/.X11-unix >/dev/null || true
+ev_diff x11 "EV-DIFF: /tmp/.X11-unix in the pod across the X restart" "$K_X11_B" "$EV_LAST"
+ev_save x0-after "EV-STATE: /tmp/.X11-unix/X0 in the pod after the X session came back: its inode and change time" \
+    gq journey-stat /tmp/.X11-unix/X0 >/dev/null || true
+x0_a=$(ev_out)
+ev_save xdpyinfo "EV-STATE: xdpyinfo from the journey pod through its /tmp/.X11-unix mount, after the X restart" \
+    gq jx xdpyinfo >/dev/null || fail "xdpyinfo from the pod failed after the X restart"
+ino_b=$(stat_field "$x0_b" inode); ino_a=$(stat_field "$x0_a" inode); ct_a=$(stat_field "$x0_a" ctime)
+[ -n "$ct_a" ] && [ -n "$t_kill" ] && [ "$ct_a" -ge "${t_kill%.*}" ] \
+    || fail "the pod's /tmp/.X11-unix/X0 is not a socket made after the kill (changed at ${ct_a:-?}, the kill at ${t_kill:-?})"
+reused=""
+[ "$ino_a" != "$ino_b" ] || reused=", the filesystem reusing the number"
+ev_pass "the pod sees a new X0: changed at $ct_a, after the kill at ${t_kill%.*} (inode $ino_b -> $ino_a$reused)"
+ev_pass "and the pod connects through it: xdpyinfo answers"
+pod_same "$K_POD_BX" "$K_POD_AX" || fail "the journey pod's container changed across the X restart"
+ev_pass "the pod is the same container across the X restart, restartCount 0"
+ev_end
+
+# --- PipeWire killed under the pod (S7.6.4, S7.8.3) --------------------------
+ev_begin S7.8.3 "Socket recreation does not invalidate client mounts" T3
+ev_save pod-before-audio "EV-PIDS: the journey pod's container before PipeWire is killed" gq pod-state journey >/dev/null || true
+K_POD_BA=$EV_LAST
+ev_save audio-before "EV-STATE: ls -li /run/desktop-audio inside the journey pod before PipeWire is killed" \
+    gq jx ls -li /run/desktop-audio >/dev/null || true
+K_AUD_B=$EV_LAST
+ev_save pulse-before "EV-STATE: /run/desktop-audio/pulse in the pod before the kill: its inode and change time" \
+    gq journey-stat /run/desktop-audio/pulse >/dev/null || true
+pu_b=$(ev_out)
+ev_end
+
+ev_begin S7.6.4 "A client recovers from an audio-stack restart without being recreated" T3
+ev_save pod-before "EV-PIDS: the journey pod's container before PipeWire is killed" gq pod-state journey >/dev/null || true
+S_POD_B=$EV_LAST
+ev_save daemons-before "EV-PIDS: the three audio daemons before PipeWire is killed" \
+    gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+S_D_B=$EV_LAST
+pw_old=$(pids_of "$(ev_out)" pipewire)
+pw_old=${pw_old#pipewire=}
+ev_audio_start before-kill 880
+gq journey-tone doomed 880 20 >/dev/null || { audio_capture_stop; fail "could not start the pod's 20 s tone"; }
+sleep 3
+ev_save streams-before "EV-STATE: pactl list short sink-inputs and source-outputs while the pod plays, before the kill" \
+    gq streams >/dev/null || true
+[ -n "$(sink_inputs "$(ev_out)")" ] || { audio_capture_stop; fail "no sink-input for the pod's player before the kill"; }
+ev_save player-before "EV-PIDS: the pod's applications before the kill: its player" gq journey-apps >/dev/null || true
+sleep 1
+t_kill_a=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x pipewire' 2>/dev/null | head -1 || true)
+ev_note "pipewire (pid $pw_old) killed at $t_kill_a, about 4 s into the pod's 20 s tone"
+for _ in $(seq 15); do st=$(gq journey-tone-status doomed 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+ev_save streams-during "EV-STATE: the sink-inputs and source-outputs just after the kill" gq streams >/dev/null || true
+ev_save player "EV-LOG-CLIENT: the pod's player across the kill: its exit status, when it ended, its pid, and its error" \
+    gq journey-tone-status doomed >/dev/null || true
+player=$(ev_out)
+p_t0=$(awk '/^played/ {print $5}' <<<"$player"); p_t1=$(awk '/^played/ {print $7}' <<<"$player")
+mark=$(awk -v k="$t_kill_a" -v s="$p_t0" 'BEGIN {if (k != "" && s != "") printf "%.2f", k - s}')
+span=()
+[ -z "$mark" ] || span=(--mark "$mark" --span "$(awk -v m="$mark" 'BEGIN {printf "%.1f", m - 1}')" "$(awk -v m="$mark" 'BEGIN {printf "%.1f", m + 1}')")
+heard=yes
+ev_audio_stop "EV-AUDIO (before): the machine's output while the pod played 880 Hz and PipeWire was killed about 4 s in: the tone, then nothing from the kill on (the red line marks the kill, timed by the player's clock)" \
+    1 0.05 880 "${span[@]}" || heard=no
+rc=$(sed -n 's/^exited \([0-9]*\)$/\1/p' <<<"$player")
+[ -n "$rc" ] || fail "the pod's player was still running 15 s after PipeWire was killed: $(echo $player)"
+[ "$rc" != 0 ] || fail "the pod's player exited 0 across PipeWire's kill: its stream did not end with an error"
+within=$(awk -v k="$t_kill_a" -v e="$p_t1" 'BEGIN {if (k != "" && e != "") printf "%.1f", e - k}')
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 10.0 else 1)' "${within:-99}" \
+    || fail "the pod's player ended ${within:-?} s after the kill, not within 10 s"
+err=$(awk 'f; /^pid / {f = 1}' <<<"$player" | said)
+[ -n "$err" ] || fail "the pod's player exited $rc without a word about why"
+ev_pass "the pod's player exited $rc, ${within} s after the kill, with: $err"
+[ "$heard" = yes ] || fail "the tone before the kill was not heard, or did not stop at the kill (check-audio's verdict says which)"
+ev_pass "the tone was heard up to the kill and stopped there"
+pw_new="" ok=no
+for _ in $(seq 60); do
+    pw_new=$(vm_ssh_quick 'sudo podman exec desktop pgrep -x pipewire' 2>/dev/null | head -1 || true)
+    if [ -n "$pw_new" ] && [ "$pw_new" != "$pw_old" ] && gq jx pactl info >/dev/null 2>&1; then ok=yes; break; fi
+    sleep 1
+done
+ev_note "a new pipewire (pid ${pw_new:-none}), the pod's pactl info answering: $ok, at $(gnow)"
+[ "$ok" = yes ] || fail "within 60 s of the kill there was no new pipewire the pod could reach"
+ev_save daemons-after "EV-PIDS: the three audio daemons after the recovery" gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+ev_diff daemons "EV-DIFF: the audio daemons across the kill (the stack restarted)" "$S_D_B" "$EV_LAST"
+ev_save pactl-info "EV-STATE: pactl info from the journey pod after the recovery" gq jx pactl info >/dev/null || true
+ev_audio_start after-recovery 770
+gq journey-tone recovered 770 4 >/dev/null || { audio_capture_stop; fail "could not start the pod's tone after the recovery"; }
+sleep 2
+ev_save streams-after "EV-STATE: the sink-inputs and source-outputs while the pod plays again after the recovery" gq streams >/dev/null || true
+si_n=$(sink_inputs "$(ev_out)")
+tone_wait recovered || true
+ev_save player-after "EV-LOG-CLIENT: the pod's next player after the recovery: its exit status, times, pid and output" \
+    gq journey-tone-status recovered >/dev/null || true
+player2=$(ev_out)
+ev_audio_stop "EV-AUDIO (after): the machine's output while the journey pod played 770 Hz after PipeWire came back: one 4 s beep" 2 0.05 770 \
+    || fail "the pod's tone after PipeWire's recovery was not heard"
+grep -q '^exited 0$' <<<"$player2" || fail "the pod's player after the recovery did not exit 0: $(echo $player2)"
+[ -n "$si_n" ] || fail "the pod's new stream never showed as a sink-input"
+ev_pass "after the recovery the same pod's next player was heard at 770 Hz and exited 0 (sink-input $si_n)"
+ev_save pod-after "EV-PIDS: the journey pod's container after the recovery" gq pod-state journey >/dev/null || true
+S_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across the audio restart (no differences: the same container)" "$S_POD_B" "$S_POD_A"
+pod_same "$S_POD_B" "$S_POD_A" || fail "the journey pod's container changed across the audio restart"
+ev_pass "the pod is the same container, restartCount 0: it recovered without being recreated"
+ev_end
+
+ev_begin S7.8.3 "Socket recreation does not invalidate client mounts" T3
+ev_copy "$ART/S7.6.4/$S_POD_A" pod-after-audio "EV-PIDS: the journey pod's container after PipeWire came back (taken in S7.6.4)"
+K_POD_AA=$EV_LAST
+ev_diff pod-audio "EV-DIFF: the journey pod across the audio restart (no differences: the same container)" "$K_POD_BA" "$K_POD_AA"
+ev_save audio-after "EV-STATE: ls -li /run/desktop-audio inside the journey pod after PipeWire came back" \
+    gq jx ls -li /run/desktop-audio >/dev/null || true
+ev_diff audio "EV-DIFF: /run/desktop-audio in the pod across the audio restart" "$K_AUD_B" "$EV_LAST"
+ev_save pulse-after "EV-STATE: /run/desktop-audio/pulse in the pod after the recovery: its inode and change time" \
+    gq journey-stat /run/desktop-audio/pulse >/dev/null || true
+pu_a=$(ev_out)
+ev_save pactl-info "EV-STATE: pactl info from the journey pod through its /run/desktop-audio mount, after the audio restart" \
+    gq jx pactl info >/dev/null || fail "pactl info from the pod failed after the audio restart"
+pi_b=$(stat_field "$pu_b" inode); pi_a=$(stat_field "$pu_a" inode); pc_a=$(stat_field "$pu_a" ctime)
+[ -n "$pc_a" ] && [ -n "$t_kill_a" ] && [ "$pc_a" -ge "${t_kill_a%.*}" ] \
+    || fail "the pod's /run/desktop-audio/pulse is not a socket made after the kill (changed at ${pc_a:-?}, the kill at ${t_kill_a:-?})"
+reused=""
+[ "$pi_a" != "$pi_b" ] || reused=", the filesystem reusing the number"
+ev_pass "the pod sees a new pulse socket: changed at $pc_a, after the kill at ${t_kill_a%.*} (inode $pi_b -> $pi_a$reused)"
+ev_pass "and the pod connects through it: pactl info answers"
+pod_same "$K_POD_BA" "$K_POD_AA" || fail "the journey pod's container changed across the audio restart"
+ev_pass "the pod is the same container across the audio restart, restartCount 0"
+ev_end
+
+# --- desktop.service restarted under the pod (S7.8.1, S7.8.2) ----------------
+ev_begin S7.8.2 "Toolkit republish under a running client is harmless" T3
+ev_save pod-before "EV-PIDS: the journey pod's container before desktop.service restarts" gq pod-state journey >/dev/null || true
+R_POD_B=$EV_LAST
+ev_save tools-before "EV-STATE: ls -li \$DESKTOP_TOOLS_BIN inside the journey pod before the restart" gq journey-tools-ls >/dev/null || true
+R_TOOLS_B=$EV_LAST
+gq journey-noise >/dev/null || fail "could not open the noise xterm"
+gq win-wait noise 30 >/dev/null || fail "the noise xterm never appeared"
+sleep 1
+ev_save png-size "EV-STATE: the size in bytes of a PNG of the display with the noise xterm over it, from the pod's screenshot: more than a pipe's 65536 holds" \
+    gq journey-shot-size >/dev/null || true
+png=$(ev_out | tail -1 | tr -d ' ')
+[ "${png:-0}" -gt 70000 ] 2>/dev/null || fail "a screenshot of the noise screen is ${png:-?} bytes: too small to hold the binary on a pipe"
+gq journey-held-start >/dev/null || fail "could not start the held screenshot"
+sleep 2
+ev_save held-before "EV-PIDS: the held screenshot before the restart: alive, the executable it runs and that file's inode, beside the toolkit file's own inode" \
+    gq journey-held-state >/dev/null || true
+held_b=$(ev_out)
+grep -q '^alive yes' <<<"$held_b" || fail "the held screenshot is not running before the restart: $(echo $held_b)"
+gq journey-loop-start >/dev/null || fail "could not start the screenshot loop"
+sleep 2
+ev_save loop-before "EV-PIDS: the screenshot loop's shell in the pod before the restart" gq jx pgrep -f shot-loop.sh >/dev/null || true
+loop_b=$(ev_out | head -1)
+ev_end
+
+ev_begin S7.8.1 "A desktop.service restart does not recreate client pods" T3
+ev_save pod-before "EV-PIDS: the journey pod's container before desktop.service restarts" gq pod-state journey >/dev/null || true
+D_POD_B=$EV_LAST
+ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the restart" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+D_D_B=$EV_LAST
+gq journey-xterm journey-3 >/dev/null || fail "could not start the pod's xterm journey-3"
+gq win-wait journey-3 30 >/dev/null || fail "the pod's xterm journey-3 never appeared"
+gq journey-tone cutoff 550 30 >/dev/null || fail "could not start the pod's 30 s tone"
+sleep 3
+ev_save apps-before "EV-PIDS: the pod's applications before the restart: xterms, the player, the screenshot loop and the held screenshot" \
+    gq journey-apps >/dev/null || true
+apps_b=$(ev_out)
+grep -q -- '-T journey-3' <<<"$apps_b" && grep -q paplay <<<"$apps_b" \
+    || fail "the pod's xterm and player are not both running before the restart: $(echo $apps_b)"
+ev_save streams-before "EV-STATE: the sink-inputs and source-outputs before the restart, the pod's tone playing" gq streams >/dev/null || true
+x_old=$(xorg_pid)
+[ -n "$x_old" ] || fail "no Xorg running before the restart"
+ev_video_start desktop-restart
+ev_note "systemctl restart desktop.service at $(gnow)"
+vm_ssh 'sudo systemctl restart desktop.service' || fail "systemctl restart desktop.service failed"
+x_wait "$x_old" || fail "no new X session within 60 s of the restart"
+t_back=$(gnow)
+aud=no
+for _ in $(seq 60); do gq jx pactl info >/dev/null 2>&1 && { aud=yes; break; }; sleep 1; done
+ev_note "a new X session answered at $t_back; the pod's pactl info answered again: $aud, at $(gnow)"
+sleep 3
+ev_video_stop "EV-VIDEO: the display across desktop.service's restart (index.txt and the notes give the times)"
+ev_end
+
+ev_begin S7.8.2 "Toolkit republish under a running client is harmless" T3
+ev_save held-after "EV-PIDS: the held screenshot after the restart: still alive, its executable the replaced file, (deleted), with the old inode, while the toolkit file has a new one" \
+    gq journey-held-state >/dev/null || true
+held_a=$(ev_out)
+ev_save loop-after "EV-PIDS: the screenshot loop's shell after the restart" gq jx pgrep -f shot-loop.sh >/dev/null || true
+loop_a=$(ev_out | head -1)
+gq journey-loop-stop >/dev/null || true
+ev_save loop-log "EV-LOG-CLIENT: the screenshot loop's log across the restart: guest time, try, exit status, the tool's output" \
+    gq journey-loop-log >/dev/null || true
+loop=$(ev_out)
+ev_save held-release "EV-LOG-CLIENT: the held screenshot, released after the restart: its exit status and the size of the PNG it finished" \
+    gq journey-held-release >/dev/null || true
+rel=$(ev_out)
+ev_save tools-after "EV-STATE: ls -li \$DESKTOP_TOOLS_BIN inside the journey pod after the restart" gq journey-tools-ls >/dev/null || true
+ev_diff tools "EV-DIFF: the toolkit in the pod across the restart (each republished file has a new inode)" "$R_TOOLS_B" "$EV_LAST"
+ev_save desktop-log "EV-LOG-DESKTOP: the restarted desktop container's publish lines (podman logs desktop)" \
+    gq desktop-publish-log >/dev/null || true
+dlog=$(ev_out)
+ev_save pod-after "EV-PIDS: the journey pod's container after the restart" gq pod-state journey >/dev/null || true
+R_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across the restart (no differences: the same container)" "$R_POD_B" "$R_POD_A"
+grep -q 'published screenshot' <<<"$dlog" || fail "the restarted desktop did not log 'published screenshot'"
+! grep -qE 'Text file busy|ETXTBSY|publish-tools failed' <<<"$dlog" \
+    || fail "the republish hit an error: $(grep -E 'Text file busy|ETXTBSY|publish-tools failed' <<<"$dlog" | head -2)"
+ev_pass "the restarted desktop logged 'published screenshot', with no Text file busy and no failed publish"
+ino_old=$(awk '/^file-inode/ {print $2}' <<<"$held_b"); exe_b=$(awk '/^exe-inode/ {print $2}' <<<"$held_b")
+ino_new=$(awk '/^file-inode/ {print $2}' <<<"$held_a"); exe_a=$(awk '/^exe-inode/ {print $2}' <<<"$held_a")
+grep -q '^alive yes' <<<"$held_a" || fail "the held screenshot did not live through the restart: $(echo $held_a)"
+grep -q '^exe .*(deleted)$' <<<"$held_a" || fail "the held screenshot's executable was not replaced under it: $(grep '^exe ' <<<"$held_a")"
+[ -n "$ino_old" ] && [ "$exe_b" = "$ino_old" ] && [ "$exe_a" = "$ino_old" ] && [ -n "$ino_new" ] && [ "$ino_new" != "$ino_old" ] \
+    || fail "the inodes do not show a republish under the held screenshot: the file $ino_old -> $ino_new, its executable $exe_b -> $exe_a"
+ev_pass "the republish gave screenshot a new inode ($ino_old -> $ino_new) while the held screenshot ran on from the old one, now (deleted)"
+rc_h=$(awk '/^rc / {print $2}' <<<"$rel"); bytes_h=$(awk '/^png-bytes/ {print $2}' <<<"$rel")
+[ "$rc_h" = 0 ] && [ "${bytes_h:-0}" -gt 65536 ] \
+    || fail "the held screenshot did not finish cleanly once released: exit ${rc_h:-?}, ${bytes_h:-0} bytes"
+ev_pass "released, it wrote the rest of its ${bytes_h}-byte PNG and exited 0: the old mapping stayed intact"
+read -r n_after n_bad <<<"$(awk -v t="$t_back" '$1 > t {n++; if ($3 != 0) b++} END {print n + 0, b + 0}' <<<"$loop")"
+n_down=$(awk '$3 != 0 {b++} END {print b + 0}' <<<"$loop")
+[ "$n_after" -ge 4 ] && [ "$n_bad" = 0 ] \
+    || fail "of the loop's $n_after tries after the desktop was back (at $t_back), $n_bad failed"
+ev_pass "every one of the loop's $n_after tries after the desktop was back succeeded ($n_down failed while it was down)"
+[ -n "$loop_b" ] && [ "$loop_b" = "$loop_a" ] || fail "the screenshot loop did not run on as one process: ${loop_b:-none} -> ${loop_a:-none}"
+ev_pass "the loop ran on as one process (pid $loop_b) across the restart"
+pod_same "$R_POD_B" "$R_POD_A" || fail "the journey pod's container changed across the restart"
+ev_pass "the pod is the same container, restartCount 0"
+ev_end
+
+ev_begin S7.8.1 "A desktop.service restart does not recreate client pods" T3
+ev_copy "$ART/S7.8.2/$R_POD_A" pod-after "EV-PIDS: the journey pod's container after the restart (taken in S7.8.2)"
+D_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across the restart (no differences: the same container)" "$D_POD_B" "$D_POD_A"
+ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the restart" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+ev_diff daemons "EV-DIFF: the desktop's daemons across the restart (all new)" "$D_D_B" "$EV_LAST"
+ev_save xterm3-log "EV-LOG-CLIENT: the pod's xterm journey-3: what it said when the restart took its X server (expected)" \
+    gq jx cat /tmp/journey-3.log >/dev/null || true
+x3_said=$(ev_out | said)
+ev_save player-cut "EV-LOG-CLIENT: the pod's 30 s player that the restart cut off: its exit status, times, pid and error (expected)" \
+    gq journey-tone-status cutoff >/dev/null || true
+cut=$(ev_out)
+ev_save apps-after "EV-PIDS: the pod's applications after the restart" gq journey-apps >/dev/null || true
+apps_a=$(ev_out)
+gq journey-xterm journey-4 >/dev/null || fail "could not start the pod's xterm journey-4"
+gq win-wait journey-4 30 >/dev/null || fail "the pod's new xterm never appeared after the restart"
+ev_shot after "EV-SHOT: the desktop after the restart, with the pod's new xterm (title journey-4)"
+ev_audio_start after-restart 660
+gq journey-tone fresh 660 3 >/dev/null || { audio_capture_stop; fail "could not start the pod's tone after the restart"; }
+tone_wait fresh || true
+ev_save player-after "EV-LOG-CLIENT: the pod's new player after the restart: its exit status, times, pid and output" \
+    gq journey-tone-status fresh >/dev/null || true
+fresh=$(ev_out)
+ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played 660 Hz after the restart: one 3 s beep" 1 0.05 660 \
+    || fail "the pod's tone after the restart was not heard"
+! grep -q -- '-T journey-3' <<<"$apps_a" || fail "the pod's xterm journey-3 outlived its X server"
+ev_pass "the pod's xterm journey-3 lost its X connection with the restart (expected)${x3_said:+: $x3_said}"
+rc_c=$(sed -n 's/^exited \([0-9]*\)$/\1/p' <<<"$cut")
+[ -n "$rc_c" ] && [ "$rc_c" != 0 ] || fail "the pod's 30 s player was not cut off by the restart: $(echo $cut)"
+cut_said=$(awk 'f; /^pid / {f = 1}' <<<"$cut" | said)
+ev_pass "the pod's 30 s player lost its stream with the restart and exited $rc_c (expected)${cut_said:+: $cut_said}"
+ev_pass "a new xterm from the same pod appeared on the restarted desktop"
+grep -q '^exited 0$' <<<"$fresh" || fail "the pod's new player did not exit 0: $(echo $fresh)"
+ev_pass "a new tone from the same pod was heard at 660 Hz and its player exited 0"
+pod_same "$D_POD_B" "$D_POD_A" || fail "the journey pod's container changed across desktop.service's restart"
+ev_pass "the pod is the same container across the restart: restartCount 0, its container id unchanged"
+ev_end
+
+# --- a pod started while the desktop is down (S7.5.4, S7.6.5) ----------------
+ev_begin S7.5.4 "A client started before the desktop is up works once it is, without restarting" T3
+vm_ssh 'sudo systemctl stop desktop.service' || fail "systemctl stop desktop.service failed"
+ev_note "desktop.service stopped at $(gnow)"
+ev_save desktop-down "EV-STATE: desktop.service with the desktop stopped, and the X socket directory" \
+    vm_ssh_quick 'systemctl is-active desktop.service; ls -l /tmp/.X11-unix' >/dev/null || true
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh journey-start ci/vm/early-pod.yaml early' \
+    || fail "the early pod was not admitted and Ready while the desktop was down"
+ev_save pod-before "EV-PIDS: the early pod's container, admitted and running with the desktop down" gq pod-state early >/dev/null || true
+E_POD_B=$EV_LAST
+gq journey-put early 990 6 early >/dev/null || fail "could not put the tone into the early pod"
+sleep 4
+ev_save x-tries-down "EV-LOG-CLIENT: the early pod's xterm tries with the desktop down: each fails to open the display" \
+    gq jx-in early cat /tmp/x-tries.log >/dev/null || true
+ev_end
+ev_begin S7.6.5 "A client started before the audio stack is up plays once it is, without restarting" T3
+ev_copy "$ART/S7.5.4/$E_POD_B" pod-before "EV-PIDS: the early pod's container with the desktop down (taken in S7.5.4)"
+F_POD_B=$EV_LAST
+ev_save audio-tries-down "EV-LOG-CLIENT: the early pod's paplay tries with the desktop down: each fails to connect" \
+    gq jx-in early cat /tmp/audio-tries.log >/dev/null || true
+ev_save streams-down "EV-STATE: pactl list short sink-inputs and source-outputs over the export with the desktop down" gq streams >/dev/null || true
+ev_audio_start early 990
+ev_end
+ev_begin S7.5.4 "A client started before the desktop is up works once it is, without restarting" T3
+ev_video_start desktop-start
+ev_note "systemctl start desktop.service at $(gnow)"
+vm_ssh 'sudo systemctl start desktop.service' || fail "systemctl start desktop.service failed"
+ev_end
+ev_begin S7.6.5 "A client started before the audio stack is up plays once it is, without restarting" T3
+si_e=""
+for _ in $(seq 60); do
+    si_e=$(sink_inputs "$(gq streams 2>/dev/null)")
+    [ -n "$si_e" ] && break
+    [ -z "$(gq jx-in early cat /tmp/early.rc 2>/dev/null)" ] || break
+    sleep 1
+done
+ev_save streams-playing "EV-STATE: the sink-inputs and source-outputs once the audio stack was up, the early pod playing" gq streams >/dev/null || true
+done_rc=""
+for _ in $(seq 60); do done_rc=$(gq jx-in early cat /tmp/early.rc 2>/dev/null || true); [ -n "$done_rc" ] && break; sleep 1; done
+ev_save audio-tries "EV-LOG-CLIENT: the early pod's paplay tries: the failures while the audio stack was down, then the one that played" \
+    gq jx-in early cat /tmp/audio-tries.log >/dev/null || true
+at=$(ev_out)
+ev_audio_stop "EV-AUDIO: the machine's output from before desktop.service started until the early pod's player ended: its 990 Hz tone, played once the audio stack was up - one 6 s beep" 2 0.05 990 \
+    || fail "the early pod's tone was not heard once the audio stack was up"
+ev_save pod-after "EV-PIDS: the early pod's container once the desktop was up" gq pod-state early >/dev/null || true
+F_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the early pod across the desktop's start (no differences: the same container)" "$F_POD_B" "$F_POD_A"
+a_fail=$(grep -c 'paplay exited' <<<"$at" || true)
+[ "$done_rc" = 0 ] && grep -q 'paplay played the tone' <<<"$at" \
+    || fail "the early pod's player never played its tone: rc '${done_rc:-none}'"
+[ "${a_fail:-0}" -ge 1 ] || fail "the early pod's player never had to retry: the audio stack was not down when it tried"
+ev_pass "the early pod's paplay failed $a_fail times while the audio stack was down, then played its tone, heard at 990 Hz"
+if [ -n "$si_e" ]; then
+    ev_pass "its stream showed as sink-input $si_e while it played"
+else
+    ev_note "its stream was not caught in pactl list short sink-inputs while it played"
+fi
+pod_same "$F_POD_B" "$F_POD_A" || fail "the early pod's container changed while it waited for audio"
+ev_pass "the early pod is the same container it started as, restartCount 0"
+ev_end
+ev_begin S7.5.4 "A client started before the desktop is up works once it is, without restarting" T3
+gq win-wait early-client 120 >/dev/null || fail "the early pod's xterm never appeared once the desktop was up"
+ev_note "the early pod's xterm was on the display at $(gnow)"
+ev_video_stop "EV-VIDEO: the display from desktop.service's start until the early pod's xterm is on it (index.txt and the notes give the times)"
+ev_shot early-client "EV-SHOT: the desktop once it came up, with the early pod's xterm (title early-client)"
+ev_client_shot early-client-own early "EV-SHOT-CLIENT: the early pod's own screenshot once the desktop was up" \
+    || fail "the early pod could not take its own screenshot once the desktop was up"
+ev_save windows "EV-STATE: xwininfo -root -tree with the early pod's xterm" gq win-tree >/dev/null || true
+ev_save apps "EV-PIDS: the early pod's applications once the desktop was up" gq journey-apps early >/dev/null || true
+ev_save x-tries "EV-LOG-CLIENT: the early pod's xterm tries: the failures while the desktop was down, then the try that stayed up" \
+    gq jx-in early cat /tmp/x-tries.log >/dev/null || true
+xt=$(ev_out)
+ev_copy "$ART/S7.6.5/$F_POD_A" pod-after "EV-PIDS: the early pod's container once the desktop was up (taken in S7.6.5)"
+E_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the early pod across the desktop's start (no differences: the same container)" "$E_POD_B" "$E_POD_A"
+x_fail=$(grep -c 'xterm exited' <<<"$xt" || true)
+last=$(grep 'try [0-9]*: xterm' <<<"$xt" | tail -1)
+[ "${x_fail:-0}" -ge 1 ] || fail "the early pod's xterm never had to retry: the desktop was not down when it started"
+grep -q ': xterm$' <<<"$last" || fail "the early pod's last xterm try is not one still running: $last"
+ev_pass "the early pod's xterm failed $x_fail times while the desktop was down; the next try stayed up, and its window appeared"
+pod_same "$E_POD_B" "$E_POD_A" || fail "the early pod's container changed while it waited for the desktop"
+ev_pass "the early pod is the same container it started as, restartCount 0"
+ev_end
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh journey-cleanup' || true
 
 log "k8s teardown: uninstall the plugin releases; resources withdrawn, host CDI specs and the desktop survive"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \

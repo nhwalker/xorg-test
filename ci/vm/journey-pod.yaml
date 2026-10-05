@@ -1,0 +1,25 @@
+# The client journeys' pod (Requirements.md F7.5, F7.6, F7.8; test-only).
+#
+# A long-running client of the desktop that lives through the desktop's own
+# events - an X server killed, PipeWire killed, desktop.service restarted -
+# and must come out of each the same container: restartPolicy Always, so a
+# container that had died would show as a restartCount above 0 rather than
+# as a pod that simply failed. Like x11-testclient it declares nothing but
+# the three capabilities: DISPLAY, the audio sockets and the toolkit come
+# only from the CDI specs.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: journey
+spec:
+  restartPolicy: Always
+  containers:
+    - name: client
+      image: localhost/desktop-container:latest
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          desktop.local/display: 1
+          desktop.local/audio: 1
+          desktop.local/tools: 1
