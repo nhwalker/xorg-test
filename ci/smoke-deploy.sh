@@ -279,11 +279,11 @@ journalctl --sync 2>/dev/null || true
 slice=$(journalctl --after-cursor="$cursor" _SYSTEMD_UNIT=desktop-seat-prep.service -o cat --no-pager 2>/dev/null || true)
 ev_text journal "EV-LOG-JOURNAL: everything desktop-seat-prep.service's own process logged on the second run (journalctl _SYSTEMD_UNIT=desktop-seat-prep.service after a cursor taken just before it)" \
     "${slice:-(nothing)}"
-# This runner has no fuser (psmisc), and seat-prep says so on every run;
-# that line is about the runner, not about the seat.
-said=$(grep -v 'fuser not available' <<<"$slice" || true)
-[ -z "$said" ] || fail "seat-prep's steady state was not silent: $said"
-ev_pass "and it logs nothing about the seat (the runner's 'fuser not available' line aside)"
+# Nothing at all, not even seat-prep's "fuser not available": this runner
+# has psmisc (desktop-preflight's DRM/VT holder check runs here), so a
+# silent steady state is a fully silent slice.
+[ -z "$slice" ] || fail "seat-prep's steady state was not silent: $slice"
+ev_pass "and its process logs nothing at all"
 logind_after=$(systemctl show -p MainPID --value systemd-logind)
 ev_text logind "EV-PIDS: systemd-logind's MainPID before and after the second run (seat-prep restarts logind only when it changed something)" \
     "before: $logind_before"$'\n'"after:  $logind_after"
