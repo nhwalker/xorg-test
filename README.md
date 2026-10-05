@@ -500,7 +500,7 @@ two extra sockets in `/run/desktop-audio` (bind-mounted from the host):
 | ALSA | (via pulse plugin) | an alsa conf drop-in routing `pcm.!default` to the pulse socket |
 
 - **Host**: the deploy tree ships `/etc/pulse/client.conf.d/…` and
-  `/etc/alsa/conf.d/60-desktop-container.conf`, so unmodified pulse and ALSA
+  `/etc/alsa/conf.d/99-zz-desktop-container.conf`, so unmodified pulse and ALSA
   apps just work (host needs `alsa-plugins-pulseaudio`, standard on EL).
 - **Inside this container**: apps use the default per-user sockets;
   ALSA apps go through `pipewire-alsa`.
@@ -512,8 +512,10 @@ podman run -v /run/desktop-audio:/run/desktop-audio \
 ```
 
 For ALSA-only apps in other containers, add the same two-stanza config the
-deploy tree drops at `/etc/alsa/conf.d/60-desktop-container.conf` (requires
-`alsa-plugins-pulseaudio` in that image).
+deploy tree drops at `/etc/alsa/conf.d/99-zz-desktop-container.conf` (requires
+`alsa-plugins-pulseaudio` in that image). Put it in `/etc/asound.conf`, or in
+an `/etc/alsa/conf.d` file that sorts after the package's own
+`99-pulseaudio-default.conf`: the last `pcm.!default` loaded wins.
 
 ### Audio has its own lifecycle
 

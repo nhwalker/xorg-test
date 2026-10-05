@@ -326,7 +326,7 @@ point of the declarative form — the file list above *is* the state).
 | `etc/systemd/logind.conf.d/50-desktop-container.conf` | logind `NAutoVTs=0` / `ReserveVT=0` drop-in |
 | `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix`; `/dev/snd` so its bind mount resolves on a soundless host |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
-| `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket. A drop-in rather than `/etc/asound.conf`, so a host-local `asound.conf` still wins; the `/etc/alsa/conf.d` mechanism is EL/Fedora packaging |
+| `etc/alsa/conf.d/99-zz-desktop-container.conf` | host ALSA clients → pulse plugin → container socket. Named to load after `alsa-plugins-pulseaudio`'s own `99-pulseaudio-default.conf`, whose server-less `pcm.!default` would otherwise win. A drop-in rather than `/etc/asound.conf`, so a host-local `asound.conf` still wins; the `/etc/alsa/conf.d` mechanism is EL/Fedora packaging |
 | `usr/local/bin/desktop-preflight` | read-only debug tool: PASS/WARN/FAIL per host-side assumption; not wired into boot |
 | `etc/systemd/system/desktop-seat-prep.service` | oneshot before `desktop.service`: converge + verify the seat (see "Seat state" below) |
 | `usr/local/libexec/seat-prep.sh` | the script that unit runs (boot-time convergence agent, not an installer) |
