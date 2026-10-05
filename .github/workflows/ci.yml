@@ -201,9 +201,11 @@ jobs:
       - name: the built image's PipeWire patches (S1.2.3, S1.2.4)
         # The build's own gates are coarse on purpose (a fast signal): one
         # finds 'desktop-audio' anywhere in pipewire.conf, the other counts
-        # rtkit.enabled over the whole file and skips a missing one. These
-        # read the patched blocks out of the image the build produced and
-        # hold them to what Requirements.md asks, block by block.
+        # rtkit.enabled over the whole file. These read the patched blocks
+        # out of the image the build produced and hold them to what
+        # Requirements.md asks, block by block: the daemon's pipewire.conf,
+        # and its clients' pipewire-pulse.conf and client.conf (PipeWire 1.4
+        # has no client-rt.conf).
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts
           EV_SOURCE: "ci.yml build-smoke (image config)"
@@ -221,7 +223,7 @@ jobs:
           ev_end
           ev_begin S1.2.4 "module-rt takes the rlimit path" T2
           f=0
-          for conf in pipewire.conf client-rt.conf; do
+          for conf in pipewire.conf pipewire-pulse.conf client.conf; do
             block=$(ev_save "module-rt-${conf%.conf}" "EV-CONFIG: the module-rt entry of /usr/share/pipewire/$conf in the built image, up to the next module" \
               img "test -f /usr/share/pipewire/$conf || { echo '(no /usr/share/pipewire/$conf in the image)'; exit 1; }
                    sed -n '/name = libpipewire-module-rt/,/name = libpipewire-module-/p' /usr/share/pipewire/$conf") \
