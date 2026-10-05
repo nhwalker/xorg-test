@@ -172,6 +172,9 @@ snd_probe() {
 # One of vm-guest.sh's read-only probes (desk, ctr-pids, xorg-log-lines,
 # xorg-log-since), so the commands here need no quoting through ssh.
 gq() { vm_ssh_quick "sudo repo/ci/vm/vm-guest.sh $*"; }
+# The same for a step that waits on the guest (win-wait, journey-held-release)
+# and may take longer than vm_ssh_quick's 20 s cap allows.
+gqw() { vm_ssh "sudo repo/ci/vm/vm-guest.sh $*"; }
 
 # EV-QEMU into the open story: one monitor command and QEMU's reply, through
 # QMP (qmp-tool.py). device_add and device_del answer with an empty reply when
@@ -2002,7 +2005,7 @@ ev_save pod-before "EV-PIDS: the journey pod's container (restartCount, id, star
     gq pod-state journey >/dev/null || true
 J_POD_B=$EV_LAST
 gq journey-xterm journey-1 >/dev/null || fail "could not start the pod's first xterm"
-gq win-wait journey-1 30 >/dev/null || fail "the journey pod's first xterm never appeared"
+gqw win-wait journey-1 30 >/dev/null || fail "the journey pod's first xterm never appeared"
 ev_save apps-before "EV-PIDS: the pod's applications before the kill: its first xterm" gq journey-apps >/dev/null || true
 grep -q -- '-T journey-1' <<<"$(ev_out)" || fail "the pod's first xterm is not running before the kill"
 ev_shot first-xterm "EV-SHOT: the desktop with the journey pod's first xterm (title journey-1), before the X server is killed"
@@ -2101,7 +2104,7 @@ x1_said=$(ev_out | said)
 ev_save apps-after "EV-PIDS: the pod's applications after the X session came back" gq journey-apps >/dev/null || true
 x1_left=$(grep -- '-T journey-1' <<<"$(ev_out)" || true)
 gq journey-xterm journey-2 >/dev/null || fail "could not start the pod's second xterm"
-gq win-wait journey-2 30 >/dev/null || fail "the pod's second xterm never appeared on the new X server"
+gqw win-wait journey-2 30 >/dev/null || fail "the pod's second xterm never appeared on the new X server"
 ev_shot second-xterm "EV-SHOT: the desktop after the X restart, with the journey pod's second xterm (title journey-2) on it"
 ev_client_shot second-xterm-own journey "EV-SHOT-CLIENT: the same moment as the pod sees it, through the new X server" \
     || fail "the journey pod could not take its own screenshot of the new X server"
@@ -2252,7 +2255,7 @@ R_POD_B=$EV_LAST
 ev_save tools-before "EV-STATE: ls -li \$DESKTOP_TOOLS_BIN inside the journey pod before the restart" gq journey-tools-ls >/dev/null || true
 R_TOOLS_B=$EV_LAST
 gq journey-noise >/dev/null || fail "could not open the noise xterm"
-gq win-wait noise 30 >/dev/null || fail "the noise xterm never appeared"
+gqw win-wait noise 30 >/dev/null || fail "the noise xterm never appeared"
 sleep 1
 ev_save png-size "EV-STATE: the size in bytes of a PNG of the display with the noise xterm over it, from the pod's screenshot: more than a pipe's 65536 holds" \
     gq journey-shot-size >/dev/null || true
@@ -2277,7 +2280,7 @@ ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before th
     gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
 D_D_B=$EV_LAST
 gq journey-xterm journey-3 >/dev/null || fail "could not start the pod's xterm journey-3"
-gq win-wait journey-3 30 >/dev/null || fail "the pod's xterm journey-3 never appeared"
+gqw win-wait journey-3 30 >/dev/null || fail "the pod's xterm journey-3 never appeared"
 gq journey-tone cutoff 550 30 >/dev/null || fail "could not start the pod's 30 s tone"
 sleep 3
 ev_save apps-before "EV-PIDS: the pod's applications before the restart: xterms, the player, the screenshot loop and the held screenshot" \
@@ -2311,7 +2314,7 @@ ev_save loop-log "EV-LOG-CLIENT: the screenshot loop's log across the restart: g
     gq journey-loop-log >/dev/null || true
 loop=$(ev_out)
 ev_save held-release "EV-LOG-CLIENT: the held screenshot, released after the restart: its exit status and the size of the PNG it finished" \
-    gq journey-held-release >/dev/null || true
+    gqw journey-held-release >/dev/null || true
 rel=$(ev_out)
 ev_save tools-after "EV-STATE: ls -li \$DESKTOP_TOOLS_BIN inside the journey pod after the restart" gq journey-tools-ls >/dev/null || true
 ev_diff tools "EV-DIFF: the toolkit in the pod across the restart (each republished file has a new inode)" "$R_TOOLS_B" "$EV_LAST"
@@ -2363,7 +2366,7 @@ cut=$(ev_out)
 ev_save apps-after "EV-PIDS: the pod's applications after the restart" gq journey-apps >/dev/null || true
 apps_a=$(ev_out)
 gq journey-xterm journey-4 >/dev/null || fail "could not start the pod's xterm journey-4"
-gq win-wait journey-4 30 >/dev/null || fail "the pod's new xterm never appeared after the restart"
+gqw win-wait journey-4 30 >/dev/null || fail "the pod's new xterm never appeared after the restart"
 ev_shot after "EV-SHOT: the desktop after the restart, with the pod's new xterm (title journey-4)"
 ev_audio_start after-restart 660
 gq journey-tone fresh 660 3 >/dev/null || { audio_capture_stop; fail "could not start the pod's tone after the restart"; }
@@ -2447,7 +2450,7 @@ pod_same "$F_POD_B" "$F_POD_A" || fail "the early pod's container changed while 
 ev_pass "the early pod is the same container it started as, restartCount 0"
 ev_end
 ev_begin S7.5.4 "A client started before the desktop is up works once it is, without restarting" T3
-gq win-wait early-client 120 >/dev/null || fail "the early pod's xterm never appeared once the desktop was up"
+gqw win-wait early-client 120 >/dev/null || fail "the early pod's xterm never appeared once the desktop was up"
 ev_note "the early pod's xterm was on the display at $(gnow)"
 ev_video_stop "EV-VIDEO: the display from desktop.service's start until the early pod's xterm is on it (index.txt and the notes give the times)"
 ev_shot early-client "EV-SHOT: the desktop once it came up, with the early pod's xterm (title early-client)"
