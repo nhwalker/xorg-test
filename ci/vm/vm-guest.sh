@@ -3233,21 +3233,24 @@ operator_setup() {
     # One continuous 150 s stream for the sound story, long enough to outlast
     # every command typed under it. 441 frames hold exactly 11 cycles of
     # 1100 Hz at 44.1 kHz, so repeating them is seamless.
-    log op "write the sound story's 1100 Hz tone"
-    python3 - /tmp/op-tone-1100.wav <<'EOF'
-import math, sys, wave
-rate, freq, secs, amp = 44100, 1100, 150, 0.5
-cycle = bytearray()
-for i in range(441):
-    s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
-    b = s.to_bytes(2, "little", signed=True)
-    cycle += b + b
-w = wave.open(sys.argv[1], "wb")
-w.setnchannels(2)
-w.setsampwidth(2)
-w.setframerate(rate)
-w.writeframes(bytes(cycle) * (rate * secs // 441))
-w.close()
+    log op "write the stories' tones: 1100 Hz for 150 s (the sound story's), 660 Hz for 3 s"
+    python3 - <<'EOF'
+import math, wave
+rate, amp = 44100, 0.5
+# 441 samples hold whole cycles of both pitches (multiples of 100 Hz), so
+# each file is one such stretch repeated.
+for path, freq, secs in (("/tmp/op-tone-1100.wav", 1100, 150), ("/tmp/op-tone-660-3s.wav", 660, 3)):
+    cycle = bytearray()
+    for i in range(441):
+        s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
+        b = s.to_bytes(2, "little", signed=True)
+        cycle += b + b
+    w = wave.open(path, "wb")
+    w.setnchannels(2)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    w.writeframes(bytes(cycle) * (rate * secs // 441))
+    w.close()
 EOF
     log op "operator-setup done"
 }
@@ -3255,7 +3258,7 @@ EOF
 operator_teardown() {
     # Every container the stories started is named op-*, the observer too.
     podman ps -a --format '{{.Names}}' | grep '^op-' | xargs -r podman rm -f -t 2 >/dev/null 2>&1 || true
-    rm -f /tmp/op-tone-1100.wav /tmp/op-host-whoami
+    rm -f /tmp/op-tone-1100.wav /tmp/op-tone-660-3s.wav /tmp/op-host-whoami
     log op "operator-teardown done"
 }
 
