@@ -1870,7 +1870,9 @@ log "cdi: each audio path works from the requesting pod (injected env only)"
 # for each path the streams before, during (polled until the player's own
 # stream shows) and after, the player's own output and the capture with its
 # verdict; the pod and the three audio daemons before and after.
-EV_SIDE=h-
+# The host's side is S7.6.1's own: nothing in the guest writes to it, so
+# the host keeps its title, tier and result (ev_begin with EV_SIDE empty).
+EV_SIDE=
 ev_begin S7.6.1 "A client plays and the operator hears it" T3
 ev_save pod-before "EV-PIDS: the cdi-verify pod's container and its main process's host pid, before it plays" \
     gq pod-state cdi-verify >/dev/null || true
@@ -1983,6 +1985,8 @@ log "the lean client plays all three paths and records, with the injected env al
 # lists its processes). Its three tones were just heard, in S7.3.4; their
 # captures are kept here again with their verdicts, and then the lean client
 # records the default sink's monitor while a tone plays through it.
+# S7.6.6, like S7.6.1, is the host's alone: its own side.
+EV_SIDE=
 ev_begin S7.6.6 "A lean client with no PipeWire of its own plays and records" T3
 ev_save pod-before "EV-PIDS: the lean client pod x11-testclient's container and its main process's host pid" \
     gq pod-state x11-testclient >/dev/null || true
