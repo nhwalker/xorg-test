@@ -1374,7 +1374,7 @@ orig_img=$(podman image inspect --format '{{.Id}}' localhost/desktop-container:l
 ctx=$(mktemp -d)
 printf 'FROM localhost/desktop-container:latest\nRUN rm -f /usr/libexec/desktop-tools/*\n' > "$ctx/Containerfile"
 ev_save build "EV-STATE: localhost/desktop-container:latest rebuilt for this check with /usr/libexec/desktop-tools emptied (the original, $orig_img, is tagged back after)" \
-    podman build --network=none --pull=never -t localhost/desktop-container:latest "$ctx" >/dev/null \
+    podman build --no-cache --network=none --pull=never -t localhost/desktop-container:latest "$ctx" >/dev/null \
     || fail "could not build the image with no tools"
 rm -r "$ctx"
 no_tools_img=$(podman image inspect --format '{{.Id}}' localhost/desktop-container:latest)
