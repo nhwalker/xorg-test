@@ -77,7 +77,7 @@ jobs:
         # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py ci/evlib.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the
@@ -445,6 +445,30 @@ jobs:
             test "$n" = 5 || f=1
           ev_check "no rule was split apart (no lone 'rwm' or 'c' argument)" \
             bash -c '! grep -qxE "rwm|c" <<<"$1"' _ "$args" || f=1
+          ev_end
+          # S5.2.3, S5.2.4: the unit's directives and the container's mounts,
+          # read per section of the generated unit by ci/unit-directives.py
+          # (quadlet copies the source's comments, so text alone proves nothing).
+          printf '%s\n' "$out" > "$tmp/generated.service"
+          src=deploy/host/etc/containers/systemd/desktop.container
+          for story in "S5.2.3|Every unit directive is emitted" "S5.2.4|Volumes, tmpfs and the /sys mount are emitted"; do
+            ev_begin "${story%%|*}" "${story#*|}" T2
+            ev_text generated-unit "EV-CONFIG: the generated unit the checks below read (the one S5.2.1 keeps)" "$out"
+            [ "${story%%|*}" = S5.2.4 ] && ev_copy "$src" source "EV-CONFIG: the source desktop.container, whose Volume=, Tmpfs=, Mount= and AddDevice= lines are each looked for in ExecStart"
+            res=$(python3 ci/unit-directives.py "${story%%|*}" "$tmp/generated.service" "$src") \
+              || { ev_fail "ci/unit-directives.py ran to the end"; f=1; }
+            [ -n "$res" ] || { ev_fail "ci/unit-directives.py made at least one check"; f=1; }
+            while IFS=$'\t' read -r verdict claim; do
+              [ -n "$verdict" ] || continue
+              if [ "$verdict" = PASS ]; then ev_pass "$claim"; else ev_fail "$claim"; f=1; fi
+            done <<<"$res"
+            ev_end
+          done
+          # S6.2.4's quadlet half; its runtime half (the container's stop
+          # signal) is in the deploy smoke.
+          ev_begin S6.2.4 "Not systemd mode" T2
+          ev_text argv "EV-STATE: ExecStart split into its arguments (as S5.2.2 keeps it)" "$args"
+          ev_check "ExecStart carries --systemd=false as one argument" grep -qx -- '--systemd=false' <<<"$args" || f=1
           ev_end
           [ "$f" = 0 ] || exit 1
           # Unit directives, asserted as DIRECTIVES rather than as strings that

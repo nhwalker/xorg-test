@@ -27,6 +27,21 @@ log()  { echo "== $*"; }
 # shellcheck source=ci/evidence.sh
 . ci/evidence.sh
 fail() { echo "FAIL: $*" >&2; ev_abort "$*"; exit 1; }
+# First line of <text> matching <regex>, as a line number (empty when none).
+line_in() { grep -n -m1 -e "$2" <<<"$1" | cut -d: -f1; }
+# The desktop's console log so far; podman's --tty console ends lines with CR.
+desktop_log() { podman logs desktop 2>/dev/null | tr -d '\r' || true; }
+# The X session is up: mwm (its client) running and the server answering.
+x_up() {
+    podman exec desktop pgrep -u desktop -x mwm >/dev/null 2>&1 \
+        && podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2>&1
+}
+wait_x_up() { # <when>
+    for _ in $(seq 30); do x_up && return 0; sleep 2; done
+    podman logs --tail 60 desktop >&2 2>&1 || true
+    fail "the X session is not up ($1): no mwm, or xdpyinfo gets no answer on :0"
+}
+first_xorg() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null || true); head -n 1 <<<"$p"; }
 [ -z "$EV_ROOT" ] || mkdir -p "$EV_ROOT"
 # The toolkit chain has three places to die (watcher never started, watcher
 # started but never triggered, generator ran and declined) and they look
@@ -129,31 +144,76 @@ if [ -e /etc/cdi/desktop.yaml ]; then
 fi
 
 log "client cdi: the override file is honored by both specs"
+ev_begin S5.5.3 "Atomic writes" T2
+ev_save cdi-before "EV-STATE: ls -li /etc/cdi before a regeneration" ls -li /etc/cdi >/dev/null || true
+cdi_before=$EV_LAST
+ino_display=$(stat -c %i "$DISPLAY_SPEC")
+ino_audio=$(stat -c %i "$AUDIO_SPEC")
+ev_end
+ev_begin S5.5.2 "Overrides and validation" T2
 mkdir -p /etc/desktop-container
 cat > /etc/desktop-container/client-cdi.conf <<'EOF'
 DISPLAY_VALUE=:3
+X11_DIR=/tmp/other-x11
 AUDIO_DIR=/run/other-audio
 EOF
+ev_copy /etc/desktop-container/client-cdi.conf override "EV-CONFIG: the override file: DISPLAY_VALUE, X11_DIR and AUDIO_DIR"
 "$CLIENT_CDI" >/dev/null
+ev_copy "$DISPLAY_SPEC" display-overridden "EV-CONFIG: the display spec written with the override file"
+ev_copy "$AUDIO_SPEC" audio-overridden "EV-CONFIG: the audio spec written with the override file"
 grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" || fail "override DISPLAY not applied"
+ev_pass "DISPLAY_VALUE reaches the display spec (DISPLAY=:3)"
+grep -q 'hostPath: /tmp/other-x11' "$DISPLAY_SPEC" && grep -q 'containerPath: /tmp/other-x11' "$DISPLAY_SPEC" \
+    || fail "override X11_DIR not applied to the display spec's mount"
+ev_pass "X11_DIR reaches the display spec's mount (/tmp/other-x11, both ends)"
 grep -q 'PULSE_SERVER=unix:/run/other-audio/pulse' "$AUDIO_SPEC" \
-    || fail "override AUDIO_DIR not applied to PULSE_SERVER"
+    && grep -q 'PIPEWIRE_REMOTE=/run/other-audio/pipewire-0' "$AUDIO_SPEC" \
+    && grep -q 'hostPath: /run/other-audio' "$AUDIO_SPEC" \
+    || fail "override AUDIO_DIR not applied to the audio spec"
+ev_pass "AUDIO_DIR reaches the audio spec: PULSE_SERVER, PIPEWIRE_REMOTE and the mount"
+if grep -q 'other-x11' "$AUDIO_SPEC" || grep -q 'other-audio' "$DISPLAY_SPEC"; then
+    fail "an override crossed into the other device's spec"
+fi
+ev_pass "each override lands in its own spec only"
+ev_end
+
+ev_begin S5.5.3 "Atomic writes" T2
+ev_save cdi-after "EV-STATE: ls -li /etc/cdi after the regeneration" ls -li /etc/cdi >/dev/null || true
+ev_diff cdi "EV-DIFF: /etc/cdi before and after the regeneration: both specs are new inodes" "$cdi_before" "$EV_LAST"
+[ "$(stat -c %i "$DISPLAY_SPEC")" != "$ino_display" ] && [ "$(stat -c %i "$AUDIO_SPEC")" != "$ino_audio" ] \
+    || fail "a spec kept its inode across a regeneration: written in place, not renamed over"
+ev_pass "both specs are new inodes (display $ino_display -> $(stat -c %i "$DISPLAY_SPEC"), audio $ino_audio -> $(stat -c %i "$AUDIO_SPEC")): written to a temp file and renamed over"
+leftovers=$(find /etc/cdi -name 'desktop-*.yaml.*' | wc -l)
+[ "$leftovers" = 0 ] || fail "generator left $leftovers temp file(s) in /etc/cdi"
+ev_pass "no temp file is left in /etc/cdi"
+ev_end
 
 log "client cdi: a bad DISPLAY value is rejected, leaving both specs intact"
+ev_begin S5.5.2 "Overrides and validation" T2
 echo 'DISPLAY_VALUE=nonsense' > /etc/desktop-container/client-cdi.conf
-if "$CLIENT_CDI" >/dev/null 2>&1; then
+ev_copy /etc/desktop-container/client-cdi.conf bad-override "EV-CONFIG: an override file with a malformed DISPLAY_VALUE"
+if ev_save rejected "the generator on the malformed value: its message and exit status" "$CLIENT_CDI" >/dev/null; then
     fail "generator accepted a malformed DISPLAY_VALUE"
 fi
+ev_pass "the generator rejects DISPLAY_VALUE=nonsense (non-zero exit)"
 grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" \
     || fail "failed run clobbered the display spec (validation must precede any write)"
 grep -q '/run/other-audio' "$AUDIO_SPEC" \
     || fail "failed run clobbered the audio spec (validation must precede any write)"
-# No temp files left behind by the rejected run.
+ev_pass "before any write: both specs still carry the previous overrides"
+ev_save cdi-rejected "EV-STATE: ls -la /etc/cdi after the rejected run" ls -la /etc/cdi >/dev/null || true
 leftovers=$(find /etc/cdi -name 'desktop-*.yaml.*' | wc -l)
 [ "$leftovers" = 0 ] || fail "generator left $leftovers temp file(s) in /etc/cdi"
+ev_pass "and no temp file is left"
 rm -f /etc/desktop-container/client-cdi.conf
 "$CLIENT_CDI" >/dev/null
-grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "defaults not restored after removing the override"
+ev_copy "$DISPLAY_SPEC" display-defaults "EV-CONFIG: the display spec once the override file is removed"
+ev_copy "$AUDIO_SPEC" audio-defaults "EV-CONFIG: the audio spec once the override file is removed"
+grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" && grep -q 'hostPath: /tmp/.X11-unix' "$DISPLAY_SPEC" \
+    && grep -q 'hostPath: /run/desktop-audio' "$AUDIO_SPEC" \
+    || fail "defaults not restored after removing the override"
+ev_pass "with the file removed the defaults return (DISPLAY=:0, /tmp/.X11-unix, /run/desktop-audio)"
+ev_end
 
 # --- SELinux labeling: the no-SELinux path -----------------------------------
 # GitHub's runners are Ubuntu with AppArmor and no SELinux, so this asserts the
@@ -209,6 +269,15 @@ ln -sf /etc/systemd/system/ci-fake-dm.service /etc/systemd/system/display-manage
 systemctl daemon-reload
 systemctl start display-manager.service
 out=$("$SEATPREP")
+# S5.3.5: the tree is not applied yet, so logind's drop-in is absent, and
+# this run changes the seat: the warning must say so.
+ev_begin S5.3.5 "Missing logind drop-in is warned about" T2
+ev_save dropin "EV-STATE: /etc/systemd/logind.conf.d before the tree is applied: no 50-desktop-container.conf" \
+    sh -c 'ls -la /etc/systemd/logind.conf.d 2>&1; test -e /etc/systemd/logind.conf.d/50-desktop-container.conf || echo "(50-desktop-container.conf absent)"' >/dev/null || true
+ev_text seat-prep "the dirty-seat run's output: a seat rule and a running display manager, so the seat changed" "$out"
+grep -q 'WARNING: logind drop-in missing' <<<"$out" || fail "seat-prep changed the seat with the logind drop-in absent and did not warn"
+ev_pass "seat-prep changed the seat and warned 'logind drop-in missing'"
+ev_end
 echo "$out" | grep -q 'removing custom seat attachment rule' || fail "seat rule not handled"
 echo "$out" | grep -q 'disabling display manager' || fail "display manager not handled"
 [ ! -e /etc/udev/rules.d/72-seat-ci-test.rules ] || fail "seat rule file survived"
@@ -227,6 +296,16 @@ if ! systemctl is-active --quiet ssh && ! systemctl is-active --quiet sshd; then
     systemctl enable --now ssh
 fi
 
+log "a soundless host: no sound card before the tree's tmpfiles run"
+ev_begin S4.4.2 "Soundless host boots and degrades gracefully" T2
+ev_save snd-before "EV-STATE: ls -la /dev/snd on the host before the tree's tmpfiles run" sh -c 'ls -la /dev/snd 2>&1; true' >/dev/null
+shopt -s nullglob
+cards=(/dev/snd/controlC*)
+shopt -u nullglob
+[ "${#cards[@]}" = 0 ] || fail "this runner has a sound card (${cards[*]}): S4.4.2 needs a soundless host"
+ev_pass "the runner has no sound card: no /dev/snd/controlC*"
+ev_end
+
 log "apply the deploy tree (verbatim README command)"
 rsync -a --chown=root:root deploy/host/ /
 [ -L /etc/systemd/system/getty@tty1.service ] || fail "getty mask did not survive as a symlink"
@@ -236,6 +315,45 @@ systemctl daemon-reload
 systemd-sysusers
 systemd-tmpfiles --create || true   # unrelated runner entries may fail; ours asserted below
 [ -d /run/desktop-audio ] && [ -d /tmp/.X11-unix ] || fail "tmpfiles dirs missing"
+
+log "the tree's files land root-owned, its scripts executable"
+ev_begin S5.1.2 "Files land root-owned with correct modes" T2
+mapfile -t tree_files < <(cd deploy/host && find . -type f | sed 's|^\.||' | sort)
+listing=$(stat -c '%A %U %G %n' "${tree_files[@]}") || fail "a file of the tree is missing from the host after the rsync"
+ev_text files "EV-STATE: mode, owner and group of every file the tree installed (stat -c '%A %U %G %n')" "$listing"
+bad=$(awk '$2 != "root" || $3 != "root"' <<<"$listing")
+[ -z "$bad" ] || fail "files not root:root: $bad"
+ev_pass "all ${#tree_files[@]} files are root:root"
+bad=$(awk 'substr($1,6,1) == "w" || substr($1,9,1) == "w"' <<<"$listing")
+[ -z "$bad" ] || fail "group- or world-writable files: $bad"
+ev_pass "none is writable by group or others"
+bad=$(awk '$4 ~ "^/usr/local/(bin|libexec)/" && (substr($1,4,1) != "x" || substr($1,7,1) != "x" || substr($1,10,1) != "x")' <<<"$listing")
+[ -z "$bad" ] || fail "scripts that are not executable by all: $bad"
+ev_pass "every script under /usr/local/bin and /usr/local/libexec is executable (rwxr-xr-x)"
+ev_end
+
+log "tmpfiles: the eight entries, with their modes and owners"
+ev_begin S5.9.3 "tmpfiles entries" T2
+ev_copy /etc/tmpfiles.d/desktop-container.conf tmpfiles "EV-CONFIG: the tree's tmpfiles.d entries, as installed"
+table=$(awk '$1 == "d" {print $2}' /etc/tmpfiles.d/desktop-container.conf | xargs stat -c '%a %U %G %n' 2>&1 || true)
+ev_text stat "EV-STATE: stat -c '%a %U %G' of each entry's path after systemd-tmpfiles --create" "$table"
+n=0
+while read -r type path mode user group _; do
+    [ "$type" = d ] || continue
+    n=$((n + 1))
+    want="$(printf '%o' "$((8#$mode))") $user $group"
+    got=$(stat -c '%a %U %G' "$path" 2>/dev/null || echo missing)
+    [ "$got" = "$want" ] || fail "tmpfiles entry $path is '$got', want '$want'"
+done < <(grep -v '^#' /etc/tmpfiles.d/desktop-container.conf | grep .)
+[ "$n" = 8 ] || fail "the tree has $n tmpfiles entries, want the eight"
+ev_pass "all eight entries exist with the mode, owner and group the tree gives them"
+ev_end
+
+ev_begin S4.4.2 "Soundless host boots and degrades gracefully" T2
+ev_save snd-after-tmpfiles "EV-STATE: ls -ld /dev/snd after the tree's tmpfiles: the empty directory it makes" \
+    ls -ld /dev/snd >/dev/null || fail "tmpfiles did not make /dev/snd"
+ev_pass "tmpfiles made an empty /dev/snd, so the quadlet's Volume=/dev/snd can mount"
+ev_end
 # /dev/snd is a bind mount now, not an AddDevice=, so it must EXIST or podman
 # refuses to create the container at all ("statfs /dev/snd: no such file or
 # directory") - there is no optional marker for Volume= the way AddDevice= has
@@ -256,6 +374,44 @@ if [ -e "$TOOLS_SPEC" ]; then
 fi
 # the sshd_config.d drop-in is read at sshd start; this runner's sshd predates it
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+
+# S5.5.4: the tools spec is written only for a directory holding a regular
+# file. TOOLS_DIR comes from the override file the generator reads; the spec
+# it writes here is removed again, since the desktop's own first publish
+# below must be what creates it.
+log "tools spec: written only for a directory that holds a regular file"
+ev_begin S5.5.4 "Tools spec is gated on a populated directory" T2
+tx=$(mktemp -d)
+echo "TOOLS_DIR=$tx" > /etc/desktop-container/client-cdi.conf
+ev_copy /etc/desktop-container/client-cdi.conf override "EV-CONFIG: the override file: TOOLS_DIR=$tx"
+tools_case() { # <moment> <what>
+    ev_save "$1-dir" "EV-STATE: ls -la $tx ($2)" ls -la "$tx" >/dev/null || true
+    ev_save "$1-run" "desktop-tools-cdi's output ($2)" /usr/local/libexec/desktop-tools-cdi
+}
+out=$(tools_case empty "empty") || fail "desktop-tools-cdi failed on an empty TOOLS_DIR"
+[ ! -e "$TOOLS_SPEC" ] || fail "an empty TOOLS_DIR produced a spec"
+grep -q 'is empty or missing: not advertising' <<<"$out" || fail "no 'empty or missing' line for an empty TOOLS_DIR"
+ev_pass "empty: no spec, and it says so"
+touch "$tx/.hidden"
+out=$(tools_case dotfile "a dotfile only") || fail "desktop-tools-cdi failed on a dotfile-only TOOLS_DIR"
+[ ! -e "$TOOLS_SPEC" ] || fail "a dotfile-only TOOLS_DIR produced a spec"
+ev_pass "a dotfile only: no spec"
+printf '#!/bin/sh\n' > "$tx/tool"
+chmod 755 "$tx/tool"
+out=$(tools_case populated "one regular file") || fail "desktop-tools-cdi failed on a populated TOOLS_DIR"
+[ -e "$TOOLS_SPEC" ] || fail "a populated TOOLS_DIR produced no spec"
+ev_copy "$TOOLS_SPEC" spec "EV-CONFIG: the spec written for the populated directory"
+grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' "$TOOLS_SPEC" && grep -q "hostPath: $tx" "$TOOLS_SPEC" \
+    && grep -q '"rbind", "ro"' "$TOOLS_SPEC" || fail "the spec lacks DESKTOP_TOOLS_BIN, the TOOLS_DIR mount or ro"
+ev_pass "one regular file: a spec with DESKTOP_TOOLS_BIN and a read-only mount of TOOLS_DIR"
+n_rel=$(line_in "$out" 'nothing to label')
+n_wrote=$(line_in "$out" '^wrote ')
+[ -n "$n_rel" ] && [ -n "$n_wrote" ] && [ "$n_rel" -lt "$n_wrote" ] \
+    || fail "the relabeler's line does not come before 'wrote' in desktop-tools-cdi's output"
+ev_pass "the relabeler ran first: its line ($n_rel) comes before 'wrote' ($n_wrote); on this SELinux-less runner it labels nothing"
+rm -f "$TOOLS_SPEC" /etc/desktop-container/client-cdi.conf
+rm -r "$tx"
+ev_end
 
 # S5.3.2: seat-prep's steady state, run the way the host runs it - as its
 # unit - before desktop.service starts. Not after: its last step fails if
@@ -289,6 +445,35 @@ ev_text logind "EV-PIDS: systemd-logind's MainPID before and after the second ru
     "before: $logind_before"$'\n'"after:  $logind_after"
 [ "$logind_after" = "$logind_before" ] || fail "the steady state restarted logind ($logind_before -> $logind_after)"
 ev_pass "it did not restart logind (MainPID $logind_before)"
+ev_end
+
+# S5.3.4: without psmisc the DRM/VT holder gate is skipped, with a notice.
+# The PATH here is a directory of links to every command in the usual
+# PATH directories except fuser.
+log "seat-prep without psmisc: the holder gate is skipped with a notice"
+ev_begin S5.3.4 "Degrades without psmisc" T2
+nofuser=$(mktemp -d)
+# /bin is /usr/bin here, so names repeat: the first one wins, and -L also
+# catches a link already made to a dangling target, which -e would miss.
+shopt -s nullglob
+for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    for e in "$d"/*; do
+        n=${e##*/}
+        [ "$n" = fuser ] || [ -e "$nofuser/$n" ] || [ -L "$nofuser/$n" ] || ln -s "$e" "$nofuser/$n"
+    done
+done
+shopt -u nullglob
+if PATH="$nofuser" command -v fuser >/dev/null; then
+    fail "fuser is still on the test PATH"
+fi
+ev_note "PATH for this run: $nofuser, links to every command in the usual PATH directories except fuser (command -v fuser finds nothing there)"
+out=$(ev_save run "EV-STATE: seat-prep.sh with fuser absent from PATH: its output and exit status" \
+    env PATH="$nofuser" "$SEATPREP") || fail "seat-prep exited non-zero without fuser"
+ev_pass "seat-prep exits 0 without fuser"
+grep -q 'fuser not available (install psmisc); skipping DRM/VT holder verification' <<<"$out" \
+    || fail "no 'fuser not available' notice without fuser"
+ev_pass "and says it skipped the DRM/VT holder check"
+rm -r "$nofuser"
 ev_end
 
 log "start desktop.service (generated from the tree's quadlet)"
@@ -550,21 +735,6 @@ fi
 # device and this is a real X session: wait_x_up holds the stories below to
 # that rather than assuming it.
 
-# First line of <text> matching <regex>, as a line number (empty when none).
-line_in() { grep -n -m1 -e "$2" <<<"$1" | cut -d: -f1; }
-# The desktop's console log so far; podman's --tty console ends lines with CR.
-desktop_log() { podman logs desktop 2>/dev/null | tr -d '\r' || true; }
-# The X session is up: mwm (its client) running and the server answering.
-x_up() {
-    podman exec desktop pgrep -u desktop -x mwm >/dev/null 2>&1 \
-        && podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2>&1
-}
-wait_x_up() { # <when>
-    for _ in $(seq 30); do x_up && return 0; sleep 2; done
-    podman logs --tail 60 desktop >&2 2>&1 || true
-    fail "the X session is not up ($1): no mwm, or xdpyinfo gets no answer on :0"
-}
-first_xorg() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null || true); head -n 1 <<<"$p"; }
 
 log "E2 on the first boot: the X session is up"
 wait_x_up "first boot"
@@ -578,6 +748,72 @@ for p in 'desktop-init:' 'preflight:' 'align-device-groups:' 'xorg-gpu-conf:' 'x
     [ -n "$n" ] || fail "no line starting '$p' in the desktop's log"
     ev_pass "'$p' lines are in it, the first at line $n: $(sed -n "${n}p" <<<"$boot_log" | cut -c1-100)"
 done
+ev_end
+
+log "a soundless host degrades gracefully: the preflight warns, PipeWire runs and exports"
+ev_begin S4.4.2 "Soundless host boots and degrades gracefully" T2
+w=$(grep 'preflight: WARN: no /dev/snd/controlC\* visible' <<<"$boot_log" || true)
+ev_text preflight-warn "EV-LOG-DESKTOP: the preflight's sound line in the desktop's log" "${w:-(none)}"
+[ -n "$w" ] || fail "the preflight did not warn that no /dev/snd/controlC* is visible"
+ev_pass "the preflight WARNs: no /dev/snd/controlC* visible"
+ev_save pipewire "EV-PIDS: the audio daemons on the soundless host" \
+    podman exec desktop ps -o pid,user,lstart,comm -C pipewire,wireplumber,pipewire-pulse >/dev/null \
+    || fail "no audio daemon running on the soundless host"
+ev_save export "EV-STATE: ls -l /run/desktop-audio on the host" ls -l /run/desktop-audio >/dev/null || true
+[ -S /run/desktop-audio/pulse ] && [ -S /run/desktop-audio/pipewire-0 ] || fail "the audio sockets are not exported"
+ev_pass "PipeWire, WirePlumber and pipewire-pulse run, and both sockets are exported"
+ev_end
+
+log "VT nodes: made by ensure-vt-devices, the runtime not exposing them"
+ev_begin S3.2.3 "VT nodes are created when the runtime does not expose them" T2
+made=$(grep '^ensure-vt-devices: ' <<<"$boot_log" || true)
+ev_text log "EV-LOG-DESKTOP: ensure-vt-devices' lines in the desktop's log this boot" "${made:-(none)}"
+for t in "tty0 (c 4:0)" "tty1 (c 4:1)"; do
+    c=$(grep -cF "ensure-vt-devices: created /dev/$t" <<<"$made" || true)
+    [ "$c" = 1 ] || fail "'created /dev/$t' appears $c time(s), want once"
+done
+ev_pass "it logged 'created /dev/tty0 (c 4:0)' and 'created /dev/tty1 (c 4:1)', once each"
+nodes=$(ev_save stat "EV-STATE: stat of /dev/tty0 and /dev/tty1 in the container: type, major:minor, mode, owner" \
+    podman exec desktop stat -c '%F %t:%T %a %U:%G %n' /dev/tty0 /dev/tty1) || fail "no VT nodes in the container"
+grep -qx 'character special file 4:0 620 root:tty /dev/tty0' <<<"$nodes" || fail "/dev/tty0 is not c 4:0 620 root:tty: $nodes"
+grep -qx 'character special file 4:1 620 desktop:tty /dev/tty1' <<<"$nodes" || fail "/dev/tty1 is not c 4:1 620 desktop:tty: $nodes"
+ev_pass "/dev/tty0 is c 4:0, 620, root:tty; /dev/tty1 is c 4:1, 620, handed to desktop:tty"
+ev_end
+
+log "accounts: the uid contract and a boring desktop-shell"
+ev_begin S5.9.1 "uid contract" T2
+both=$(ev_save both "EV-STATE: the host's getent passwd desktop, then the image's id -u desktop" \
+    sh -c 'getent passwd desktop; podman exec desktop id -u desktop') || fail "could not read the desktop account on both sides"
+host_line=$(sed -n 1p <<<"$both")
+[ "$(cut -d: -f3 <<<"$host_line")" = 61000 ] || fail "the host's desktop is not uid 61000: $host_line"
+[ "$(cut -d: -f7 <<<"$host_line")" = /usr/sbin/nologin ] || fail "the host's desktop has a login shell: $host_line"
+ev_pass "the host's desktop is uid 61000 with /usr/sbin/nologin"
+[ "$(sed -n 2p <<<"$both")" = 61000 ] || fail "the image's desktop is uid $(sed -n 2p <<<"$both"), not 61000"
+ev_pass "the image's desktop is uid 61000 too"
+ev_end
+ev_begin S5.9.2 "desktop-shell is boring" T2
+idl=$(ev_save id "EV-STATE: id desktop-shell" id desktop-shell) || fail "no desktop-shell account"
+grep -qE '^uid=[0-9]+\(desktop-shell\) gid=[0-9]+\(desktop-shell\) groups=[0-9]+\(desktop-shell\)$' <<<"$idl" \
+    || fail "desktop-shell has supplementary groups: $idl"
+ev_pass "no supplementary groups (only its own)"
+pw=$(ev_save passwd-status "EV-STATE: passwd -S desktop-shell" passwd -S desktop-shell) || fail "passwd -S failed"
+[ "$(awk '{print $2}' <<<"$pw")" = L ] || fail "desktop-shell's password is not locked: $pw"
+ev_pass "its password is locked (passwd -S: L)"
+acct=$(ev_save account "EV-STATE: getent passwd desktop-shell and stat of its home" \
+    sh -c 'getent passwd desktop-shell; stat -c "%a %U:%G %n" /home/desktop-shell') || fail "could not read desktop-shell's entry or home"
+[ "$(sed -n 1p <<<"$acct" | cut -d: -f7)" = /bin/bash ] || fail "desktop-shell's shell is not /bin/bash"
+ev_pass "its shell is /bin/bash"
+[ "$(sed -n 2p <<<"$acct")" = "700 desktop-shell:desktop-shell /home/desktop-shell" ] || fail "desktop-shell's home is not 0700 and its own: $(sed -n 2p <<<"$acct")"
+ev_pass "its home is 0700 and its own"
+ev_end
+
+ev_begin S6.2.4 "Not systemd mode" T2
+sig=$(ev_save stop-signal "EV-STATE: podman inspect desktop --format '{{.Config.StopSignal}}' (the running container)" \
+    podman inspect desktop --format '{{.Config.StopSignal}}') || fail "could not inspect the running container"
+case "$sig" in
+    SIGTERM|15) ev_pass "the running container stops with SIGTERM ($sig)" ;;
+    *) fail "the running container's stop signal is '$sig', not SIGTERM" ;;
+esac
 ev_end
 
 log "boot oneshots: each one's first line, in the documented order, before 'oneshots done'"
@@ -824,6 +1060,74 @@ DP-1  1920x1080@60  +0+0     primary
 DP-2  1920x1080@60  +1920+0
 EOF
 
+# Before the restart below: what it should change, recorded.
+log "before the restart: unit start times, the published toolkit, the host-shell key"
+ev_begin S5.8.2 "Moves with the container" T2
+ev_save started-before "EV-STATE: ActiveEnterTimestamp of desktop.service and desktop-session.service before the restart" \
+    systemctl show -p Id -p ActiveEnterTimestamp desktop.service desktop-session.service >/dev/null || true
+started_before=$EV_LAST
+t_desk=$(systemctl show -p ActiveEnterTimestampMonotonic --value desktop.service)
+t_sess=$(systemctl show -p ActiveEnterTimestampMonotonic --value desktop-session.service)
+since_restart=$(date '+%Y-%m-%d %H:%M:%S')
+ev_end
+
+ev_begin S7.2.1 "Published at boot, 0755, by rename" T2
+ev_save bin-before "EV-STATE: ls -li and sha256sum of the published toolkit before the restart" \
+    sh -c 'ls -lia /var/lib/desktop-container/bin; sha256sum /var/lib/desktop-container/bin/screenshot' >/dev/null || true
+bin_before=$EV_LAST
+ino_tool=$(stat -c %i /var/lib/desktop-container/bin/screenshot)
+ev_end
+
+ev_begin S7.2.2 "Stale tools are pruned, dotfiles left alone" T2
+printf 'not shipped by this image\n' > /var/lib/desktop-container/bin/stale-tool
+printf 'a dotfile\n' > /var/lib/desktop-container/bin/.keep
+ev_save bin-planted "EV-STATE: ls -la of the toolkit dir with an unshipped file and a dotfile planted" \
+    ls -la /var/lib/desktop-container/bin >/dev/null || true
+planted=$EV_LAST
+ev_end
+
+# S7.2.3: watch the directory across the republish. apt only if needed.
+command -v inotifywait >/dev/null || { apt-get update -q >/dev/null && apt-get install -y -q inotify-tools >/dev/null; } \
+    || fail "could not install inotify-tools for the republish watch"
+watch_dir=/var/lib/desktop-container/bin
+initial=$(ls -A "$watch_dir")
+# Line-buffered, so stopping it loses no event.
+stdbuf -oL inotifywait -m -q -e create,delete,moved_to,moved_from --format '%e %f' "$watch_dir" > /tmp/ev-inotify.log 2>&1 &
+watcher=$!
+sleep 1
+
+ev_begin S5.7.4 "Re-running rotates the key and invalidates the old one" T2
+cp /etc/desktop-container/host-shell-key /tmp/ev-old-key
+chmod 600 /tmp/ev-old-key
+fp_old=$(ssh-keygen -lf /etc/desktop-container/host-shell-key.pub | awk '{print $2}')
+ev_save key-old "EV-STATE: ssh-keygen -lf of the host-shell public key in use" \
+    ssh-keygen -lf /etc/desktop-container/host-shell-key.pub >/dev/null || fail "no host-shell public key"
+key_old=$EV_LAST
+systemctl restart desktop-host-shell.service || fail "a second run of desktop-host-shell.service failed"
+ev_save key-new "EV-STATE: ssh-keygen -lf of the public key after a second run" \
+    ssh-keygen -lf /etc/desktop-container/host-shell-key.pub >/dev/null || fail "no public key after the second run"
+ev_diff key "EV-DIFF: the public key's fingerprint before and after the second run" "$key_old" "$EV_LAST"
+fp_new=$(ssh-keygen -lf /etc/desktop-container/host-shell-key.pub | awk '{print $2}')
+[ -n "$fp_new" ] && [ "$fp_new" != "$fp_old" ] || fail "the second run kept the same key ($fp_old)"
+ev_pass "a second run writes a different key ($fp_old -> $fp_new)"
+sshopt=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+if ev_save old-key-ssh "the old private key against sshd: refused" \
+        ssh "${sshopt[@]}" -i /tmp/ev-old-key desktop-shell@127.0.0.1 whoami >/dev/null; then
+    fail "the old key still logs in after the rotation"
+fi
+ev_pass "the old private key no longer authenticates"
+who=$(ev_save new-key-ssh "the new private key: whoami" \
+    ssh "${sshopt[@]}" -i /etc/desktop-container/host-shell-key desktop-shell@127.0.0.1 whoami) || fail "the new key does not log in"
+[ "$(tail -n 1 <<<"$who")" = desktop-shell ] || fail "the new key logged in as '$who'"
+ev_pass "the new private key logs in as desktop-shell"
+if ev_save container-before "the container's ssh host before desktop.service restarts: it still holds the old key" \
+        podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami >/dev/null; then
+    fail "the container still logs in with its copy of the old key"
+fi
+ev_pass "until desktop.service restarts the container, holding the old key, is refused"
+rm -f /tmp/ev-old-key
+ev_end
+
 log "desktop.service survives a restart (and the host session moves with it)"
 systemctl restart desktop.service
 up=0
@@ -894,6 +1198,84 @@ ev_end
 # tree does not actually ship.
 install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf
 
+# After the restart above: what it changed.
+log "after the restart: both units moved, the toolkit republished, the container's key renewed"
+ev_begin S5.8.2 "Moves with the container" T2
+ev_save started-after "EV-STATE: ActiveEnterTimestamp of the two units after systemctl restart desktop.service" \
+    systemctl show -p Id -p ActiveEnterTimestamp desktop.service desktop-session.service >/dev/null || true
+ev_diff started "EV-DIFF: the two units' ActiveEnterTimestamp before and after: both moved" "$started_before" "$EV_LAST"
+[ "$(systemctl show -p ActiveEnterTimestampMonotonic --value desktop.service)" -gt "$t_desk" ] \
+    || fail "desktop.service did not restart"
+[ "$(systemctl show -p ActiveEnterTimestampMonotonic --value desktop-session.service)" -gt "$t_sess" ] \
+    || fail "desktop-session.service did not restart with desktop.service (PartOf= lost?)"
+ev_pass "restarting desktop.service restarted desktop-session.service too: both start times moved"
+ev_save journal "EV-LOG-JOURNAL: desktop-session.service's journal since the restart: stopped and started with the container" \
+    journalctl -u desktop-session.service --since "$since_restart" --no-pager -o short-iso >/dev/null || true
+ev_end
+
+ev_begin S7.2.1 "Published at boot, 0755, by rename" T2
+ev_save bin-after "EV-STATE: ls -li and sha256sum of the published toolkit after the restart" \
+    sh -c 'ls -lia /var/lib/desktop-container/bin; sha256sum /var/lib/desktop-container/bin/screenshot' >/dev/null || true
+ev_diff bin "EV-DIFF: the toolkit dir before and after the restart's republish" "$bin_before" "$EV_LAST"
+[ "$(stat -c %a /var/lib/desktop-container/bin/screenshot)" = 755 ] || fail "the republished screenshot is not 0755"
+ev_pass "the republished screenshot is 0755"
+[ "$(stat -c %i /var/lib/desktop-container/bin/screenshot)" != "$ino_tool" ] || fail "the republish wrote the old file in place"
+ev_pass "it is a new inode ($ino_tool -> $(stat -c %i /var/lib/desktop-container/bin/screenshot)): copied to a temp file and renamed over"
+left=$(find /var/lib/desktop-container/bin -maxdepth 1 -name '.screenshot.*')
+[ -z "$left" ] || fail "temp files left by the republish: $left"
+ev_pass "no temp file is left"
+ev_end
+
+ev_begin S7.2.2 "Stale tools are pruned, dotfiles left alone" T2
+ev_save bin-pruned "EV-STATE: ls -la of the toolkit dir after the restart" ls -la /var/lib/desktop-container/bin >/dev/null || true
+ev_diff bin "EV-DIFF: the toolkit dir with the planted files, then after the republish" "$planted" "$EV_LAST"
+[ ! -e /var/lib/desktop-container/bin/stale-tool ] || fail "the unshipped stale-tool survived the republish"
+ev_pass "the unshipped regular file is gone"
+[ -e /var/lib/desktop-container/bin/.keep ] || fail "the dotfile was removed"
+ev_pass "the dotfile is left alone"
+pr=$(desktop_log | grep '^pruned ' || true)
+ev_text log "EV-LOG-DESKTOP: publish-tools' 'pruned' lines in the desktop's log" "${pr:-(none)}"
+grep -qx 'pruned stale-tool (no longer shipped by this image)' <<<"$pr" || fail "no 'pruned stale-tool' line"
+ev_pass "publish-tools logged 'pruned stale-tool (no longer shipped by this image)'"
+rm -f /var/lib/desktop-container/bin/.keep
+ev_end
+
+ev_begin S7.2.3 "The directory is never emptied during a republish" T2
+sleep 1
+kill "$watcher" 2>/dev/null || true
+wait "$watcher" 2>/dev/null || true
+ev_text initial "EV-STATE: ls -A of the toolkit dir when the watch began" "$initial"
+ev_copy /tmp/ev-inotify.log inotify "EV-STATE: the inotifywait -m transcript across the restart (event, name)"
+replay=$(python3 -c '
+import sys
+entries = set(sys.argv[1].split())
+low = len([e for e in entries if not e.startswith(".")])
+for line in open(sys.argv[2]):
+    ev, _, name = line.strip().partition(" ")
+    if not name:
+        continue
+    if "CREATE" in ev or "MOVED_TO" in ev:
+        entries.add(name)
+    elif "DELETE" in ev or "MOVED_FROM" in ev:
+        entries.discard(name)
+    low = min(low, len([e for e in entries if not e.startswith(".")]))
+print(low)' "$initial" /tmp/ev-inotify.log)
+events=$(grep -c . /tmp/ev-inotify.log || true)
+[ "$events" -gt 0 ] || fail "the watch saw no events: the republish did not happen in the watched directory"
+ev_note "replayed $events events from the starting listing; the fewest non-dot entries at any point: $replay"
+[ "$replay" -ge 1 ] || fail "at some point during the republish the toolkit directory held no tool"
+ev_pass "across the republish the directory always held at least one tool ($replay at its lowest)"
+rm -f /tmp/ev-inotify.log
+ev_end
+
+ev_begin S5.7.4 "Re-running rotates the key and invalidates the old one" T2
+cwho=$(ev_save container-after "the container's ssh host after desktop.service restarted: the new key" \
+    podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) \
+    || fail "the container could not ssh to the host after the restart"
+[ "$(tail -n 1 <<<"$cwho")" = desktop-shell ] || fail "the container's ssh host answered '$cwho'"
+ev_pass "after desktop.service restarted, the container logs in again (whoami: desktop-shell)"
+ev_end
+
 # --- a scratch desktop container: no host mounts, no host session, no VT ------
 # Plain `podman run` of the image with none of the quadlet's mounts or
 # devices: desktop-init's fallbacks are all that stands between it and a
@@ -941,6 +1323,13 @@ st=$(ev_save stat-scratch "EV-STATE: stat of /run/user/61000 in the scratch cont
     podman exec ev-scratch stat -c '%A %U:%G %n' /run/user/61000) || fail "no /run/user/61000 in the scratch container"
 [ "${st%% /*}" = "drwx------ desktop:desktop" ] || fail "/run/user/61000 is '$st', want drwx------ desktop:desktop"
 ev_pass "and makes /run/user/61000 itself: drwx------ desktop:desktop"
+ev_end
+
+ev_begin S3.7.3 "Loss of --pid=host is detected at boot" T2
+pf=$(grep '^preflight: ' <<<"$scratch_log" || true)
+ev_text preflight "EV-LOG-DESKTOP: the preflight block of the scratch container, run without --pid=host" "${pf:-(none)}"
+grep -q '^preflight: FAIL: container init is PID 1' <<<"$pf" || fail "the preflight did not report init as PID 1 without --pid=host"
+ev_pass "without --pid=host the preflight reports 'FAIL: container init is PID 1'"
 ev_end
 
 ev_begin S2.1.3 "Boot markers" T2
@@ -1007,6 +1396,14 @@ sleep 1
 ev_save pids-before "EV-PIDS: every uid-61000 process on the host before the stop" \
     ps -o pid,ppid,sess,tty,lstart,comm -u 61000 >/dev/null || true
 stop_epoch=$(date +%s)
+# Which processes outlive the SIGTERM, and for how long: desktop-init gives
+# each tree 5 s before it KILLs what is left.
+( for _ in $(seq 24); do
+      echo "-- $(date +%T.%N | cut -c1-12)"
+      ps -o pid,ppid,stat,comm -u 61000 --no-headers 2>/dev/null || true
+      sleep 0.5
+  done ) > "$tmp/samples" 2>&1 &
+sampler=$!
 took=$(ev_save stop "EV-STATE: time systemctl stop desktop.service (podman's stop timeout, after which it would SIGKILL, is 10 s)" \
     bash -c 'TIMEFORMAT="took %R s"; time systemctl stop desktop.service') || fail "systemctl stop desktop.service failed"
 took=$(sed -n 's/^took \([0-9.]*\) s$/\1/p' <<<"$took")
@@ -1019,6 +1416,8 @@ wait_out=$(cat "$tmp/wait")
 ev_text podman-wait "EV-STATE: what 'podman wait desktop', started before the stop, printed: the container's exit code" "${wait_out:-(nothing)}"
 [ "$(tail -n 1 <<<"$wait_out")" = 0 ] || fail "podman wait printed '$wait_out', want exit code 0"
 ev_pass "podman wait, started before the stop, reports exit code 0"
+wait "$sampler" 2>/dev/null || true
+ev_copy "$tmp/samples" during-stop "EV-PIDS: every uid-61000 process on the host, sampled every 0.5 s from just before the stop (what outlives the SIGTERM, and for how long)"
 ev_save unit "EV-STATE: systemctl show of desktop.service after the stop" \
     systemctl show -p Result,ExecMainCode,ExecMainStatus,ActiveState desktop.service >/dev/null || true
 ev_save pids-after "EV-PIDS: every uid-61000 process on the host after the stop" \
