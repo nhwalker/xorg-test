@@ -1450,7 +1450,6 @@ def s3_9_11(ctx, st):
 
 
 def s3_9_12(ctx, st):
-    g = ctx.g
     names0 = sorted(n for n, _ in xi_slaves(ctx))
     k0 = len(xi_ids(ctx, USB_KBD))
     h0, c0 = node_counts(ctx)
@@ -1643,7 +1642,6 @@ def s3_11_1(ctx, st):
 
 
 def s7_7_1(ctx, st):
-    m = ctx.m
     xs = ctx.xstate()
     fx, fy = ctx.free_spot(xs, (300, 200))
     ctx.client_sink("s771", "op771", f"40x10+{fx}+{fy}", "s771")
