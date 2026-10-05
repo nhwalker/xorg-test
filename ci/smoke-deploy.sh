@@ -27,8 +27,10 @@ log()  { echo "== $*"; }
 # shellcheck source=ci/evidence.sh
 . ci/evidence.sh
 fail() { echo "FAIL: $*" >&2; ev_abort "$*"; exit 1; }
-# First line of <text> matching <regex>, as a line number (empty when none).
-line_in() { grep -n -m1 -e "$2" <<<"$1" | cut -d: -f1; }
+# First line of <text> matching <regex>, as a line number (empty when none:
+# under pipefail grep's no-match status would otherwise end the script, with
+# no FAIL saying why, at the caller's assignment).
+line_in() { grep -n -m1 -e "$2" <<<"$1" | cut -d: -f1 || true; }
 # The desktop's console log so far; podman's --tty console ends lines with CR.
 desktop_log() { podman logs desktop 2>/dev/null | tr -d '\r' || true; }
 # The X session is up: mwm (its client) running and the server answering.
@@ -1448,7 +1450,14 @@ ev_begin S2.5.1 "SIGTERM stops both trees cleanly" T2
 tmp=$(mktemp -d)
 podman wait desktop > "$tmp/wait" 2>&1 &
 waiter=$!
-podman logs -f desktop > "$tmp/follow" 2>&1 &
+# The log is followed through its k8s-file, by descriptor, rather than with
+# `podman logs -f`, which ends when the container does (with --rm, at once):
+# in one run its output lacked desktop-init's "SIGTERM:" line, written just
+# before the exit. An open descriptor reads everything written before the
+# file was removed. Each line is "<time> stdout|stderr F|P <text>".
+ctr_log=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Path}}' 2>/dev/null || true)
+[ -n "$ctr_log" ] && [ -f "$ctr_log" ] || fail "the container's k8s-file log is not at '$ctr_log'"
+tail -n +1 -f "$ctr_log" > "$tmp/follow" 2>&1 &
 follower=$!
 sleep 1
 ev_save pids-before "EV-PIDS: every uid-61000 process on the host before the stop" \
@@ -1496,13 +1505,13 @@ left=$(pgrep -l -u 61000 -x 'Xorg|mwm|xterm|pipewire|wireplumber|pipewire-pulse'
 ev_pass "no Xorg, mwm, xterm, pipewire, wireplumber or pipewire-pulse is left on the host"
 sleep 1
 kill "$follower" 2>/dev/null || true
-follow=$(tr -d '\r' < "$tmp/follow")
+follow=$(sed -E 's/^[^ ]+ (stdout|stderr) [FP] //' "$tmp/follow" | tr -d '\r')
 rm -r "$tmp"
 n_term=$(line_in "$follow" '^desktop-init: SIGTERM:')
 [ -n "$n_term" ] || { ev_text follow "EV-LOG-DESKTOP: the desktop's log, followed from before the stop" "$follow"
                       fail "desktop-init logged no 'SIGTERM:' line on the stop"; }
 after_term=$(sed -n "${n_term},\$p" <<<"$follow")
-ev_text follow-tail "EV-LOG-DESKTOP: the desktop's log, followed from before the stop, from desktop-init's 'SIGTERM:' line to the end" "$after_term"
+ev_text follow-tail "EV-LOG-DESKTOP: the desktop's log, followed (its k8s-file, by descriptor) from before the stop, from desktop-init's 'SIGTERM:' line to the end" "$after_term"
 if grep -q 'restarting in 3s' <<<"$after_term"; then
     fail "a tree restarted during the shutdown: $(grep 'restarting in 3s' <<<"$after_term")"
 fi
