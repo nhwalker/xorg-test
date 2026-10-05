@@ -50,6 +50,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
 
+# Evidence (Requirements.md, "Evidence standard"). vm-e2e.sh switches it on
+# per call with EV_ROOT=/var/tmp/ev and copies that tree back to the host's
+# artifacts afterwards; without EV_ROOT every assertion still runs.
+# shellcheck source=ci/evidence.sh
+. ci/evidence.sh
+[ -z "$EV_ROOT" ] || mkdir -p "$EV_ROOT"
+
 # EL sudo's secure_path omits /usr/local/bin, where the k3s installer and
 # our helm download land. Without this the k3s readiness loop silently
 # spins on "command not found".
@@ -67,52 +74,62 @@ fail() {
     # run should not require counting backwards past the Xorg log.
     _failmsg="FAIL: vm-guest: $*"
     echo "$_failmsg" >&2
-    echo "---- diagnostics: podman logs desktop (tail) ----" >&2
-    podman logs desktop 2>&1 | tail -80 >&2 || true
-    echo "---- diagnostics: Xorg log (tail) ----" >&2
-    podman exec desktop sh -c 'tail -40 /home/desktop/.local/share/xorg/Xorg.0.log' >&2 2>/dev/null || true
-    echo "---- diagnostics: postmortem ----" >&2
-    podman logs desktop 2>&1 | grep 'postmortem:' | tail -30 >&2 || true
-    echo "---- diagnostics: preflight ----" >&2
-    podman logs desktop 2>&1 | grep 'preflight:' >&2 || true
-    echo "---- diagnostics: desktop-init state ----" >&2
-    podman exec desktop sh -c 'ls -l /run/desktop-init-ready /run/desktop-init.pid 2>&1; echo "-- session procs:"; ps -o pid,user,comm -u desktop 2>&1' >&2 2>&1 || true
-    echo "---- diagnostics: desktop audio (export sockets + pipewire procs) ----" >&2
-    podman exec desktop sh -c \
-        'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
-        >&2 2>&1 || true
-    # phase-deploy runs enforcing, where a denial is often the whole story
-    # and is invisible in every other log here.
-    echo "---- diagnostics: SELinux mode + client-facing labels ----" >&2
-    getenforce >&2 2>/dev/null || true
-    ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin >&2 2>/dev/null || true
-    systemctl status desktop-selinux.service --no-pager -l >&2 2>/dev/null | head -20 || true
-    echo "---- diagnostics: recent SELinux denials ----" >&2
-    ausearch -m avc -ts recent 2>/dev/null | tail -20 >&2 || echo "(none / ausearch unavailable)" >&2
-    if command -v k3s >/dev/null; then
-        echo "---- diagnostics: k3s state ----" >&2
-        k3s kubectl get nodes,pods -A -o wide >&2 2>/dev/null || true
-        echo "---- diagnostics: node allocatable ----" >&2
-        k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' >&2 2>/dev/null || true
-        echo "" >&2
-        echo "---- diagnostics: pod images actually running ----" >&2
-        k3s kubectl get pods -A -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGEID:.status.containerStatuses[0].imageID' >&2 2>&1 || true
-        echo "---- diagnostics: client CDI specs ----" >&2
-        for f in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml; do
-            echo "-- $f" >&2
-            cat "$f" >&2 2>/dev/null || echo "(missing)" >&2
-        done
-        echo "---- diagnostics: cdi-device-plugin logs ----" >&2
-        k3s kubectl logs -l app.kubernetes.io/name=cdi-device-plugin --tail=30 >&2 2>&1 || true
-        echo "---- diagnostics: kubelet plugin dir ----" >&2
-        ls -la /var/lib/kubelet/device-plugins/ >&2 2>/dev/null || true
-        echo "---- diagnostics: crio CDI view ----" >&2
-        journalctl -u crio --no-pager -o cat 2>/dev/null | grep -i cdi | tail -20 >&2 || true
-        k3s kubectl describe pod x11-client-demo cdi-verify display-only audio-only >&2 2>/dev/null || true
-        journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
-    fi
+    local d
+    d=$(diagnostics 2>&1)
+    printf '%s\n' "$d" >&2
+    # A story open when it failed keeps them: a red story is reviewable from
+    # its own directory, not only from the job log.
+    ev_text failure-diagnostics "what fail() printed when this story failed: the desktop log, Xorg log, preflight, audio, SELinux and k3s state" "$d"
+    ev_abort "$*"
     echo "$_failmsg" >&2
     exit 1
+}
+
+diagnostics() {
+    echo "---- diagnostics: podman logs desktop (tail) ----"
+    podman logs desktop 2>&1 | tail -80 || true
+    echo "---- diagnostics: Xorg log (tail) ----"
+    podman exec desktop sh -c 'tail -40 /home/desktop/.local/share/xorg/Xorg.0.log' 2>/dev/null || true
+    echo "---- diagnostics: postmortem ----"
+    podman logs desktop 2>&1 | grep 'postmortem:' | tail -30 || true
+    echo "---- diagnostics: preflight ----"
+    podman logs desktop 2>&1 | grep 'preflight:' || true
+    echo "---- diagnostics: desktop-init state ----"
+    podman exec desktop sh -c 'ls -l /run/desktop-init-ready /run/desktop-init.pid 2>&1; echo "-- session procs:"; ps -o pid,user,comm -u desktop 2>&1' 2>&1 || true
+    echo "---- diagnostics: desktop audio (export sockets + pipewire procs) ----"
+    podman exec desktop sh -c \
+        'ls -la /run/desktop-audio 2>&1; echo "-- pipewire procs:"; ps -o pid,comm -C pipewire -C pipewire-pulse -C wireplumber 2>&1; echo "-- listening unix sockets:"; ss -lxn 2>&1 | grep desktop-audio' \
+        2>&1 || true
+    # phase-deploy runs enforcing, where a denial is often the whole story
+    # and is invisible in every other log here.
+    echo "---- diagnostics: SELinux mode + client-facing labels ----"
+    getenforce 2>/dev/null || true
+    ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin 2>/dev/null || true
+    systemctl status desktop-selinux.service --no-pager -l  2>/dev/null | head -20 || true
+    echo "---- diagnostics: recent SELinux denials ----"
+    ausearch -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
+    if command -v k3s >/dev/null; then
+        echo "---- diagnostics: k3s state ----"
+        k3s kubectl get nodes,pods -A -o wide 2>/dev/null || true
+        echo "---- diagnostics: node allocatable ----"
+        k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' 2>/dev/null || true
+        echo "" 
+        echo "---- diagnostics: pod images actually running ----"
+        k3s kubectl get pods -A -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGEID:.status.containerStatuses[0].imageID' 2>&1 || true
+        echo "---- diagnostics: client CDI specs ----"
+        for f in /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml; do
+            echo "-- $f" 
+            cat "$f"  2>/dev/null || echo "(missing)" 
+        done
+        echo "---- diagnostics: cdi-device-plugin logs ----"
+        k3s kubectl logs -l app.kubernetes.io/name=cdi-device-plugin --tail=30 2>&1 || true
+        echo "---- diagnostics: kubelet plugin dir ----"
+        ls -la /var/lib/kubelet/device-plugins/ 2>/dev/null || true
+        echo "---- diagnostics: crio CDI view ----"
+        journalctl -u crio --no-pager -o cat 2>/dev/null | grep -i cdi | tail -20 || true
+        k3s kubectl describe pod x11-client-demo cdi-verify display-only audio-only 2>/dev/null || true
+        journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 || true
+    fi
 }
 
 wait_for() { # tries interval description command...
@@ -270,9 +287,16 @@ phase_deploy() {
     [ "$who" = desktop-shell ] || fail "container 'ssh host' whoami='$who', want desktop-shell"
 
     log pd "desktop-preflight fully green on the VM"
-    out=$(desktop-preflight) || { echo "$out"; fail "desktop-preflight reported FAILs"; }
+    ev_begin S5.10.1 "Fully green on a provisioned host" T3
+    rc=0
+    out=$(ev_save desktop-preflight "EV-STATE: desktop-preflight's full report on the provisioned VM; the last line reads 'done: 0 FAIL(s)'" \
+        desktop-preflight) || rc=$?
     echo "$out"
-    echo "$out" | grep -q 'done: 0 FAIL' || fail "preflight did not report 0 FAILs"
+    [ "$rc" = 0 ] || fail "desktop-preflight exited $rc (it reported FAILs)"
+    ev_pass "desktop-preflight exited 0"
+    grep -q 'done: 0 FAIL' <<<"$out" || fail "preflight did not report 0 FAILs"
+    ev_pass "its report ends 'done: 0 FAIL(s)'"
+    ev_end
 
     log pd "HOST audio: HDA device visible, pulse socket reachable from the host"
     podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop \
@@ -1394,8 +1418,13 @@ verify_privileges() {
     # expected ones are present. A list of what we granted would drift with the
     # quadlet; a list of what must never be granted is the actual invariant.
     log vp "the capability bounding set excludes the dangerous ones"
+    ev_begin S6.1.2 "Forbidden capabilities absent" T3
+    ev_save init-status "EV-STATE: /proc/<desktop-init>/status (the Cap* lines; CapEff is what the checks read)" \
+        grep -E '^(Name|Pid|Cap[A-Za-z]+|Seccomp):' "/proc/$initpid/status" >/dev/null || true
     capeff=$(podman exec desktop sh -c "awk '/^CapEff:/{print \$2}' /proc/$initpid/status" 2>/dev/null || echo "")
     [ -n "$capeff" ] || fail "could not read CapEff from the container's init process"
+    ev_save capsh-decode "EV-STATE: CapEff decoded to capability names by capsh (none of the 13 below may appear)" \
+        capsh --decode="$capeff" >/dev/null || ev_note "capsh is not installed on this host; the bit checks below decode CapEff themselves"
     #             name            bit  why it must not be there
     for spec in  "SYS_MODULE      16   load kernel modules" \
                  "SYS_RAWIO       17   raw port and /dev/mem access" \
@@ -1416,7 +1445,9 @@ verify_privileges() {
         if [ $(( (0x$capeff >> $2) & 1 )) = 1 ]; then
             fail "CAP_$1 is in the container's effective set (CapEff=$capeff): $3. --privileged back?"
         fi
+        ev_pass "CAP_$1 (bit $2) is not in CapEff=$capeff"
     done
+    ev_end
     log vp "  CapEff=$capeff - none of the 13 forbidden capabilities present"
 
     # And the device cgroup really is bounded: a node outside the allowlist
@@ -1647,14 +1678,16 @@ operator_setup() {
     wait_for 20 1 "the observer to read the window tree" \
         podman exec -e DISPLAY="$disp" op-observer xwininfo -root -tree
 
-    # The input tests' sink terminals idle in a `sleep 60` after their read,
-    # and one may still be up. The operator's first story looks at the
-    # desktop as the session leaves it, so they go first - as the session
-    # user, since container root holds no CAP_KILL (verify_audio_lifecycle).
-    log op "retire the input tests' sink terminals"
-    podman exec -u desktop desktop pkill -u desktop -f 'xterm -T inputtest' || true
-    wait_for 15 1 "the input tests' sink terminals to exit" \
-        sh -c '! podman exec desktop pgrep -u desktop -f "xterm -T inputtest" >/dev/null'
+    # The terminals earlier phases leave up: phase-deploy's deploy-proof
+    # xterm, which every shard runs first, and the input tests' sink
+    # terminals, which idle in a `sleep 60` after their read. The operator's
+    # first story looks at the desktop as the session leaves it, so they go
+    # first - as the session user, since container root holds no CAP_KILL
+    # (verify_audio_lifecycle). pgrep/pkill patterns are extended regexps.
+    log op "retire the terminals earlier phases left up"
+    podman exec -u desktop desktop pkill -u desktop -f 'xterm -T (deploy-proof|inputtest)' || true
+    wait_for 15 1 "the earlier phases' terminals to exit" \
+        sh -c '! podman exec desktop pgrep -u desktop -f "xterm -T (deploy-proof|inputtest)" >/dev/null'
 
     # One continuous 150 s stream for the sound story, long enough to outlast
     # every command typed under it. 441 frames hold exactly 11 cycles of

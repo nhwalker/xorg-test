@@ -46,6 +46,9 @@ import traceback
 import wave
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import evlib  # noqa: E402  (ci/evlib.py: the evidence format every tier shares)
+
 DESKTOP_IMAGE = "localhost/desktop-container:latest"
 TESTCLIENT_IMAGE = "localhost/desktop-testclient:latest"
 OBSERVER = "op-observer"
@@ -131,80 +134,54 @@ class Run:
             print(f"== operator({sid}): {text}", flush=True)
 
 
-class Story:
+# What every operator story's evidence.md says about how it was driven.
+INTRO = ("Every pointer and key event went through QEMU's own input devices "
+         "(`qemu.log`); the harness only looked at X (xwininfo/xprop from the "
+         "observer container) and at QEMU screendumps.")
+
+
+class Story(evlib.StoryWriter):
+    """One story's evidence directory, in the format every tier shares
+    (ci/evlib.py), plus the operator phase's QMP transcript (qemu.log)."""
+
     def __init__(self, run, sid, title):
-        self.run, self.sid, self.title = run, sid, title
-        self.dir = os.path.join(run.art, sid)
-        os.makedirs(self.dir, exist_ok=True)
-        self.files = []      # (file, what the reviewer should see in it)
-        self.checks = []     # (passed, claim)
-        self.records = []    # observed and recorded, deliberately not asserted
-        self._n = 0
-        self._tl = open(os.path.join(self.dir, "timeline.log"), "w", buffering=1)
-        self._qemu = open(os.path.join(self.dir, "qemu.log"), "w", buffering=1)
+        self.run = run
+        self.sid = sid
+        d = os.path.join(run.art, sid)
+        os.makedirs(d, exist_ok=True)
+        # Opened first, so the story's own timeline has its "begin" line too.
+        self._tl = open(os.path.join(d, "timeline.log"), "w", buffering=1)
+        self._qemu = open(os.path.join(d, "qemu.log"), "w", buffering=1)
+        run.story = self
+        super().__init__(run.art, sid, title, tier="T3",
+                         source=os.environ.get("EV_SOURCE", "the VM e2e operator phase"),
+                         intro=INTRO)
+
+    def log(self, kind, text):
+        # evlib's own timeline writes go through the run, so the run-wide and
+        # the story's timeline get one line each, not two.
+        self.run.log(kind, text)
 
     def log_line(self, kind, line):
-        self._tl.write(line + "\n")
-        if kind == "qmp":
+        if self._tl:
+            self._tl.write(line + "\n")
+        if kind == "qmp" and self._qemu:
             self._qemu.write(line + "\n")
 
-    def name(self, moment, ext):
-        # Numbered, so a directory listing reads in the order things happened.
-        self._n += 1
-        return f"{self._n:02d}-{moment}.{ext}" if ext else f"{self._n:02d}-{moment}"
-
-    def path(self, name):
-        return os.path.join(self.dir, name)
-
-    def attach(self, name, what):
-        self.files.append((name, what))
-        self.run.log("file", f"{name}: {what}")
-
-    def write(self, moment, text, what, ext="txt"):
-        name = self.name(moment, ext)
-        with open(self.path(name), "w") as f:
-            f.write(text)
-        self.attach(name, what)
-        return name
-
     def check(self, ok, claim, detail=""):
-        ok = bool(ok)
-        self.checks.append((ok, claim + (f" ({detail})" if detail else "")))
-        self.run.log("check", ("PASS " if ok else "FAIL ") + claim
-                     + (f" ({detail})" if detail else ""), echo=True)
+        text = claim + (f" ({detail})" if detail else "")
+        ok = super().check(ok, text)
+        print(f"== operator({self.sid}): {'PASS' if ok else 'FAIL'} {text}", flush=True)
         if not ok:
             raise StoryFailed(claim + (f": {detail}" if detail else ""))
 
     def record(self, text):
-        self.records.append(text)
-        self.run.log("record", text, echo=True)
+        self.note(text)
+        print(f"== operator({self.sid}): {text}", flush=True)
 
     def finish(self, error=None, trace=None):
-        status = "PASS" if error is None else "FAIL"
+        status = super().finish(error, trace)
         self.run.story = None
-        out = [f"# {self.sid} — {self.title}", ""]
-        out.append(f"**{status}**" + (f" — {error}" if error else ""))
-        out += ["",
-                f"Spec: `Requirements.md`, {self.sid}. Every pointer and key event "
-                "went through QEMU's own input devices (`qemu.log`); the harness only "
-                "looked at X (xwininfo/xprop from the observer container) and at QEMU "
-                "screendumps.", "", "## Checks, in the order they ran", ""]
-        for i, (ok, claim) in enumerate(self.checks, 1):
-            out.append(f"{i}. {'✅' if ok else '❌'} {claim}")
-        if not self.checks:
-            out.append("(none ran)")
-        if self.records:
-            out += ["", "## Recorded (observed, not asserted)", ""]
-            out += [f"- {r}" for r in self.records]
-        out += ["", "## Files", "", "| File | What to look for |", "|---|---|"]
-        out += [f"| `{n}` | {w} |" for n, w in self.files]
-        out += ["| `timeline.log` | everything this story did, timestamped (EV-TIMELINE) |",
-                "| `qemu.log` | every QMP command sent: the input events, screendumps and "
-                "monitor commands (EV-QEMU) |"]
-        if trace:
-            out += ["", "## Failure trace", "", "```", trace.rstrip(), "```"]
-        with open(self.path("evidence.md"), "w") as f:
-            f.write("\n".join(out) + "\n")
         self._tl.close()
         self._qemu.close()
         return status
@@ -692,9 +669,19 @@ class Ctx:
     def save_state(self, moment, text, what):
         return self.st.write(moment, text, what)
 
+    def save_cmd(self, moment, cmd, what, label=None):
+        """evidence.sh's ev_save: the command, then what it printed. Never an
+        empty file, so 'printed nothing' reads differently from 'never ran'."""
+        out = self.g.sh(f"{cmd}; true", label=label or cmd)
+        self.st.write(moment, f"$ {cmd}\n" + (out if out.strip() else "(no output)\n"), what)
+        return out
+
     def diff(self, moment, before, after, what):
-        d = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
-                                         "before", "after"))
+        # Rule 1 (Requirements.md, evidence standard): before and after are
+        # kept as files beside the diff, never the diff alone.
+        b = self.st.write(f"{moment}-before", before, f"the 'before' side of {moment}")
+        a = self.st.write(f"{moment}-after", after, f"the 'after' side of {moment}")
+        d = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), b, a))
         return self.st.write(moment, d or "(no difference)\n", what, ext="diff")
 
     def pids(self, moment):
@@ -1003,9 +990,9 @@ class Ctx:
         with contextlib.suppress(Exception):
             st.write("failure-ps", self.g.ps(), "every process when the story failed")
         with contextlib.suppress(Exception):
-            st.write("failure-desktop-log",
-                     self.g.sh("podman logs --tail 60 desktop 2>&1; true", label="podman logs desktop"),
-                     "the desktop container's log (EV-LOG-DESKTOP), last 60 lines")
+            self.save_cmd("failure-desktop-log", "podman logs --tail 60 desktop 2>&1",
+                          "the desktop container's log (EV-LOG-DESKTOP), last 60 lines",
+                          label="podman logs desktop")
 
 
 # US layout, which is what the session gets: nothing configures another.
@@ -1503,24 +1490,22 @@ def s11_2_1(ctx, st):
             ctx.click(info.ax + info.w // 2, info.ay + info.h // 2, button="middle")
             ctx.chord("ret")
 
-        for src in apps:
-            for dst in apps:
-                if src == dst:
-                    continue
-                tag = f"{src.replace(' ', '')}-to-{dst.replace(' ', '')}"
-                decoy = f"decoy{s}{len(st.checks)}"
-                ctx.click(*word_point(src), count=2)
-                ctx.shot(f"{s}-{tag}-selected", f"{sel}: '{words[src]}' selected by a double-click "
-                         f"in {owners[src]} xterm")
-                # The control: overwrite the cut buffer xterm also writes, so a
-                # word that arrives can only have come through the selection.
-                ctx.g.xprobe(f"xprop -root -f CUT_BUFFER0 8s -set CUT_BUFFER0 {decoy}",
-                             label=f"observer: CUT_BUFFER0 := {decoy} (control)")
-                paste_into(dst)
-                got = wait_until(lambda: words[src] in lines(dst), 5, 0.4)
-                ctx.shot(f"{s}-{tag}-pasted", f"{sel}: '{words[src]}' pasted into {owners[dst]} xterm")
-                st.check(got, f"{sel}: text selected in {owners[src]} xterm pastes into {owners[dst]}",
-                         f"{owners[dst]} sink ends {lines(dst)[-1:]}, the cut buffer held '{decoy}'")
+        pairs = [(src, dst) for src in apps for dst in apps if src != dst]
+        for n, (src, dst) in enumerate(pairs, 1):
+            tag = f"{src.replace(' ', '')}-to-{dst.replace(' ', '')}"
+            decoy = f"decoy{s}{n}"
+            ctx.click(*word_point(src), count=2)
+            ctx.shot(f"{s}-{tag}-selected", f"{sel}: '{words[src]}' selected by a double-click "
+                     f"in {owners[src]} xterm")
+            # The control: overwrite the cut buffer xterm also writes, so a
+            # word that arrives can only have come through the selection.
+            ctx.g.xprobe(f"xprop -root -f CUT_BUFFER0 8s -set CUT_BUFFER0 {decoy}",
+                         label=f"observer: CUT_BUFFER0 := {decoy} (control)")
+            paste_into(dst)
+            got = wait_until(lambda: words[src] in lines(dst), 5, 0.4)
+            ctx.shot(f"{s}-{tag}-pasted", f"{sel}: '{words[src]}' pasted into {owners[dst]} xterm")
+            st.check(got, f"{sel}: text selected in {owners[src]} xterm pastes into {owners[dst]}",
+                     f"{owners[dst]} sink ends {lines(dst)[-1:]}, the cut buffer held '{decoy}'")
 
         for who in apps:
             ctx.save_state(f"{s}-sink-{who.replace(' ', '')}", "\n".join(lines(who)) + "\n",
@@ -1611,10 +1596,11 @@ def menu_host_terminal(ctx, st, state):
              "whoami typed into it and its answer")
     st.check(who == "desktop-shell", "typing into Host Terminal runs commands on the host as desktop-shell",
              f"whoami wrote {who!r} on the host")
-    journal = ctx.g.sh(f"journalctl -u sshd --since @{state['epoch']} -o short-precise --no-pager "
-                       "| grep 'Accepted publickey for desktop-shell'; true", label="sshd's journal")
-    st.write("sshd-journal", journal, "EV-LOG-JOURNAL: sshd accepting the desktop-shell key for this "
-             "login")
+    journal = ctx.save_cmd("sshd-journal",
+                           f"journalctl -u sshd --since @{state['epoch']} -o short-precise --no-pager "
+                           "| grep 'Accepted publickey for desktop-shell'",
+                           "EV-LOG-JOURNAL: sshd accepting the desktop-shell key for this login",
+                           label="sshd's journal")
     st.check(journal.strip(), "sshd logged the publickey login behind the window")
     xorg_kept(ctx, st, state, "Host Terminal", before)
 
@@ -1741,9 +1727,9 @@ def menu_quit_session(ctx, st, state):
              "the new session shows its xterm at 100x30+60+60")
     x, y = ctx.free_point(xs)
     st.check(img.px(x, y) == ROOT_RGB, "and the #101216 root", f"sampled {img.px(x, y)} at ({x},{y})")
-    st.write("desktop-log", ctx.g.sh(f"podman logs --since {state['since']} desktop 2>&1 | tail -80; true",
-                                     label="podman logs desktop"),
-             "the desktop's log for this story (EV-LOG-DESKTOP): the session's exit and restart")
+    ctx.save_cmd("desktop-log", f"podman logs --since {state['since']} desktop 2>&1 | tail -80",
+                 "the desktop's log for this story (EV-LOG-DESKTOP): the session's exit and restart",
+                 label="podman logs desktop")
 
 
 # --- S11.3.1: sound under the operator's control ---------------------------------
@@ -2119,8 +2105,9 @@ def sound_persistence(ctx, st):
     container's home directory, where WirePlumber keeps them, is not meant
     to outlive the container)."""
     g = ctx.g
-    st.write("player-log", g.sh("podman logs op-player 2>&1; true", label="podman logs op-player"),
-             "the player's own output (EV-LOG-CLIENT): empty unless paplay complained")
+    ctx.save_cmd("player-log", "podman logs op-player 2>&1",
+                 "the player's own output (EV-LOG-CLIENT): '(no output)' unless paplay complained",
+                 label="podman logs op-player")
     g.client_stop("player")
     audio_snapshot(ctx, "persist-0-before", "volume, mute and default output as the operator left them")
     pw = ctx.pid_of("pipewire")

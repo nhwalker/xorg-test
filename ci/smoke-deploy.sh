@@ -21,7 +21,13 @@ AUDIO_SPEC=/etc/cdi/desktop-audio.yaml
 TOOLS_SPEC=/etc/cdi/desktop-tools.yaml
 TOOLS_BIN=/var/lib/desktop-container/bin
 log()  { echo "== $*"; }
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# Evidence (Requirements.md, "Evidence standard"): stories write
+# $EV_ROOT/<story>/ through ci/evidence.sh; ci.yml uploads it. A failure inside
+# an open story records that story as FAIL before the script exits.
+# shellcheck source=ci/evidence.sh
+. ci/evidence.sh
+fail() { echo "FAIL: $*" >&2; ev_abort "$*"; exit 1; }
+[ -z "$EV_ROOT" ] || mkdir -p "$EV_ROOT"
 # The toolkit chain has three places to die (watcher never started, watcher
 # started but never triggered, generator ran and declined) and they look
 # identical from the outside: a published binary and no spec. Print enough to
@@ -433,14 +439,20 @@ log "logging: the container log is bounded, not inherited from the host default"
 # the same reason the privilege checks are: desktop-init and the whole session
 # stream to /dev/console continuously, so an unbounded sink is a slow
 # disk-filling bug that nothing else in the suite would notice.
+ev_begin S2.6.2 "The container log is bounded" T2
+ev_save inspect-logconfig "EV-STATE: podman inspect of the running container's log configuration (Type k8s-file, Size 64MB)" \
+    podman inspect desktop --format '{{json .HostConfig.LogConfig}}' >/dev/null || true
 drv=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Type}}')
 [ "$drv" = k8s-file ] || fail "container log driver is '$drv', want k8s-file (LogDriver= did not reach podman)"
+ev_pass "the running container's log driver is k8s-file"
 # podman normalises the value: "64m" goes in, "64MB" comes back - match the
 # number case-insensitively, not the string we passed in.
 lc=$(podman inspect desktop --format '{{.HostConfig.LogConfig.Size}}' 2>/dev/null || true)
 [ -n "$lc" ] || lc=$(podman inspect desktop --format '{{json .HostConfig.LogConfig}}')
-echo "$lc" | grep -qiE '64 ?mb|67108864' \
+grep -qiE '64 ?mb|67108864' <<<"$lc" \
     || fail "no 64M max-size on the container log (got '$lc'): --log-opt did not reach podman"
+ev_pass "its log is capped at 64 MB (podman reports '$lc')"
+ev_end
 log "  driver=k8s-file, max-size=$lc"
 
 log "desktop-preflight: fully green (no-KMS FAIL tolerated on KMS-less runners)"

@@ -1,15 +1,25 @@
-# Tiers 1-3: static checks, image builds (offline gate + GHCR base cache),
-# and the boot-smoke suite driven by the declarative deploy/ tree.
+# Every test tier, one workflow, so one job can read every tier's evidence:
+#   static        T0: lint, schema and pure-logic checks
+#   build-smoke   T2: image builds (offline gate + GHCR base cache) and the
+#                 boot-smoke suite driven by the declarative deploy/ tree
+#   images -> vm  T3: one image build, then the VM e2e split into shards that
+#                 each boot their own Rocky 9 KVM guest (SELinux enforcing)
+#   vm-e2e        one check that is green only when every shard is
+#   coverage-gate every job's evidence against Requirements.md: each story
+#                 directory complete (S9.3.1), and every story marked ✅ backed
+#                 by passing evidence from this run
+# Each test job writes artifacts/<story>/ (ci/evidence.sh, ci/evlib.py) and
+# uploads it, so a reviewer reads what happened instead of re-running it.
 name: ci
 on:
   pull_request:
   push:
     branches: [main]
-  # Runnable on a branch without opening a PR. e2e-vm has had this all along;
-  # ci did not, so everything in it - including the quadlet dry-run - could
-  # only be exercised through a PR. That is part of why a dry-run assertion
-  # that had stopped being able to fail sat here undetected: there was no
-  # cheap way to run it against a work-in-progress branch and read the output.
+  # Runnable on a branch without opening a PR. Before the VM suite moved in
+  # here, ci could only be exercised through a PR - part of why a dry-run
+  # assertion that had stopped being able to fail sat here undetected: there
+  # was no cheap way to run it against a work-in-progress branch and read
+  # the output.
   workflow_dispatch:
 permissions:
   contents: read
@@ -63,11 +73,11 @@ jobs:
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight \
             deploy/host/usr/local/bin/desktop-monitors-capture
-      - name: python syntax (VM harness)
-        # The VM harness's Python runs only inside e2e-vm, after the image
+      - name: python syntax (VM harness, evidence library)
+        # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the
@@ -82,14 +92,24 @@ jobs:
         # and getting this wrong fails with "no FROM statement found" - which
         # names neither the arg nor the line. hadolint does not catch it, so
         # the rule is enforced here rather than trusted to review.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static"
         run: |
-          python3 - <<'PY'
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S1.1.4 "Build ARGs are global" T0
+          rc=0
+          ev_save arg-scoping "the check's output: every Containerfile* it read, and each ARG's position against the first FROM" \
+            python3 - <<'PY' || rc=$?
           import glob, sys
           bad = []
           for f in sorted(glob.glob('Containerfile*')):
               lines = [l.strip() for l in open(f)
                        if l.strip() and not l.lstrip().startswith('#')]
               froms = [i for i, l in enumerate(lines) if l.upper().startswith('FROM')]
+              args = [l for l in lines if l.upper().startswith('ARG')]
+              print(f"{f}: {len(args)} ARG(s), first FROM at statement {froms[0] + 1 if froms else '-'}")
               if not froms:
                   continue
               for i, l in enumerate(lines):
@@ -101,6 +121,10 @@ jobs:
               print("\n".join(bad)); sys.exit(1)
           print("all Containerfile ARGs precede the first FROM")
           PY
+          if [ "$rc" = 0 ]; then ev_pass "every ARG in every Containerfile* precedes the first FROM"
+          else ev_fail "an ARG follows the first FROM (see the check's output)"; fi
+          ev_end
+          exit "$rc"
       - name: helm lint + template assertions
         run: |
           helm lint charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all
@@ -116,6 +140,14 @@ jobs:
             examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml \
             ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml \
             ci/vm/testpattern-pod.yaml
+
+      - name: upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-static
+          path: artifacts/
+          if-no-files-found: ignore
 
   build-smoke:
     runs-on: ubuntu-latest
@@ -145,6 +177,9 @@ jobs:
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
       - name: deploy tree quadlet dry-run + CDI spec checks
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (quadlet dry-run)"
         # Validate the declarative deploy/ tree: the quadlet generator must
         # accept the unit, and everything must land in the generated service
         # on ANY podman version - all features live in the base unit
@@ -170,7 +205,13 @@ jobs:
           [ -n "$q" ] || q=$(sudo find /usr -type f -name quadlet 2>/dev/null | head -n1)
           [ -n "$q" ] || { echo "podman quadlet generator not found on runner"; podman --version; exit 1; }
           echo "using quadlet generator: $q"
-          out=$(QUADLET_UNIT_DIRS="$tmp" "$q" -dryrun -no-kmsg-log)
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S5.2.1 "The generator accepts the unit and emits the privilege reduction" T2
+          out=$(QUADLET_UNIT_DIRS="$tmp" "$q" -dryrun -no-kmsg-log) \
+            || { ev_abort "quadlet -dryrun rejected desktop.container"; exit 1; }
+          ev_pass "quadlet -dryrun accepted desktop.container ($q, $(podman --version))"
+          ev_text generated-unit "EV-CONFIG: the unit quadlet generated from desktop.container; every check below reads its ExecStart line" "$out"
           echo "--- generated unit ---"; echo "$out"; echo "--- end ---"
           # Assert against the GENERATED ExecStart, not against "anywhere in
           # the output". Anywhere-in-the-output is how the old
@@ -179,19 +220,29 @@ jobs:
           # comments now, and the check could not tell a comment from a flag.
           # An assertion that cannot fail when the behaviour reverses is worse
           # than no assertion, because it reads as coverage.
-          exec_line=$(echo "$out" | grep -m1 '^ExecStart=')
-          [ -n "$exec_line" ] || { echo "no ExecStart= in generated unit"; exit 1; }
-          echo "$exec_line" | grep -q -- '--privileged' \
-            && { echo "the generated unit is --privileged; the reduction regressed"; exit 1; }
+          exec_line=$(grep -m1 '^ExecStart=' <<<"$out" || true)
+          [ -n "$exec_line" ] || { ev_abort "no ExecStart= in the generated unit"; exit 1; }
+          # Here-strings, not `echo | grep -q`: under pipefail an early-exiting
+          # grep can SIGPIPE the echo and turn a match into a failure.
+          f=0
+          ev_check "ExecStart has no --privileged (the reduction has not regressed)" \
+            bash -c '! grep -q -- --privileged <<<"$1"' _ "$exec_line" || f=1
           # Patterns accept "--flag=value" or "--flag value": quadlet chooses
           # the spelling and it is not worth a red build to guess which.
           # The privilege reduction, as it reaches podman.
-          echo "$exec_line" | grep -qi -- '--cap-drop[= ]all'
-          echo "$exec_line" | grep -qE -- '--security-opt[= ]label[=:]disable'
+          ev_check "ExecStart drops every capability (--cap-drop all)" \
+            grep -qi -- '--cap-drop[= ]all' <<<"$exec_line" || f=1
+          ev_check "ExecStart turns SELinux separation off (--security-opt label=disable)" \
+            grep -qE -- '--security-opt[= ]label[=:]disable' <<<"$exec_line" || f=1
           # The log bound, both halves (see the logging block in the unit).
-          echo "$exec_line" | grep -q  -- '--log-driver[= ]k8s-file'
-          echo "$exec_line" | grep -q  -- '--log-opt[= ]max-size=64m'
-          echo "$exec_line" | grep -q  -- '--device[= ]nvidia.com/gpu=all'
+          ev_check "ExecStart sets --log-driver k8s-file" \
+            grep -q -- '--log-driver[= ]k8s-file' <<<"$exec_line" || f=1
+          ev_check "ExecStart caps the log at --log-opt max-size=64m" \
+            grep -q -- '--log-opt[= ]max-size=64m' <<<"$exec_line" || f=1
+          ev_check "ExecStart requests the GPU (--device nvidia.com/gpu=all)" \
+            grep -q -- '--device[= ]nvidia.com/gpu=all' <<<"$exec_line" || f=1
+          ev_end
+          [ "$f" = 0 ] || exit 1
           # Unit directives, asserted as DIRECTIVES rather than as strings that
           # appear somewhere. Every one of these also exists verbatim in the
           # source .container, and quadlet copies the source's comments into
@@ -300,6 +351,9 @@ jobs:
         # desktop-shell ssh both directions, desktop-preflight fully green).
         # Also runs the root-only branch tests for the CDI converger and a
         # dirty-seat seat-prep scenario.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/smoke-deploy.sh)"
         run: sudo -E ci/smoke-deploy.sh
       - name: collect diagnostics on failure
         if: failure()
@@ -307,3 +361,186 @@ jobs:
           sudo podman ps -a || true
           sudo podman logs desktop 2>&1 | tail -100 || true
           sudo journalctl -u desktop.service --no-pager | tail -50 || true
+      - name: upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-smoke
+          path: artifacts/
+          if-no-files-found: ignore
+
+  images:
+    # T3's images, built once and handed to every VM shard, so all of them
+    # test the same bytes. The same offline gate as build-smoke.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: ghcr login (base cache; skipped on fork PRs)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        # --password-stdin, never -p: an argument would put the token in the
+        # process list and in podman's own error output on a failed login.
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: build images (reuse GHCR bases when possible)
+        env:
+          PUSH_BASES: "0"
+        run: |
+          sudo -E ci/build-bases.sh
+          # --network=none is the offline gate, not a speed-up: these layers
+          # must build with no network at all, so a dependency can never be
+          # added without also changing a Containerfile.*.base and forcing a
+          # base rebuild. A build that needs the network fails here loudly
+          # instead of drifting.
+          #
+          # Before the desktop image: that layer stages the client tools out of
+          # this one (Containerfile's `tools` build stage).
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
+          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+          sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+          # Lean non-desktop client fixture (networked build; CI-only, not a
+          # product artifact, so the offline rule does not apply to it). Must
+          # come AFTER the screenshot build: it pulls the binary out of that
+          # image with COPY --from.
+          sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
+          # One archive per image: podman-save's docker-archive format
+          # silently collapses multiple images into the FIRST one with all
+          # tags attached (the plugin tag would end up naming the desktop
+          # image).
+          mkdir -p vm-images
+          sudo podman save -o vm-images/images-desktop.tar localhost/desktop-container:latest
+          sudo podman save -o vm-images/images-plugin.tar localhost/cdi-device-plugin:latest
+          sudo podman save -o vm-images/images-testclient.tar localhost/desktop-testclient:latest
+          sudo chmod 644 vm-images/*.tar
+          # The digests every shard records in its run.json, so a reviewer can
+          # see all shards tested the same images.
+          for i in desktop-container cdi-device-plugin desktop-testclient; do
+            printf '%s %s\n' "$i" "$(sudo podman image inspect "localhost/$i:latest" --format '{{.Id}}')"
+          done | tee vm-images/image-ids.txt
+      - name: hand the images to the VM shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images
+          path: vm-images/
+          retention-days: 1
+          compression-level: 1
+
+  vm:
+    # Tiers 4-5: full-stack e2e in a KVM-accelerated Rocky 9 VM with virtio
+    # graphics/input/sound and SELinux enforcing. Each shard boots its own VM
+    # from the same images, applies the declarative deploy/ tree to the stock
+    # host (phase deploy), then runs its own part of the suite:
+    #   core      privileges, log bounds, the audio paths and lifecycle,
+    #             typed input, input and sound-card hotplug
+    #   operator  the person at the display, through QEMU's devices (E11)
+    #   k8s       k3s + a cdi-device-plugin release per capability, with
+    #             confined client pods wired up by CDI
+    # SELinux stays enforcing throughout - nothing here calls setenforce.
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [core, operator, k8s]
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable kvm access
+        run: |
+          test -e /dev/kvm || { echo "no /dev/kvm on runner"; exit 1; }
+          sudo chmod 666 /dev/kvm
+      - name: install qemu + tools
+        # These are genuinely not on the runner image, so apt is required.
+        # Retries + a transfer timeout because a stalled mirror otherwise
+        # hangs with no output until the job's cap kills it: with these, apt
+        # gives up on the bad mirror in 30s and retries, and a real outage
+        # fails fast with a message instead of a blank timeout.
+        run: |
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS update -q
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat imagemagick
+      - name: cache rocky cloud image
+        id: rocky
+        uses: actions/cache@v4
+        with:
+          path: ci/vm/Rocky-9-GenericCloud.qcow2
+          key: rocky9-genericcloud-v1
+      - name: download rocky cloud image
+        if: steps.rocky.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o ci/vm/Rocky-9-GenericCloud.qcow2 \
+            https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+      - name: fetch the images built once for every shard
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-images
+          path: ci/vm/
+      - name: run VM e2e (${{ matrix.shard }})
+        env:
+          EV_SOURCE: "ci.yml vm (${{ matrix.shard }})"
+        run: ci/vm/vm-e2e.sh "${{ matrix.shard }}"
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-vm-${{ matrix.shard }}
+          path: ci/vm/artifacts/
+          if-no-files-found: ignore
+
+  vm-e2e:
+    # One check for the whole VM suite, green only when every shard is: the
+    # name the single-job workflow used, so anything that waits on it keeps
+    # working.
+    needs: vm
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: every shard passed
+        run: |
+          echo "vm shards: ${{ needs.vm.result }}"
+          [ "${{ needs.vm.result }}" = success ]
+
+  coverage-gate:
+    # Requirements.md says every story leaves reviewable evidence. This reads
+    # what every job of this run left and fails when (a) a story directory is
+    # incomplete - no evidence.md, an indexed file missing or empty, a story
+    # that never finished (S9.3.1) - or (b) a story the document marks ✅ has
+    # no passing evidence from this run. It runs even when a test job failed,
+    # so a red run still says which stories it took down with it.
+    needs: [static, build-smoke, vm]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: gather every job's evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: evidence-*
+          path: evidence/
+      - name: check it against Requirements.md
+        run: |
+          rc=0
+          python3 ci/evlib.py gate --requirements Requirements.md \
+            --report coverage-gate.md --json coverage-gate.json evidence/ || rc=$?
+          cat coverage-gate.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: upload the gate's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-gate
+          path: |
+            coverage-gate.md
+            coverage-gate.json
+          if-no-files-found: ignore
