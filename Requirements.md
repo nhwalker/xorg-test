@@ -353,13 +353,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: when the session exits, desktop-init logs `session exited (rc=N); restarting in 3s`, a new session starts, and within ~45 s the operator sees the desktop again (root colour, initial xterm, mwm frames).
 - Acceptance: kill Xorg as uid desktop; new Xorg and mwm pids; display answers.
 - Evidence: EV-VIDEO of the display through the restart (blank → desktop back); EV-PIDS before/after (Xorg and mwm changed, desktop-init unchanged); EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_lifecycle` kills Xorg but waits only for any mwm, not for new Xorg and mwm pids. The restart is proven with saved evidence only for "Quit session" (`operator-e2e:menu_quit_session`, in `artifacts/S11.1.1/`).
+- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_x_restart` (S4.5.1's step) kills Xorg and waits for a new Xorg pid and a running mwm, but keeps nothing of the restart for this story. The restart is proven with saved evidence only for "Quit session" (`operator-e2e:menu_quit_session`, in `artifacts/S11.1.1/`).
 
 **S2.3.3 Session cleanup is scoped by session id and session tag, never by uid**
 - Requirement: after a session exits, every pid in that session id, and every desktop-user process whose environment carries that run's `DESKTOP_SESSION_TAG`, is TERMed then KILLed after 5 s; same-uid processes outside it (the audio tree, the host's `desktop-session-lead`, any other uid-61000 process on the host, processes started by `podman exec`) are untouched. The session id is the one `startx`, `xinit` and Xorg share; xinit starts the X client in a session of its own, which mwm leads (and each xterm's shell leads another), and the tag is what reaches those and whatever was started from them. A process that starts itself with a scrubbed environment escapes the tag, and so the cleanup unless it is in the server's session.
 - Acceptance: start a `nohup sleep` from the session's xterm, then kill Xorg; within 6 s no process carries the old leader's session id or the old tag; the old mwm, xterm and `sleep` are gone; PipeWire pid unchanged; host `desktop-session-lead` pid unchanged; a deliberately spawned uid-61000 `sleep` on the host survives.
 - Evidence: EV-PIDS before/after listing every uid-61000 process on the **host**, the index marking which must persist.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_lifecycle` asserts only that PipeWire keeps its pid when Xorg is killed, and nothing checks the host's other uid-61000 processes.
+- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_x_restart` asserts only that PipeWire keeps its pid when Xorg is killed, and nothing checks the host's other uid-61000 processes.
 
 **S2.3.4 Session leader sanity check never fires in a normal boot**
 - Requirement: `WARNING: ... is not its own session leader` never appears in a normal boot or after a restart of either tree.
@@ -945,9 +945,9 @@ event, EV-TIMELINE.
 
 **S4.5.1 Audio survives an X session restart**
 - Requirement: PipeWire's pid is unchanged and the export reachable after Xorg is killed and the session restarts; a tone playing through the restart is heard without a gap.
-- Acceptance: `guest:verify_audio_lifecycle` for the pid and the export; a 20 s tone captured across the Xorg kill, with no quiet stretch and no capture time missing against the wall clock.
+- Acceptance: `guest:verify_audio_x_restart` for the pid and the export; a 20 s tone captured across the Xorg kill, with no quiet stretch and no capture time missing against the wall clock.
 - Evidence: EV-PIDS; `pactl info`; EV-AUDIO of a 20 s tone spanning the restart with the spectrogram showing no gap.
-- Tier: T3 · Coverage: ❌ evidence not saved, and no tone is played across the restart; `guest:verify_audio_lifecycle` asserts that PipeWire keeps its pid and the export stays reachable.
+- Tier: T3 · Coverage: ✅ `guest:verify_audio_x_restart` kills Xorg as the desktop user while a pulse client in the desktop container, outside the X session, plays a 20 s 1100 Hz tone: a new Xorg and mwm come up, PipeWire keeps its pid, the export answers `pactl info`, the player exits 0 within 21 s, and `check-audio.py` finds the tone unbroken across the kill (no stretch below −40 dBFS longer than 0.1 s; its span within 19.6–20.6 s). `artifacts/S4.5.1/` (artifact `evidence-vm-core`) holds the pids before and after, `pactl info`, the player's record, and the capture with its verdict and a level plot marking the kill.
 
 **S4.5.2 Audio recovers from its own crash without disturbing X**
 - Requirement: new PipeWire pid, export reachable, mwm still running.
@@ -1585,13 +1585,13 @@ the client window; EV-SHOT-CLIENT from inside the client; EV-LOG-CLIENT;
 - Requirement: a pod started while `desktop.service` is stopped is admitted (specs are host state), its app retries the display, and when the desktop comes up its window appears, `restartCount` 0.
 - Acceptance: stop desktop; apply a pod whose command loops on `xterm` until success; start desktop; window appears; `restartCount` 0.
 - Evidence: common set; EV-LOG-CLIENT showing the retries then success; EV-VIDEO from desktop start to window appearance.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": with `desktop.service` stopped, the early pod (`ci/vm/early-pod.yaml`) is admitted and its xterm fails to open the display, try after try; once the desktop starts, its next try stays up and its window appears, and the pod is the same container, `restartCount` 0. `artifacts/S7.5.4/` (artifact `evidence-vm-k8s`) holds the stopped desktop, the xterm's tries, a video from the desktop's start until the window is on it, the screen and the pod's own screenshot, the window tree, and the pod before and after with the diff.
 
 **S7.5.5 After an X session restart, a client container reconnects without being recreated**
 - Requirement: when Xorg restarts, X clients lose their connection (that is X11); the application container itself must not need recreating: its next `xterm` connects to the new server, `restartCount` 0, same container id.
 - Acceptance: pod running `sleep infinity` spawns an xterm; kill Xorg; after the session returns, the pod spawns another xterm, which appears; the pod's container id unchanged.
-- Evidence: common set across the restart; EV-LOG-CLIENT (the first xterm's "connection to X server lost" message is expected and quoted); EV-VIDEO.
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted only in part, as a side effect: after `operator-e2e:s11_1_1`'s Quit session the long-running `op-observer` client container must reach the new X server, but no window from it appears and its container id is not recorded.
+- Evidence: common set across the restart; EV-LOG-CLIENT (the first xterm's error on losing its server is expected and quoted); EV-VIDEO.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": the journey pod's xterm journey-1 is on the screen when Xorg is killed; it ends with its X server, its own error quoted; once the session is back, the same pod's next xterm, journey-2, appears and the pod's own screenshot reaches the new server; the pod is the same container, `restartCount` 0. `artifacts/S7.5.5/` (artifact `evidence-vm-k8s`) holds the pod and its applications before and after with the diff, both screens with the pod's own screenshots, the window trees, the first xterm's log and the video across the restart.
 
 **S7.5.6 A client's capture matches what the operator sees**
 - Requirement: EV-SHOT-CLIENT from a client matches the QEMU screendump of the same moment far better than any flipped, mirrored or rotated version of it. They may legitimately differ (a pointer drawn into one capture and not the other), so the comparison is a margin, not equality.
@@ -1625,21 +1625,21 @@ EV-LOG-CLIENT (the player's output), EV-AUDIO with spectrogram, EV-TIMELINE.
 
 **S7.6.3 A client's playback continues through an X session restart, uninterrupted**
 - Requirement: an application container playing a 20 s tone when Xorg is killed keeps playing with no gap, `restartCount` 0, same app pid.
-- Acceptance: start playback at 1100 Hz from a pod; kill Xorg; capture the whole span; the spectrogram shows a continuous 1100 Hz line across the restart; `check-audio.py` on a window straddling the restart passes.
+- Acceptance: start playback at 1100 Hz from a pod; kill Xorg; capture the whole span; `check-audio.py` over the whole capture finds no stretch below −40 dBFS longer than 0.1 s and the tone's full 20 s span, its level plot marking the kill; the player is one process throughout, its stream one sink-input.
 - Evidence: common set; EV-AUDIO spanning the restart with the restart timestamp marked on the spectrogram; EV-VIDEO of the display going down and back while the tone continues.
-- Tier: T3 · Coverage: ❌ (the desktop-side pid proof exists in `guest:verify_audio_lifecycle`; the client's uninterrupted experience is unproven).
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": a 20 s 1100 Hz tone from the journey pod plays while Xorg is killed about 5 s in: one player process before and after, its stream the same sink-input before, during and after, and it exits 0 within 21 s; `check-audio.py` finds the tone unbroken across the kill (no stretch below −40 dBFS longer than 0.1 s; its span within 19.6–20.6 s); the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. `artifacts/S7.6.3/` (artifact `evidence-vm-k8s`) holds the streams before, during and after, the player's record, the capture with its verdict and a level plot marking the kill, the video, and the pod and the daemons before and after with the diffs.
 
 **S7.6.4 A client recovers from an audio-stack restart without being recreated**
 - Requirement: when PipeWire restarts, a client's current stream ends with a clean error; the same container's next playback succeeds; `restartCount` 0.
 - Acceptance: pod plays; kill pipewire; the player exits nonzero within 10 s with a connection error; after the export is back, the same pod plays again and is heard.
 - Evidence: common set; EV-LOG-CLIENT quoting the error; two EV-AUDIO captures (before: tone then stop at the kill timestamp; after: tone).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": PipeWire is killed about 4 s into a 20 s 880 Hz tone from the journey pod: the player exits nonzero within 10 s with its connection error, and the capture holds the tone up to the kill and nothing after it (its span checked against the kill's time on the level plot); once the export is back, the same pod's next player is heard at 770 Hz and exits 0; the pod is the same container, `restartCount` 0. `artifacts/S7.6.4/` (artifact `evidence-vm-k8s`) holds both captures with their verdicts and level plots, the players' records with the error, the streams before, during and after, the daemons before and after, `pactl info` from the pod, and the pod before and after.
 
 **S7.6.5 A client started before the audio stack is up plays once it is, without restarting**
 - Requirement: a pod admitted while the audio export is absent retries and succeeds when the export appears; `restartCount` 0.
 - Acceptance: stop desktop; apply a pod whose command loops on `paplay` until success; start desktop; a tone is heard; `restartCount` 0.
 - Evidence: common set; EV-LOG-CLIENT showing retries; EV-AUDIO.
-- Tier: T3 · Coverage: ❌ no test: `guest:verify_cdi` only waits for an export that is already up; the desktop is never stopped before a pod is applied.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": the early pod, applied with the desktop stopped, tries `paplay` until one works: the tries fail while the audio stack is down, then its 990 Hz tone plays and is heard, its stream listed while it plays; the pod is the same container, `restartCount` 0. `artifacts/S7.6.5/` (artifact `evidence-vm-k8s`) holds the tries, the streams with the desktop down and while it played, the capture with its verdict and level plot, and the pod before and after.
 
 **S7.6.6 A lean client with no PipeWire of its own plays and records**
 - Requirement: the testclient image plays all three paths and records via the injected env alone.
@@ -1719,19 +1719,19 @@ the referenced feature.
 - Requirement: client pods lose their X connection and audio stream (expected), are not restarted by kubernetes, and work again against the new desktop with the same container id.
 - Acceptance: pods running `sleep infinity` with child apps; `systemctl restart desktop.service`; `restartCount` 0, container id unchanged; new xterm and new tone succeed.
 - Evidence: common set from F7.7; EV-SHOT after; EV-AUDIO after; EV-LOG-CLIENT quoting the expected disconnect messages.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": `systemctl restart desktop.service` under the journey pod: its xterm journey-3 loses its X connection and its 30 s player its stream, both expected and quoted; then a new xterm from the same pod, journey-4, appears and a new 660 Hz tone from it is heard; the pod is the same container, `restartCount` 0, its container id unchanged. `artifacts/S7.8.1/` (artifact `evidence-vm-k8s`) holds the pod, its applications and the daemons before and after with the diffs, the streams, the disconnect messages, a video across the restart, the screen after, and the capture with its verdict and level plot.
 
 **S7.8.2 Toolkit republish under a running client is harmless**
 - Requirement: a client that has the toolkit mounted keeps a working `screenshot` across a desktop restart (new inode, old mapping intact).
 - Acceptance: run `screenshot` in a loop from a pod across the restart; every invocation after the desktop is back succeeds; none fails with `ETXTBSY`/`Text file busy` on the desktop side (EV-LOG-DESKTOP has `published screenshot`).
 - Evidence: the loop's log (EV-LOG-CLIENT); `ls -li` of the published binary before/after; EV-LOG-DESKTOP; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": across `desktop.service`'s restart, a screenshot held mid-write in the pod (its PNG larger than a pipe holds) keeps running from the replaced binary, its executable `(deleted)` at the old inode while the toolkit file has a new one, and, released, writes its PNG and exits 0; a screenshot loop in the pod fails while the desktop is down and succeeds on every try once it is back, as one process; the restarted desktop logs `published screenshot`, with no `Text file busy`; the pod is the same container, `restartCount` 0. `artifacts/S7.8.2/` (artifact `evidence-vm-k8s`) holds `ls -li` of the toolkit in the pod before and after with the diff, the held screenshot's state before and after and its release, the loop's log, the desktop's publish lines, and the pod before and after.
 
 **S7.8.3 Socket recreation does not invalidate client mounts**
 - Requirement: because the CDI mounts are directories, a client's `/tmp/.X11-unix` and `/run/desktop-audio` show the **new** sockets after Xorg or PipeWire recreate them.
-- Acceptance: `ls -li` of both dirs from inside a long-running pod before and after the respective restart: inode numbers changed, the pod sees the new ones, and connects.
+- Acceptance: `ls -li` of both dirs from inside a long-running pod before and after the respective restart: each socket is new, its change time after the kill (the inode number is no proof: the filesystem may reuse it, as XFS did for X0), the pod sees the new ones, and connects.
 - Evidence: the two `ls -li` pairs from inside the pod (EV-DIFF); `xdpyinfo`/`pactl info` from the pod after; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted only for the display half, as a side effect: after `operator-e2e:s11_1_1`'s Quit session the long-running `op-observer` client must reach the new X server through its `/tmp/.X11-unix` mount; the audio half is never exercised.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": inside the journey pod, `/tmp/.X11-unix/X0` after Xorg's restart and `/run/desktop-audio/pulse` after PipeWire's are new sockets, each changed after its kill, and the pod connects through each (`xdpyinfo`, `pactl info`); the pod is the same container across both, `restartCount` 0. XFS reused X0's inode number, so the change time is the proof. `artifacts/S7.8.3/` (artifact `evidence-vm-k8s`) holds `ls -li` of both directories from inside the pod before and after with the diffs, each socket's inode and change time, `xdpyinfo` and `pactl info` from the pod, and the pod before and after each restart.
 
 ---
 
@@ -2301,13 +2301,13 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | E1 Image build | 14 | 12 | 0 | 2 | 0 |
 | E2 Boot & supervision | 25 | 17 | 1 | 7 | 0 |
 | E3 Display & session | 62 | 43 | 1 | 15 | 3 |
-| E4 Audio | 23 | 14 | 0 | 8 | 1 |
+| E4 Audio | 23 | 15 | 0 | 7 | 1 |
 | E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
 | E6 Privileges | 9 | 3 | 0 | 6 | 0 |
-| E7 Client contract & journeys | 40 | 11 | 1 | 28 | 0 |
+| E7 Client contract & journeys | 40 | 19 | 1 | 20 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **130** | **4** | **111** | **6** |
+| **Total** | **251** | **139** | **4** | **102** | **6** |
 
 Regenerate after editing with:
 
