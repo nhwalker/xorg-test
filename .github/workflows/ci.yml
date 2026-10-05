@@ -428,7 +428,7 @@ jobs:
           compression-level: 1
 
   vm:
-    # Tiers 4-5: full-stack e2e in a KVM-accelerated Rocky 9 VM with virtio
+    # T3: full-stack e2e in a KVM-accelerated Rocky 9 VM with virtio
     # graphics/input/sound and SELinux enforcing. Each shard boots its own VM
     # from the same images, applies the declarative deploy/ tree to the stock
     # host (phase deploy), then runs its own part of the suite:
