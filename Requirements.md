@@ -755,9 +755,9 @@ slice, EV-TIMELINE.
 
 **S3.9.5 A hot-added keyboard delivers keystrokes**
 - Requirement: keys sent through the re-added device itself reach the focused application, and the operator sees them.
-- Acceptance: the keyboard re-added with `display=<virtio-vga id>` (the e2e must give `-device virtio-vga` an `id=`), then `input-send-event` with `"device"` set to that virtio-vga id; the sink xterm records the text (or `xinput test <id>` shows the events). QMP's `device` names a display device, not an input device: `"device": "kvmkbd"` is refused ("not bound to a QemuConsole").
+- Acceptance: the keyboard re-added with `display=<virtio-vga id>` (the e2e must give `-device virtio-vga` an `id=`), then `input-send-event` with `"device"` set to that virtio-vga id; the sink xterm records the text (or `xinput test <id>` shows the events). QMP's `device` names a display device, not an input device. The e2e's QEMU (8.2.2) does not refuse an event that names the keyboard: it aborts, its console lookup reaching a text console that has no `device` property (`Property 'qemu-fixed-text-console.device' not found`), so the e2e names only the display.
 - Evidence: EV-QEMU transcript showing the `device` field; sink file (EV-LOG-CLIENT); EV-SHOT of the text on screen; `xinput test` output (EV-STATE).
-- Tier: T3 · Coverage: ❌ not asserted: `e2e` "KVM switch simulation" already types `kvmok` through the re-added `kvmkbd`, because QEMU gives unrouted key events to the newest keyboard, but nothing checks or saves which device carried them.
+- Tier: T3 · Coverage: ✅ `e2e` "input routing" re-adds the USB keyboard bound to the virtio-vga's console (`device_add usb-kbd,id=kvmkbd,bus=xhci.0,display=vga0`) and types `boundkey` through `qmp-type.py`, every key event naming `device` vga0, head 0: the sink xterm reads `boundkey`, and `xinput test` on the re-added keyboard's own X device sees all nine key presses. `artifacts/S3.9.5/` (artifact `evidence-vm-core`) holds the QMP transcript, the screendump, the sink file and the `xinput test` output.
 
 **S3.9.6 The session accepts input after a keyboard cycle**
 - Requirement: a remove/re-add cycle does not wedge the X session or its input stack.
@@ -769,23 +769,23 @@ slice, EV-TIMELINE.
 - Requirement: a mouse or tablet added while the desktop runs appears as a new `event*` node inside the container.
 - Acceptance: node count rises after `device_add usb-mouse` (relative) and `device_add usb-tablet` (absolute).
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "pointer hotplug": `device_add usb-mouse` (relative) and `usb-tablet` (absolute) each add an event node on the VM host and in the container, the pointers' own nodes among the container's. `artifacts/S3.9.7/` (artifact `evidence-vm-core`) holds F3.9's common set before and after with the diffs, QEMU's replies and the Xorg log from just before.
 
 **S3.9.8 Pointer plug-in is adopted by Xorg**
 - Requirement: the device appears in `xinput list` as a pointer.
 - Acceptance: as stated, for a relative and an absolute device.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "pointer hotplug": `xinput list` gains `QEMU QEMU USB Mouse` and `QEMU QEMU USB Tablet`, each a slave pointer, and Xorg's two adding lines for each are quoted from its log. In `artifacts/S3.9.8/` (artifact `evidence-vm-core`).
 
 **S3.9.9 Pointer plug-out removes the node from the container**
 - Requirement and acceptance: as S3.9.3, for the pointer.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "pointer hotplug": after `device_del hotmouse` and `hottablet` the VM host loses both nodes and the pointers' own nodes are gone from the container, its count back to the baseline. `artifacts/S3.9.9/` (artifact `evidence-vm-core`) holds F3.9's common set plugged in and after, with the diffs and QEMU's replies.
 
 **S3.9.10 Pointer plug-out is seen by Xorg**
 - Requirement and acceptance: as S3.9.4, for the pointer.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "pointer hotplug": both pointers leave `xinput list`, and Xorg's log records `config/udev: removing device` for each. In `artifacts/S3.9.10/` (artifact `evidence-vm-core`).
 
 **S3.9.11 A hot-added pointer delivers motion and buttons**
 - Requirement: events through the hot-added device move the pointer and click; the operator sees the cursor move and a window take focus.
@@ -839,7 +839,7 @@ event, EV-TIMELINE.
 - Requirement: forcing `Virtual-2` to `on` under a layout that declares it changes nothing except `xrandr` now saying `connected`.
 - Acceptance: `echo on`; `xr_is Virtual-2 connected 1024x768+1024+0`; dims `2048x768`; `echo detect` afterwards.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`: with the layout declared, Virtual-2 forced `on` reads `connected 1024x768+1024+0`, the screen stays 2048x768 with Virtual-1 at `1024x768+0+0`, and no client window moves or resizes (the window-tree diff is empty); set back to `detect`, Virtual-2 reads disconnected again at the same place. `artifacts/S3.10.4/` (artifact `evidence-vm-core`) holds sysfs, `xrandr --verbose` and the window tree at each step, with the diffs and the Xorg log.
 
 **S3.10.5 Monitor plug-in without a layout is detected and does not reflow**
 - Requirement: under autodetection a connector coming up is `connected` in `xrandr`; screen size and existing geometry unchanged (no auto-enable).
@@ -991,9 +991,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S4.7.3 A hot-added card plays, and it is the new card that is heard**
 - Requirement: audio routed to the hot-added card's sink is rendered by that device.
-- Acceptance: `wpctl set-default <id>`; play a 990 Hz tone; `wavcapture` on the shared `audiodev` and `check-audio.py` assert it; `pactl list short sink-inputs` during playback shows the stream on the new sink; restore the default sink.
+- Acceptance: the new card's sink made the default (`pactl set-default-sink`) at full volume and the built-in card's sink muted, so that only the new card can carry the tone; play a 990 Hz tone; `wavcapture` on the shared `audiodev` and `check-audio.py` assert it; `pactl list short sink-inputs` during playback shows the stream on the new sink; unmute and restore the default sink. Full volume because WirePlumber starts a new device at 0.40, which the USB card renders as −24 dB: a tone at 0.6 of full scale then peaks near 0.04, under `check-audio.py`'s silence floor.
 - Evidence: EV-AUDIO (990 Hz, spectrogram); `pactl list short sink-inputs` mid-playback naming the USB sink (EV-STATE); `wpctl status` with the default marker on the new sink; common set.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no `pactl list short sink-inputs` or `/dev/snd` listings saved); asserted as a side effect by `operator-e2e:s11_3_1`, whose capture follows the hot-added card's volume and mute once the client's stream is on it.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug, again": with the USB card's sink the default at full volume and the built-in card's sink muted, a pulse client's 990 Hz tone is heard at the machine's output (`check-audio.py` at 990 Hz), and mid-playback its stream sits on the USB sink. `artifacts/S4.7.3/` (artifact `evidence-vm-core`) holds F4.7's common set across the card's arrival, `wpctl status` with the `*` on the USB sink and the built-in one `MUTED`, the sink-inputs and sinks mid-playback, and the capture with its verdict and level plot.
 
 **S4.7.4 Sound card plug-out removes the node from the container**
 - Requirement: after `device_del`, the `controlC*` node is gone inside the container.
@@ -1017,13 +1017,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: a client streaming to the hot-added card when it is removed is either moved to the remaining sink or gets a clean error; the three daemons keep their pids.
 - Acceptance: start a long `pw-play`/`paplay` to the new sink; `device_del`; daemon pids unchanged; export reachable; the client exits or continues on the built-in sink within 10 s.
 - Evidence: EV-AUDIO spanning the removal (spectrogram shows the tone continuing or stopping cleanly at the removal timestamp); EV-PIDS; EV-LOG-CLIENT (the player's stderr); `pactl list short sink-inputs` before/after.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug, again": a 15 s 660 Hz stream plays on the USB card when it is unplugged; by the first check after the removal its stream is on the built-in card's sink, and it plays on to the end (the player exits 0); the three daemons keep their pids and the export answers `pactl info`. `artifacts/S4.7.7/` (artifact `evidence-vm-core`) holds the capture across the removal, whose level plot shows the tone continuing, the sink-inputs and sinks before and after, the player's record, and the daemons' pids with the diff.
 
 **S4.7.8 Capture device plug-in and plug-out reach WirePlumber**
 - Requirement: a hot-added card with a capture path appears as an `alsa_input.*` source and disappears on removal.
-- Acceptance: `pactl list short sources` gains and loses it. Vehicle: PCI hot-add of a capture-capable card with a built-in codec (`AC97` or `ES1370`, `audiodev=snd0`), if the guest image has its driver (untested); otherwise T4 only, with the attempt and its error recorded here. QEMU's HDA codec bus refuses `device_add`, and `usb-audio` has no capture path.
+- Acceptance: `pactl list short sources` gains and loses it. Vehicle: PCI hot-add of `AC97` (`audiodev=snd0`), whose driver the e2e's guest kernel ships (`snd-intel8x0`; `snd-ens1370`, for `ES1370`, too). QEMU's HDA codec bus refuses `device_add`, and `usb-audio` has no capture path.
 - Evidence: common set with sources; EV-QEMU including the `device_add` replies.
-- Tier: T3/T4 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug: a capture-capable card on PCI": `device_add AC97,id=hotcap,audiodev=snd0` brings `alsa_input.pci-0000_00_0b.0.analog-stereo` into `pactl list short sources`, and `device_del hotcap` takes it away. `artifacts/S4.7.8/` (artifact `evidence-vm-core`) holds `modinfo`'s answer for both candidate drivers, QEMU's replies, and F4.7's common set with sources before, plugged in and after, with the diffs.
 
 **S4.7.9 Recording from a hot-added capture device works**
 - Requirement: a client can `parec`/`arecord` from the new source.
@@ -2300,14 +2300,14 @@ moves to ✅ only when a CI run has saved its evidence, which the
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 12 | 0 | 2 | 0 |
 | E2 Boot & supervision | 25 | 17 | 1 | 7 | 0 |
-| E3 Display & session | 62 | 37 | 1 | 21 | 3 |
-| E4 Audio | 23 | 11 | 0 | 11 | 1 |
+| E3 Display & session | 62 | 43 | 1 | 15 | 3 |
+| E4 Audio | 23 | 14 | 0 | 8 | 1 |
 | E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
 | E6 Privileges | 9 | 3 | 0 | 6 | 0 |
 | E7 Client contract & journeys | 40 | 11 | 1 | 28 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **121** | **4** | **120** | **6** |
+| **Total** | **251** | **130** | **4** | **111** | **6** |
 
 Regenerate after editing with:
 
