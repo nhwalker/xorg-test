@@ -82,7 +82,11 @@ ev_pull() {
 # Whatever happened, leave every story directory rendered and the guest's
 # half copied back: a red run must be as reviewable as a green one.
 ev_finish() {
-    [ -z "${EV_VID_PID:-}" ] || kill "$EV_VID_PID" 2>/dev/null || true
+    # A recording still running turns its frames into PNGs once stopped:
+    # give it up to 20 s, so the artifact holds PNGs, not raw frames.
+    if [ -n "${EV_VID_PID:-}" ] && kill "$EV_VID_PID" 2>/dev/null; then
+        for _ in $(seq 40); do kill -0 "$EV_VID_PID" 2>/dev/null || break; sleep 0.5; done
+    fi
     ev_pull
     python3 ../evlib.py render "$ART" >/dev/null 2>&1 || true
 }
@@ -203,7 +207,7 @@ ev_video_stop() { # <what>
     kill "$EV_VID_PID" 2>/dev/null || true
     wait "$EV_VID_PID" 2>/dev/null || true
     EV_VID_PID=""
-    ev_attach "$EV_VID/" "EV-VIDEO raw frames at 2 fps; index.txt gives each frame's UTC time, to read against timeline.log"
+    ev_attach "$EV_VID/" "EV-VIDEO raw frames at 2 fps; index.txt gives each frame's UTC time, to read against timeline.log, and how long QEMU took to write it"
     if convert -delay 50 -loop 0 "$EV_DIR/$EV_VID"/frame-*.png -resize 50% "$EV_DIR/$EV_VID.gif" 2>/dev/null; then
         ev_attach "$EV_VID.gif" "$1"
     else
@@ -257,9 +261,11 @@ ev_qemu_hda() { # <moment> <host t0> <host t1>
 }
 # What the guest and QEMU said about the audio across a capture window: the
 # scheduling and xruns after, the desktop's log since the window opened, and
-# QEMU's HDA trace. Diagnosis kept with the story: S4.5.1's and S7.6.3's
-# tones have come out short with no gap in them (run 37335026876: the pod's
-# 20 s tone played in 18.64 s), and these say where the time went.
+# QEMU's HDA trace. Kept with the story because S7.6.3's tone has come out
+# short with no gap in it (run 37335026876: 20 s played in 18.64 s). Run
+# 37338352192 said why: QEMU's sound card dropped its buffer 18 times, each
+# at a frame of the story's own PNG video, which QEMU compressed in the
+# loop its audio runs in. The video now takes raw frames (qmp-tool.py).
 audio_window_record() { # <host t0> <host t1> <guest t0>
     ev_save sched-after "EV-STATE: PipeWire's threads and pw-top's batch view after the tone: an ERR count above the one before is an xrun during it" \
         gq audio-sched >/dev/null || true
