@@ -209,7 +209,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the three base images build from scratch against the live UBI image and Rocky repos, and the offline layers still build on the result.
 - Acceptance: weekly `--pull --no-cache` rebuild succeeds and the offline builds pass on it.
 - Evidence: build logs; `rpm -qa` of the fresh base (EV-STATE) diffed against the previous week's (EV-DIFF) so package drift is visible.
-- Tier: T2 · Coverage: ❌ evidence not saved: `base-rebuild.yml` uploads nothing and records no `rpm -qa` list or week-on-week diff; the weekly rebuild and the offline builds on it are asserted by `base-rebuild.yml`.
+- Tier: T2 · Coverage: ✅ (workflow `base-rebuild.yml`) `ci/base-rebuild.sh` runs the rebuild and keeps its evidence, and the workflow uploads it as `evidence-base-rebuild` whether the builds pass or not. The three bases build from current upstream (`--pull --no-cache`) and the three application layers build offline (`--network=none`) on them, a check and the build's log for each. `rpm -qa` of the desktop base GHCR held before the run (its `:latest`, pulled first) and of the fresh base are kept, with their diff: the week's package drift. The bases are pushed only after a successful rebuild, by every scheduled run and by a dispatched one whose `push` input is on. Under `S1.1.2/` (artifact `evidence-base-rebuild` of a `base-rebuild.yml` run).
 
 **S1.1.3 Base images are content-addressed**
 - Requirement: `ci/build-bases.sh` reuses a GHCR base whose tag is the hash of its inputs and rebuilds only on a miss.
@@ -271,7 +271,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: every script under `image/` and `deploy/host/usr/local/` passes `shellcheck -S error`; every script `Containerfile` installs is mode 0755; the shellcheck list in `ci.yml` is complete.
 - Acceptance: a `find`-derived list equals the list in `ci.yml`; `find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755` in the image is empty.
 - Evidence: both lists and their diff (EV-DIFF); the `find` output (EV-STATE).
-- Tier: T0/T2 · Coverage: ❌ list completeness and modes untested; `ci.yml` "shellcheck (error severity)" checks a hand list that already omits `image/session/xinitrc.desktop` and `deploy/host/usr/local/libexec/desktop-session-lead`.
+- Tier: T0/T2 · Coverage: ✅ `static`'s "every shipped script is shellchecked (S1.2.6's list)" step: `ci/script-list.py` finds every shell script git tracks under `image/` and `deploy/host/usr/local/` by its `#!` line (22 of them) and the scripts the "shellcheck (error severity)" step names there, its globs expanded; the two lists' diff is empty. Its self-test takes a listed script out of the step and must name it. Both lists, their diff and the self-test are under `artifacts/S1.2.6/` (artifact `evidence-static`); the shellcheck step itself passes in the same job. `smoke` runs `find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755` in a scratch container of the image: empty, the twelve files under `/usr/local/bin` and `xinitrc.desktop` all `755 root:root`, under `artifacts/S1.2.6/` (artifact `evidence-smoke`).
 
 **S1.2.7 Image carries no NVIDIA userspace**
 - Requirement: no `nvidia_drv.so`, `libnvidia*`, `libglxserver_nvidia*` in the image.
@@ -499,7 +499,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: for video/render/input/audio, the container group is renumbered to the host node's gid; collisions move the other group to a free gid ≥ 60000; missing groups are created; root-group and absent nodes are skipped with a log line; the final-state table and `id desktop` are logged; the narrow form touches only the named groups.
 - Acceptance: T1 in a scratch container with fabricated nodes per branch; T3 preflight `desktop user can read` PASS for all three node kinds.
 - Evidence: T1 `getent group` before/after per branch (EV-DIFF); T3 EV-LOG-DESKTOP align table + preflight lines; `ls -ln /dev/dri /dev/input /dev/snd` host and container (EV-STATE).
-- Tier: T1/T3 · Coverage: 🟡 ✅ the T3 half: `guest:session_groups`, in the core shard. Every group in align-device-groups' final-state table carries the gid of the host node it names: video 39 (`/dev/dri/card0`), render 105 (`/dev/dri/renderD128`), input 104 (`/dev/input/event0`), audio 63 (`/dev/snd/controlC0`). The table ends with `id desktop`, and the container preflight passes `desktop user can read` for `/dev/dri/card0`, `/dev/input/event0` and `/dev/snd/controlC0`. Under `artifacts/S3.2.2/` (artifact `evidence-vm-core`): the align lines, the preflight lines, `ls -ln` of the nodes on the host and in the container, and `getent group` with `id desktop`. ❌ the T1 half: no branch-by-branch test of `align-device-groups.sh` yet.
+- Tier: T1/T3 · Coverage: ✅ the T1 half: `build-smoke`'s "align-device-groups' branches (S3.2.2's T1 half)" step (`ci/align-groups-tests.sh`) runs `align-device-groups.sh` as root in a scratch container of the image per branch, a plain file with the wanted group standing in for each node (the script reads only whether a node exists and its group). Renumber: video 39 becomes the node's 2001, the desktop user in it. Collision: the group squatting on the target gid moves to 60001, the first free gid from 60000 (60000 taken), and render takes 2002. Missing group: input is created with the node's gid. A root-group node and an absent node are skipped with their log lines, the gids unchanged. Already aligned: nothing moves, and the final table names all four groups with their devices' gids and ends with `id desktop`. The narrow form renumbers audio alone, the table its one row. An unknown group is named and changes nothing. Per branch under `artifacts/S3.2.2/` (artifact `evidence-smoke`): the setup, the transcript, `getent group` before and after, and their diff. ✅ the T3 half: `guest:session_groups`, in the core shard. Every group in align-device-groups' final-state table carries the gid of the host node it names: video 39 (`/dev/dri/card0`), render 105 (`/dev/dri/renderD128`), input 104 (`/dev/input/event0`), audio 63 (`/dev/snd/controlC0`). The table ends with `id desktop`, and the container preflight passes `desktop user can read` for `/dev/dri/card0`, `/dev/input/event0` and `/dev/snd/controlC0`. Under `artifacts/S3.2.2/` (artifact `evidence-vm-core`): the align lines, the preflight lines, `ls -ln` of the nodes on the host and in the container, and `getent group` with `id desktop`.
 
 **S3.2.3 VT nodes are created when the runtime does not expose them**
 - Requirement: `ensure-vt-devices.sh` creates `/dev/tty0` (c 4:0) and `/dev/tty1` (c 4:1), mode 620, `root:tty` (desktop-init then hands `tty1` to the session user), no-op when present.
@@ -1155,9 +1155,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.4.2 Real generation, transient failure, no-downgrade, recovery to stub**
 - Requirement: with `nvidia-ctk` and `/dev/nvidiactl` the real spec is written; a failing `nvidia-ctk` keeps an existing real spec; without a toolkit an existing real spec is kept while `/dev/nvidiactl` exists or the `nvidia` module is loaded (`/proc/modules`); with neither, the stub returns.
-- Acceptance: `smoke` with a fake `nvidia-ctk` and fake `/dev/nvidiactl`; the `/proc/modules` trigger needs an override (Appendix A).
+- Acceptance: `smoke` with a fake `nvidia-ctk` and fake `/dev/nvidiactl`; the `/proc/modules` trigger through the script's `CDI_PROC_MODULES` (Appendix A).
 - Evidence: the spec after each step (EV-CONFIG × 4); the script's stdout.
-- Tier: T2 · Coverage: 🟡 the `/proc/modules` leg is not tested: the script reads `/proc/modules` itself, with no override a test could use (Appendix A). The other legs are asserted by `smoke`, which saves the converger's output and the spec after each of five legs (stub; generated; a failing `nvidia-ctk` keeps the real spec; no toolkit with the device node present keeps it; neither, back to the stub) under `artifacts/S5.4.2/` (artifact `evidence-smoke`).
+- Tier: T2 · Coverage: ✅ `smoke` runs the converger through six legs, saving its output and the spec after each, under `artifacts/S5.4.2/` (artifact `evidence-smoke`): no toolkit and no hardware, the stub; a fake `nvidia-ctk` and a fake `/dev/nvidiactl`, the real spec it generates; a failing `nvidia-ctk` keeps the real spec; no toolkit with the device node present keeps it; no toolkit and no device node with the `nvidia` module loaded keeps it (the module list given as `CDI_PROC_MODULES` is the runner's `/proc/modules` with an `nvidia` line added, kept as evidence); neither, the runner's own `/proc/modules` (no `nvidia` line, its count kept), back to the stub.
 
 **S5.4.3 Stale real spec fails loudly, regenerates on restart**
 - Requirement: after a driver update the stale spec fails container creation; `systemctl restart desktop-cdi-refresh` fixes it.
@@ -1289,7 +1289,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: no key → hint logged, exit 0; empty `shell-user` → warning, exit 0; both present → `~/.ssh/config` and a 0400 key copy; preflight WARNs `no host shell material`.
 - Acceptance: T1 in a scratch container; T2 stop the unit, delete the key files, restart desktop.
 - Evidence: EV-LOG-DESKTOP (the hint and the preflight WARN); `~/.ssh/config` (EV-CONFIG); `ls -l /home/desktop/.ssh`; T3 EV-SHOT of the host-terminal xterm showing the failure message and "Press Enter to close".
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: 🟡 ✅ the T1 half: `build-smoke`'s "host-shell-setup's cases (S5.7.7's T1 half)" step (`ci/host-shell-setup-tests.sh`) runs the image's `host-shell-setup.sh` in a scratch container per case, `/etc/desktop-container` written there as the quadlet's read-only mount would give it. No key: the hint names the missing key and how to enable it, exit 0, no `~/.ssh`, and the preflight WARNs `no host shell material`. No `shell-user` file, and an empty one: a warning naming it, exit 0, no ssh config. Both present: `~/.ssh` 0700, a 0400 key copy byte-identical to the mounted key and a 0600 config (`Host host`, `HostName 127.0.0.1`, the user, `IdentityFile`, `IdentitiesOnly yes`), all `desktop:desktop`, and the preflight PASSes the material. Per case under `artifacts/S5.7.7/` (artifact `evidence-smoke`): the setup and the transcript; the config. ✅ the T2 half: `smoke` applies the documented off-switch (the quadlet's two lines commented out, `daemon-reload`: the unit quadlet generated neither wants nor orders itself after `desktop-host-shell.service`), stops the unit and deletes the key files. The desktop starts and its X session comes up; nothing made a key; host-shell-setup logs the missing key and how to enable it; the preflight WARNs; the container has no `~/.ssh/config`. With the quadlet put back, the next start makes a fresh key and host-shell-setup configures the host shell. The quadlet's lines, the generated unit's dependencies, `/etc/desktop-container`, both starts' log lines and `~/.ssh` are under `artifacts/S5.7.7/` (artifact `evidence-smoke`). ❌ the T3 EV-SHOT the evidence names (the Host Terminal window showing the failure and "Press Enter to close", shared with S5.7.8) is not in this run.
 
 **S5.7.8 The menu wrapper keeps its window open on failure**
 - Requirement: on `ssh host` failure, `host-terminal` prints the exit code, the enablement command and the common causes, waits for Enter, exits with ssh's code; on success exits 0 at once.
@@ -1361,7 +1361,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: every row listed in the script fires when its condition is staged.
 - Acceptance: T2 table-driven: stage, run, grep, restore.
 - Evidence: per condition: the staging command, the row, the restore (EV-STATE table).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` runs `ci/preflight-rows.py host` on the runner the tree is applied to. It reads every FAIL and WARN row out of `desktop-preflight` itself (40), stages each row's condition in a case of its own, and checks that the case makes its row fire; a row no case names fails the story, so a row added to the script fails it until a case stages it. Cases run the preflight in a private mount namespace: a path hidden under `/dev/null`, a directory covered by a tmpfs, a command taken off `PATH`, fakes of `systemctl` and `podman` first on `PATH` answering the calls a case lists, a sleep holding the host's first DRM card. All 40 rows fired. Under `artifacts/S5.10.3/` (artifact `evidence-smoke`): the rows read from the source, the preflight with nothing staged, each case's staging and report, and the table of every row, the case that staged it and the line it printed.
 
 ### F5.11 Container preflight (`preflight-check.sh`)
 
@@ -1375,7 +1375,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: every FAIL/WARN in the script fires when staged (omitted mounts/devices/flags via `podman run`).
 - Acceptance: T2 table-driven.
 - Evidence: per case: the `podman run` command and the preflight block (EV-LOG-DESKTOP).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `build-smoke`'s "every row of the container preflight fires (S5.11.2)" step runs `ci/preflight-rows.py container`: every FAIL and WARN row read out of `preflight-check.sh` (18), each staged in `podman run --rm` of the image with none of the quadlet's devices or mounts and a setup of its own (an unreadable card, a foreign-seat tag, the host pid namespace missing, `/sys` absent or writable, a stub spec with an NVIDIA device node, and the rest); all 18 fired. Under `artifacts/S5.11.2/` (artifact `evidence-smoke`): the rows read from the source, each case's `podman run` command and preflight block, and the table. Its `/sys` cases found a defect, fixed by `claude/fix-preflight-sys-missing` and merged into this branch: with no `/sys` mount the script printed `FAIL: /sys is mounted WRITABLE ()` instead of its own `WARN: /sys not found in /proc/self/mounts`.
 
 ---
 
@@ -2171,19 +2171,19 @@ them without root or a container. Defaults must remain the production paths.
 | Script | Hard-coded today | Proposed override | Unblocks |
 |---|---|---|---|
 | `image/xorg/xorg-gpu-conf.sh` | `/dev/dri`, `/dev/nvidia*`, `/sys/class/drm`, lib dirs, output path | `GPU_DEV_DIR`, `GPU_SYS_DRM`, `GPU_LIB_DIRS`, `GPU_OUT` | S3.1.1–S3.1.5 |
-| `image/xorg/align-device-groups.sh` | node globs under `/dev` | `DEV_ROOT` prefix | S3.2.2 |
+| `image/xorg/align-device-groups.sh` | node globs under `/dev` | **not needed**: a scratch container of the image per branch, plain files with the wanted group standing in for the nodes (`ci/align-groups-tests.sh`) | S3.2.2 |
 | `image/xorg/ensure-vt-devices.sh` | `/dev` | `DEV_ROOT` | S3.2.3 |
-| `image/xorg/preflight-check.sh` | all of the above plus `/run/udev`, the pid file, `/proc/self/mounts`, `/etc/desktop-container` | one `PREFLIGHT_ROOT` prefix, or `podman run` with mounts omitted | S5.11.2 |
+| `image/xorg/preflight-check.sh` | all of the above plus `/run/udev`, the pid file, `/proc/self/mounts`, `/etc/desktop-container` | **used**: `podman run` with the quadlet's mounts and devices omitted (`ci/preflight-rows.py container`) | S5.11.2 |
 | `image/session/session-postmortem` | Xorg log glob | **built**: `POSTMORTEM_XLOG_GLOB` | S2.3.5 |
 | `image/session/start-audio` | daemons by name | `PATH` (used: fake daemons) | S2.4.4, S2.4.5 |
-| `image/session/host-shell-setup.sh` | `SRC`, `DHOME` | export the existing variables | S5.7.7 |
+| `image/session/host-shell-setup.sh` | `SRC`, `DHOME` | **not needed**: a scratch container of the image per case (`ci/host-shell-setup-tests.sh`) | S5.7.7 |
 | `image/session/host-terminal` | `ssh` by name | `PATH` (used: a fake `ssh`) | S5.7.8 |
 | `image/tools/publish-tools.sh` | `SRC`, `DEST` | export the existing variables | S7.2.2, S7.2.3 |
 | `deploy/host/usr/local/libexec/desktop-host-shell-setup` | `/etc/desktop-container`, `/etc/ssh/authorized_keys.d` | **built**: `DESKTOP_CONTAINER_DIR`, `HOST_SHELL_AK_DIR` | S5.7.5 |
 | `deploy/host/usr/local/bin/desktop-monitors-capture` | `podman exec … xrandr --query` | **built**: `DESKTOP_XRANDR_CMD` | S3.4.12 |
 | `deploy/host/usr/local/libexec/desktop-selinux` | takes paths as args already | — | S5.6.4–S5.6.6 |
 | `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | also honour an env override | S5.5.4 |
-| `deploy/host/usr/local/libexec/desktop-cdi-refresh` | `/proc/modules` (the loaded-`nvidia` trigger of the no-downgrade rule) | `CDI_PROC_MODULES` | S5.4.2 (module half) |
+| `deploy/host/usr/local/libexec/desktop-cdi-refresh` | `/proc/modules` (the loaded-`nvidia` trigger of the no-downgrade rule) | **built**: `CDI_PROC_MODULES` | S5.4.2 (module half) |
 
 Probe tooling the client-side and hotplug stories need, and where it stands:
 
@@ -2201,9 +2201,9 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 
 The `script-unit` step of `ci.yml` `static` covers S1.1.3, S2.3.5, S2.4.4,
 S2.4.5, S3.4.12, S5.7.5 and S5.7.8 so far. S3.1.x need the `xorg-gpu-conf.sh`
-overrides above; S5.7.7, S3.2.2 and S3.2.3 need root or a scratch container of
-the image, since they install files as the session user or create groups and
-device nodes.
+overrides above. S5.7.7's and S3.2.2's T1 halves run in scratch containers of
+the image in `build-smoke`, since they install files as the session user or
+create groups; S3.2.3, which creates device nodes, needs the same.
 
 ## Appendix B — Suggested new VM e2e phases
 
@@ -2302,16 +2302,16 @@ moves to ✅ only when a CI run has saved its evidence, which the
 
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
-| E1 Image build | 14 | 12 | 0 | 2 | 0 |
+| E1 Image build | 14 | 14 | 0 | 0 | 0 |
 | E2 Boot & supervision | 25 | 24 | 0 | 1 | 0 |
-| E3 Display & session | 62 | 57 | 1 | 1 | 3 |
+| E3 Display & session | 62 | 58 | 1 | 0 | 3 |
 | E4 Audio | 23 | 21 | 0 | 1 | 1 |
-| E5 Deploy tree | 50 | 43 | 2 | 4 | 1 |
+| E5 Deploy tree | 50 | 46 | 1 | 2 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 39 | 0 | 1 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **210** | **3** | **32** | **6** |
+| **Total** | **251** | **216** | **2** | **27** | **6** |
 
 Regenerate after editing with:
 
