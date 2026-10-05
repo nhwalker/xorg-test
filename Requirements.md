@@ -347,19 +347,19 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `start-session` runs via `setsid -c` as uid 61000 with the documented environment and tty1 as controlling tty.
 - Acceptance: `ps -o sess=,tty= -p <Xorg pid>` shows sid == the session leader pid and `tty1`; the leader's environment (the leader is `startx`) holds exactly the variables `run_session` in `image/init/desktop-init` sets, plus the `PWD` and `SHLVL` bash adds to anything it execs, and no `NVIDIA_*` or other container variables.
 - Evidence: EV-PIDS with sid and tty columns; `tr '\0' '\n' < /proc/<leader>/environ` (EV-STATE).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: Xorg is in the process session `startx` leads, with tty1 as its controlling tty, and the leader's environment is exactly `run_session`'s ten variables plus the `PWD` and `SHLVL` bash adds, with no container variable. `artifacts/S2.3.1/` (artifact `evidence-vm-core`) holds the session's processes with their session ids and ttys (`ps -s`) and the leader's environment.
 
 **S2.3.2 The session restarts after Xorg exits, and the operator gets the desktop back**
 - Requirement: when the session exits, desktop-init logs `session exited (rc=N); restarting in 3s`, a new session starts, and within ~45 s the operator sees the desktop again (root colour, initial xterm, mwm frames).
 - Acceptance: kill Xorg as uid desktop; new Xorg and mwm pids; display answers.
 - Evidence: EV-VIDEO of the display through the restart (blank → desktop back); EV-PIDS before/after (Xorg and mwm changed, desktop-init unchanged); EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_lifecycle` kills Xorg but waits only for any mwm, not for new Xorg and mwm pids. The restart is proven with saved evidence only for "Quit session" (`operator-e2e:menu_quit_session`, in `artifacts/S11.1.1/`).
+- Tier: T3 · Coverage: ✅ `guest:verify_session_restart` kills Xorg as the desktop user, the console moved to tty2 first: within 45 s a new Xorg and mwm are up under the same desktop-init and the display answers, and desktop-init has logged the session's exit and its restart in 3 s; `e2e` records the display from before the kill until the desktop is back. `artifacts/S2.3.2/` (artifact `evidence-vm-core`) holds desktop-init, Xorg and mwm before and after with the diff, the desktop's log from the kill on, and the video.
 
 **S2.3.3 Session cleanup is scoped by session id and session tag, never by uid**
 - Requirement: after a session exits, every pid in that session id, and every desktop-user process whose environment carries that run's `DESKTOP_SESSION_TAG`, is TERMed then KILLed after 5 s; same-uid processes outside it (the audio tree, the host's `desktop-session-lead`, any other uid-61000 process on the host, processes started by `podman exec`) are untouched. The session id is the one `startx`, `xinit` and Xorg share; xinit starts the X client in a session of its own, which mwm leads (and each xterm's shell leads another), and the tag is what reaches those and whatever was started from them. A process that starts itself with a scrubbed environment escapes the tag, and so the cleanup unless it is in the server's session.
-- Acceptance: start a `nohup sleep` from the session's xterm, then kill Xorg; within 6 s no process carries the old leader's session id or the old tag; the old mwm, xterm and `sleep` are gone; PipeWire pid unchanged; host `desktop-session-lead` pid unchanged; a deliberately spawned uid-61000 `sleep` on the host survives.
+- Acceptance: start a `sleep` carrying the session's `DESKTOP_SESSION_TAG` (`podman exec -e`, as a process started from the session's xterm inherits it), a `podman exec` `sleep` without it, and a uid-61000 `sleep` on the host; kill Xorg; within 6 s no process carries the old leader's session id or the old tag; the old mwm, xterm and tagged `sleep` are gone; PipeWire pid unchanged; host `desktop-session-lead` pid unchanged; the untagged `sleep` and the host's survive.
 - Evidence: EV-PIDS before/after listing every uid-61000 process on the **host**, the index marking which must persist.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_lifecycle` asserts only that PipeWire keeps its pid when Xorg is killed, and nothing checks the host's other uid-61000 processes.
+- Tier: T3 · Coverage: ✅ `guest:verify_session_restart`: before the kill a `sleep` carrying the session's tag, a `podman exec` `sleep` without it and a uid-61000 `sleep` on the host are started; within 6 s of the kill no process of the old session id or with the old tag is left, the old mwm and the tagged `sleep` among them, while the untagged `sleep`, the host's, PipeWire and `desktop-session-lead` keep their pids. `artifacts/S2.3.3/` (artifact `evidence-vm-core`) holds what each probe must do, every uid-61000 process on the host before and after with its session id, and the diff (the old session, its xterm and the tagged `sleep` gone, the rest unchanged).
 
 **S2.3.4 Session leader sanity check never fires in a normal boot**
 - Requirement: `WARNING: ... is not its own session leader` never appears in a normal boot or after a restart of either tree.
@@ -389,9 +389,9 @@ the same directory also receives the diagnostics the harness already prints
 
 **S2.4.2 Any daemon exiting restarts the whole stack**
 - Requirement: `start-audio` returns on the *first* of the three exiting, logs which, TERMs the survivors, and a complete new set starts after 3 s.
-- Acceptance: kill pipewire → three new pids, line logged, export reachable (✅). Kill wireplumber alone → same with `wireplumber exited` (❌). Kill pipewire-pulse alone → same (❌).
+- Acceptance: kill pipewire, then wireplumber, then pipewire-pulse, each alone → each time three new pids, `<name> exited` and the restart logged, the export reachable.
 - Evidence: EV-PIDS before/after for the three daemons; EV-LOG-DESKTOP with the `<name> exited` and `restarting in 3s` lines; EV-AUDIO of a tone after recovery.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke`, `guest:verify_audio_lifecycle` and `operator-e2e:sound_persistence` kill only pipewire and check only its new pid.
+- Tier: T3 · Coverage: ✅ `guest:verify_audio_restarts` kills pipewire, wireplumber and pipewire-pulse in turn, each alone, as the desktop user: each time start-audio logs `<name> exited`, desktop-init logs the stack's restart in 3 s, all three daemons come back with new pids, and the export answers; `e2e` then hears a pulse client's 440 Hz tone through the restarted stack. `artifacts/S2.4.2/` (artifact `evidence-vm-core`) holds the daemons before and after each kill with the diffs, the desktop's log from each kill on, and the capture with its verdict and level plot.
 
 **S2.4.3 Stale export sockets are cleared before every audio start**
 - Requirement: the socket and lock files are removed before each start so PipeWire can re-bind.
@@ -421,7 +421,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `umask 0000` makes the exported sockets world-connectable.
 - Acceptance: as the unprivileged `rocky` user on the VM host, `pactl info` succeeds and `paplay` of a tone is heard.
 - Evidence: `ls -l /run/desktop-audio` (EV-STATE); `id` of the probe user; EV-AUDIO.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:play_as_rocky`: as the unprivileged `rocky` user on the VM host, `pactl info` answers over the export, and `paplay` of an 880 Hz tone is heard at the machine's output. `artifacts/S2.4.7/` (artifact `evidence-vm-core`) holds rocky's `id`, `ls -l /run/desktop-audio`, the `pactl info` and `paplay` transcript, and the capture with its verdict and level plot.
 
 ### F2.5 Shutdown
 
@@ -511,13 +511,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `-nolisten tcp`; nothing listens on 6000+ on the host network.
 - Acceptance: `ss -ltn` on the VM host shows no 6000-range listener.
 - Evidence: `ss -ltnp` (EV-STATE); `ps -o args= -C Xorg` showing `-nolisten tcp`.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: Xorg's command line carries `-nolisten tcp`, and `ss -ltnp` on the VM host, whose network the container shares, lists no listener on TCP 6000–6063. `artifacts/S3.2.4/` (artifact `evidence-vm-core`) holds `ss -ltnp` and Xorg's command line.
 
 **S3.2.5 The session activates its VT, so the operator sees it**
 - Requirement: Xorg `VT_ACTIVATE`s tty1 at start; the desktop is visible even if the console was on another VT.
-- Acceptance: `fgconsole` is `1` after boot; `chvt 2`, kill Xorg, after restart `fgconsole` is `1` and the display shows the desktop.
-- Evidence: `fgconsole` before/after (EV-STATE); EV-SHOT after restart showing the desktop, not a text console.
-- Tier: T3 · Coverage: ❌.
+- Acceptance: the active VT (`/sys/class/tty/tty0/active`, what `fgconsole` reports) is tty1 after boot; switch the console to tty2, kill Xorg; after the restart the active VT is tty1 and the display shows the desktop.
+- Evidence: the active VT before, after the switch and after the restart (EV-STATE); EV-SHOT after restart showing the desktop, not a text console.
+- Tier: T3 · Coverage: ✅ `guest:verify_session_restart`: the active VT is tty1, the console is switched to tty2 before Xorg is killed, and the new session takes it back to tty1 by itself; `e2e` then shoots the display, the desktop on tty1. `artifacts/S3.2.5/` (artifact `evidence-vm-core`) holds the active VT before, after the switch and after the restart, and the screenshot.
 
 **S3.2.6 The X socket is shared through the host directory**
 - Requirement: Xorg's socket appears at the host's `/tmp/.X11-unix/X0`; a host process can render/capture.
@@ -531,7 +531,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `xhost +local:` ran; any local uid connects without a cookie.
 - Acceptance: `xhost` lists `LOCAL:`; a client with only the socket connects.
 - Evidence: `xhost` output (EV-STATE).
-- Tier: T3 · Coverage: ❌ `xhost` is never run or saved; `guest:phase_deploy` asserts only that a confined client holding just the socket opens `:0`.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: `xhost` as the session user lists `LOCAL:`, and a confined client of uid 4321 with no passwd entry, no cookie and no `XAUTHORITY`, given only `desktop.local/display=all`, opens `:0` with `xdpyinfo`. `artifacts/S3.3.1/` (artifact `evidence-vm-core`) holds the `xhost` output and the client's run.
 
 **S3.3.2 Screensaver and DPMS are off, so the screen never blanks on the user**
 - Requirement: `xset s off` and `xset -dpms` took effect.
@@ -708,7 +708,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `/run/udev` is mounted `ro` and non-empty; no udevd process shares the container's mount namespace (a process listing proves nothing: under `--pid=host` the host's `systemd-udevd` shows up inside).
 - Acceptance: mount line shows `ro`; preflight PASS.
 - Evidence: `/proc/self/mounts` line and `ls /run/udev/data | wc -l` (EV-STATE); EV-LOG-DESKTOP preflight line.
-- Tier: T3 · Coverage: ❌ nothing asserts the mount, the database or the preflight line; typing working (`e2e` "input: type into an xterm") implies only that Xorg can read the udev database.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: `/run/udev` is mounted `ro` in the container's own mount table and holds the host's database (`/run/udev/data` is not empty), the preflight logs `PASS: host udev database mounted at /run/udev`, and no udevd on the host is in the container's mount namespace. `artifacts/S3.8.5/` (artifact `evidence-vm-core`) holds the mount line, the database's entry count, the preflight's lines, and every udevd with its mount namespace beside desktop-init's.
 
 **S3.8.6 Foreign seat tags are detected and undone**
 - Requirement: a device attached to another seat is reported by preflight as a WARN until `seat-prep` removes the rule and re-triggers udev.
@@ -922,7 +922,7 @@ event, EV-TIMELINE.
 - Requirement: `RLIMIT_RTPRIO` hard = 95, memlock 64 MiB, nice 31 on the PipeWire process itself.
 - Acceptance: `/proc/<pipewire>/limits`.
 - Evidence: the limits file (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved (the limits file); `guest:verify_privileges` asserts only the rtprio hard limit, not memlock or nice.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges` reads `/proc/<pipewire>/limits`: realtime priority 95, locked memory 64 MiB (67108864 bytes) and nice 31, each soft and hard. `artifacts/S4.3.1/` (artifact `evidence-vm-core`) holds the limits file.
 
 **S4.3.2 PipeWire holds SCHED_FIFO above priority 1 without rtkit**
 - Requirement: no `rtkit-daemon`; ≥ 1 PipeWire thread is `FF` with rtprio > 1.
@@ -945,9 +945,9 @@ event, EV-TIMELINE.
 
 **S4.5.1 Audio survives an X session restart**
 - Requirement: PipeWire's pid is unchanged and the export reachable after Xorg is killed and the session restarts; a tone playing through the restart is heard without a gap.
-- Acceptance: `guest:verify_audio_lifecycle` for the pid and the export; a 20 s tone captured across the Xorg kill, with no quiet stretch and no capture time missing against the wall clock.
+- Acceptance: `guest:verify_audio_x_restart` for the pid and the export; a 20 s tone captured across the Xorg kill, with no quiet stretch and no capture time missing against the wall clock.
 - Evidence: EV-PIDS; `pactl info`; EV-AUDIO of a 20 s tone spanning the restart with the spectrogram showing no gap.
-- Tier: T3 · Coverage: ❌ evidence not saved, and no tone is played across the restart; `guest:verify_audio_lifecycle` asserts that PipeWire keeps its pid and the export stays reachable.
+- Tier: T3 · Coverage: ✅ `guest:verify_audio_x_restart` kills Xorg as the desktop user while a pulse client in the desktop container, outside the X session, plays a 20 s 1100 Hz tone: a new Xorg and mwm come up, PipeWire keeps its pid, the export answers `pactl info`, the player exits 0 within 21 s, and `check-audio.py` finds the tone unbroken across the kill (no stretch below −40 dBFS longer than 0.1 s; its span within 19.6–20.6 s). `artifacts/S4.5.1/` (artifact `evidence-vm-core`) holds the pids before and after, `pactl info`, the player's record, the capture with its verdict and a level plot marking the kill, and what says where any lost audio went: PipeWire's thread scheduling and `pw-top` before and after, the desktop's log, and QEMU's own trace of its emulated HDA codec over the capture.
 
 **S4.5.2 Audio recovers from its own crash without disturbing X**
 - Requirement: new PipeWire pid, export reachable, mwm still running.
@@ -1395,19 +1395,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `CapEff` decodes to exactly the nine granted capabilities.
 - Acceptance: `capsh --decode` equals the set.
 - Evidence: the decode output vs the quadlet's `AddCapability` lines (EV-DIFF).
-- Tier: T3 · Coverage: ❌ no test; `guest:verify_privileges` reads `CapEff` but checks only the forbidden bits.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges` decodes desktop-init's `CapEff` bit by bit and compares it with the installed quadlet's `AddCapability` lines: the same nine, no difference. `artifacts/S6.1.3/` (artifact `evidence-vm-core`) holds the quadlet's capability lines, both sorted lists and the empty diff.
 
 **S6.1.4 Device cgroup is bounded**
 - Requirement: `/dev/mem` cannot be read; the five allowed majors can.
 - Acceptance: a `c 1:1` node created in the container's own `/dev` cannot be opened (EPERM), and one node of each allowed major (13, 116, 226, 4, 5) can. Not under `/tmp`: podman mounts `Tmpfs=` `nodev` by default, so a node there is refused whatever the device cgroup allows.
-- Evidence: the `mknod`/`dd` transcript with errno (EV-STATE); `cat /sys/fs/cgroup/.../devices.list` or the eBPF equivalent where readable.
-- Tier: T3 · Coverage: ❌ evidence not saved, and `guest:verify_privileges` cannot tell a device-cgroup denial from the nodev on `/tmp` (podman's default for `Tmpfs=`), where it makes the `/dev/mem` node; the allowed majors are exercised only as side effects of the X, input and audio tests.
+- Evidence: the `mknod`/`dd` transcript with errno (EV-STATE); the quadlet's `--device-cgroup-rule` flags and the device list of the container's OCI spec, which crun compiles into the cgroup v2 BPF program (cgroup v2 has no `devices.list`).
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`, as container root in the container's own `/dev`: a `c 1:1` node is refused (`Operation not permitted`) and a node of each allowed major (13, 116, 226, 4, 5) opens; the container's OCI spec lists the quadlet's five rules after its deny-all. `artifacts/S6.1.4/` (artifact `evidence-vm-core`) holds the quadlet's rules, the spec's device list in order, and each probe with its error.
 
 **S6.1.5 `/sys` is read-only and non-recursive**
-- Requirement: `/sys` mount is `ro`; nothing is mounted at `/sys/fs/cgroup` or `/sys/fs/selinux` inside (the empty mountpoint directories remain under a non-recursive bind).
-- Acceptance: `guest:verify_privileges` (ro); ❌ submounts.
-- Evidence: `/proc/<init>/mounts` filtered to `/sys` (EV-STATE); `ls /sys/fs`.
-- Tier: T3 · Coverage: ❌ submounts untested and evidence not saved; `guest:verify_privileges` asserts `ro` from the init's own mount table.
+- Requirement: `/sys` mount is `ro`, and the bind is non-recursive: none of the host's mounts under `/sys` (its cgroup2, selinuxfs, debugfs and the rest) is in the container. The only mounts under the container's `/sys` are podman's own, from the container's OCI spec: the container's own cgroup2 at `/sys/fs/cgroup`, read-only, and empty read-only tmpfs masks over the spec's masked paths (`/sys/firmware`, `/sys/fs/selinux`).
+- Acceptance: `guest:verify_privileges`: `/sys` is `ro` in the container's own mount table; every mount under it is one the OCI spec makes, in the form the spec gives it (its cgroup mount a read-only cgroup2, each masked path an empty read-only tmpfs); none of the VM host's mounts under `/sys` is among them.
+- Evidence: `/proc/<init>/mounts` filtered to `/sys` (EV-STATE); the OCI spec's mounts, masked and read-only paths under `/sys` (EV-CONFIG); the VM host's own mounts under `/sys` (EV-STATE); the masks' listing and `ls /sys/fs`; the container's and the host's cgroup namespaces.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`: `/sys` is `ro` in the container's own mount table; the mounts under it are the container's own read-only cgroup2 at `/sys/fs/cgroup`, as its OCI spec asks, and podman's empty read-only tmpfs masks over `/sys/firmware` and `/sys/fs/selinux`, the spec's masked paths; none of the VM host's nine mounts under `/sys` is in the container. `artifacts/S6.1.5/` (artifact `evidence-vm-core`) holds the container's `/sys` mounts, the spec's, the host's, the masks' listing, `/sys/fs`, and the two cgroup namespaces (they differ: the container sees only its own cgroup tree).
 
 ### F6.2 Namespace sharing and mandatory access control
 
@@ -1415,19 +1415,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: the container sees host pids but, as container root, cannot signal a host process of another uid (`kill -0 <pid>` → EPERM) nor read pid 1's memory or environ. kill(2) allows a signal between processes of the same uid without `CAP_KILL`, and with no user namespace container root is host uid 0, so signalling host processes that also run as root is not prevented by this design; the original `kill -0 1` → EPERM acceptance could not hold.
 - Acceptance: as stated, as container root.
 - Evidence: the three command transcripts with errno (EV-STATE); `ls /proc | head`.
-- Tier: T3 · Coverage: ❌ negatives untested and evidence not saved; `smoke` and `guest:verify_privileges` assert visibility (the recorded init pid resolves to `desktop-init` on the host).
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`, as container root: `/proc` lists the host's pids, but `kill -0` on a `sleep` of the unprivileged `rocky` user is refused (`Operation not permitted`), and pid 1's `environ` and `mem` cannot be read (`Permission denied`). `artifacts/S6.2.1/` (artifact `evidence-vm-core`) holds the target process, `ls /proc`, and the three transcripts with their exit statuses.
 
 **S6.2.2 Host network namespace**
 - Requirement: the container's interfaces equal the host's.
 - Acceptance: `readlink /proc/self/ns/net` inside equals the host's, and the interface names in `/proc/net/dev` match (the image may not ship `ip`).
 - Evidence: both outputs (EV-DIFF empty).
-- Tier: T3 · Coverage: ❌ no direct test and no evidence; shared networking is exercised only as a side effect, by the container's `ssh host` (to `127.0.0.1`) reaching the host's sshd in `smoke` and `guest:phase_deploy`.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`: `readlink /proc/self/ns/net` is the same inside the container as on the VM host, and so are the interface names in `/proc/net/dev`. `artifacts/S6.2.2/` (artifact `evidence-vm-core`) holds both namespace links, both interface lists and their empty diff.
 
 **S6.2.3 SELinux separation off for the desktop, AppArmor unconfined**
 - Requirement: desktop processes run `spc_t`/unconfined; on an AppArmor host the profile is `unconfined`.
 - Acceptance: `ps -Z -p <init>` on the VM; `podman inspect … AppArmorProfile` on the runner.
 - Evidence: both outputs (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ no test of the running labels; `dryrun` checks only that `label=disable` reaches the generated `ExecStart`, and `apparmor=unconfined` is not checked anywhere.
+- Tier: T2/T3 · Coverage: ✅ the T3 half: `guest:verify_privileges` finds desktop-init running as `system_u:system_r:spc_t:s0` on the VM, SELinux enforcing; `artifacts/S6.2.3/` (artifact `evidence-vm-core`) holds its label and `podman inspect`'s process label, AppArmor profile and security options. The T2 half: `smoke` on the runner, an AppArmor host, finds `podman inspect` reporting `AppArmorProfile=unconfined` and desktop-init's `/proc/<pid>/attr/current` reading `unconfined`; `artifacts/S6.2.3/` (artifact `evidence-smoke`) holds both.
 
 **S6.2.4 Not systemd mode**
 - Requirement: `--systemd=false`: stop signal SIGTERM; no systemd-mode tmpfs set.
@@ -1459,8 +1459,8 @@ because "it works" without "and nothing restarted" is not the claim.
 **S7.1.2 Confined clients work under enforcing**
 - Requirement: no `label=disable`, no `--privileged` on any client; a static guard keeps it that way.
 - Acceptance: `guest:phase_deploy` probes; a static check finds no `--privileged` or `label=disable` on any `podman run`/`podman create` command or client manifest under `ci/` and `examples/` (a plain grep would match the log and failure messages that name `--privileged` when describing the desktop container).
-- Evidence: `getenforce`; `ps -Z` of a probe; `ausearch -m avc -ts recent` (empty) (EV-STATE); the grep output.
-- Tier: T3/T0 · Coverage: ❌ no static guard and no evidence saved; `guest:phase_deploy`'s podman probes run without `label=disable` or `--privileged` and pass under enforcing.
+- Evidence: `getenforce`; a probe's own SELinux label (`/proc/self/attr/current`, what `ps -Z` shows); `ausearch -m avc` since the probes began (no denial with a `container_t` subject) (EV-STATE); the static guard's verdict.
+- Tier: T3/T0 · Coverage: ✅ the T0 half: `ci/client-guard.py`, run by the static job, reads every `podman run` and `podman create` under `ci/` and `examples/` as the shell would (continuations, quoting, heredoc bodies skipped) and every argv list the Python there builds, and finds none passing `--privileged` or `label=disable`, and no client manifest asking for `privileged: true` or `spc_t`; its self-test first shows that it flags each kind of violation and passes a mere mention. The guard's whole verdict is under `artifacts/S7.1.2/` (artifact `evidence-static`). The T3 half: `guest:phase_deploy` finds SELinux `Enforcing` on the VM host, a confined display client labelled `container_t` that opens `:0`, and no AVC denial with a `container_t` subject since the probes began; `getenforce`, the probe's label with `xdpyinfo`'s verdict, and `ausearch -m avc` since the probes began are under `artifacts/S7.1.2/` (artifact `evidence-vm-core`).
 
 > **`podman exec` does not get a device's env.** podman applies the edits
 > when the container starts, to the process it starts with: an exec session
@@ -1509,19 +1509,19 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: three releases → three resources at 10; a requesting pod gets env + sockets; a control pod gets nothing.
 - Acceptance: `guest:phase2`, `guest:verify_cdi`.
 - Evidence: `kubectl get node -o jsonpath=allocatable` (EV-STATE); the verifier and control pods' `env`/`mountinfo` (EV-DIFF between them); plugin logs (EV-LOG-CLIENT).
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:phase2` and `guest:verify_cdi` assert the three allocatable resources and the injected edits, but the control pod is checked only for `DISPLAY` and the X socket, not the audio env or mount.
+- Tier: T3 · Coverage: ✅ `guest:phase2` and `guest:verify_cdi`: the three releases make `desktop.local/display`, `audio` and `tools` allocatable at 10 each. The verifier pod, whose manifest declares nothing but its request, gets `DISPLAY=:0`, `PULSE_SERVER` and `PIPEWIRE_REMOTE`; its X socket is mounted writable and `xdpyinfo` opens `:0`, and its audio sockets are mounted writable and `pactl info` answers. The control pod, the same image and manifest without the request, gets no `DISPLAY`, `PULSE_SERVER` or `PIPEWIRE_REMOTE` and no `/tmp/.X11-unix` or `/run/desktop-audio` mount. `artifacts/S7.3.1/` (artifact `evidence-vm-k8s`) holds the node's allocatable resources, the three plugins' logs, both pods' environments and mounts, and the control pod's against the verifier's as diffs.
 
 **S7.3.2 Split holds in pods**
 - Requirement: display-only has display, no audio, no toolkit; audio-only plays, has no display and cannot `xdpyinfo`.
 - Acceptance: `guest:verify_split`.
 - Evidence: per pod `env`, `mountinfo`, `xdpyinfo` exit (EV-STATE); EV-AUDIO from audio-only.
-- Tier: T3 · Coverage: ❌ evidence not saved (no audio is captured from `audio-only`); `guest:verify_split` asserts the split, but its only check that `audio-only` can play is `pactl info` connecting.
+- Tier: T3 · Coverage: ✅ `guest:verify_split`: the display-only pod has `DISPLAY=:0` and `xdpyinfo` opens it, with no `PULSE_SERVER`, `PIPEWIRE_REMOTE` or `DESKTOP_TOOLS_BIN` and no audio or toolkit mount. The audio-only pod has `PULSE_SERVER` and `PIPEWIRE_REMOTE`, `pactl info` answers over them and its 440 Hz tone is heard at the machine's output, while it has no `DISPLAY`, no `/tmp/.X11-unix` mount, and `xdpyinfo` fails. `artifacts/S7.3.2/` (artifact `evidence-vm-k8s`) holds each pod's environment, mounts and `xdpyinfo` verdict, the audio-only pod's `pactl info`, and its capture with its verdict and level plot.
 
 **S7.3.3 Pods are confined and declare no securityContext**
 - Requirement: `container_t`; manifests carry no `securityContext`, `volumes`, `env`, or CDI annotation.
 - Acceptance: `guest:phase2`, `ci/helm-assertions.sh`.
 - Evidence: `/proc/self/attr/current` from the pod (EV-STATE); the manifests (EV-CONFIG).
-- Tier: T0/T3 · Coverage: ❌ evidence not saved; `ci/helm-assertions.sh` checks all four omissions only on the example, `cdi-verify` and `testclient` manifests (the narrow fixtures and `testpattern` only for `securityContext`), and `guest:phase2` reads `container_t` from one pod.
+- Tier: T0/T3 · Coverage: ✅ the T0 half: `ci/helm-assertions.sh`, run by the static job, checks all eight client manifests (the example, `cdi-verify`, `testclient`, `display-only`, `audio-only`, `testpattern`, `journey` and `early`): each requests a `desktop.local` resource and declares no `securityContext`, `volumes`, `volumeMounts`, `env`, CDI annotation or privilege. The assertions' output and the eight manifests as committed are under `artifacts/S7.3.3/` (artifact `evidence-static`). The T3 half: the demo pod runs as `container_t`, and the API server holds no `securityContext` for it beyond its empty default; the manifest as applied, the pod as the API server holds it and the pod's own label are under `artifacts/S7.3.3/` (artifact `evidence-vm-k8s`).
 
 **S7.3.4 A lean non-desktop image works**
 - Requirement: an image with no X server and no window manager, running no audio daemon of its own (no `pipewire`, `wireplumber` or `pipewire-pulse` process), opens the display and plays all three paths with injected env only. (The lean image does carry the daemon packages, pulled in as dependencies of `pipewire-utils` and `pipewire-alsa`; nothing starts them.)
@@ -1537,15 +1537,15 @@ because "it works" without "and nothing restarted" is not the claim.
 
 **S7.3.6 Teardown seam**
 - Requirement: `helm uninstall` withdraws the resources; host specs and the desktop survive; existing client pods that were already running keep their windows (they hold their mounts).
-- Acceptance: `guest:verify_teardown` (display, audio); ❌ extend to `tools`; ❌ a running client pod keeps working through the uninstall.
+- Acceptance: `guest:verify_teardown` for the display, audio and tools releases, with a client pod running through the uninstall.
 - Evidence: allocatable before/after (EV-DIFF); `ls -l /etc/cdi` unchanged; EV-SHOT of the client window still present; the client pod's `restartCount` (EV-PIDS).
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_teardown` covers the display and audio releases (resources withdrawn, host specs and the desktop kept), but not `tools`, and no running client pod is watched through the uninstall.
+- Tier: T3 · Coverage: ✅ `guest:verify_teardown`: `helm uninstall` of the display, audio and tools releases leaves none of the three resources allocatable and their daemonsets gone; `/etc/cdi` is unchanged, every spec the same size and time; `desktop.service` stays active with its X socket. A client pod running through the uninstall is the same container (`restartCount` 0), keeps its window on the screen and opens `:0` with `xdpyinfo` afterwards. `artifacts/S7.3.6/` (artifact `evidence-vm-k8s`) holds the allocatable resources and `/etc/cdi` before and after with the diffs, the client pod and its windows before and after with the diff, and the screen after the uninstall.
 
 **S7.3.7 The desktop survives CRI-O and k3s arriving**
 - Requirement: `desktop.service` active and `X0` present after the runtime install.
 - Acceptance: `guest:phase2`.
 - Evidence: EV-PIDS of Xorg/mwm/pipewire before and after the install (unchanged); EV-SHOT.
-- Tier: T3 · Coverage: ❌ no pid proof and no EV-PIDS saved: `guest:phase2` asserts only that `desktop.service` is active and the `X0` socket file exists, which a restarted desktop also passes.
+- Tier: T3 · Coverage: ✅ `guest:phase2`: desktop-init, Xorg, mwm and the audio daemons have the same pids and start times before and after CRI-O and k3s are installed, `desktop.service` is active and the X socket is there; `e2e` shoots the desktop after. `artifacts/S7.3.7/` (artifact `evidence-vm-k8s`) holds the processes before and after (`ps -o pid,ppid,lstart,comm`) with their empty diff, and the screenshot.
 
 ### F7.4 Screenshot delivery as the toolkit's proof
 
@@ -1567,31 +1567,31 @@ the client window; EV-SHOT-CLIENT from inside the client; EV-LOG-CLIENT;
 - Requirement: `podman run --device desktop.local/display=all <img> xterm` puts an xterm on the desktop; the user can click into it and type; the text appears in that window.
 - Acceptance: window present in `xwininfo -root -tree` with the client's title; QMP click at its centre + typed text; the client-side sink file has the text.
 - Evidence: common set; EV-SHOT with the typed text visible inside the client's window.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no client-side screenshot, no `podman inspect` before and after); asserted in part by `operator-e2e:s11_1_3` and `operator-e2e:s11_2_1`, which type and paste into podman client xterms and read the client-side sinks, but no story clicks a client window and then types into it.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_5_1`: a podman client of the desktop image (`podman run --device desktop.local/display=all`) opens a sink xterm titled `s751app`, which `xwininfo -root -tree` lists under its title. With the session's xterm focused first, a click at the client's centre and a typed line land in its sink, read inside its own container; its own capture (the toolkit's screenshot) is of the whole screen; it is the same container and application before and after, `restartCount` 0. `artifacts/S7.5.1/` (artifact `evidence-vm-operator`) holds the window tree, the client before and after (id, the application's host pid, restart count, start time) with the diff, the sink file, the screen with the typed line, the client's own capture, and its log.
 
 **S7.5.2 The same under kubernetes**
 - Requirement: S7.5.1 for `examples/x11-client-pod.yaml`.
-- Acceptance: as S7.5.1 against the demo pod.
+- Acceptance: as S7.5.1 against the demo pod, its window found as the pod's own X client rather than by its title: EL's `/etc/bashrc` retitles an xterm whose shell is interactive at the first prompt, so the demo's `-title` does not last.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌ evidence not saved and no interaction: `guest:phase2` only waits for the demo pod to run, and `e2e` checks the screendump taken then (`desktop-k3s-client.png`) only for being non-blank.
+- Tier: T3 · Coverage: ✅ `e2e` with `guest:pod_windows`: the demo pod's xterm, found as the pod's own X client (`screenshot --list-clients` gives each client's resource base and pid; the window is the one X allocated from it), is on the screen; a QMP click at its centre and a typed line run in the pod's shell, and `/tmp/s752` holds the word; it is the same container and xterm before and after, `restartCount` 0. `artifacts/S7.5.2/` (artifact `evidence-vm-k8s`) holds the pod before and after with the diff, its X client and windows, the window tree, the QMP commands, the file the line wrote, the screen with the typed line, the pod's own capture (with its image's screenshot binary: the demo requests no toolkit), and its log.
 
 **S7.5.3 A client window gets decoration, focus and keyboard**
 - Requirement: a client window has an mwm frame, takes focus on click (frame turns the active colour) and receives keystrokes.
 - Acceptance: pixel sample of the frame before/after the click; sink text.
 - Evidence: EV-SHOT pair with sampled frame colours; sink file; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence incomplete (no sink file for the window that was clicked); asserted in part by `operator-e2e:s3_5_3`, which samples a podman client's frame colour before and after a click (`artifacts/S3.5.3/`), while keystrokes reach client windows only in `operator-e2e:s11_1_3` and `operator-e2e:s11_2_1`.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_5_3`: a podman client's sink xterm sits in an mwm frame with a title bar. With the session's xterm focused, the client's frame is the inactive `#22262d`; a click at its centre turns it the active `#41637f` and the session xterm's inactive, and the keys typed next land in the client's sink; it is the same container and application before and after, `restartCount` 0. `artifacts/S7.5.3/` (artifact `evidence-vm-operator`) holds the window tree with the frame, the screens before and after the click (the sampled colours are in the checks), the sink file, the screen with the typed line, the client before and after with the diff, and its log.
 
 **S7.5.4 A client started before the desktop is up works once it is, without restarting**
 - Requirement: a pod started while `desktop.service` is stopped is admitted (specs are host state), its app retries the display, and when the desktop comes up its window appears, `restartCount` 0.
 - Acceptance: stop desktop; apply a pod whose command loops on `xterm` until success; start desktop; window appears; `restartCount` 0.
 - Evidence: common set; EV-LOG-CLIENT showing the retries then success; EV-VIDEO from desktop start to window appearance.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": with `desktop.service` stopped, the early pod (`ci/vm/early-pod.yaml`) is admitted and its xterm fails to open the display, try after try; once the desktop starts, its next try stays up and its window appears, and the pod is the same container, `restartCount` 0. `artifacts/S7.5.4/` (artifact `evidence-vm-k8s`) holds the stopped desktop, the xterm's tries, a video from the desktop's start until the window is on it, the screen and the pod's own screenshot, the window tree, and the pod before and after with the diff.
 
 **S7.5.5 After an X session restart, a client container reconnects without being recreated**
 - Requirement: when Xorg restarts, X clients lose their connection (that is X11); the application container itself must not need recreating: its next `xterm` connects to the new server, `restartCount` 0, same container id.
 - Acceptance: pod running `sleep infinity` spawns an xterm; kill Xorg; after the session returns, the pod spawns another xterm, which appears; the pod's container id unchanged.
-- Evidence: common set across the restart; EV-LOG-CLIENT (the first xterm's "connection to X server lost" message is expected and quoted); EV-VIDEO.
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted only in part, as a side effect: after `operator-e2e:s11_1_1`'s Quit session the long-running `op-observer` client container must reach the new X server, but no window from it appears and its container id is not recorded.
+- Evidence: common set across the restart; EV-LOG-CLIENT (the first xterm's error on losing its server is expected and quoted); EV-VIDEO.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": the journey pod's xterm journey-1 is on the screen when Xorg is killed; it ends with its X server, its own error quoted; once the session is back, the same pod's next xterm, journey-2, appears and the pod's own screenshot reaches the new server; the pod is the same container, `restartCount` 0. `artifacts/S7.5.5/` (artifact `evidence-vm-k8s`) holds the pod and its applications before and after with the diff, both screens with the pod's own screenshots, the window trees, the first xterm's log and the video across the restart.
 
 **S7.5.6 A client's capture matches what the operator sees**
 - Requirement: EV-SHOT-CLIENT from a client matches the QEMU screendump of the same moment far better than any flipped, mirrored or rotated version of it. They may legitimately differ (a pointer drawn into one capture and not the other), so the comparison is a margin, not equality.
@@ -1603,7 +1603,7 @@ the client window; EV-SHOT-CLIENT from inside the client; EV-LOG-CLIENT;
 - Requirement: three client pods hold live connections and all three windows are on screen.
 - Acceptance: `guest:verify_concurrency` with each pod's window at its own position, three client windows found in `xwininfo -root -tree`, and `screenshot --list-clients` run while all three are connected.
 - Evidence: EV-SHOT with three windows; `screenshot --list-clients`; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence incomplete (`screenshot --list-clients` is not run for these pods); `guest:verify_concurrency` asserts three live X connections but not three windows on screen (all three xterms open at `+200+200`, so `concurrent-clients.png` cannot show them apart).
+- Tier: T3 · Coverage: ✅ `guest:verify_concurrency`: three pods' xterms, placed at three places on the right of the screen and each found as its pod's own X client, are on the screen with none covering another, while `screenshot --list-clients` lists their connections; the three pods are the same containers throughout, `restartCount` 0. `artifacts/S7.5.7/` (artifact `evidence-vm-k8s`) holds each pod before and after with the diffs, `screenshot --list-clients`, each pod's X client and windows, the window tree, and the screen with the three windows.
 
 ### F7.6 Client application journeys: audio
 
@@ -1615,7 +1615,7 @@ EV-LOG-CLIENT (the player's output), EV-AUDIO with spectrogram, EV-TIMELINE.
 - Requirement: a pod with `desktop.local/audio` plays via pulse, PipeWire-native and ALSA, and each is heard.
 - Acceptance: `guest:play_audio_pod` × 3 with frequency checks.
 - Evidence: common set; three EV-AUDIO captures.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no sink-input listing, pids or spectrograms; only the WAVs `artifacts/audio-cdi-*.wav` are saved); asserted by `guest:play_audio_pod` × 3 with frequency checks.
+- Tier: T3 · Coverage: ✅ `e2e` with `guest:play_audio_pod` × 3: the cdi-verify pod, with only the injected env, plays 440 Hz over pulse (`paplay`), 880 Hz over PipeWire (`pw-play`) and 1320 Hz over ALSA (`aplay`), and each is heard at the machine's output at its pitch. Each player's stream is listed while it plays, found by its client's executable (`paplay` and `pw-play` run as `pacat` and `pw-cat`). The pod and the three audio daemons are the same before and after. `artifacts/S7.6.1/` (artifact `evidence-vm-k8s`) holds, per path, the streams before, during and after (pactl's short lists, and each playing stream's client: its name, executable and pid), the player's output, and the capture with its verdict and level plot; and the pod and the daemons before and after with the diffs.
 
 **S7.6.2 A client records**
 - Requirement: a pod records the sink monitor and the recording carries the tone.
@@ -1625,27 +1625,27 @@ EV-LOG-CLIENT (the player's output), EV-AUDIO with spectrogram, EV-TIMELINE.
 
 **S7.6.3 A client's playback continues through an X session restart, uninterrupted**
 - Requirement: an application container playing a 20 s tone when Xorg is killed keeps playing with no gap, `restartCount` 0, same app pid.
-- Acceptance: start playback at 1100 Hz from a pod; kill Xorg; capture the whole span; the spectrogram shows a continuous 1100 Hz line across the restart; `check-audio.py` on a window straddling the restart passes.
+- Acceptance: start playback at 1100 Hz from a pod; kill Xorg; capture the whole span; `check-audio.py` over the whole capture finds no stretch below −40 dBFS longer than 0.1 s and the tone's full 20 s span, its level plot marking the kill; the player is one process throughout, its stream one sink-input.
 - Evidence: common set; EV-AUDIO spanning the restart with the restart timestamp marked on the spectrogram; EV-VIDEO of the display going down and back while the tone continues.
-- Tier: T3 · Coverage: ❌ (the desktop-side pid proof exists in `guest:verify_audio_lifecycle`; the client's uninterrupted experience is unproven).
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": a 20 s 1100 Hz tone from the journey pod plays while Xorg is killed about 5 s in: one player process before and after, its stream the same sink-input before, during and after, and it exits 0 within 21 s; `check-audio.py` finds the tone unbroken across the kill (no stretch below −40 dBFS longer than 0.1 s; its span within 19.6–20.6 s); the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. `artifacts/S7.6.3/` (artifact `evidence-vm-k8s`) holds the streams before, during and after, the player's record, the capture with its verdict and a level plot marking the kill, the video, the pod and the daemons before and after with the diffs, and, as in S4.5.1, the scheduling, the desktop's log and QEMU's HDA trace.
 
 **S7.6.4 A client recovers from an audio-stack restart without being recreated**
 - Requirement: when PipeWire restarts, a client's current stream ends with a clean error; the same container's next playback succeeds; `restartCount` 0.
 - Acceptance: pod plays; kill pipewire; the player exits nonzero within 10 s with a connection error; after the export is back, the same pod plays again and is heard.
 - Evidence: common set; EV-LOG-CLIENT quoting the error; two EV-AUDIO captures (before: tone then stop at the kill timestamp; after: tone).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": PipeWire is killed about 4 s into a 20 s 880 Hz tone from the journey pod: the player exits nonzero within 10 s with its connection error, and the capture holds the tone up to the kill and nothing after it (its span checked against the kill's time on the level plot); once the export is back, the same pod's next player is heard at 770 Hz and exits 0; the pod is the same container, `restartCount` 0. `artifacts/S7.6.4/` (artifact `evidence-vm-k8s`) holds both captures with their verdicts and level plots, the players' records with the error, the streams before, during and after, the daemons before and after, `pactl info` from the pod, and the pod before and after.
 
 **S7.6.5 A client started before the audio stack is up plays once it is, without restarting**
 - Requirement: a pod admitted while the audio export is absent retries and succeeds when the export appears; `restartCount` 0.
 - Acceptance: stop desktop; apply a pod whose command loops on `paplay` until success; start desktop; a tone is heard; `restartCount` 0.
 - Evidence: common set; EV-LOG-CLIENT showing retries; EV-AUDIO.
-- Tier: T3 · Coverage: ❌ no test: `guest:verify_cdi` only waits for an export that is already up; the desktop is never stopped before a pod is applied.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": the early pod, applied with the desktop stopped, tries `paplay` until one works: the tries fail while the audio stack is down, then its 990 Hz tone plays and is heard, its stream listed while it plays; the pod is the same container, `restartCount` 0. `artifacts/S7.6.5/` (artifact `evidence-vm-k8s`) holds the tries, the streams with the desktop down and while it played, the capture with its verdict and level plot, and the pod before and after.
 
 **S7.6.6 A lean client with no PipeWire of its own plays and records**
 - Requirement: the testclient image plays all three paths and records via the injected env alone.
 - Acceptance: `e2e` lean-client loop for playback; for recording, a `parec` loopback recorded in the lean client, pulled out and analysed.
 - Evidence: three EV-AUDIO; EV-AUDIO-REC; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ the lean client never records, and its playback WAVs (`artifacts/audio-testclient-*.wav`) are saved without spectrograms; playback is asserted by `e2e` "cdi: a LEAN non-desktop image" with `check-audio.py`.
+- Tier: T3 · Coverage: ✅ `e2e` "cdi: a LEAN non-desktop image": the testclient pod plays 440, 880 and 1320 Hz over pulse, PipeWire and ALSA with only the injected env, each heard at its pitch, and records the default sink's monitor with `parec` while a 660 Hz tone plays; the recording, copied out of the VM, carries 660 Hz. The pod is the same container throughout, `restartCount` 0. `artifacts/S7.6.6/` (artifact `evidence-vm-k8s`) holds the three captures (taken in S7.3.4) with their verdicts and level plots, the recording with its verdict and level plot, and the pod before and after with the diff.
 
 ### F7.7 Hotplug continuity for running client applications
 
@@ -1719,19 +1719,19 @@ the referenced feature.
 - Requirement: client pods lose their X connection and audio stream (expected), are not restarted by kubernetes, and work again against the new desktop with the same container id.
 - Acceptance: pods running `sleep infinity` with child apps; `systemctl restart desktop.service`; `restartCount` 0, container id unchanged; new xterm and new tone succeed.
 - Evidence: common set from F7.7; EV-SHOT after; EV-AUDIO after; EV-LOG-CLIENT quoting the expected disconnect messages.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": `systemctl restart desktop.service` under the journey pod: its xterm journey-3 loses its X connection and its 30 s player its stream, both expected and quoted; then a new xterm from the same pod, journey-4, appears and a new 660 Hz tone from it is heard; the pod is the same container, `restartCount` 0, its container id unchanged. `artifacts/S7.8.1/` (artifact `evidence-vm-k8s`) holds the pod, its applications and the daemons before and after with the diffs, the streams, the disconnect messages, a video across the restart, the screen after, and the capture with its verdict and level plot.
 
 **S7.8.2 Toolkit republish under a running client is harmless**
 - Requirement: a client that has the toolkit mounted keeps a working `screenshot` across a desktop restart (new inode, old mapping intact).
 - Acceptance: run `screenshot` in a loop from a pod across the restart; every invocation after the desktop is back succeeds; none fails with `ETXTBSY`/`Text file busy` on the desktop side (EV-LOG-DESKTOP has `published screenshot`).
 - Evidence: the loop's log (EV-LOG-CLIENT); `ls -li` of the published binary before/after; EV-LOG-DESKTOP; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": across `desktop.service`'s restart, a screenshot held mid-write in the pod (its PNG larger than a pipe holds) keeps running from the replaced binary, its executable `(deleted)` at the old inode while the toolkit file has a new one, and, released, writes its PNG and exits 0; a screenshot loop in the pod fails while the desktop is down and succeeds on every try once it is back, as one process; the restarted desktop logs `published screenshot`, with no `Text file busy`; the pod is the same container, `restartCount` 0. `artifacts/S7.8.2/` (artifact `evidence-vm-k8s`) holds `ls -li` of the toolkit in the pod before and after with the diff, the held screenshot's state before and after and its release, the loop's log, the desktop's publish lines, and the pod before and after.
 
 **S7.8.3 Socket recreation does not invalidate client mounts**
 - Requirement: because the CDI mounts are directories, a client's `/tmp/.X11-unix` and `/run/desktop-audio` show the **new** sockets after Xorg or PipeWire recreate them.
-- Acceptance: `ls -li` of both dirs from inside a long-running pod before and after the respective restart: inode numbers changed, the pod sees the new ones, and connects.
+- Acceptance: `ls -li` of both dirs from inside a long-running pod before and after the respective restart: each socket is new, its change time after the kill (the inode number is no proof: the filesystem may reuse it, as XFS did for X0), the pod sees the new ones, and connects.
 - Evidence: the two `ls -li` pairs from inside the pod (EV-DIFF); `xdpyinfo`/`pactl info` from the pod after; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted only for the display half, as a side effect: after `operator-e2e:s11_1_1`'s Quit session the long-running `op-observer` client must reach the new X server through its `/tmp/.X11-unix` mount; the audio half is never exercised.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": inside the journey pod, `/tmp/.X11-unix/X0` after Xorg's restart and `/run/desktop-audio/pulse` after PipeWire's are new sockets, each changed after its kill, and the pod connects through each (`xdpyinfo`, `pactl info`); the pod is the same container across both, `restartCount` 0. XFS reused X0's inode number, so the change time is the proof. `artifacts/S7.8.3/` (artifact `evidence-vm-k8s`) holds `ls -li` of both directories from inside the pod before and after with the diffs, each socket's inode and change time, `xdpyinfo` and `pactl info` from the pod, and the pod before and after each restart.
 
 ---
 
@@ -2299,15 +2299,15 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 12 | 0 | 2 | 0 |
-| E2 Boot & supervision | 25 | 17 | 1 | 7 | 0 |
-| E3 Display & session | 62 | 43 | 1 | 15 | 3 |
-| E4 Audio | 23 | 14 | 0 | 8 | 1 |
+| E2 Boot & supervision | 25 | 22 | 1 | 2 | 0 |
+| E3 Display & session | 62 | 47 | 1 | 11 | 3 |
+| E4 Audio | 23 | 16 | 0 | 6 | 1 |
 | E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
-| E6 Privileges | 9 | 3 | 0 | 6 | 0 |
-| E7 Client contract & journeys | 40 | 11 | 1 | 28 | 0 |
+| E6 Privileges | 9 | 9 | 0 | 0 | 0 |
+| E7 Client contract & journeys | 40 | 31 | 1 | 8 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **130** | **4** | **111** | **6** |
+| **Total** | **251** | **167** | **4** | **74** | **6** |
 
 Regenerate after editing with:
 
