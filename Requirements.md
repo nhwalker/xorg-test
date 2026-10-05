@@ -227,13 +227,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: UBI packages win over Rocky (priority 99 vs 200); Rocky supplies only what UBI lacks.
 - Acceptance: in the base image, `rpm -qi glibc` reports a Red Hat vendor; `rpm -qi xorg-x11-server-Xorg` reports Rocky.
 - Evidence: `rpm -qa --qf '%{NAME} %{VENDOR}\n'` of the base (EV-STATE), with the two named rows quoted in the index.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's contents" saves `rpm -qa --qf '%{NAME} %{VENDOR}'` of the base image, sorted, and checks glibc's vendor is `Red Hat, Inc.` and xorg-x11-server-Xorg's `Rocky Enterprise Software Foundation`, the two rows quoted in the index, under `artifacts/S1.1.5/` (artifact `evidence-smoke`).
 
 **S1.1.6 The client toolkit is staged from the screenshot image**
 - Requirement: `Containerfile`'s `tools` stage copies `/screenshot` into `/usr/libexec/desktop-tools/` with mode 0755, from `TOOLS_IMAGE`.
 - Acceptance: `ls -l` in a scratch container shows `-rwxr-xr-x`; a build with `--build-arg TOOLS_IMAGE=<other>` stages that image's binary.
 - Evidence: the `ls -l` and `sha256sum` of the staged binary vs the source image's (EV-STATE).
-- Tier: T2 · Coverage: ❌ no test of the staged file: `smoke` and `guest:phase_deploy` check only the published copy, whose mode `publish-tools.sh` re-sets, so the image's mode, its checksum and the `TOOLS_IMAGE` override are untested.
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's contents" saves `ls -l` and `sha256sum` of the staged `/usr/libexec/desktop-tools/screenshot` (`-rwxr-xr-x`) and the `sha256sum` of `/screenshot` in the screenshot image (equal); then rebuilds the desktop image with `--build-arg TOOLS_IMAGE=` a scratch image holding a marker file and checks the marker is what gets staged, keeping that build's output and both sums; under `artifacts/S1.1.6/` (artifact `evidence-smoke`).
 
 ### F1.2 Image contents
 
@@ -241,13 +241,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: user `desktop` uid 61000, group `desktop` gid 61000, supplementary groups `video input audio render tty`, home `/home/desktop`.
 - Acceptance: `id desktop` in a scratch container matches exactly.
 - Evidence: `id desktop`, `getent passwd desktop`, `getent group video input audio render tty` (EV-STATE).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's contents" saves `id desktop`, `getent passwd desktop` and `getent group` of the six groups from a scratch container of the image, and checks uid and gid 61000, exactly the supplementary groups audio input render tty video, and the home, under `artifacts/S1.2.1/` (artifact `evidence-smoke`).
 
 **S1.2.2 Session dotfiles come from `/etc/skel`**
 - Requirement: `/home/desktop/.mwmrc` and `.Xdefaults` are byte-identical to the repo files.
 - Acceptance: `cmp` inside a scratch container.
 - Evidence: `sha256sum` of both pairs (EV-STATE).
-- Tier: T2 · Coverage: ❌ no test of byte identity; the files' effect is exercised by `operator-e2e:s3_5_2` (`~/.Xdefaults` colours) and `operator-e2e:s11_1_1` (the `~/.mwmrc` root menu).
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's contents" saves `sha256sum` of `/home/desktop/.mwmrc` and `.Xdefaults` in a scratch container of the image and of the repo files, and checks both pairs equal, under `artifacts/S1.2.2/` (artifact `evidence-smoke`).
 
 **S1.2.3 PipeWire native socket exported**
 - Requirement: `/usr/share/pipewire/pipewire.conf` lists `/run/desktop-audio/pipewire-0` in the `protocol-native` sockets.
@@ -265,7 +265,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the drop-in serves `unix:native` and `unix:/run/desktop-audio/pulse`.
 - Acceptance: file present with both addresses; runtime S4.1.1.
 - Evidence: the file (EV-CONFIG).
-- Tier: T2 · Coverage: ❌ no test of the file; the `/run/desktop-audio/pulse` address is exercised at runtime by `smoke` (the socket returns after a PipeWire restart) and `guest:phase_deploy` (`pactl info` from the host).
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's contents" saves the drop-in from a scratch container of the image and checks its `server.address` list has `"unix:native"` and `"unix:/run/desktop-audio/pulse"`, under `artifacts/S1.2.5/` (artifact `evidence-smoke`); the runtime half is S4.1.1.
 
 **S1.2.6 All shipped scripts are executable and shellcheck-clean**
 - Requirement: every script under `image/` and `deploy/host/usr/local/` passes `shellcheck -S error`; every script `Containerfile` installs is mode 0755; the shellcheck list in `ci.yml` is complete.
@@ -277,13 +277,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: no `nvidia_drv.so`, `libnvidia*`, `libglxserver_nvidia*` in the image.
 - Acceptance: `find /usr/lib64 /usr/lib -name '*nvidia*'` is empty.
 - Evidence: the (empty) find output and `rpm -qa | grep -i nvidia` (EV-STATE).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's contents" saves `find /usr/lib64 /usr/lib -name '*nvidia*'` and `rpm -qa | grep -i nvidia` from a scratch container of the image, both empty, under `artifacts/S1.2.7/` (artifact `evidence-smoke`).
 
 **S1.2.8 Entry point and stop signal**
 - Requirement: `CMD` is `/usr/local/bin/desktop-init`; `STOPSIGNAL` is `SIGTERM`.
 - Acceptance: `podman inspect` shows both.
 - Evidence: `podman inspect --format '{{.Config.StopSignal}} {{.Config.Cmd}}'` (EV-STATE).
-- Tier: T2 · Coverage: ❌ no test of the image config; `smoke` finds `desktop-init` running as the container's init, but `StopSignal` is never checked.
+- Tier: T2 · Coverage: ✅ `ci.yml` "the built image's contents" saves `podman image inspect --format '{{.Config.StopSignal}} {{.Config.Cmd}}'` of the image and checks `SIGTERM` and `[/usr/local/bin/desktop-init]`, under `artifacts/S1.2.8/` (artifact `evidence-smoke`).
 
 ---
 
@@ -295,25 +295,25 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `ensure-vt-devices` → `align-device-groups` → `host-shell-setup` → `preflight-check` → `xorg-gpu-conf` → `xorg-monitor-conf` → `publish-tools`, each once per container start (`align-device-groups` also runs before every audio start, S2.4.6, and that run can begin before `oneshots done` is logged).
 - Acceptance: the first log line of each boot oneshot appears in that order before `oneshots done` (`ensure-vt-devices` logs only when it creates a node).
 - Evidence: EV-LOG-DESKTOP from container start to `oneshots done`, the seven first-lines highlighted in the index.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves the first boot's log up to `oneshots done` and checks each oneshot's first line in the documented order before it (`ensure-vt-devices` included: on this runner it creates the VT nodes), each checked line number in the index, and that the GPU decision, the monitor generator's line, `host shell configured` and `tools published to` each appear once, under `artifacts/S2.1.1/` (artifact `evidence-smoke`).
 
 **S2.1.2 A failing oneshot never blocks the session**
 - Requirement: any oneshot exiting nonzero is logged and the session still launches; `publish-tools` failure logs `ERROR: publish-tools failed`.
 - Acceptance: with `/usr/libexec/desktop-tools` emptied, the container still writes `/run/desktop-init-ready` and starts the session; the ERROR line is present.
 - Evidence: EV-LOG-DESKTOP showing the ERROR line followed by `oneshots done` and the session starting; EV-PIDS showing the session alive.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` restarts the desktop on an image rebuilt with `/usr/libexec/desktop-tools` emptied (the original is tagged back after) and saves the build, that start's log (`ERROR: publish-tools failed`, then `oneshots done`, then the X server starting, line numbers in the index), the empty directory, the ready marker and the X session's processes, xdpyinfo answering, under `artifacts/S2.1.2/` (artifact `evidence-smoke`).
 
 **S2.1.3 Boot markers**
 - Requirement: `/run/desktop-init.pid` holds desktop-init's own host pid; `/run/desktop-init-ready` is written after the oneshots and the runtime-dir wait, just before the first X session starts, so it never depends on the session (`desktop-init` writes it before its session loop).
 - Acceptance: the pid resolves on the host to `desktop-init`; the ready marker's mtime precedes the first Xorg's start time.
 - Evidence: `cat /run/desktop-init.pid`, host `cat /proc/<pid>/comm`, `ls -l /run/desktop-init-ready` (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved; `smoke` and `guest:verify_privileges` check that the pid file names `desktop-init` on the host, but no test makes the X session fail before looking for the ready marker.
+- Tier: T2 · Coverage: ✅ `smoke` saves the pid file and the host's `/proc/<pid>/comm` (`desktop-init`), `ls -l --full-time` of the ready marker and the first Xorg's process line, and checks the marker is older than that Xorg's start (boot instant from `CLOCK_BOOTTIME` plus its start ticks; a few hundredths of a second apart on the runner); and, from a scratch container of the image whose X session cannot start, the ready marker and its log, under `artifacts/S2.1.3/` (artifact `evidence-smoke`).
 
 **S2.1.4 `/run` and `/tmp` are fresh per container start**
 - Requirement: both are tmpfs, so nothing stale survives a restart.
 - Acceptance: `/proc/self/mounts` in the running container shows tmpfs on `/run` and `/tmp`, before and after `systemctl restart desktop.service`. (A sentinel file proves nothing here: the unit runs `podman run --replace --rm`, so every start is a new container.)
 - Evidence: the mount table lines (EV-STATE); `ls` of the sentinels before and after (EV-DIFF).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves the `/run` and `/tmp` lines of the container's `/proc/self/mounts` (tmpfs) before and after `systemctl restart desktop.service`, and `ls -l` of a sentinel written in each before, gone after, with their diff, under `artifacts/S2.1.4/` (artifact `evidence-smoke`).
 
 ### F2.2 Runtime directory and seat handover
 
@@ -327,19 +327,19 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: with no host session unit, desktop-init creates `/run/user/61000` (0700, desktop) after the wait, logs `no host login session appeared; creating ... standalone`, and the desktop works.
 - Acceptance: `systemctl mask --now desktop-session`, restart desktop; the fallback line is logged; audio sockets export; the X session starts (T3). Unmask and restart afterwards. (`disable` is not enough: the quadlet's `Wants=desktop-session.service` starts the unit again whenever `desktop.service` starts.)
 - Evidence: EV-LOG-DESKTOP (fallback line); `stat` of the dir (EV-STATE); EV-SHOT of the desktop up (T3); EV-AUDIO of a tone (T3).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ❌ the acceptance's own procedure (desktop-session masked on a full deploy, the X session up, T3 EV-SHOT and EV-AUDIO) is not run. Saved: `smoke`'s scratch container of the image, with no host login session at all, logs the fallback line and makes `/run/user/61000` `drwx------ desktop:desktop`, under `artifacts/S2.2.2/` (artifact `evidence-smoke`).
 
 **S2.2.3 tty1 is handed to the session user**
 - Requirement: `/dev/tty1` in the container is owned `desktop:tty` before every session start.
 - Acceptance: `stat -c %U:%G /dev/tty1` is `desktop:tty`, still after an X session restart.
 - Evidence: the `stat` output before and after a session restart (EV-STATE pair).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves `stat -c '%U:%G %a'` of `/dev/tty1` in the container before and after an X session restart (mwm killed with SIGKILL; a new Xorg answers), `desktop:tty` both times, under `artifacts/S2.2.3/` (artifact `evidence-smoke`).
 
 **S2.2.4 Audio export dir exists even without the host mount**
 - Requirement: `/run/desktop-audio` is created 1777 inside the container if the bind mount is absent.
 - Acceptance: `podman run` without that volume: dir exists, mode 1777, sockets appear in it.
 - Evidence: `ls -ld` and `ls -l` of the dir (EV-STATE).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` runs a scratch container of the image with none of the quadlet's mounts and saves its mount table (nothing at `/run/desktop-audio`), `ls -ld` of the directory (`drwxrwxrwt`) and `ls -l` with PipeWire's `pipewire-0` and `pulse` sockets in it, under `artifacts/S2.2.4/` (artifact `evidence-smoke`).
 
 ### F2.3 X session supervision
 
@@ -365,7 +365,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `WARNING: ... is not its own session leader` never appears in a normal boot or after a restart of either tree.
 - Acceptance: grep is empty.
 - Evidence: EV-LOG-DESKTOP with the (empty) grep result stated.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves the desktop's log after its boot, an audio stack restart and an X session restart (both counted in the index), with the grep for `is not its own session leader` over it stated empty, and the log of the start after a stop, checked the same way, under `artifacts/S2.3.4/` (artifact `evidence-smoke`).
 
 **S2.3.5 Postmortem runs on abnormal exit only**
 - Requirement: `session-postmortem` runs after every abnormal end of the X session and never after a clean one; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists. Abnormal is a nonzero session exit, or an X server that did not shut down cleanly: xinit exits 0 whenever the server goes away, killed or crashed included, so `desktop-init` reads the server's log, which says `Server terminated successfully` only after a clean shutdown, and logs `the X server did not shut down cleanly` before the postmortem.
@@ -377,7 +377,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
 - Acceptance: kill mwm as uid desktop (SIGTERM, `kill`'s default: mwm quits without asking, since the image drops `kill` from mwm's `showFeedback`); Xorg pid changes; new mwm; display answers.
 - Evidence: EV-VIDEO; EV-PIDS before/after; EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: 🟡 asserted for "Quit session" by `operator-e2e:menu_quit_session`, with the video, pid tables and desktop log saved in `artifacts/S11.1.1/`; mwm being killed, the acceptance's own trigger, is not tested.
+- Tier: T3 · Coverage: 🟡 the acceptance's trigger is asserted at T2, its own EV-VIDEO not taken: `smoke` sends mwm SIGTERM as the session user and saves desktop-init, Xorg and mwm before and after (a new Xorg and mwm, the same desktop-init, the display answering) and the log's clean end (`session exited (rc=0)`, no postmortem), under `artifacts/S2.3.6/` (artifact `evidence-smoke`). "Quit session" is asserted with its video, pid tables and desktop log by `operator-e2e:menu_quit_session` in `artifacts/S11.1.1/`.
 
 ### F2.4 Audio supervision
 
@@ -385,7 +385,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `start-audio` runs via `setsid` (no controlling tty) as uid 61000 under `supervise_audio`; the leader pid is in `/run/desktop-audio-leader.pid`.
 - Acceptance: PipeWire's sid equals the recorded leader pid; `ps -o tty= -p <pipewire>` is `?`.
 - Evidence: EV-PIDS with sid/tty; the leader pid file (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved; `smoke` "STRUCTURE" asserts that PipeWire's sid equals the recorded leader, but nothing checks that it has no tty.
+- Tier: T2 · Coverage: ✅ `smoke` saves the leader pid file, the audio tree's process table (`ps -s <leader>`: pid, ppid, session, tty, user) and the leader's parent chain, and checks pipewire is in the leader's session with no tty (`?`) as uid 61000, the leader's parent a child of desktop-init, under `artifacts/S2.4.1/` (artifact `evidence-smoke`).
 
 **S2.4.2 Any daemon exiting restarts the whole stack**
 - Requirement: `start-audio` returns on the *first* of the three exiting, logs which, TERMs the survivors, and a complete new set starts after 3 s.
@@ -429,13 +429,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: on SIGTERM desktop-init kills the audio supervisor loop first, stops both trees by sid, exits 0; the audio stack is not restarted during shutdown. Every process of both trees exits on that SIGTERM: none lasts until the KILL desktop-init sends 5 s later.
 - Acceptance: `systemctl stop desktop.service` returns well within the 10 s stop timeout; the exit code from a `podman wait desktop` started beforehand is 0; no Xorg, mwm, xterm, pipewire, wireplumber or pipewire-pulse process remains on the host; the log from a `podman logs -f desktop` started beforehand has no `restarting in 3s` after `SIGTERM:`. (Not `podman stop`: the unit runs `podman run --replace --rm` with `Restart=always`, so systemd starts a new container at once and nothing is left to inspect. The host login session's own uid-61000 processes, the user manager and its bus, rightly remain.)
 - Evidence: `time systemctl stop desktop.service` and the `podman wait` exit code (EV-STATE); EV-PIDS of all uid-61000 host processes before and after; EV-LOG-DESKTOP tail from `SIGTERM:` (the followed log).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves `time systemctl stop desktop.service` (well inside 10 s), the exit code from a `podman wait` started before (0), every uid-61000 host process before and after and sampled every 0.5 s during the stop (the last process of either tree gone within 4 s: none waits for desktop-init's KILL), and the log followed from before the stop, from `SIGTERM:` on, with no `restarting in 3s`, under `artifacts/S2.5.1/` (artifact `evidence-smoke`).
 
 **S2.5.2 The X socket is unlinked by the server, not pinned by a mount**
 - Requirement: after a stop, `/tmp/.X11-unix/X0` is gone or dead; the next start creates a fresh working socket.
 - Acceptance: stop, start, `xdpyinfo` works.
 - Evidence: `ls -li /tmp/.X11-unix` across the cycle (EV-STATE pair).
-- Tier: T2 · Coverage: ❌ evidence not saved; asserted only as a side effect of `guest:verify_fixed_layout`, which restarts `desktop.service` and then needs `xdpyinfo` to answer.
+- Tier: T2 · Coverage: ✅ `smoke` saves `ls -li /tmp/.X11-unix` with the desktop running, after a stop (no `X0`) and after the next start (a new `X0`; xdpyinfo answers, saved), with the diff, under `artifacts/S2.5.2/` (artifact `evidence-smoke`). The inode number can repeat on the runner's ext4 `/tmp`, so the check is that the stop left none.
 
 ### F2.6 Logging
 
@@ -443,7 +443,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: desktop-init, the oneshots, the session and the audio stack write to `/dev/console`.
 - Acceptance: `podman logs desktop` contains lines from each of `desktop-init:`, `preflight:`, `align-device-groups:`, `xorg-gpu-conf:`, `xorg-monitor-conf:`, `start-audio:`, `published`.
 - Evidence: EV-LOG-DESKTOP of a full boot with the seven prefixes indexed.
-- Tier: T2 · Coverage: ❌ evidence not saved; only two of the seven prefixes are checked (`xorg-monitor-conf:` by `smoke`, `desktop-init:` by `guest:phase_deploy`).
+- Tier: T2 · Coverage: ✅ `smoke` saves the first boot's whole log and checks each of the seven prefixes, its first line quoted in the index, under `artifacts/S2.6.1/` (artifact `evidence-smoke`).
 
 **S2.6.2 The container log is bounded**
 - Requirement: `LogDriver=k8s-file` and `--log-opt max-size=64m` both reach the running container.
@@ -503,9 +503,9 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.2.3 VT nodes are created when the runtime does not expose them**
 - Requirement: `ensure-vt-devices.sh` creates `/dev/tty0` (c 4:0) and `/dev/tty1` (c 4:1), mode 620, `root:tty` (desktop-init then hands `tty1` to the session user), no-op when present.
-- Acceptance: `stat -c '%F %t:%T %a' /dev/tty1` in the container is `character special device 4:1 620`; log says `created /dev/tty1` once.
+- Acceptance: `stat -c '%F %t:%T %a' /dev/tty1` in the container is `character special file 4:1 620`; log says `created /dev/tty1` once.
 - Evidence: the `stat` (EV-STATE); EV-LOG-DESKTOP line.
-- Tier: T2 · Coverage: ❌ nothing checks the nodes or the `created /dev/tty1` line; T3 implies `/dev/tty1` exists only because the session, whose stdin it is, starts (`guest:phase_deploy`).
+- Tier: T2 · Coverage: ✅ `smoke` saves ensure-vt-devices' lines this boot (`created /dev/tty0 (c 4:0)` and `created /dev/tty1 (c 4:1)`, once each: the runner's runtime exposes neither) and `stat` of both nodes in the container (character special, 4:0 and 4:1, 620; tty1 handed to `desktop:tty`), under `artifacts/S3.2.3/` (artifact `evidence-smoke`).
 
 **S3.2.4 Xorg does not listen on TCP**
 - Requirement: `-nolisten tcp`; nothing listens on 6000+ on the host network.
@@ -689,7 +689,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: if desktop-init is pid 1, preflight reports `FAIL: container init is PID 1`.
 - Acceptance: `podman run` the image without `--pid=host`; the FAIL line appears.
 - Evidence: EV-LOG-DESKTOP of that run.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke`'s scratch container of the image runs without `--pid=host`; its preflight block, with `FAIL: container init is PID 1`, is saved under `artifacts/S3.7.3/` (artifact `evidence-smoke`).
 
 ### F3.8 Input
 
@@ -939,7 +939,7 @@ event, EV-TIMELINE.
 - Requirement: with no `/dev/snd` on the host, tmpfiles creates an empty one, the container starts, preflight WARNs `no /dev/snd/controlC* visible`, PipeWire runs and exports sockets.
 - Acceptance: `smoke`, after recording `ls -la /dev/snd` before tmpfiles runs and asserting it holds no `controlC*`, with the preflight WARN grepped (today nothing records that the runner has no card).
 - Evidence: `ls -ld /dev/snd` on the host (EV-STATE); EV-LOG-DESKTOP preflight WARN; EV-PIDS (pipewire); `ls -l /run/desktop-audio`.
-- Tier: T2 · Coverage: ❌ evidence not saved (`ci.yml` uploads no artifacts); `smoke` asserts that the container starts and PipeWire runs, but it neither greps the preflight WARN nor records that the runner has no sound card.
+- Tier: T2 · Coverage: ✅ `smoke` saves `ls -la /dev/snd` before the tree's tmpfiles run (no `controlC*`: the runner has no sound card) and `ls -ld` after (the empty directory), the preflight's `no /dev/snd/controlC* visible` WARN, the running PipeWire daemons and `ls -l /run/desktop-audio` with both sockets, under `artifacts/S4.4.2/` (artifact `evidence-smoke`).
 
 ### F4.5 Lifecycle independence
 
@@ -1064,7 +1064,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: every file from the tree is `root:root`; scripts are executable.
 - Acceptance: `find` over the installed paths.
 - Evidence: `find <paths> -printf '%M %u %g %p\n'` (EV-STATE).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves `stat -c '%A %U %G %n'` of every file the tree installed (26) and checks all are `root:root`, none group- or world-writable, and every script under `/usr/local/bin` and `/usr/local/libexec` `rwxr-xr-x`, under `artifacts/S5.1.2/` (artifact `evidence-smoke`).
 
 **S5.1.3 Reboot is sufficient, and the operator gets a desktop with no one touching the host**
 - Requirement: after a reboot with no manual starts, `desktop.service` is active, all oneshots succeeded, the session is up and visible, the tools spec is rewritten, labels are present, and `seat-prep` changed nothing.
@@ -1090,13 +1090,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `WantedBy`, both `Conflicts`, `Wants=`/`After=` for all six units, `Wants=desktop-session.service`, `Restart=always`, `TimeoutStartSec=300`.
 - Acceptance: anchored greps on the dry-run output.
 - Evidence: EV-CONFIG with the directives listed in the index.
-- Tier: T2 · Coverage: ❌ evidence not saved; `dryrun` asserts `WantedBy`, both `Conflicts` and four of the seven `Wants=`, but no `After=`, `Restart=` or `TimeoutStartSec=`.
+- Tier: T2 · Coverage: ✅ `dryrun` reads the generated unit per section (`ci/unit-directives.py`) and checks `WantedBy=multi-user.target`, both `Conflicts`, `Wants=` and `After=` for the six units, `Wants=desktop-session.service`, `Restart=always` and `TimeoutStartSec=300`, each a check in the index, the unit saved under `artifacts/S5.2.3/` (artifact `evidence-smoke`).
 
 **S5.2.4 Volumes, tmpfs and the `/sys` mount are emitted**
 - Requirement: every `Volume=`, both `Tmpfs=`, the `/sys` `Mount=` and `AddDevice=nvidia.com/gpu=all` appear in `ExecStart`, and `--device /dev/dri` wherever `/dev/dri` exists when the unit is generated (`AddDevice=-/dev/dri` is optional).
 - Acceptance: greps on `ExecStart`.
 - Evidence: EV-CONFIG.
-- Tier: T2 · Coverage: ❌ no test greps `ExecStart` for them; only read-only `/sys` (`guest:verify_privileges`) and `/run/user` propagation (`guest:phase_deploy`) are proven, and only at runtime.
+- Tier: T2 · Coverage: ✅ `dryrun` checks each `Volume=`, `Tmpfs=`, `Mount=` and `AddDevice=` line of the source as the podman argument it becomes in the generated `ExecStart` (`--device /dev/dri` included: the runner has it), each a check in the index, the unit and the source saved under `artifacts/S5.2.4/` (artifact `evidence-smoke`).
 
 **S5.2.5 `Conflicts=` backstop**
 - Requirement: `desktop.service` cannot run alongside `getty@tty1.service` or `display-manager.service`.
@@ -1134,13 +1134,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: without `fuser`, the gate is skipped with a notice, exit 0.
 - Acceptance: run `seat-prep.sh` with `fuser` absent from `PATH`; assert exit 0 and the `fuser not available` notice.
 - Evidence: the notice line.
-- Tier: T2 · Coverage: ❌ no test; `smoke` and `dryrun` filter the `fuser not available` notice out instead of asserting it, and nothing makes sure the runner lacks `psmisc`.
+- Tier: T2 · Coverage: ✅ `smoke` runs `seat-prep.sh` with a `PATH` of every command but `fuser` and saves its output (`fuser not available (install psmisc); skipping DRM/VT holder verification`) and exit status (0), under `artifacts/S5.3.4/` (artifact `evidence-smoke`).
 
 **S5.3.5 Missing logind drop-in is warned about**
 - Requirement: a changed seat with the drop-in absent logs `WARNING: logind drop-in missing`.
-- Acceptance: T2 with a temporarily moved drop-in on a dirty seat.
+- Acceptance: T2 on a dirty seat with the drop-in absent (before the tree is applied, or moved aside).
 - Evidence: the warning line.
-- Tier: T2 · Coverage: ❌ no test; `smoke`'s dirty-seat run happens before the tree is applied, so it already prints the warning, but nothing checks for it.
+- Tier: T2 · Coverage: ✅ `smoke`'s dirty-seat run, before the tree is applied, saves the logind drop-in directory without the drop-in and seat-prep's output, which changes the seat and says `WARNING: logind drop-in missing`, under `artifacts/S5.3.5/` (artifact `evidence-smoke`).
 
 ### F5.4 GPU CDI convergence (`desktop-cdi-refresh`)
 
@@ -1174,19 +1174,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `DISPLAY_VALUE` and `X11_DIR` apply to the display spec and `AUDIO_DIR` to the audio spec; malformed `DISPLAY_VALUE` is rejected before any write; no temp files remain; defaults return when the file is removed.
 - Acceptance: `smoke`, `dryrun`.
 - Evidence: the override file and the specs after each step (EV-CONFIG); `ls /etc/cdi` (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved; asserted by `smoke` and `dryrun` except `X11_DIR`, which no test sets.
+- Tier: T2 · Coverage: ✅ `smoke` saves the override file (`DISPLAY_VALUE`, `X11_DIR`, `AUDIO_DIR`) and both specs it gives, each override in its own spec only; a malformed `DISPLAY_VALUE` rejected before any write (the message, both specs unchanged, `ls /etc/cdi` with no temp file); and the default specs once the file is removed; under `artifacts/S5.5.2/` (artifact `evidence-smoke`).
 
 **S5.5.3 Atomic writes**
 - Requirement: specs are written via temp file + rename.
 - Acceptance: inode changes and no leftovers.
 - Evidence: `ls -li /etc/cdi` before/after (EV-DIFF).
-- Tier: T2 · Coverage: ❌ evidence not saved; `smoke` asserts only that no temp files are left in `/etc/cdi`, never that the inode changes.
+- Tier: T2 · Coverage: ✅ `smoke` saves `ls -li /etc/cdi` before and after a regeneration, with the diff: both specs are new inodes, and no temp file is left, under `artifacts/S5.5.3/` (artifact `evidence-smoke`).
 
 **S5.5.4 Tools spec is gated on a populated directory**
 - Requirement: empty dir or dotfiles only → no spec; one regular file → spec with `DESKTOP_TOOLS_BIN` and an `ro` mount; `TOOLS_DIR` overridable; the relabeler is invoked first.
 - Acceptance: T2 with `TOOLS_DIR=/tmp/x` set in `/etc/desktop-container/client-cdi.conf` (or in the environment once the Appendix A override lands: today the script assigns `TOOLS_DIR` itself): empty, dotfile-only, populated.
 - Evidence: the script's stdout per case; `ls -la /tmp/x`; the spec (EV-CONFIG).
-- Tier: T2 · Coverage: ❌ evidence not saved; `smoke` and `guest:phase_deploy` assert only the populated path.
+- Tier: T2 · Coverage: ✅ `smoke` sets `TOOLS_DIR` in the override file and runs `desktop-tools-cdi` on it empty, with a dotfile only and with one regular file, saving `ls -la` and the output of each run and the one spec written (`DESKTOP_TOOLS_BIN`, the directory mounted `ro`); the relabeler's line comes before `wrote`; under `artifacts/S5.5.4/` (artifact `evidence-smoke`).
 
 **S5.5.5 The `.path` unit advertises once per boot and parks**
 - Requirement: the service stays active; removing the spec does not re-advertise until the service is stopped; a reboot with a populated dir rewrites it.
@@ -1268,7 +1268,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: a second run writes a different key; the old private key no longer authenticates; the container regains access after `desktop.service` restarts.
 - Acceptance: as stated.
 - Evidence: `ssh-keygen -lf` of old and new public keys (EV-DIFF); old-key ssh transcript (refused); new-key transcript; container `ssh host` before and after the restart.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` re-runs `desktop-host-shell.service` and saves `ssh-keygen -lf` of the public key before and after (different, with the diff), the old private key refused by sshd, the new one logging in as `desktop-shell`, and the container's `ssh host` refused before `desktop.service` restarts and logging in after, under `artifacts/S5.7.4/` (artifact `evidence-smoke`).
 
 **S5.7.5 Empty or missing shell-user / account**
 - Requirement: empty `shell-user` → exit 0, nothing written; missing `shell-user` → exit 1 with a hint (the tree ships the file: re-apply it, or use the quadlet's off-switch to turn the feature off), nothing written; account missing → exit 1 with the sysusers hint.
@@ -1306,7 +1306,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `PartOf=desktop.service` restarts the session with the container.
 - Acceptance: `smoke`.
 - Evidence: `systemctl show -p ActiveEnterTimestamp desktop.service desktop-session.service` before/after (EV-DIFF both moved); EV-LOG-JOURNAL.
-- Tier: T2 · Coverage: ❌ evidence not saved; `smoke` checks only that `desktop-session.service` is active after `systemctl restart desktop.service`, which still passes if `PartOf=` is removed.
+- Tier: T2 · Coverage: ✅ `smoke` saves `systemctl show -p ActiveEnterTimestamp` of `desktop.service` and `desktop-session.service` before and after `systemctl restart desktop.service`, with the diff (both moved), and the session unit's journal since, under `artifacts/S5.8.2/` (artifact `evidence-smoke`).
 
 **S5.8.3 Does not steal the controlling tty**
 - Requirement: the container's `setsid -c` on tty1 succeeds.
@@ -1317,7 +1317,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 **S5.8.4 The desktop runs with the unit disabled**
 - Requirement: see S2.2.2.
 - Evidence: as S2.2.2.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ❌ as S2.2.2: the fallback is shown only in a scratch container, not with the unit disabled on a full deploy.
 
 ### F5.9 Accounts, tmpfiles, sysusers
 
@@ -1325,19 +1325,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: host `desktop` is uid 61000 with `nologin`; the image's `desktop` is uid 61000.
 - Acceptance: compare host `getent` with `podman exec desktop id -u desktop`.
 - Evidence: both outputs side by side (EV-STATE).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves the host's `getent passwd desktop` (uid 61000, `/usr/sbin/nologin`) beside the image's `id -u desktop` (61000), under `artifacts/S5.9.1/` (artifact `evidence-smoke`).
 
 **S5.9.2 `desktop-shell` is boring**
 - Requirement: no supplementary groups, locked password, `/bin/bash`, home 0700.
 - Acceptance: `id`, `passwd -S`, `stat`.
 - Evidence: the three outputs (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved; only the account's existence (a `desktop-preflight` row run by `dryrun`, `smoke` and `guest:phase_deploy`) and a working login shell (the `ssh ... whoami` checks) are asserted, not its groups, password lock or home mode.
+- Tier: T2 · Coverage: ✅ `smoke` saves `id desktop-shell` (no supplementary group), `passwd -S desktop-shell` (`L`, locked) and its passwd entry and home (`/bin/bash`, `700 desktop-shell:desktop-shell`), under `artifacts/S5.9.2/` (artifact `evidence-smoke`).
 
 **S5.9.3 tmpfiles entries**
 - Requirement: the eight entries with their modes and owners (`/home/desktop`, added for the host login session, is the eighth).
 - Acceptance: `stat -c '%a %U' …` for each.
 - Evidence: one `stat` table (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved; `smoke` asserts that four of the paths exist and that the toolkit dir is 0755, but no other mode and no owner.
+- Tier: T2 · Coverage: ✅ `smoke` saves the installed tmpfiles.d file and the `stat` table of its eight paths after `systemd-tmpfiles --create`, each with the mode, owner and group the entry gives it, under `artifacts/S5.9.3/` (artifact `evidence-smoke`).
 
 ### F5.10 Host preflight (`desktop-preflight`)
 
@@ -1433,7 +1433,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `--systemd=false`: stop signal SIGTERM; no systemd-mode tmpfs set.
 - Acceptance: the generated `ExecStart` carries `--systemd=false` (`dryrun`), and `podman inspect` `StopSignal` is SIGTERM. A missing `/run/systemd/system` inside proves nothing: with `desktop-init` as the command, podman's systemd mode would not create it either.
 - Evidence: both (EV-STATE).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `dryrun` saves the generated `ExecStart` split into arguments, `--systemd=false` one of them, and `smoke` saves the running container's `podman inspect` stop signal (15, SIGTERM), both under `artifacts/S6.2.4/` (artifact `evidence-smoke`).
 
 ---
 
@@ -1477,19 +1477,19 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: `screenshot` appears in the host dir mode 0755; a republish produces a new inode.
 - Acceptance: `smoke`; inode changes across a restart; no temp files.
 - Evidence: `ls -li` before/after (EV-DIFF); `sha256sum`.
-- Tier: T2 · Coverage: ❌ evidence not saved; `smoke` asserts the binary is published at 0755, but not that a republish changes its inode or leaves no temp file.
+- Tier: T2 · Coverage: ✅ `smoke` saves `ls -li` and `sha256sum` of the toolkit directory before and after `systemctl restart desktop.service`, with the diff: `screenshot` republished 0755 as a new inode, no temp file left, under `artifacts/S7.2.1/` (artifact `evidence-smoke`).
 
 **S7.2.2 Stale tools are pruned, dotfiles left alone**
 - Requirement: an unshipped regular file is removed on the next publish; a dotfile is not.
 - Acceptance: as stated.
 - Evidence: `ls -la` before/after (EV-DIFF); EV-LOG-DESKTOP `pruned` line.
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` plants an unshipped regular file and a dotfile in the toolkit directory, restarts the desktop, and saves `ls -la` before and after with the diff (the file gone, the dotfile kept) and publish-tools' `pruned stale-tool (no longer shipped by this image)` line, under `artifacts/S7.2.2/` (artifact `evidence-smoke`).
 
 **S7.2.3 The directory is never emptied during a republish**
 - Requirement: prune after publish, one entry at a time.
 - Acceptance: an inotify watch never sees the directory empty.
 - Evidence: the `inotifywait -m` transcript across a restart (EV-STATE).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` saves the directory's listing and an `inotifywait -m` transcript across the restart's republish (the temp file created and renamed over `screenshot`, the unshipped file deleted) and replays it: the directory always held a tool; under `artifacts/S7.2.3/` (artifact `evidence-smoke`).
 
 **S7.2.4 Clients receive it read-only via `DESKTOP_TOOLS_BIN`**
 - Requirement: the device injects the env and an `ro` mount; the binary executes; not writable; a pod without the request has neither.
@@ -2298,16 +2298,16 @@ moves to ✅ only when a CI run has saved its evidence, which the
 
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
-| E1 Image build | 14 | 5 | 0 | 9 | 0 |
-| E2 Boot & supervision | 25 | 6 | 1 | 18 | 0 |
-| E3 Display & session | 62 | 25 | 1 | 33 | 3 |
-| E4 Audio | 23 | 4 | 0 | 18 | 1 |
-| E5 Deploy tree | 50 | 11 | 1 | 37 | 1 |
-| E6 Privileges | 9 | 2 | 0 | 7 | 0 |
-| E7 Client contract & journeys | 40 | 7 | 1 | 32 | 0 |
+| E1 Image build | 14 | 12 | 0 | 2 | 0 |
+| E2 Boot & supervision | 25 | 17 | 1 | 7 | 0 |
+| E3 Display & session | 62 | 27 | 1 | 31 | 3 |
+| E4 Audio | 23 | 5 | 0 | 17 | 1 |
+| E5 Deploy tree | 50 | 24 | 1 | 24 | 1 |
+| E6 Privileges | 9 | 3 | 0 | 6 | 0 |
+| E7 Client contract & journeys | 40 | 10 | 1 | 29 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **65** | **4** | **176** | **6** |
+| **Total** | **251** | **103** | **4** | **138** | **6** |
 
 Regenerate after editing with:
 
