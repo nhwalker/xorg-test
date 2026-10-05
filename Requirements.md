@@ -371,7 +371,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `session-postmortem` runs after every abnormal end of the X session and never after a clean one; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists. Abnormal is a nonzero session exit, or an X server that did not shut down cleanly: xinit exits 0 whenever the server goes away, killed or crashed included, so `desktop-init` reads the server's log, which says `Server terminated successfully` only after a clean shutdown, and logs `the X server did not shut down cleanly` before the postmortem.
 - Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL (the session still exits `rc=0`; `desktop-init`'s `did not shut down cleanly` line comes first), and none after a clean end (Quit session, `rc=0`). Which ends get a postmortem is `desktop-init`'s doing, so only T2/T3 can prove it.
 - Evidence: T1 the script's stdout per case (EV-STATE); T2 EV-LOG-DESKTOP slice containing `postmortem:` lines.
-- Tier: T1/T2 · Coverage: ❌ the T2/T3 half is not saved: the real `postmortem:` lines after Xorg is killed with SIGKILL, and none after a clean end. The T1 half is: `script-unit` runs the postmortem on fabricated Xorg logs, one per known signature (each gets the log's tail and its `LIKELY CAUSE`), one with no known signature (the tail, no verdict), none at all (its own line), and with `SERVICE_RESULT=success` (silent), under `artifacts/S2.3.5/` (artifact `evidence-static`).
+- Tier: T1/T2 · Coverage: ✅ the T1 half: `script-unit` runs the postmortem on fabricated Xorg logs, one per known signature (each gets the log's tail and its `LIKELY CAUSE`), one with no known signature (the tail, no verdict), none at all (its own line), and with `SERVICE_RESULT=success` (silent), under `artifacts/S2.3.5/` (artifact `evidence-static`). The T2/T3 half, at T3: `guest:verify_audio_lifecycle` kills Xorg with SIGKILL and saves the desktop's log from just before: `the X server did not shut down cleanly`, the postmortem with the killed server's log tail, then `session exited (rc=0)`, in that order, under `artifacts/S2.3.5/` (artifact `evidence-vm-core`); `operator-e2e:menu_quit_session` checks that Quit session logs `session exited (rc=0)` and no `postmortem:` line, its desktop log under `artifacts/S11.1.1/` (artifact `evidence-vm-operator`).
 
 **S2.3.6 mwm exit ends the session and it restarts**
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
@@ -403,7 +403,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `start-audio` waits up to 10 s for `$XDG_RUNTIME_DIR/pipewire-0` before launching wireplumber.
 - Acceptance: T1 with a fake `pipewire` that binds after 2 s; T3 wireplumber alive after boot and after a stack restart.
 - Evidence: T1 stdout with timestamps; T3 EV-PIDS.
-- Tier: T1/T3 · Coverage: ❌ the T3 EV-PIDS is not saved: wireplumber is shown alive after boot (`guest:phase_deploy`) and after a stack restart (`e2e` "audio hotplug") only as a side effect. The T1 half is: `script-unit` runs `start-audio` with fake daemons first on `PATH`; with a `pipewire` that binds after 2 s, wireplumber starts once the socket exists, and with one that never binds it starts after the bounded wait (about 10 s). The timestamped stdout and each fake's own log are under `artifacts/S2.4.4/` (artifact `evidence-static`).
+- Tier: T1/T3 · Coverage: ✅ the T1 half: `script-unit` runs `start-audio` with fake daemons first on `PATH`; with a `pipewire` that binds after 2 s, wireplumber starts once the socket exists, and with one that never binds it starts after the bounded wait (about 10 s). The timestamped stdout and each fake's own log are under `artifacts/S2.4.4/` (artifact `evidence-static`). The T3 half: `guest:verify_audio_lifecycle` saves the audio daemons' process table (pid, ppid, session, user, start time) with the desktop up and again after pipewire is killed and the stack restarts, wireplumber alive both times with a new pid after the restart, under `artifacts/S2.4.4/` (artifact `evidence-vm-core`).
 
 **S2.4.5 A daemon ignoring SIGTERM is escalated**
 - Requirement: survivors not exited 5 s after TERM are KILLed; `start-audio` always returns.
@@ -473,19 +473,19 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the first `connected` connector's card becomes `kmsdev`; otherwise `card0`.
 - Acceptance: T1 fabricated sysfs (card0 disconnected, card1 connected → card1; none → card0). T3: `decision: modesetting driver on /dev/dri/card0` logged and in the file.
 - Evidence: EV-CONFIG; EV-LOG-DESKTOP decision line; `cat /sys/class/drm/card*-*/status` (EV-STATE).
-- Tier: T1/T3 · Coverage: ❌ no direct test and no evidence saved; `guest:verify_fixed_layout` exercises the modesetting branch only implicitly (its `Virtual 2048 768` check needs the `gpu0` Device this script writes).
+- Tier: T1/T3 · Coverage: ✅ `script-unit` runs `xorg-gpu-conf.sh` on fabricated sysfs (`GPU_SYS_DRM`, `GPU_DEV_DIR`): with card0's connector disconnected and card1's connected, card1 becomes `kmsdev` and the decision is logged; with no connector connected, card0 does and the script says it defaulted; under `artifacts/S3.1.3/` (artifact `evidence-static`). `guest:phase_deploy` saves the VM's connector statuses, xorg-gpu-conf's lines up to `decision: modesetting driver on /dev/dri/card0` (its first connected connector is card0-Virtual-1) and the `20-gpu.conf` naming that card as `kmsdev`, under `artifacts/S3.1.3/` (artifact `evidence-vm-core`).
 
 **S3.1.4 No KMS device removes the config**
 - Requirement: if the chosen node is absent, delete stale `20-gpu.conf` and log it.
 - Acceptance: T1 pre-created file removed; T2: a scratch `podman run` of the image without `/dev/dri`, with a `20-gpu.conf` written first, removes it. (The build-smoke runner usually has KMS, and the production container is recreated on every start, so neither shows a stale file on its own.)
 - Evidence: `ls /etc/X11/xorg.conf.d/` before/after (EV-STATE pair); EV-LOG-DESKTOP line.
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: ✅ `script-unit` runs `xorg-gpu-conf.sh` with a stale `20-gpu.conf` and no node for the chosen card: the file is removed and the removal logged, under `artifacts/S3.1.4/` (artifact `evidence-static`). `smoke` runs it in a scratch container of the image without `/dev/dri`, a stale `20-gpu.conf` written first, and saves `ls /etc/X11/xorg.conf.d` before (the stale file) and after (none) with the logged removal, under `artifacts/S3.1.4/` (artifact `evidence-smoke`).
 
 **S3.1.5 Evidence is logged before the decision**
 - Requirement: DRM nodes, every connector's status and NVIDIA nodes are logged before `decision:`.
 - Acceptance: order of lines.
 - Evidence: EV-LOG-DESKTOP slice.
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: ✅ `script-unit` on fabricated sysfs with two connectors: the DRM nodes, both connectors' statuses and the NVIDIA nodes are each logged before the decision, under `artifacts/S3.1.5/` (artifact `evidence-static`). `smoke` reads the real container's log this boot up to its decision: the DRM nodes, the runner's one connector and the NVIDIA nodes come before it; the runner's sysfs statuses are saved beside it, under `artifacts/S3.1.5/` (artifact `evidence-smoke`).
 
 ### F3.2 Rootless Xorg and device access
 
@@ -551,7 +551,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: no file, or comments/globals only → no `30-monitors.conf`, stale one removed, no-op logged.
 - Acceptance: as stated.
 - Evidence: `ls /etc/X11/xorg.conf.d/` (EV-STATE); EV-LOG-DESKTOP no-op line; T3 `xrandr` showing autodetected geometry.
-- Tier: T0/T2/T3 · Coverage: ❌ the T3 `xrandr` after a restore is not saved (`guest:verify_fixed_layout` asserts the restore). Saved: `layout-tests` (no file, comments only, globals only: each removes a stale config and logs the no-op; `ls` of `xorg.conf.d` and the log per case) under `artifacts/S3.4.1/` (artifact `evidence-static`), and `smoke` (the shipped comments-only file, the generator's no-op line, `ls` in the container) under `artifacts/S3.4.1/` (artifact `evidence-smoke`).
+- Tier: T0/T2/T3 · Coverage: ✅ `layout-tests` (no file, comments only, globals only: each removes a stale config and logs the no-op; `ls` of `xorg.conf.d` and the log per case) under `artifacts/S3.4.1/` (artifact `evidence-static`); `smoke` (the shipped comments-only file, the generator's no-op line, `ls` in the container) under `artifacts/S3.4.1/` (artifact `evidence-smoke`); and `guest:verify_fixed_layout`, once the declared layout is withdrawn: the restored comments-only file, `ls -l /etc/X11/xorg.conf.d` with no `30-monitors.conf`, the generator's no-op line, and `xrandr` with Virtual-2 disconnected and the screen autodetected, under `artifacts/S3.4.1/` (artifact `evidence-vm-core`).
 
 **S3.4.2 modesetting emission**
 - Requirement: per-output `Monitor` sections with the documented options, a `Screen` on `gpu0` with pinned `Virtual`, no `MetaModes`.
@@ -617,7 +617,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: one line per enabled output; refuses non-root; fails cleanly when the desktop is down; its output through the generator reproduces the geometry.
 - Acceptance: T3 with the two-output layout live: the two expected lines; T1 canned `xrandr` text; T3 desktop stopped → exit 1 with the hint.
 - Evidence: the tool's stdout (EV-STATE); the generator's output from it (EV-CONFIG); `xrandr` after applying it (EV-DIFF vs the original).
-- Tier: T1/T3 · Coverage: ❌ the T3 half is not saved (the live two-output layout, the desktop stopped, `xrandr` after applying the block). The T1 half is: `script-unit` runs `desktop-monitors-capture` on canned `xrandr` text (`DESKTOP_XRANDR_CMD`): a non-root caller is refused (exit 2); the capture prints one line per enabled output, the rotated output's panel size restored with `rotate=left`; a failing query exits 1 with the hint; and the block, through the generator, gives back xrandr's framebuffer and positions. The canned text, each run's output and the generated config are under `artifacts/S3.4.12/` (artifact `evidence-static`).
+- Tier: T1/T3 · Coverage: ✅ the T1 half: `script-unit` runs `desktop-monitors-capture` on canned `xrandr` text (`DESKTOP_XRANDR_CMD`): a non-root caller is refused (exit 2); the capture prints one line per enabled output, the rotated output's panel size restored with `rotate=left`; a failing query exits 1 with the hint; and the block, through the generator, gives back xrandr's framebuffer and positions; under `artifacts/S3.4.12/` (artifact `evidence-static`). The T3 half: `guest:verify_fixed_layout` captures the live two-output layout (Virtual-1 primary at +0+0, Virtual-2 at +1024+0), applies the block, and saves the generated `30-monitors.conf` and `xrandr` before and after with their diff (the same 2048x768 geometry); with desktop.service stopped the capture exits 1 with the hint; under `artifacts/S3.4.12/` (artifact `evidence-vm-core`). The refresh does not round-trip exactly (declared 60, read back as 59.92, re-derived as 59.68 Hz); the requirement asks for the geometry.
 
 ### F3.5 Rendering and theme
 
@@ -2299,15 +2299,15 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 5 | 0 | 9 | 0 |
-| E2 Boot & supervision | 25 | 4 | 1 | 20 | 0 |
-| E3 Display & session | 62 | 20 | 1 | 38 | 3 |
+| E2 Boot & supervision | 25 | 6 | 1 | 18 | 0 |
+| E3 Display & session | 62 | 25 | 1 | 33 | 3 |
 | E4 Audio | 23 | 4 | 0 | 18 | 1 |
 | E5 Deploy tree | 50 | 11 | 1 | 37 | 1 |
 | E6 Privileges | 9 | 2 | 0 | 7 | 0 |
 | E7 Client contract & journeys | 40 | 7 | 1 | 32 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **58** | **4** | **183** | **6** |
+| **Total** | **251** | **65** | **4** | **176** | **6** |
 
 Regenerate after editing with:
 
