@@ -294,6 +294,8 @@ xi_judge_added() { # <story> <devices before> <devices after> <xinput before> <x
         grep -qF "Adding input device $name (" "$EV_DIR/$xl" \
             && grep -qF "XINPUT: Adding extended input device \"$name\"" "$EV_DIR/$xl" && logged=yes
         ev_note "'$name': xinput entries $nb -> $na; both of Xorg's adding lines in the log: $logged"
+        ev_text "adding-lines" "EV-LOG-XORG: Xorg's two adding lines for '$name', quoted from the slice" \
+            "$(grep -F -e "Adding input device $name (" -e "XINPUT: Adding extended input device \"$name\"" "$EV_DIR/$xl" || echo "(neither line is in the slice)")"
         if [ "$na" -gt "$nb" ]; then
             ev_pass "xinput list gained an entry for '$name' ($nb -> $na)"
         elif [ "$logged" = yes ]; then
@@ -1017,6 +1019,7 @@ ev_end
 # guest, so the id is free by the time the removal shows up in /dev.
 ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
 input_import S3.9.3 switched-away "after device_del kvmkbd (the KVM switched away)"
+xl2=$(gq xorg-log-lines 2>/dev/null || echo 0)
 ev_qemu device-add-usb "EV-QEMU: device_add usb-kbd,id=kvmkbd,bus=xhci.0 (the KVM switches back) and QEMU's reply (empty: accepted)" \
     "device_add usb-kbd,id=kvmkbd,bus=xhci.0" >/dev/null || fail "QEMU refused to re-add the USB keyboard"
 kvm_on_host=$kvm_off_host kvm_on_nodes=$kvm_off_nodes
@@ -1030,6 +1033,8 @@ log "  switched back: host=$kvm_on_host container-nodes=$kvm_on_nodes"
 sleep 2
 input_set back "after the USB keyboard was re-added (the KVM switched back)"
 input_diffs back "the USB keyboard's return"
+ev_save xorg-log-usb "EV-LOG-XORG: the Xorg log's lines since just before the USB keyboard was re-added" \
+    gq xorg-log-since "$xl2" >/dev/null || true
 [ "$kvm_on_host" -ge "$kvm_base_host" ] \
     || fail "the keyboard never came back on the VM host ($kvm_off_host -> $kvm_on_host)"
 ev_pass "the VM host has the keyboard's node again: $kvm_off_host -> $kvm_on_host event nodes"
@@ -1122,6 +1127,8 @@ done
 log "  plugged in: host=$snd_on_host container-nodes=$snd_on_nodes wireplumber-devices=$snd_on_devs"
 snd_set on "with the USB sound card plugged in"
 snd_diffs on "the card's arrival"
+ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before the card was plugged in" \
+    vm_ssh_quick "sudo podman logs --since '$snd_t0' desktop" >/dev/null || true
 SND_ON_PW=$SN_PW SND_ON_DEF=$SN_DEF
 [ "$snd_on_host" -gt "$snd_base_host" ] \
     || fail "device_add usb-audio did not create a card on the VM host ($snd_base_host -> $snd_on_host): QEMU never attached it, so nothing below means anything"
