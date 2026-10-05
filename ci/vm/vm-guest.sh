@@ -2331,26 +2331,33 @@ jx_in() { local pod=$1; shift; k3s kubectl exec "$pod" -- "$@"; }
 journey_run() { # <name> < script
     k3s kubectl exec -i "$JPOD" -- sh -c "cat > /tmp/run/.$1 && mv /tmp/run/.$1 /tmp/run/$1.sh"
 }
-# An xterm from the pod; its output in /tmp/<title>.log there.
+# An xterm from the pod; its output in /tmp/<title>.log there. Its name
+# (WM_CLASS instance) is what win_up looks for, and it keeps its title:
+# without allowTitleOps off, the interactive bash it runs retitles it
+# user@host:dir at its first prompt (EL's /etc/bashrc PROMPT_COMMAND).
 journey_xterm() { # <title>
     journey_run "xterm-$1" <<EOF
-exec xterm -T '$1' -geometry 60x6+640+420 > /tmp/$1.log 2>&1
+exec xterm -name '$1' -T '$1' -xrm 'XTerm*allowTitleOps: false' -geometry 60x6+640+420 > /tmp/$1.log 2>&1
 EOF
 }
 # The pod's applications, one per line: pid and command line.
 journey_apps() { # [pod]
     k3s kubectl exec "${1:-$JPOD}" -- pgrep -a -f 'xterm|paplay|shot-loop|screenshot' || true
 }
-# Whether a window with that title is on the display, seen from the desktop.
-# The tree is read whole before it is searched: piped into grep -q under
-# pipefail, xwininfo dies of SIGPIPE once grep has its match, and the found
-# window reads as missing (run 37327333528's journey-1).
+# Whether an xterm started with -name <name> is on the display, seen from
+# the desktop: xwininfo -tree lists each window as
+# 0x... "<title>": ("<name>" "XTerm"). The name, not the title: an xterm's
+# shell can retitle its window, and EL's /etc/bashrc does at the first
+# prompt - three runs (37325367423, 37327333528, 37328956567) looked for the
+# title journey-1 under a window by then titled root@journey. The tree is
+# read whole before it is searched: piped into grep -q under pipefail,
+# xwininfo dies of SIGPIPE once grep has its match.
 win_up() {
     local tree
     tree=$(podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree 2>/dev/null) || return 1
-    grep -qF "\"$1\"" <<<"$tree"
+    grep -qF "(\"$1\" \"XTerm\")" <<<"$tree"
 }
-win_wait() { wait_for "${2:-30}" 1 "a window titled $1 on the display" win_up "$1"; }
+win_wait() { wait_for "${2:-30}" 1 "an xterm named $1 on the display" win_up "$1"; }
 # The display's windows, from the desktop (F7.5's xwininfo -root -tree).
 win_tree() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree; }
 # EV-SHOT-CLIENT: the toolkit's screenshot run in the pod, its PNG on stdout.
@@ -2418,7 +2425,7 @@ journey_tools_ls() { k3s kubectl exec "${1:-$JPOD}" -- sh -c 'ls -li "$DESKTOP_T
 # mid-run, its executable mapped, until journey_held_release opens the tap.
 journey_noise() { # an xterm over all of Virtual-1, filled with random hex
     journey_run noise <<'EOF'
-exec xterm -T noise -geometry 170x58+0+0 -hold -e od -An -tx1 -w56 -N 4000 /dev/urandom > /tmp/noise.log 2>&1
+exec xterm -name noise -T noise -geometry 170x58+0+0 -hold -e od -An -tx1 -w56 -N 4000 /dev/urandom > /tmp/noise.log 2>&1
 EOF
 }
 journey_shot_size() { # the size of a PNG of the display as it is now

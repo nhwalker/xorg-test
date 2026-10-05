@@ -40,7 +40,8 @@ spec:
           while :; do
             n=$((n + 1))
             echo "$(date -u +%T.%3N) try $n: xterm" >> /tmp/x-tries.log
-            xterm -T early-client -geometry 60x6+640+300 >> /tmp/x-tries.log 2>&1
+            xterm -name early-client -T early-client -xrm 'XTerm*allowTitleOps: false' \
+              -geometry 60x6+640+300 >> /tmp/x-tries.log 2>&1
             echo "$(date -u +%T.%3N) try $n: xterm exited $?" >> /tmp/x-tries.log
             sleep 1
           done
