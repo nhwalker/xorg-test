@@ -597,8 +597,10 @@ ev_end
 # decision. podman's --tty console ends lines with CR, stripped here.
 log "xorg-gpu-conf: the evidence lines come before the decision"
 ev_begin S3.1.5 "Evidence is logged before the decision" T2
-gpu_block=$(podman logs desktop 2>/dev/null | tr -d '\r' \
-    | awk '/^xorg-gpu-conf: /{print} /^xorg-gpu-conf: decision:/{exit}' || true)
+# Read whole, then cut: an awk that exits at the decision inside the pipe
+# would leave tr writing into a closed pipe (SIGPIPE, "Broken pipe").
+gpu_block=$(podman logs desktop 2>/dev/null | tr -d '\r' || true)
+gpu_block=$(awk '/^xorg-gpu-conf: /{print} /^xorg-gpu-conf: decision:/{exit}' <<<"$gpu_block")
 ev_text log "EV-LOG-DESKTOP: xorg-gpu-conf's lines in the desktop's log this boot, up to its decision" "${gpu_block:-(none)}"
 ev_save sysfs "EV-STATE: the runner's DRM connectors, which the container's sysfs shows too (cat /sys/class/drm/card*-*/status)" \
     sh -c 'for f in /sys/class/drm/card*-*/status; do [ -e "$f" ] && echo "$f: $(cat "$f")"; done; true' >/dev/null || true
