@@ -13,10 +13,19 @@
 
   qmp-tool.py video SOCKET DIR [FPS]
       Screendump the display into DIR/frame-NNNN.png at FPS (default 2)
-      until SIGTERM or SIGINT, with DIR/index.txt naming each frame and its
-      UTC time, to read against timeline.log. Give it a monitor socket of
-      its own: QMP serves one client at a time, and a frame every half
-      second would make every other command wait.
+      until SIGTERM or SIGINT, with DIR/index.txt naming each frame, its
+      UTC time (to read against timeline.log) and how long QEMU took to
+      write it. Give it a monitor socket of its own: QMP serves one client
+      at a time, and a frame every half second would make every other
+      command wait.
+
+      QEMU writes each frame as a PPM, its raw pixels, and the frames become
+      PNGs once the recording stops. QEMU compresses a PNG screendump in its
+      main loop, the loop its emulated sound card and audio backend run in,
+      and the sound card drops 8 KiB of audio (46 ms) when that loop falls
+      behind: in run 37338352192 a PNG frame every half second cost S7.6.3's
+      tone 18 such drops, each at a frame, while S4.5.1's tone, with no
+      video, had none.
 
 Through QMP rather than the HMP socket because replies come back as JSON
 strings: no prompt, banner or terminal escapes to strip from evidence.
@@ -25,6 +34,7 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
 import time
 
@@ -85,21 +95,29 @@ def video(sock, out_dir, fps):
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    rc = 0
     with open(os.path.join(out_dir, "index.txt"), "a", buffering=1) as index:
         i = 0
         while not stop:
             t0 = time.monotonic()
             i += 1
-            name = f"frame-{i:04d}.png"
+            name = f"frame-{i:04d}"
             try:
-                q.cmd("screendump", filename=os.path.abspath(os.path.join(out_dir, name)),
-                      format="png")
-                index.write(f"{name} {stamp()}\n")
+                q.cmd("screendump", filename=os.path.abspath(os.path.join(out_dir, name + ".ppm")),
+                      format="ppm")
+                index.write(f"{name}.png {stamp()} (QEMU wrote it in {1000 * (time.monotonic() - t0):.0f} ms)\n")
             except SystemExit as e:
-                index.write(f"{name} failed: {e}\n")
-                return 1
+                index.write(f"{name}.png failed: {e}\n")
+                rc = 1
+                break
             time.sleep(max(0.0, 1.0 / fps - (time.monotonic() - t0)))
-    return 0
+    # The PNGs, now that QEMU is no longer waiting on them.
+    for f in sorted(os.listdir(out_dir)):
+        if f.endswith(".ppm"):
+            ppm = os.path.join(out_dir, f)
+            subprocess.run(["convert", ppm, ppm[:-4] + ".png"], check=False, timeout=60)
+            os.unlink(ppm)
+    return rc
 
 
 def main():
