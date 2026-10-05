@@ -77,7 +77,7 @@ jobs:
         # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the
@@ -141,6 +141,27 @@ jobs:
           else ev_fail "an ARG follows the first FROM (see the check's output)"; fi
           ev_end
           exit "$rc"
+      - name: no client runs privileged or unconfined (S7.1.2's static guard)
+        # Every podman run/create under ci/ and examples/, read as the shell
+        # reads it, and every client manifest there: none may ask for
+        # --privileged or label=disable (privileged: true, spc_t). A grep
+        # cannot do this - the log lines and failure messages that NAME
+        # --privileged would match - so the guard tokenizes, and its
+        # self-test first shows it flags a violation and passes a mention.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/client-guard.py)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S7.1.2 "Confined clients work under enforcing" T0
+          rc=0
+          ev_save guard "client-guard.py --self-test: its self-test, then every podman run/create command and client manifest under ci/ and examples/ it judged" \
+            python3 ci/client-guard.py --self-test >/dev/null || rc=$?
+          if [ "$rc" = 0 ]; then ev_pass "no podman run/create under ci/ and examples/ passes --privileged or label=disable, no client manifest asks for privileged: true or spc_t, and the self-test flags each"
+          else ev_fail "a client asks for --privileged or label=disable, or the guard's self-test failed (see its output)"; fi
+          ev_end
+          exit "$rc"
       - name: helm lint + template assertions
         run: |
           helm lint charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all
@@ -155,7 +176,7 @@ jobs:
           ./kubeconform -strict -summary \
             examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml \
             ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml \
-            ci/vm/testpattern-pod.yaml
+            ci/vm/testpattern-pod.yaml ci/vm/journey-pod.yaml ci/vm/early-pod.yaml
 
       - name: upload evidence
         if: always()

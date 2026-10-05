@@ -505,6 +505,8 @@ phase_deploy() {
     # and confining it needs a policy module of its own). Nothing downstream of
     # it is exempt, which is the asymmetry these commands exist to prove.
     log pd "a CONFINED podman client resolves desktop.local/display=all and opens :0"
+    # S7.1.2 reads SELinux's denials from here on (ausearch -ts: a time of day).
+    s712_t0=$(date +%H:%M:%S)
     ev_begin S7.1.1 "Each device grants only its own capability" T3
     # Every probe also prints its whole environment, the two mounts that
     # matter and its own SELinux label: what the device gave it, and proof
@@ -581,6 +583,26 @@ phase_deploy() {
         grep -qx "$want" <<<"$out" || fail "a container with no device got something ('$want' missing)"
     done
     ev_pass "no device: nothing (no DISPLAY, no audio env, neither mount)"
+    ev_end
+
+    # S7.1.2's T3 half: those probes ran confined, under enforcing, and
+    # SELinux denied them nothing. (Its static half is the static job's
+    # ci/client-guard.py.)
+    ev_begin S7.1.2 "Confined clients work under enforcing" T3
+    ev_save getenforce "EV-STATE: getenforce on the VM host" getenforce >/dev/null || true
+    [ "$(getenforce)" = Enforcing ] || fail "SELinux is $(getenforce) on the VM host, not Enforcing"
+    ev_pass "SELinux is Enforcing on the VM host"
+    lbl=$(ev_save probe-label "EV-STATE: a confined display client: its own SELinux label (/proc/self/attr/current), then xdpyinfo's verdict" \
+        podman run --rm --device desktop.local/display=all localhost/desktop-container:latest \
+        sh -c 'cat /proc/self/attr/current; echo; xdpyinfo >/dev/null && echo XDPYINFO_OK') || true
+    grep -q ':container_t:' <<<"$lbl" || fail "the probe did not run as container_t: $(echo $lbl)"
+    grep -q XDPYINFO_OK <<<"$lbl" || fail "the confined probe could not open :0"
+    ev_pass "a client runs confined, as $(grep -o '[a-z_]*:[a-z_]*:container_t:[^[:space:]]*' <<<"$lbl" | sed -n 1p), and opens :0"
+    avc=$(ev_save avc "EV-STATE: ausearch -m avc -ts $s712_t0: SELinux's denials since the probes began" \
+        sh -c "ausearch -m avc -ts $s712_t0 2>&1 || true") || true
+    ! grep -q 'scontext=[^ ]*:container_t:' <<<"$avc" \
+        || fail "SELinux denied a confined client: $(grep -m1 'scontext=[^ ]*:container_t:' <<<"$avc")"
+    ev_pass "no AVC denial since the probes began has a container_t subject"
     ev_end
 
     ev_begin S5.5.1 "Display and audio specs are disjoint, rw, directory mounts" T3
