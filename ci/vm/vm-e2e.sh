@@ -239,6 +239,36 @@ ev_client_shot() { # <moment> <pod> <what>
 win_rect() {
     sed -nE 's/^(0x[0-9a-f]+) .* ([0-9]+)x([0-9]+)\+-?[0-9]+\+-?[0-9]+ +\+(-?[0-9]+)\+(-?[0-9]+) map=IsViewable$/\1 \2 \3 \4 \5/p' | sed -n 1p
 }
+# The guest's clock now, as a Unix time with nanoseconds.
+gnow() { vm_ssh_quick 'date +%s.%N' 2>/dev/null | tail -1; }
+# QEMU's own trace of its emulated HDA codec (-trace on the command line)
+# between two host times, into the open story; prints how many overruns.
+# hda_audio_overrun is the codec dropping its 8 KiB buffer because QEMU's
+# audio backend did not take it; hda_audio_adjust is the codec re-timing its
+# read of the guest's audio to keep that buffer half full. Neither is the
+# desktop's doing: they say whether the emulator itself kept up.
+ev_qemu_hda() { # <moment> <host t0> <host t1>
+    local lines n
+    lines=$(awk -F'[@:]' -v a="$2" -v b="$3" '$3 ~ /^hda_audio_/ && $2 + 0 >= a + 0 && $2 + 0 <= b + 0' "$ART/qemu-trace.log" 2>/dev/null || true)
+    n=$(grep -c 'hda_audio_overrun' <<<"$lines" || true)
+    ev_text "$1" "EV-QEMU: QEMU's own trace of its HDA codec while the tone played (pid@host time:event): $n hda_audio_overrun (the codec dropping its 8 KiB buffer, QEMU's backend not having taken it) and $(grep -c 'hda_audio_adjust' <<<"$lines" || true) hda_audio_adjust (the codec re-timing its read of the guest's audio)" \
+        "${lines:-(no hda_audio trace line in the window)}"
+    echo "${n:-0}"
+}
+# What the guest and QEMU said about the audio across a capture window: the
+# scheduling and xruns after, the desktop's log since the window opened, and
+# QEMU's HDA trace. Diagnosis kept with the story: S4.5.1's and S7.6.3's
+# tones have come out short with no gap in them (run 37335026876: the pod's
+# 20 s tone played in 18.64 s), and these say where the time went.
+audio_window_record() { # <host t0> <host t1> <guest t0>
+    ev_save sched-after "EV-STATE: PipeWire's threads and pw-top's batch view after the tone: an ERR count above the one before is an xrun during it" \
+        gq audio-sched >/dev/null || true
+    ev_save desktop-log "EV-LOG-DESKTOP: the desktop container's log from the tone's start on (PipeWire's own warnings, xruns among them, land here)" \
+        gq desktop-log-since "$3" >/dev/null || true
+    local n
+    n=$(ev_qemu_hda qemu-hda "$1" "$2")
+    ev_note "QEMU's HDA codec overran ${n:-0} time(s) while the tone played"
+}
 
 # F3.9's common set into the open story as <moment>-* files: QEMU's USB
 # devices, /dev/input on the host and in the container, the kernel's input
@@ -697,6 +727,8 @@ qemu-system-x86_64 \
     -qmp "unix:$QMP,server,nowait" \
     -qmp "unix:$QMPV,server,nowait" \
     -serial "file:$ART/serial.log" \
+    -msg timestamp=on -D "$PWD/$ART/qemu-trace.log" \
+    -trace enable=hda_audio_overrun -trace enable=hda_audio_adjust \
     -daemonize -pidfile qemu.pid
 
 log "wait for ssh"
@@ -886,6 +918,9 @@ log "audio lifecycle: independent of the X session, and recovers on its own"
 # must play on with no gap, no stall and none of it missing.
 EV_SIDE=h-
 ev_begin S4.5.1 "Audio survives an X session restart" T3
+ev_save sched-before "EV-STATE: PipeWire's threads with their scheduling class and realtime priority, and pw-top's batch view (each node's ERR column counts its xruns), before the tone" \
+    gq audio-sched >/dev/null || true
+t_cap0=$(date +%s.%N) g_cap0=$(gnow)
 ev_audio_start through-x 1100
 gq tone-start s451 1100 20 - >/dev/null || { audio_capture_stop; fail "could not start the 20 s tone for S4.5.1"; }
 ev_end
@@ -903,8 +938,10 @@ t_kill=$(vm_ssh_quick 'cat /run/verify-audio-x.kill' 2>/dev/null || true)
 p_t0=$(awk '/^played/ {print $5}' <<<"$player")
 mark=$(awk -v k="$t_kill" -v s="$p_t0" 'BEGIN {if (k != "" && s != "") printf "%.2f", k - s}')
 heard=yes
+t_cap1=$(date +%s.%N)
 ev_audio_stop "EV-AUDIO: the machine's output while a pulse client played a 20 s 1100 Hz tone, the X server killed a few seconds in (the plot's red line, timed by the player's clock): it must play on with no gap and none of it missing" \
     15 0.05 1100 --max-gap 0.1 --span 19.6 20.6 ${mark:+--mark "$mark"} || heard=no
+audio_window_record "$t_cap0" "$t_cap1" "$g_cap0"
 grep -q '^exited 0$' <<<"$player" || fail "the S4.5.1 player did not end cleanly: $(echo $player)"
 played=$(awk '/^played/ {print $2}' <<<"$player")
 python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 21.0 else 1)' "${played:-99}" \
@@ -1835,29 +1872,37 @@ A_POD_B=$EV_LAST
 ev_save daemons-before "EV-PIDS: the desktop's three audio daemons before the pod plays" \
     gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
 A_DMN_B=$EV_LAST
+# Each player's stream is found by its client's executable: paplay and
+# pw-play are links to pacat and pw-cat, which is what their clients run
+# (stream_apps says more).
 for path in pulse pipewire alsa; do
     hz=$(freq_for "$path")
-    case $path in pulse) pbin=paplay ;; pipewire) pbin='pw-(play|cat)' ;; alsa) pbin=aplay ;; esac
+    case $path in pulse) pbin=pacat ;; pipewire) pbin=pw-cat ;; alsa) pbin=aplay ;; esac
     ev_save "streams-before-$path" "EV-STATE: the streams playing before the pod's $path tone" gq stream-apps >/dev/null || true
     ev_audio_start "cdi-$path" "$hz"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path cdi-verify 3" > "$ART/.player-$path.out" 2>&1 &
     pl=$!
-    during="" s=""
+    during="" s="" polls=""
     for _ in $(seq 16); do
         sleep 0.5
         s=$(gq stream-apps 2>/dev/null || true)
-        if grep -Eq "application\.process\.binary = \"$pbin\"" <<<"$s"; then during=$s; break; fi
+        polls+="--- $(date -u +%H:%M:%S.%3N)"$'\n'"$s"$'\n'
+        if grep -Eq "binary \"$pbin\"" <<<"$s"; then during=$s; break; fi
     done
     pl_rc=0
     wait "$pl" || pl_rc=$?
-    ev_text "streams-during-$path" "EV-STATE: the streams while the pod's $path player played (polled every 0.5 s until its stream showed): its stream, with the player's binary and pid" "${during:-${s:-(no listing)}}"
+    if [ -n "$during" ]; then
+        ev_text "streams-during-$path" "EV-STATE: the streams while the pod's $path player played (polled every 0.5 s until its stream showed): its stream, its client's executable $pbin and pid" "$during"
+    else
+        ev_text "streams-during-$path" "EV-STATE: every listing taken while the pod's $path player played, each with its time (UTC): none shows a stream whose client runs $pbin" "${polls:-(no listing)}"
+    fi
     ev_audio_stop "EV-AUDIO: the machine's output while the cdi-verify pod played its $hz Hz tone over the $path path, with only the injected env - listen for one beep" 1 0.05 "$hz" \
         || fail "client pod $path audio capture is empty or silent"
     ev_copy "$ART/.player-$path.out" "player-$path" "EV-LOG-CLIENT: the pod's $path player: its command, its own output and its exit status"
     ev_save "streams-after-$path" "EV-STATE: the streams after the $path player ended" gq stream-apps >/dev/null || true
     [ "$pl_rc" = 0 ] || fail "client pod $path playback failed (see the player's log)"
     [ -n "$during" ] || fail "no stream of the pod's $path player was listed while it played"
-    ev_pass "over $path the pod's player ($(grep -Eo 'application\.process\.binary = "[^"]*"' <<<"$during" | sed -n 1p | cut -d'"' -f2)) played: its stream was listed while it played, and the machine's output carried its $hz Hz tone"
+    ev_pass "over $path the pod's player played: its stream was listed while it played ($(grep -E "binary \"$pbin\"" <<<"$during" | sed -n 1p)), and the machine's output carried its $hz Hz tone"
 done
 ev_save pod-after "EV-PIDS: the cdi-verify pod after the three paths played" gq pod-state cdi-verify >/dev/null || true
 ev_diff pod "EV-DIFF: the cdi-verify pod before and after (empty: the same container)" "$A_POD_B" "$EV_LAST"
@@ -2109,7 +2154,6 @@ log "client journeys: long-running pods through the desktop's own restarts"
 # up (S7.5.4, S7.6.5). The times in the notes are the guest's clock, which
 # the pods share.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh journey-start' || fail "the journey pod did not become Ready"
-gnow() { vm_ssh_quick 'date +%s.%N' 2>/dev/null | tail -1; }
 xorg_pid() { vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | sed -n 1p || true; }
 # Until a new X session answers: an Xorg other than <old pid>, and mwm up.
 x_wait() { # <old Xorg pid>
@@ -2178,7 +2222,10 @@ T_D_B=$EV_LAST
 aud_b=$(pids_of "$(ev_out)" pipewire wireplumber pipewire-pulse)
 x_old=$(xorg_pid)
 [ -n "$x_old" ] || fail "no Xorg to kill"
+ev_save sched-before "EV-STATE: PipeWire's threads with their scheduling class and realtime priority, and pw-top's batch view (each node's ERR column counts its xruns), before the tone" \
+    gq audio-sched >/dev/null || true
 ev_video_start x-restart
+t_cap0=$(date +%s.%N) g_cap0=$(gnow)
 ev_audio_start through-restart 1100
 gq journey-tone through 1100 20 >/dev/null || { audio_capture_stop; fail "could not start the pod's 20 s tone"; }
 sleep 3
@@ -2207,8 +2254,10 @@ player=$(ev_out)
 p_t0=$(awk '/^played/ {print $5}' <<<"$player")
 mark=$(awk -v k="$t_kill" -v s="$p_t0" 'BEGIN {if (k != "" && s != "") printf "%.2f", k - s}')
 heard=yes
+t_cap1=$(date +%s.%N)
 ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played a 20 s 1100 Hz tone, the X server killed about 5 s in (the plot's red line, timed by the player's clock): the tone must play on with no gap and none of it missing" \
     15 0.05 1100 --max-gap 0.1 --span 19.6 20.6 ${mark:+--mark "$mark"} || heard=no
+audio_window_record "$t_cap0" "$t_cap1" "$g_cap0"
 ev_video_stop "EV-VIDEO: the display going down and coming back while the pod's tone plays (index.txt and the notes give the times)"
 T_VID=$EV_VID
 ev_save pod-after "EV-PIDS: the journey pod's container after the X session came back" gq pod-state journey >/dev/null || true
