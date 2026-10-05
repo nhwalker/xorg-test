@@ -2161,7 +2161,7 @@ verify_privileges() {
         grep -o -- '--device-cgroup-rule="[^"]*"' /etc/containers/systemd/desktop.container >/dev/null || true
     spec=$(oci_spec_path) \
         || fail "could not find the desktop container's OCI spec (podman inspect's OCIConfigPath, or config.json in its StaticDir)"
-    devs=$(ev_save spec-devices "EV-STATE: the device list of the container's OCI spec ($spec), in order: what crun compiled into the cgroup v2 BPF program. Podman's defaults come first; 'm' alone lets mknod make a node, not open it" \
+    devs=$(ev_save spec-devices "EV-STATE: the device list of the container's OCI spec ($spec), in order, which crun compiles into the cgroup v2 BPF program beside its own built-in allowances for standard nodes such as /dev/null (not listed here): deny everything, then the DRM nodes the quadlet adds as devices, then the quadlet's five rules" \
         spec_devices "$spec") \
         || fail "could not read the device list of the OCI spec $spec"
     for major in 13 116 226 4 5; do
@@ -2909,14 +2909,20 @@ verify_session_restart() {
     pw=$(pipewire_pid)
     lead=$(systemctl show -p MainPID --value desktop-session.service)
     [ "${lead:-0}" != 0 ] || fail "desktop-session.service has no main process to watch"
+    # The probes. The host's sleep has its own stdio: holding this ssh
+    # session's, a failure here kept the session open until it ended
+    # (run 37330812438: ten minutes). In the image, sleep is coreutils-single's
+    # shebang script, so its command line reads
+    # "/usr/bin/coreutils --coreutils-prog-shebang=sleep /usr/bin/sleep 600":
+    # the probes are matched by how their command lines end.
     podman exec -d -u desktop -e DESKTOP_SESSION_TAG="$tag" desktop sleep 600
     podman exec -d -u desktop desktop sleep 601
-    setpriv --reuid=61000 --regid=61000 --clear-groups sleep 602 &
+    setpriv --reuid=61000 --regid=61000 --clear-groups sleep 602 </dev/null >/dev/null 2>&1 &
     sleep 1
     local tagged untagged hostside
-    tagged=$(pgrep -u 61000 -fx 'sleep 600' | sed -n 1p || true)
-    untagged=$(pgrep -u 61000 -fx 'sleep 601' | sed -n 1p || true)
-    hostside=$(pgrep -u 61000 -fx 'sleep 602' | sed -n 1p || true)
+    tagged=$(pgrep -u 61000 -f '(^|/)sleep 600$' | sed -n 1p || true)
+    untagged=$(pgrep -u 61000 -f '(^|/)sleep 601$' | sed -n 1p || true)
+    hostside=$(pgrep -u 61000 -f '(^|/)sleep 602$' | sed -n 1p || true)
     [ -n "$tagged" ] && [ -n "$untagged" ] && [ -n "$hostside" ] \
         || fail "the probe sleeps did not all start: tagged '$tagged', untagged '$untagged', host '$hostside'"
 
