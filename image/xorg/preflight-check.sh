@@ -132,7 +132,7 @@ if [ ! -f "$MONCONF" ]; then
     pass "no fixed monitor layout configured: Xorg will autodetect from EDID"
 else
     declared=$(grep -vE '^[[:space:]]*(#|$)' "$MONCONF" \
-        | grep -vE '^[[:space:]]*(watch|virtual|nvidia-connected|nvidia-edid)[[:space:]]' \
+        | grep -vE '^[[:space:]]*(virtual|nvidia-connected|nvidia-edid)[[:space:]]' \
         | awk '{print $1}')
     if [ -z "$declared" ]; then
         pass "fixed monitor layout file present but declares no outputs: Xorg will autodetect"
