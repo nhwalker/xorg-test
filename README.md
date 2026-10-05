@@ -839,12 +839,24 @@ entry fails; the rest of the desktop is unaffected.
 
 ## CI
 
-Three workflows verify everything short of NVIDIA hardware, on every PR:
+Two workflows verify everything short of NVIDIA hardware. **`ci.yml`** runs
+every test tier on every PR and every push to `main`, and on demand
+(`workflow_dispatch`); **`base-rebuild.yml`** rebuilds the base images weekly.
 
-- **`ci.yml`** — static checks (go fmt/vet/test for the plugin and the
-  screenshot binary, shellcheck, helm lint + golden template assertions in
-  `ci/helm-assertions.sh`, kubeconform over the plugin chart and the client
-  manifests) and the builds: base images are pulled from GHCR by content
+```
+static ──────────────────► evidence-static ───┐
+build-smoke ─────────────► evidence-smoke ────┤
+images ─┬► vm (core) ─────► evidence-vm-core ──┼──► coverage-gate
+        ├► vm (operator) ─► evidence-vm-operator┤
+        └► vm (k8s) ──────► evidence-vm-k8s ───┘
+              └──────────► vm-e2e (green only when every vm shard is)
+```
+
+- **`static`** — go fmt/vet/test for the plugin and the screenshot binary,
+  shellcheck, `ci/monitor-layout-tests.sh`, helm lint + golden template
+  assertions in `ci/helm-assertions.sh`, kubeconform over the plugin chart
+  and the client manifests.
+- **`build-smoke`** — the builds: base images are pulled from GHCR by content
   hash (`ci/build-bases.sh`, rebuilt only when their inputs change) and
   the application layers build with `--network=none` — the offline
   invariant is a CI gate. The same job resolves every CDI device against a
@@ -859,56 +871,75 @@ Three workflows verify everything short of NVIDIA hardware, on every PR:
   full composition — rsync-apply, boot from the tree's quadlet, converger
   oneshots, stub-CDI marker on the container's init process (which is a
   HOST pid — the pid-namespace shape is itself asserted, both ways), audio
-  sockets, PipeWire's pid holding still across the X session restarts that
-  runner's missing KMS causes anyway, `desktop-shell` ssh in both
-  directions, `desktop-preflight` green, service restart.
-- **`e2e-vm.yml`** — the full stack in a KVM-booted **Rocky 9 VM** with
-  virtio display/input/sound and **SELinux enforcing**
-  (`ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh`). The `deploy/` tree is applied
-  to the stock host: seat-prep evicts the boot getty, real Xorg starts
-  rootless on a real KMS device, mwm runs, audio plays over all three
-  client paths and is proven independent of the X session's lifecycle in
-  both directions (see "Audio has its own lifecycle"), the root-owned
-  `desktop-shell` ssh trust is proven in both
-  directions under enforcing, podman clients resolve each CDI device and
-  get its capability and no other, input is typed in over the real virtual
-  keyboard, hotplug is asserted through to the container's `/dev` and a full
-  KVM-style remove/re-add cycle is exercised via QEMU for both a USB keyboard
-  and a USB sound card — the latter through to WirePlumber, and in both
-  directions (see "Input and audio hotplug, and KVM switches"), a fixed
-  monitor layout is declared across the GPU's two
-  connectors — one of which QEMU never connects — and asserted to come up
-  whole and to hold when a connector is forced down under the running server
-  (see "Fixed monitor layout"), the container's privileges are asserted to be less
-  than `--privileged` (see "Container privileges"), and
-  `desktop-preflight` is asserted fully green. The podman clients run
+  sockets, PipeWire in its own process session apart from the X session's
+  and restarted, socket re-exported, when it is killed, `desktop-shell` ssh
+  in both directions, `desktop-preflight` green, service restart.
+- **`images`**, then **`vm (core)`**, **`vm (operator)`** and **`vm (k8s)`** —
+  the full stack in a KVM-booted **Rocky 9 VM** with virtio
+  display/input/sound and **SELinux enforcing** (`ci/vm/vm-e2e.sh` +
+  `ci/vm/vm-guest.sh`). `images` builds the images once; each shard boots
+  its own VM from them, in parallel, and starts by applying the `deploy/`
+  tree to the stock host: seat-prep evicts the boot getty, real Xorg starts
+  rootless on a real KMS device, mwm runs, the root-owned `desktop-shell`
+  ssh trust is proven in both directions under enforcing, podman clients
+  resolve each CDI device and get its capability and no other, a fixed
+  monitor layout is declared across the GPU's two connectors — one of which
+  QEMU never connects — and asserted to come up whole and to hold when a
+  connector is forced down under the running server (see "Fixed monitor
+  layout"), and `desktop-preflight` is asserted fully green. The podman clients run
   **confined** — no `label=disable` anywhere in the suite — against the
   `container_file_t` labels `desktop-selinux.service` applied, which are
-  themselves asserted directly beforehand. Before kubernetes arrives, an
-  operator phase (`ci/vm/operator-e2e.py`) works the desktop the way the
-  person at the display does, through QEMU's own tablet and keyboard and
-  never by injecting into X: windows moved, resized, iconified, maximized,
-  raised and closed with the mouse and again from the keyboard alone, text
-  carried by PRIMARY and CLIPBOARD between the desktop's xterm and two
-  client containers', every root-menu entry chosen, and volume, mute and
-  output changed from a desktop terminal while a client container plays a
-  tone. Each story leaves an evidence directory in the artifacts:
-  screendumps, video frames, window-tree diffs, pid tables, the audio
-  capture, and an `evidence.md` saying what to look for in each. Then k3s +
-  CRI-O join the same machine **with the desktop still running on its
-  quadlet and SELinux still enforcing**, and one `cdi-device-plugin`
-  release per capability makes each resource allocatable — confined client pods (asserted to be
-  `container_t`, declaring no `securityContext`) then draw on the display and
-  play/record audio
-  purely through CDI injection, checked against a control pod that
-  requests nothing and must get nothing, and against narrow pods proving a
-  display-only client gets no audio and an audio-only client cannot open
-  the display at all. Teardown asserts the other half of that seam:
-  `helm uninstall` withdraws the resources and touches neither the host
-  CDI specs nor the desktop. Screendumps of the virtual display are
-  uploaded as artifacts.
+  themselves asserted directly beforehand. Then each shard runs its part:
+  - **core** — the container's privileges are asserted to be less than
+    `--privileged` (see "Container privileges"), both log sinks are bounded,
+    audio plays over all three client paths and is proven independent of the
+    X session's lifecycle in both directions (see "Audio has its own
+    lifecycle"), input is typed in over the real virtual keyboard, and
+    hotplug is asserted through to the container's `/dev`, with a full
+    KVM-style remove/re-add cycle exercised via QEMU for both a USB keyboard
+    and a USB sound card — the latter through to WirePlumber, and in both
+    directions (see "Input and audio hotplug, and KVM switches").
+  - **operator** — `ci/vm/operator-e2e.py` works the desktop the way the
+    person at the display does, through QEMU's own tablet and keyboard and
+    never by injecting into X: windows moved, resized, iconified, maximized,
+    raised and closed with the mouse and again from the keyboard alone, text
+    carried by PRIMARY and CLIPBOARD between the desktop's xterm and two
+    client containers', every root-menu entry chosen, and volume, mute and
+    output changed from a desktop terminal while a client container plays a
+    tone.
+  - **k8s** — k3s + CRI-O join the machine **with the desktop still running
+    on its quadlet and SELinux still enforcing**, and one
+    `cdi-device-plugin` release per capability makes each resource
+    allocatable — confined client pods (asserted to be `container_t`,
+    declaring no `securityContext`) then draw on the display and play/record
+    audio purely through CDI injection, checked against a control pod that
+    requests nothing and must get nothing, and against narrow pods proving a
+    display-only client gets no audio and an audio-only client cannot open
+    the display at all. Teardown asserts the other half of that seam:
+    `helm uninstall` withdraws the resources and touches neither the host
+    CDI specs nor the desktop.
+
+  `ci/vm/vm-e2e.sh` with no argument runs every shard in one VM, in that
+  order; `core`, `operator` or `k8s` runs one.
+- **`vm-e2e`** — one check, green only when every vm shard is.
+- **`coverage-gate`** — runs even when a test job fails. It gathers every
+  job's evidence and checks it against `Requirements.md`: each story
+  directory must be complete (an `evidence.md`, every file it indexes
+  present and non-empty, a result), and every story `Requirements.md` marks
+  ✅ must have passing evidence from this run. Its report goes to the job
+  summary and to the `coverage-gate` artifact.
 - **`base-rebuild.yml`** — weekly from-scratch base rebuilds pushed to
   GHCR: early warning for Rocky/UBI point-release drift.
+
+**Evidence.** Every test job uploads what it saw as an artifact
+(`evidence-static`, `evidence-smoke`, `evidence-vm-<shard>`): one directory
+per story, written through `ci/evidence.sh` (shell) or `ci/evlib.py`
+(Python). Each holds the story's checks in the order they ran, what was
+recorded but not asserted, the files themselves (screendumps, command
+output and before/after diffs, pid tables, audio captures, QMP transcripts)
+and an `evidence.md` saying what to look for in each. Each VM shard also
+writes `run.json`: the image ids, QEMU, guest kernel and podman versions it
+ran with. `Requirements.md` ("Evidence standard") defines the format.
 
 Not covered by CI (needs the real machine): everything NVIDIA (CDI
 injection, `nvidia_drv.so`, GL acceleration) and physical-input quirks

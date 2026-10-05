@@ -132,8 +132,9 @@ seconds; process/socket/node state does not.
 ### 2.5 Artifacts
 
 Counters are written to `ci/vm/artifacts/xorg-input-count.txt`; WAV captures
-and PNG screendumps land next to it. The job uploads the directory even on
-failure.
+and PNG screendumps land next to it. The hotplug phases run in `ci.yml`'s
+`vm (core)` job, which uploads the directory as the `evidence-vm-core`
+artifact even on failure.
 
 ### 2.6 Running it yourself
 
@@ -146,16 +147,16 @@ sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile
 sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
 sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
 sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
-for t in desktop-container cdi-device-plugin desktop-testclient; do
-  sudo podman save -o ci/vm/images-${t%%-*}.tar localhost/$t:latest   # names: images-desktop/plugin/testclient.tar
-done
+sudo podman save -o ci/vm/images-desktop.tar localhost/desktop-container:latest
+sudo podman save -o ci/vm/images-plugin.tar localhost/cdi-device-plugin:latest
+sudo podman save -o ci/vm/images-testclient.tar localhost/desktop-testclient:latest
 curl -fL -o ci/vm/Rocky-9-GenericCloud.qcow2 \
   https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
-ci/vm/vm-e2e.sh
+ci/vm/vm-e2e.sh            # every shard in one VM; or: ci/vm/vm-e2e.sh core
 ```
 
-(Check `e2e-vm.yml` for the exact `podman save` file names; the loop above is
-illustrative.) To explore by hand, copy the `qemu-system-x86_64` line out of
+(These are the archive names `ci.yml`'s `images` job writes and
+`vm-e2e.sh` copies into the guest.) To explore by hand, copy the `qemu-system-x86_64` line out of
 `vm-e2e.sh`, drop `-daemonize` if you want it in the foreground, then drive
 `mon.sock` with `socat` while `ssh -p 2222 rocky@127.0.0.1` watches the guest.
 

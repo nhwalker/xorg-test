@@ -61,7 +61,7 @@ renumbering.
 | **T0 static** | any machine, no root | files only | `ci.yml` `static`: go fmt/vet/test, shellcheck, `py_compile` of the VM harness, `ci/monitor-layout-tests.sh`, ARG-scoping check, helm/kubeconform |
 | **T1 script-unit** | any machine, no root, or a scratch container of the image | one script with fabricated inputs | *does not exist yet* — see Appendix A for the refactors it needs |
 | **T2 build-smoke** | ubuntu runner, root, podman, systemd, **no sound card, no SELinux**; KMS not guaranteed (the Azure runners usually expose a Hyper-V DRM device, and X then really runs, per `ci/smoke-deploy.sh`) | the deploy tree booting a real container | `ci.yml` `build-smoke` + `ci/smoke-deploy.sh` |
-| **T3 VM e2e** | Rocky 9 KVM guest, virtio GPU/input/HDA, **SELinux enforcing**, k3s + CRI-O | real Xorg on a real KMS device, hotplug via QEMU, confined clients, a capturable display and audio backend | `e2e-vm.yml` → `ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh` + `ci/vm/operator-e2e.py` |
+| **T3 VM e2e** | Rocky 9 KVM guest, virtio GPU/input/HDA, **SELinux enforcing**, k3s + CRI-O | real Xorg on a real KMS device, hotplug via QEMU, confined clients, a capturable display and audio backend | `ci.yml` `images` → `vm` (shards `core`, `operator`, `k8s`, each its own VM) → `ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh` + `ci/vm/operator-e2e.py` |
 | **T4 hardware** | a provisioned physical host | NVIDIA, physical KVM switch, real monitors/EDID, USB audio, a person | manual checklist (Appendix C); to become a guided script that prompts the tester for each physical action and gathers the evidence itself |
 
 A story's tier is the *lowest* tier that can prove it honestly. Pushing a
@@ -81,6 +81,12 @@ Text in a job log is not saved evidence here: it is not indexed per story,
 and nothing checks that it was produced. This is the rule Appendix D counts
 by; a story whose assertion exists but whose evidence is not saved is ❌.
 
+CI holds the marks to it: `ci.yml`'s `coverage-gate` job reads every job's
+evidence and fails the run when a story marked ✅ here has no passing
+evidence in it, or when a story's directory is incomplete (S9.3.1). A ✅ line
+that files its evidence under another story's directory names it as
+`artifacts/<story>/`, which is how the gate finds it.
+
 Reference shorthand: `smoke` = `ci/smoke-deploy.sh`; `guest:<fn>` =
 `ci/vm/vm-guest.sh` function; `e2e` = `ci/vm/vm-e2e.sh`; `dryrun` = the
 "deploy tree quadlet dry-run + CDI spec checks" step of `ci.yml`;
@@ -94,9 +100,9 @@ A green assertion tells a reviewer that a script was satisfied. Evidence tells
 them what the machine actually did. Every story names the evidence it attaches;
 a test that passes without producing its evidence is incomplete. The standard
 below defines the kinds, how each is captured in this rig, and the report
-layout. Today the suite already produces some of these (QEMU screendumps, WAV
-captures, counter files, failure diagnostics); Appendix E lists the capture
-helpers still to build.
+layout. Every tier writes evidence through one library, `ci/evidence.sh`
+from the shell and `ci/evlib.py` from Python, in the layout below; Appendix E
+lists the capture helpers that exist and the ones still to build.
 
 ### Evidence kinds
 
@@ -124,25 +130,33 @@ defines.
 
 ### Report layout
 
-One directory per run, one subdirectory per story that executed:
+Each CI job writes one directory, one subdirectory per story it ran, and
+uploads it as its own artifact (`evidence-static`, `evidence-smoke`,
+`evidence-vm-<shard>`); `coverage-gate` reads them side by side.
+`ci/evlib.py`'s docstring is the format's reference.
 
 ```
 artifacts/
-  run.json                      # environment manifest: QEMU/podman/kernel versions, image digests, git sha, date
-  timeline.log                  # EV-TIMELINE for the whole run
+  run.json                      # VM shards: QEMU, guest kernel and podman versions, image ids, git sha, date
+  timeline.log                  # EV-TIMELINE for the job
   S7.7.4/
-    evidence.md                 # index: PASS/FAIL, the assertion text, one line per file saying what to look for
-    before-wpctl-status.txt     # EV-STATE
-    after-wpctl-status.txt
-    state.diff                  # EV-DIFF
-    audio-1100hz.wav            # EV-AUDIO
-    audio-1100hz.png            # spectrogram
-    check-audio.txt             # analyser verdict
-    pids-before.txt pids-after.txt   # EV-PIDS (incl. pod restartCount)
-    client.log                  # EV-LOG-CLIENT
-    desktop-log.txt             # EV-LOG-DESKTOP slice
-    display.mp4 frames/         # EV-VIDEO
-  …
+    evidence.md                 # the index: PASS/FAIL, every check in the order it ran, what was
+                                #   recorded but not asserted, one line per file saying what to look for
+    meta.tsv checks.tsv notes.tsv files.tsv result   # what evidence.md is rendered from
+    timeline.log                # this story's lines of the EV-TIMELINE
+    01-wpctl-status-before.txt  # EV-STATE; files are numbered in the order they were captured
+    02-wpctl-status-after.txt
+    03-wpctl-status.diff        # EV-DIFF
+    04-audio-1100hz.wav         # EV-AUDIO
+    05-level.png                # spectrogram, or the level plot at the story's pitch
+    06-analysis.txt             # analyser verdict
+    07-pids-before.txt 08-pids-after.txt   # EV-PIDS (incl. pod restartCount)
+    09-client-log.txt           # EV-LOG-CLIENT
+    10-desktop-log.txt          # EV-LOG-DESKTOP slice
+    11-display/ 11-display.gif  # EV-VIDEO: raw frames with their index, and the assembled gif
+    qemu.log                    # EV-QEMU: the QMP commands the story sent (operator phase)
+    h-checks.tsv h01-shot.png   # a VM story written from both sides: the host's additions carry an h
+  …                             #   prefix, so copying the guest's files back never overwrites them
 ```
 
 `evidence.md` is the human entry point. It answers, in order: what was the
@@ -188,7 +202,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `Containerfile`, `Containerfile.plugin` and `Containerfile.screenshot` build with `--network=none` against their prebuilt bases.
 - Acceptance: all three builds succeed under `podman build --network=none --pull=never` (`--network=none` alone governs only `RUN` steps; podman would still fetch a missing `FROM` or `COPY --from` image).
 - Evidence: build output of each showing `--network=none` on the command line and the final image id; `podman image inspect` of each result (EV-STATE).
-- Tier: T2 · Coverage: ❌ evidence not saved: the build output reaches only the job log and no `podman image inspect` is taken; asserted by `ci.yml` "application layers (offline gate)" (also `e2e-vm.yml`, `base-rebuild.yml`).
+- Tier: T2 · Coverage: ❌ evidence not saved: the build output reaches only the job log and no `podman image inspect` is taken; asserted by `ci.yml` "application layers (offline gate)" (also `ci.yml` `images`, `base-rebuild.yml`).
 
 **S1.1.2 Bases rebuild from current upstream**
 - Requirement: the three base images build from scratch against the live UBI image and Rocky repos, and the offline layers still build on the result.
@@ -206,7 +220,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: every `ARG` in every `Containerfile*` precedes the first `FROM`.
 - Acceptance: the ARG-scoping check passes.
 - Evidence: the check's stdout listing the files inspected.
-- Tier: T0 · Coverage: ❌ evidence not saved: the check prints one summary line, not the files it inspected; asserted by `ci.yml` "build args stay global (multi-stage ARG scoping)".
+- Tier: T0 · Coverage: ✅ `ci.yml` "build args stay global (multi-stage ARG scoping)" saves the check's output under `artifacts/S1.1.4/` (artifact `evidence-static`): each `Containerfile*` it read, with its ARG count and the position of its first FROM (an ARG after that FROM would be quoted by name, and fail the check).
 
 **S1.1.5 Rocky repos fill gaps only**
 - Requirement: UBI packages win over Rocky (priority 99 vs 200); Rocky supplies only what UBI lacks.
@@ -434,7 +448,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `LogDriver=k8s-file` and `--log-opt max-size=64m` both reach the running container.
 - Acceptance: `podman inspect` shows `k8s-file` and a 64 MB size.
 - Evidence: the inspect output (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved (job log only); asserted on the running container by `smoke` and `guest:verify_log_bounds`, and in the generated unit by `dryrun`.
+- Tier: T2/T3 · Coverage: ✅ `smoke` saves `podman inspect`'s log configuration of the running container (`Type` k8s-file, `Size` 64MB) under `artifacts/S2.6.2/` (artifact `evidence-smoke`) and checks both. `guest:verify_log_bounds` asserts the same on the VM (job log only), and `dryrun` checks the generated unit (S5.2.1).
 
 ---
 
@@ -682,7 +696,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: QEMU HID → evdev → Xorg → focused xterm; the operator sees their keystrokes.
 - Acceptance: `e2e` "input: type into an xterm", and `operator-e2e:s11_1_3`.
 - Evidence: EV-SHOT `input-typed.png`; sink file (EV-LOG-CLIENT); EV-QEMU transcript.
-- Tier: T3 · Coverage: ✅ `e2e` "input: type into an xterm" (keeps `input-typed.png`) and `operator-e2e:s11_1_3`, which types through QEMU's keyboard into focused xterms; sink files, shots and `qemu.log` under `artifacts/S11.1.3/`.
+- Tier: T3 · Coverage: ✅ `e2e` "input: type into an xterm" saves the QMP transcript, the shot and the sink file under `artifacts/S3.8.1/` (artifact `evidence-vm-core`); `operator-e2e:s11_1_3` also types through QEMU's keyboard into focused xterms, with sink files, shots and `qemu.log` under `artifacts/S11.1.3/`.
 
 > **Retired IDs:** S3.8.2 (hot-added input reaches the container), S3.8.3
 > (KVM-style remove/re-add cycle) and S3.8.4 (the re-added device itself
@@ -1063,7 +1077,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `quadlet -dryrun` succeeds; `ExecStart` has `--cap-drop all`, `--security-opt label[=:]disable`, `--log-driver k8s-file`, `--log-opt max-size=64m`, `--device nvidia.com/gpu=all`, and no `--privileged`.
 - Acceptance: `dryrun`.
 - Evidence: the generated unit (EV-CONFIG).
-- Tier: T2 · Coverage: ❌ evidence not saved (`dryrun` prints the generated unit only to the job log); asserted by `dryrun`.
+- Tier: T2 · Coverage: ✅ `dryrun` saves the unit quadlet generated under `artifacts/S5.2.1/` (artifact `evidence-smoke`) and checks each flag on its `ExecStart` line, `--privileged` absent included; the evidence names the quadlet binary that ran and its podman version.
 
 **S5.2.2 Every PodmanArgs flag reaches ExecStart intact**
 - Requirement: `--pid=host`, `--systemd=false`, `--tty`, `--security-opt apparmor=unconfined`, the three `--ulimit`s, and five `--device-cgroup-rule` arguments each arriving as **one** argument.
@@ -1330,7 +1344,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `done: 0 FAIL(s)`, exit 0.
 - Acceptance: `guest:phase_deploy`.
 - Evidence: the full output (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved (the full output reaches only the job log); asserted by `guest:phase_deploy`.
+- Tier: T3 · Coverage: ✅ `guest:phase_deploy` saves `desktop-preflight`'s full report under `artifacts/S5.10.1/` (artifact `evidence-vm-core`) and checks its exit status and its last line.
 
 **S5.10.2 Reports a partially-applied host accurately**
 - Requirement: on the dry-run's partially applied runner the report ends `done: N FAIL(s)` and shows `FAIL: quadlet unit missing`, `PASS: GPU-less host: stub CDI spec`, `PASS: desktop-shell account exists` and `PASS: default target is multi-user.target`.
@@ -1374,7 +1388,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: none of these 13 capabilities is in init's `CapEff`: `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_BOOT`, `SYS_TIME`, `NET_ADMIN`, `NET_RAW`, `DAC_READ_SEARCH`, `SYSLOG`, `BPF`, `PERFMON`, `SYS_ADMIN`, `KILL` (the list `guest:verify_privileges` checks; `README.md` names a different 13).
 - Acceptance: `guest:verify_privileges`.
 - Evidence: `CapEff` and its `capsh --decode` (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved (`CapEff` hex in the job log only, never decoded); asserted by `guest:verify_privileges`.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges` saves init's `/proc/<pid>/status` and `capsh --decode` of its `CapEff` under `artifacts/S6.1.2/` (artifact `evidence-vm-core`), and checks each of the 13 bits on its own.
 
 **S6.1.3 Granted set is exactly what the quadlet lists**
 - Requirement: `CapEff` decodes to exactly the nine granted capabilities.
@@ -2067,16 +2081,17 @@ environment (`README.md` "Look and feel (dark theme)"), so the root menu, the
 window frames, the key bindings, the X selections and a terminal are the
 operator's whole toolset.
 
-How these stories are run (`ci/vm/operator-e2e.py`, a phase of its own
-between the hotplug checks and phase 2), and what that takes for granted:
+How these stories are run (`ci/vm/operator-e2e.py`: in CI the
+`vm (operator)` job, which boots its own VM and runs them right after
+phase-deploy; in a single-VM run of `ci/vm/vm-e2e.sh`, between the hotplug
+checks and phase 2), and what that takes for granted:
 
 - The input is QEMU's: pointer and key events go over QMP to QEMU's own
   devices, never into the X server. Pointer events reach the virtio tablet.
   Key events reach whichever keyboard QEMU activated last: the virtio
-  keyboard after boot, or the USB keyboard `kvmkbd` once the KVM-switch
-  simulation has re-added it (QEMU makes a newly added USB keyboard the
-  active one), which is what happens when the operator stories run after
-  it in the same VM. The harness only looks at X, with `xwininfo` and
+  keyboard after boot, which is the CI case, or the USB keyboard `kvmkbd`
+  once the KVM-switch simulation has re-added it (QEMU makes a newly added
+  USB keyboard the active one), which is the single-VM case. The harness only looks at X, with `xwininfo` and
   `xprop` in an observer container of the lean client image that holds
   `desktop.local/display` and nothing else (the host has no X tools), and
   at QEMU's screendumps. The observer sends no input; its one write is
@@ -2093,7 +2108,9 @@ between the hotplug checks and phase 2), and what that takes for granted:
 - Order matters: S11.1.1's last entry ends the X session and S11.3.1 ends
   by restarting `desktop.service`, so those two run last, in that order.
   The operator-facing F3.3 and F3.5 checks (S3.3.2, S3.3.3, S3.5.2,
-  S3.5.3) run first, on the desktop as the session leaves it.
+  S3.5.3) run first, on the desktop as the session leaves it; the setup
+  before them closes the terminals earlier phases left up (phase-deploy's
+  among them).
 
 **Common set**: EV-SHOT before and after each action, and EV-VIDEO across any
 action with movement; the EV-QEMU transcript of every pointer and key event
@@ -2169,7 +2186,7 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 |---|---|---|
 | `xinput` | S3.9.2, S3.9.4, S3.9.5, S3.9.8, S3.9.10, S3.9.11, S3.9.12 | `Containerfile.testclient` (CI-only); run as a podman client in phase-deploy or from `x11-testclient` in phase 2 |
 | `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.5.3, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S10.2.2, S11.1.1–S11.1.3, S11.2.1 | **shipped**: `Containerfile.testclient` carries both, and the operator phase runs them in its observer container; on a T4 host, built and loaded there too (Appendix C) |
-| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | **shipped**: imagemagick is on the `e2e-vm.yml` apt line and makes the gifs; ffmpeg is not installed |
+| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | **shipped**: imagemagick is on the `ci.yml` `vm` job's apt line and makes the gifs; ffmpeg is not installed |
 | `sox` or `ffmpeg` | spectrograms for EV-AUDIO | not installed; the operator phase draws a level plot at the story's pitch instead (EV-AUDIO) |
 | `inotify-tools` | S7.2.3 | the `build-smoke` runner (apt), S7.2.3 being T2 |
 | `alsa-utils` + `alsa-plugins-pulseaudio` | S4.2.2 | VM guest |
@@ -2271,20 +2288,22 @@ story whose assertion exists but whose named evidence is not yet captured
 (e.g. "✅ captures; ❌ spectrograms") counts as ❌: an unreviewable pass is a
 gap by this document's definition. The coverage lines were re-checked against
 the code story by story on 2026-10-05 and now follow this rule; the counts
-before that review were 69 ✅, 42 🟡, 136 ❌ and 4 🔧.
+before that review were 69 ✅, 42 🟡, 136 ❌ and 4 🔧. Since then each story
+moves to ✅ only when a CI run has saved its evidence, which the
+`coverage-gate` job then keeps true.
 
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
-| E1 Image build | 14 | 0 | 0 | 14 | 0 |
-| E2 Boot & supervision | 25 | 0 | 1 | 24 | 0 |
+| E1 Image build | 14 | 1 | 0 | 13 | 0 |
+| E2 Boot & supervision | 25 | 1 | 1 | 23 | 0 |
 | E3 Display & session | 62 | 8 | 1 | 50 | 3 |
 | E4 Audio | 23 | 0 | 0 | 22 | 1 |
-| E5 Deploy tree | 50 | 0 | 0 | 49 | 1 |
-| E6 Privileges | 9 | 0 | 0 | 9 | 0 |
+| E5 Deploy tree | 50 | 2 | 0 | 47 | 1 |
+| E6 Privileges | 9 | 1 | 0 | 8 | 0 |
 | E7 Client contract & journeys | 40 | 0 | 0 | 40 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 2 | 1 | 2 | 0 |
-| **Total** | **251** | **10** | **3** | **232** | **6** |
+| **Total** | **251** | **15** | **3** | **227** | **6** |
 
 Regenerate after editing with:
 
@@ -2295,36 +2314,43 @@ for e in 1 2 3 4 5 6 7 10 11; do
 done
 ```
 
-## Appendix E — Evidence capture helpers to build
+## Appendix E — Evidence capture helpers
 
-The evidence standard needs a handful of harness functions. All of them
-belong in `ci/vm/vm-e2e.sh` (host side) or `vm-guest.sh` (guest side) and
-should be written once and reused by every story.
+The evidence standard needs a handful of harness functions, written once and
+reused by every story. Each story's directory is written in one format
+(`ci/evlib.py`'s docstring; "Report layout" above) by one of two writers.
 
-The operator phase has its own, in Python (`ci/vm/operator-e2e.py`): `Story`
-covers `ev_begin`/`ev_end`/`ev_note` and writes each story's `evidence.md`,
-`timeline.log` and `qemu.log` (its QMP transcript); `Ctx.shot`, `Ctx.video`,
-`Ctx.pids` and `Ctx.diff` cover `ev_shot`, `ev_video_*`, `ev_pids` and
-`ev_diff`; S11.3.1 captures and analyses its own audio. The shell phases
-still have none of these, and `artifacts/timeline.log` holds the operator
-phase alone until they do.
+**Built:**
+
+| Helper | Where | Does |
+|---|---|---|
+| `ev_begin <story> <title> [tier]` / `ev_end [reason]` / `ev_abort <reason>` | `ci/evidence.sh`, any shell tier | opens `artifacts/<story>/` and its `meta.tsv`; settles PASS/FAIL and renders `evidence.md`; `ev_abort` is what `fail()` calls, so a red story is still written |
+| `ev_check <claim> <cmd…>` / `ev_pass` / `ev_fail` | `ci/evidence.sh` | one line in `checks.tsv` per assertion, in order |
+| `ev_note <text>` | `ci/evidence.sh` | observed and recorded, deliberately not asserted (`notes.tsv`) |
+| `ev_save <moment> <what> <cmd…>` | `ci/evidence.sh` | runs the command and keeps the command line, its output and its exit status as the next numbered file (EV-STATE, EV-LOG-*) |
+| `ev_text`, `ev_copy`, `ev_diff`, `ev_attach` | `ci/evidence.sh` | text already in hand, a copied file (EV-CONFIG), `diff -u` of two kept files (EV-DIFF), a file already written |
+| `EV_SIDE=h-` | `ci/evidence.sh` | a VM story written from the guest and the host at once; the host's files carry an `h` prefix |
+| `StoryWriter` | `ci/evlib.py` | the same, from Python; the operator phase's `Story` builds on it and adds `qemu.log`, its QMP transcript |
+| `Ctx.shot`, `Ctx.video`, `Ctx.pids`, `Ctx.diff`, `Ctx.save_cmd`, `Ctx.diagnostics` | `ci/vm/operator-e2e.py` | EV-SHOT, EV-VIDEO (frames, index, gif), EV-PIDS, EV-DIFF with both sides kept, command output, and the failure shot, tree, process table and desktop log |
+| `ev_shot <moment> <what>` | `ci/vm/vm-e2e.sh` (host) | QEMU screendump into the open story |
+| `guest_ev <root\|""> <phase…>`, `ev_pull` | `ci/vm/vm-e2e.sh` (host) | runs a `vm-guest.sh` phase with evidence on and copies the guest's story directories back |
+| `QMP_TRANSCRIPT=<file>` | `ci/vm/qmp-type.py` | writes every QMP command it sends, timestamped (EV-QEMU) |
+| `write_manifest` | `ci/vm/vm-e2e.sh` (host) | `run.json`: image ids, QEMU, guest kernel and podman versions, git sha, date |
+| `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance); holds the ✅ marks in this document to the run's evidence |
+
+**Still to build** (the stories that name them stay ❌ until they exist):
 
 | Helper | Side | Does |
 |---|---|---|
-| `ev_begin <story>` / `ev_end <story> <PASS\|FAIL>` | host | creates `artifacts/<story>/`, opens `evidence.md`, appends to `timeline.log` |
-| `ev_note <story> <text>` | host | appends a line to the story's index and the timeline |
-| `ev_shot <story> <moment>` | host | QEMU screendump into the story dir, noted in the index |
-| `ev_video_start <story> <fps>` / `ev_video_stop <story>` | host | background screendump loop; on stop assembles mp4/gif and lists frames |
-| `ev_audio_start <story> <label>` / `ev_audio_stop <story> <label> <hz>` | host | `wavcapture`/`stopcapture`, then `check-audio.py` and a spectrogram into the dir |
-| `ev_state <story> <moment> <label> <command…>` | guest, via ssh | runs the command, stores `<moment>-<label>.txt`; `ev_diff <story> <label>` diffs before/after |
-| `ev_pids <story> <moment> [pod…]` | guest | the EV-PIDS table for the desktop processes plus any pods' `restartCount`/container id |
-| `ev_desktop_log <story>` | guest | `podman logs desktop` from the story's start marker |
-| `ev_client_log <story> <pod\|ctr>` | guest | `kubectl logs` / `podman logs` plus any sink file |
-| `ev_qemu <story> <moment>` | host | `info usb`, `info pci`, `info qtree` into the dir |
-| `ev_check` | host | post-run: every executed story has an `evidence.md`, and every file it names exists and is non-empty (S9.3.1) |
-| `ev_procedure <story> <doc> <heading> [n]` | host extracts, guest runs | copies the n-th fenced block under `<heading>` in `<doc>`, at the run's git sha, into `procedure.sh`; runs it one command at a time as the maintainer would (a root shell on the guest); writes `procedure-transcript.txt` with each command's output and exit status (EV-PROCEDURE). Placeholders come from a declared map that the index lists |
-| `ev_fresh_host <story> [profile]` | host | a new qcow2 overlay on the stock cloud image, booted, so a provisioning story starts from a host nothing has touched; `profile` selects variants such as the `gdm` image for S10.1.5 |
-| `ev_time_to_desktop <story> <mark>` | host | from a timeline mark, polls until the display shows the desktop by S3.3.3's probes (root-colour pixel, an xterm in the window tree); writes the elapsed seconds to the index |
+| `ev_video_start <fps>` / `ev_video_stop` | host | the shell phases' EV-VIDEO: a background screendump loop; on stop the gif and the frame list |
+| `ev_audio_start <label>` / `ev_audio_stop <label> <hz>` | host | `wavcapture`/`stopcapture`, then `check-audio.py`'s verdict and a level plot or spectrogram into the story |
+| `ev_pids <moment> [pod…]` | guest | the shell phases' EV-PIDS table, plus any pods' `restartCount`/container id |
+| `ev_desktop_log` | guest | `podman logs desktop` from the story's start marker |
+| `ev_client_log <pod\|ctr>` | guest | `kubectl logs` / `podman logs` plus any sink file |
+| `ev_qemu <moment>` | host | `info usb`, `info pci`, `info qtree` into the story |
+| `ev_procedure <doc> <heading> [n]` | host extracts, guest runs | copies the n-th fenced block under `<heading>` in `<doc>`, at the run's git sha, into `procedure.sh`; runs it one command at a time as the maintainer would (a root shell on the guest); writes `procedure-transcript.txt` with each command's output and exit status (EV-PROCEDURE). Placeholders come from a declared map that the index lists |
+| `ev_fresh_host [profile]` | host | a new qcow2 overlay on the stock cloud image, booted, so a provisioning story starts from a host nothing has touched; `profile` selects variants such as the `gdm` image for S10.1.5 |
+| `ev_time_to_desktop <mark>` | host | from a timeline mark, polls until the display shows the desktop by S3.3.3's probes (root-colour pixel, an xterm in the window tree); writes the elapsed seconds to the index |
 
 Audio frequency registry (keep in `freq_for` in `vm-e2e.sh` and `gen_tone` in
 `vm-guest.sh`):
