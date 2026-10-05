@@ -5244,7 +5244,7 @@ sl_narrow_rows() {
 
 soundless() { # before|plugged|realign|played|after
     [ "${EV_PROFILE:-}" = soundless ] || fail "the soundless steps need the VM booted without a sound card (EV_PROFILE=soundless)"
-    local log since rows node ngid cgid c0 c1 n_lines old
+    local log since rows node ngid cgid c0 c1 n_lines old d0 p0 p1 cm
     case "${1:-}" in
         before)
             log sl "a soundless host: no card, the host's audio group on $SL_GID, the image's in the container"
@@ -5285,6 +5285,10 @@ soundless() { # before|plugged|realign|played|after
             sleep 4
             ev_save client-before "EV-PIDS: the client as it started: id, pid, start, restarts, status" sl_inspect >/dev/null || fail "no client to inspect"
             sl_inspect > /run/ev-sl-client
+            # F7.7's common set: Xorg, mwm and the audio daemons, before and after.
+            ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the card arrives" \
+                ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+            echo "$EV_LAST" > /run/ev-sl-daemons
             ev_save client-log-early "EV-LOG-CLIENT: the client's first tries, with no card's sink to play to" podman logs "$SL_CLIENT" >/dev/null || true
             clog=$(sl_clog)
             grep -q '^try 1 at ' <<<"$clog" || fail "the client logged no failed try with no card"
@@ -5364,8 +5368,18 @@ soundless() { # before|plugged|realign|played|after
             [ -n "$c0" ] && [ "$c1" = "$c0" ] || fail "the client is not the same container and process: $c0 -> $c1"
             grep -q ' restarts=0 status=running$' <<<"$c1" || fail "the client restarted or stopped: $c1"
             ev_pass "the same container and process throughout, never restarted, still running: $c1"
+            ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the client played" \
+                ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+            d0=$(cat /run/ev-sl-daemons 2>/dev/null || true)
+            [ -n "$d0" ] || fail "the daemons' table from before the card is missing"
+            ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons before the card arrived (-) and after the client played (+): the audio daemons are new, the stack having restarted to align to the card; Xorg and mwm are not" "$d0" "$EV_LAST"
+            for cm in Xorg mwm; do
+                p0=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$d0") p1=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$EV_LAST")
+                [ -n "$p0" ] && [ "$p0" = "$p1" ] || fail "$cm is not the same process across the card's arrival: ${p0:-none} -> ${p1:-none}"
+            done
+            ev_pass "Xorg and mwm are the same processes across the card's arrival and the audio stack's restart"
             podman rm -f -t 2 "$SL_CLIENT" >/dev/null 2>&1 || true
-            rm -f /run/ev-sl-client
+            rm -f /run/ev-sl-client /run/ev-sl-daemons
             ev_end
             ;;
         *) fail "soundless: before, plugged, realign, played or after" ;;
