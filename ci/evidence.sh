@@ -41,7 +41,9 @@ EV_LAST=""
 EV_LIB_DIR="${EV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 _ev_ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
-_ev_one() { printf '%s' "$*" | tr '\t\n' '  '; }
+# One TSV field: no tab, newline or carriage return inside it (ssh ends its
+# messages with \r\n, and a reader splitting on \r would break the row).
+_ev_one() { printf '%s' "$*" | tr '\t\n\r' '   '; }
 
 ev_log() { # <kind> <text>
     [ -n "$EV_ROOT" ] || return 0

@@ -854,10 +854,26 @@ mt_layout_case_check() { # the same case, after the restart
             ! grep -q 'xorg-monitor-conf: ERROR' <<<"$log" || fail "'$1' gave an ERROR: $(grep -m1 ERROR <<<"$log")"
             [ "$gen" = yes ] || fail "no 30-monitors.conf was generated with '$1'"
             if [ "$1" = virtual ]; then
-                ev_save "xorg-size-$1" "EV-LOG-XORG: the Xorg log's lines on the screen's size and the outputs' initial modes, the case '$1'" \
-                    podman exec desktop grep -iE 'virtual|pitch|screen size|initial mode|using initial' "$XORG_LOG" >/dev/null || true
+                # What monitors.conf says the line does on modesetting
+                # (claude/fix-virtual-docs; run 37387054418 held the screen to
+                # the declared virtual size, which X never gives): it reaches
+                # the Screen section and caps the modes probed at start, and
+                # the screen starts at the declared outputs' extents.
+                local vw vh xlog xs
+                read -r vw vh <<<"$(grep -m1 '^virtual ' "$MT_MONCONF" | awk '{split($2, a, "x"); print a[1], a[2]}')"
+                ev_save "generated-$1" "EV-CONFIG: the generated /etc/X11/xorg.conf.d/30-monitors.conf, the case '$1'" \
+                    podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf >/dev/null || true
+                podman exec desktop grep -q "Virtual $vw $vh" /etc/X11/xorg.conf.d/30-monitors.conf \
+                    || fail "the generated config does not carry Virtual $vw $vh"
+                xlog=$(ev_save "xorg-size-$1" "EV-LOG-XORG: the Xorg log's lines on the virtual size and the outputs' initial modes, the case '$1'" \
+                    podman exec desktop grep -iE 'virtual|pitch|screen size|initial mode|using initial' "$XORG_LOG") || true
+                grep -q 'too large for virtual size' <<<"$xlog" \
+                    || fail "the Xorg log leaves out no mode for the virtual size: the server did not read Virtual $vw $vh"
                 dims=$(dpy_dims)
-                [ "$dims" = "$(grep -m1 '^virtual ' "$MT_MONCONF" | awk '{print $2}')" ] || fail "the screen is $dims, not the declared virtual size"
+                [ "$dims" = "${mode%%@*}" ] || fail "the screen is $dims, not the declared output's extents, ${mode%%@*}"
+                ev_pass "on modesetting, as monitors.conf says: Virtual $vw $vh is in the generated config and the server read it (modes too large for it left out at start), and the screen starts at the declared output's extents, $dims"
+                xs=$(xr)
+                ev_note "xrandr's screen line, the case '$1': $(grep -m1 '^Screen ' <<<"$xs")"
             fi
             ev_pass "(c) '$1' with a valid value beside a valid output line: the layout is applied ($(grep -m1 'fixed layout' <<<"$log" | sed 's/.*xorg-monitor-conf: //'))" ;;
         restore)
@@ -1505,41 +1521,33 @@ mt_sel_break() {
     else
         ev_fail "the client's loop kept opening the display with /tmp/.X11-unix relabelled tmp_t"
     fi
-    # Run 37382027299: ausearch found nothing 1.5 s and 2.6 s after the first
-    # failure while setroubleshoot reported the denial at 2.9 s; the record
-    # reaches audit.log after a delay. The harness waits for it (up to 60 s)
-    # before the entry's checks, and records how long it took.
+    # ausearch reads its standard input instead of the audit log when that
+    # is a pipe (audit-userspace src/ausearch.c: is_pipe(0), unless
+    # --input-logs), and this script runs over ssh with no terminal, its
+    # stdin one. Runs 37382027299 to 37387054418 read that empty pipe:
+    # "<no matches>" with the client's AVC records in audit.log (31 by the
+    # last one), which looked like auditd holding them back. The harness's
+    # own probes say --input-logs; the entry's check runs at a terminal, as
+    # a maintainer runs it (mt_sel_diagnose).
     local t0 avc="" waited=""
+    ev_save stdin "EV-STATE: this script's standard input: a pipe here, which ausearch would read instead of the audit log" \
+        stat -L -c '%F' /proc/self/fd/0 >/dev/null || true
     t0=$(date +%s)
     for i in $(seq 60); do
-        avc=$(ausearch -m avc -ts recent 2>&1 || true)
+        avc=$(ausearch --input-logs -m avc -ts recent 2>&1 || true)
         grep -q 'avc: *denied' <<<"$avc" && { waited=$(( $(date +%s) - t0 )); break; }
         sleep 1
     done
-    ev_save avc "EV-STATE: ausearch -m avc -ts recent, raw: the denial" sh -c 'ausearch -m avc -ts recent 2>&1; true' >/dev/null || true
-    ev_save auditd "EV-CONFIG: auditd's flush settings and state (the delay before a record reaches audit.log)" \
-        sh -c 'grep -E "^(flush|freq|write_logs|log_format) *=" /etc/audit/auditd.conf; auditctl -s 2>&1' >/dev/null || true
+    ev_save avc "EV-STATE: ausearch --input-logs -m avc -ts recent, raw: the denial" \
+        sh -c 'ausearch --input-logs -m avc -ts recent 2>&1; true' >/dev/null || true
     if [ -n "$waited" ]; then
         ev_pass "an AVC denial is logged: ausearch found it ${waited} s after the client's loop failed"
     else
-        ev_fail "no AVC denial reached the audit log within 60 s of the client's loop failing"
+        ev_fail "no AVC denial in the audit log within 60 s of the client's loop failing"
         ev_save setroubleshoot "EV-LOG-JOURNAL: setroubleshoot's reports since the relabel" \
             sh -c "journalctl --no-pager -o short-precise -t setroubleshoot --since @$(mt_get since-break) 2>&1; true" >/dev/null || true
-        # Run 37384618550: setroubleshoot reported the denial while ausearch
-        # found nothing for 60 s. Does auditd hold the record unwritten?
-        # A rotation makes it write out what it holds.
-        ev_save audit-log "EV-STATE: /var/log/audit/audit.log's size and time and its AVC record count, before a rotation" \
+        ev_save audit-log "EV-STATE: /var/log/audit/audit.log's size and time and its AVC record count" \
             sh -c 'stat -c "%s bytes, modified %y" /var/log/audit/audit.log; grep -c "type=AVC" /var/log/audit/audit.log' >/dev/null || true
-        ev_save audit-rotate "EV-PROCEDURE: harness-only diagnosis: service auditd rotate (auditd writes out what it holds and starts a new log)" \
-            service auditd rotate >/dev/null || true
-        sleep 2
-        avc=$(ausearch -m avc -ts recent 2>&1 || true)
-        ev_text avc-after-rotate "EV-STATE: ausearch -m avc -ts recent after the rotation" "$avc"
-        if grep -q 'avc: *denied' <<<"$avc"; then
-            ev_note "after service auditd rotate, ausearch finds the denial: auditd had the record and had not written it to audit.log"
-        else
-            ev_note "after service auditd rotate, ausearch still finds no denial"
-        fi
     fi
     ev_end
 }
@@ -1551,7 +1559,13 @@ mt_sel_diagnose() {
                 "$(mt_span "$MT_SEL_LEAD" '^ls -Zd ')" \
                 "$(mt_span "$MT_SEL_LEAD" '^ausearch ')"; do
         rc=0
-        out=$(ev_save "check-${line%% *}" "EV-PROCEDURE: \`$line\`, as the entry writes it: its output and exit status" sh -c "$line") || rc=$?
+        case "$line" in
+            # At a terminal, as the maintainer runs it: with its stdin a pipe
+            # ausearch would read that instead of the log (mt_sel_break).
+            ausearch\ *) out=$(ev_save "check-${line%% *}" "EV-PROCEDURE: \`$line\`, as the entry writes it, run at a terminal (ci/vm/pty-answer.py): its output and exit status" \
+                              python3 ci/vm/pty-answer.py "$line") || rc=$? ;;
+            *) out=$(ev_save "check-${line%% *}" "EV-PROCEDURE: \`$line\`, as the entry writes it: its output and exit status" sh -c "$line") || rc=$? ;;
+        esac
         case "$line" in
             ls\ *) grep -q 'tmp_t.*/tmp/\.X11-unix' <<<"$out" && ev_pass "\`$line\` shows /tmp/.X11-unix's wrong label, tmp_t" \
                        || ev_fail "\`$line\` does not show the wrong label" ;;

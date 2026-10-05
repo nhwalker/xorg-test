@@ -53,8 +53,8 @@ def stamp():
 
 
 def one_line(text):
-    """TSV-safe: no tabs or newlines inside a field."""
-    return " ".join(str(text).replace("\t", " ").split("\n")).strip()
+    """TSV-safe: no tabs, newlines or carriage returns inside a field."""
+    return " ".join(str(text).replace("\t", " ").replace("\r", " ").split("\n")).strip()
 
 
 # --- writing ------------------------------------------------------------------
@@ -149,9 +149,11 @@ class StoryWriter:
 def _rows(path, width):
     out = []
     try:
-        with open(path) as f:
+        # Rows end at \n alone: a stray \r inside a field (an ssh message
+        # kept before the writers dropped them) is not a row break.
+        with open(path, newline="\n") as f:
             for line in f:
-                line = line.rstrip("\n")
+                line = line.rstrip("\n").replace("\r", " ")
                 if not line:
                     continue
                 parts = line.split("\t")
@@ -194,7 +196,7 @@ def read_result(d):
     """('PASS'|'FAIL'|'INCOMPLETE', reason). A host-side failed check fails
     the story even though only the guest side writes `result`."""
     try:
-        first = open(os.path.join(d, "result")).read().strip().split("\t", 1)
+        first = open(os.path.join(d, "result"), newline="\n").read().replace("\r", " ").strip().split("\t", 1)
     except FileNotFoundError:
         first = None
     failed = [c for c in read_checks(d) if c[1] != "PASS"]
