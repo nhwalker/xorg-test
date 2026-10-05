@@ -290,12 +290,15 @@ jobs:
             same "$(awk '$2=="/usr/libexec/desktop-tools/screenshot"{print $1}' <<<"$staged")" "$sha_src"
           # TOOLS_IMAGE is a build argument: a build given another image must
           # stage that image's /screenshot. A scratch image holding a marker
-          # file stands in for it.
+          # file stands in for it. Both builds skip the layer cache: one run's
+          # cache lookup failed inside podman ("checking if cached image exists
+          # from a previous build: getting top layer info: layer not known"),
+          # an error about the runner's storage, not about the image.
           other=$(mktemp -d)
           printf 'not the screenshot tool: a marker staged from TOOLS_IMAGE=localhost/ci-other-tools\n' > "$other/screenshot"
           printf 'FROM scratch\nCOPY screenshot /screenshot\n' > "$other/Containerfile"
           if ev_save build-other "EV-STATE: a scratch image whose /screenshot is a marker file, then the desktop image rebuilt with --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest" \
-               sudo sh -c "podman build --network=none --pull=never -t localhost/ci-other-tools:latest '$other' && podman build --network=none --pull=never --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest -t localhost/desktop-container:ci-other-tools -f Containerfile ." >/dev/null; then
+               sudo sh -c "podman build --no-cache --network=none --pull=never -t localhost/ci-other-tools:latest '$other' && podman build --no-cache --network=none --pull=never --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest -t localhost/desktop-container:ci-other-tools -f Containerfile ." >/dev/null; then
             other_sums=$(ev_save staged-other "EV-STATE: sha256sum of the file that build staged, then of the marker" \
               sudo sh -c "podman run --rm --network=none localhost/desktop-container:ci-other-tools sha256sum /usr/libexec/desktop-tools/screenshot; sha256sum '$other/screenshot'") || f=1
             check "built with TOOLS_IMAGE=localhost/ci-other-tools, the image stages that image's /screenshot (the marker)" \
