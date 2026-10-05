@@ -62,8 +62,9 @@ give_up() {
 
 # --- CVT timing generator ----------------------------------------------------
 # VESA Coordinated Video Timings, standard (non-reduced) blanking - the same
-# arithmetic as xf86CVTMode()/the cvt(1) tool, in integer shell so the image
-# needs neither cvt nor a floating point helper.
+# arithmetic as xserver 1.20's xf86CVTMode(), which this image's Xorg and its
+# cvt(1) use, in integer shell so the generator needs neither cvt nor a
+# floating point helper.
 #
 # A generated Modeline is what makes "enabled while disconnected" actually
 # work on the modesetting driver: with no monitor there is no EDID, with no
@@ -72,20 +73,26 @@ give_up() {
 # resolution means the mode list is identical whether the KVM is pointed at
 # this host or not - which is the whole point.
 #
-# Time is carried in picoseconds; every intermediate is an exact integer at
-# that scale, so nothing rounds differently from the float original.
-# Sets CVT_NAME and CVT_MODELINE.
+# Time is carried in picoseconds, which keeps every intermediate an integer.
+# The float original can still land on the other side of a rounding step
+# where a value falls exactly on one: against the image's cvt(1), 3432x1931@60
+# gets one more line of vertical total and 3104x2328@60 a clock 0.25 MHz
+# higher - the only two of 6884 modes compared (every CVT aspect ratio,
+# heights 360-2400, 50/60/75/85 Hz). Sets CVT_NAME and CVT_MODELINE.
 cvt_mode() {
     local w=$1 h=$2 mhz=$3          # mhz: refresh in milli-Hz (60000 = 60Hz)
     local vsync frame hperiod vsyncbp vtotal duty hblank htotal clock
     local hss hse vss vse
 
-    # Vertical sync width comes from the aspect ratio (CVT table).
-    if   [ $((h * 4 / 3))   -eq "$w" ]; then vsync=4
-    elif [ $((h * 16 / 9))  -eq "$w" ]; then vsync=5
-    elif [ $((h * 16 / 10)) -eq "$w" ]; then vsync=6
-    elif [ $((h * 5 / 4))   -eq "$w" ]; then vsync=7
-    elif [ $((h * 15 / 9))  -eq "$w" ]; then vsync=7
+    # Vertical sync width comes from the aspect ratio (CVT table). Each test
+    # also needs the height to divide evenly, as xf86CVTMode() checks it:
+    # without that, integer division calls 1280x768 15:9 (768 * 15 / 9 is
+    # exactly 1280), where cvt(1) finds no standard ratio and uses 10 lines.
+    if   [ $((h % 3))  -eq 0 ] && [ $((h * 4 / 3))   -eq "$w" ]; then vsync=4
+    elif [ $((h % 9))  -eq 0 ] && [ $((h * 16 / 9))  -eq "$w" ]; then vsync=5
+    elif [ $((h % 10)) -eq 0 ] && [ $((h * 16 / 10)) -eq "$w" ]; then vsync=6
+    elif [ $((h % 4))  -eq 0 ] && [ $((h * 5 / 4))   -eq "$w" ]; then vsync=7
+    elif [ $((h % 9))  -eq 0 ] && [ $((h * 15 / 9))  -eq "$w" ]; then vsync=7
     else vsync=10
     fi
 
@@ -95,8 +102,12 @@ cvt_mode() {
     hperiod=$(((frame - 550000000) / (h + 3)))
     [ "$hperiod" -gt 0 ] || return 1
 
+    # The floor is vsync + 3, as xf86CVTMode() in xserver 1.20 has it
+    # (CVT_MIN_V_PORCH). The VESA formula, and libxcvt since, use the 6-line
+    # minimum back porch instead; this follows the cvt(1) the image ships.
+    # It only bites on small or slow modes with no standard aspect ratio.
     vsyncbp=$((550000000 / hperiod + 1))
-    [ "$vsyncbp" -lt $((vsync + 6)) ] && vsyncbp=$((vsync + 6))
+    [ "$vsyncbp" -lt $((vsync + 3)) ] && vsyncbp=$((vsync + 3))
     vtotal=$((h + 3 + vsyncbp))
 
     # Blanking duty cycle on a percent scale carried in parts per million:

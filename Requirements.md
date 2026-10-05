@@ -559,8 +559,8 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T0 · Coverage: ❌ evidence not saved; asserted by `layout-tests` "modesetting", which does not check `PreferredMode`.
 
 **S3.4.3 CVT timings match `cvt(1)`**
-- Requirement: the integer derivation equals cvt's output.
-- Acceptance: verbatim equality for 1920x1080@60 and 1280x1024@60; 59.94 carried. ❌ a wider table exercising every aspect branch (2560x1440, 3840x2160, 1080x1920, 75 Hz, 4:3, 5:4).
+- Requirement: the integer derivation equals, field for field, the Modeline the image's own `cvt(1)` prints (xserver 1.20.11's `xf86CVTMode()`; libxcvt's newer cvt differs from it in hsync start and the back porch floor). The one exception is a value that lands exactly on a rounding step, where cvt's single-precision floats can round the other way: of 6884 modes compared, 3432x1931@60 (one more line of vertical total) and 3104x2328@60 (a clock 0.25 MHz higher). Open: a width that is not a multiple of 8, such as 1366x768: `cvt(1)` changes the mode itself to 1368 wide, while the generator keeps the declared width.
+- Acceptance: field-for-field equality for 1920x1080@60 and 1280x1024@60; 59.94 carried. ❌ a wider table exercising every aspect branch (2560x1440, 3840x2160, 1080x1920, 75 Hz, 4:3, 5:4, 16:10, 15:9, and 1280x768, which only the divisibility check keeps out of 15:9).
 - Evidence: a table of declared mode → generated Modeline → `cvt` output (EV-STATE).
 - Tier: T0 · Coverage: ❌ no wider table, and nothing is saved; `layout-tests` pins 1920x1080@60 and 1280x1024@60 verbatim and checks that 59.94 is carried.
 
