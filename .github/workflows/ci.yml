@@ -162,10 +162,29 @@ jobs:
           else ev_fail "a client asks for --privileged or label=disable, or the guard's self-test failed (see its output)"; fi
           ev_end
           exit "$rc"
-      - name: helm lint + template assertions
+      - name: helm lint + template assertions (and S7.3.3's static half)
+        # The chart's golden assertions, then every client manifest's: each
+        # requests a desktop.local resource and declares nothing of its own.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/helm-assertions.sh)"
         run: |
           helm lint charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all
-          ci/helm-assertions.sh
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S7.3.3 "Pods are confined and declare no securityContext" T0
+          rc=0
+          ev_save assertions "ci/helm-assertions.sh: the chart's assertions, then each client manifest's: a desktop.local request, and no securityContext, volumes, volumeMounts, env, CDI annotation or privilege" \
+            ci/helm-assertions.sh >/dev/null || rc=$?
+          for m in examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml \
+                   ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml ci/vm/testpattern-pod.yaml \
+                   ci/vm/journey-pod.yaml ci/vm/early-pod.yaml; do
+            ev_copy "$m" "manifest-$(basename "$m" .yaml)" "EV-CONFIG: $m, as committed"
+          done
+          if [ "$rc" = 0 ]; then ev_pass "all eight client manifests request a desktop.local resource and declare no securityContext, volumes, volumeMounts, env, CDI annotation or privilege"
+          else ev_fail "ci/helm-assertions.sh failed (see its output)"; fi
+          ev_end
+          exit "$rc"
       - name: kubeconform (k8s schema validation)
         # The client manifests are plain YAML (a resource request, no
         # chart), so they are validated directly, not via helm template.

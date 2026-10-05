@@ -62,6 +62,9 @@ cd "$REPO"
 # spins on "command not found".
 export PATH="/usr/local/bin:$PATH"
 
+# The desktop's processes S7.3.7 follows across the k3s install.
+S737_COMMS=desktop-init,xinit,Xorg,mwm,pipewire,wireplumber,pipewire-pulse
+
 # CRI-O stream to install for phase 2 (the documented runtime for CDI). Kept
 # near k3s's k8s minor; CRI-O interops across a minor or two if it drifts.
 CRIO_VERSION="${CRIO_VERSION:-v1.31}"
@@ -1112,6 +1115,19 @@ phase2() {
     log p2 "SELinux must stay enforcing: the k8s client path ships this way"
     [ "$(getenforce)" = Enforcing ] || fail "SELinux is not enforcing"
 
+    # S7.3.7: the desktop must come through CRI-O's and k3s's arrival
+    # untouched - the same processes, not just an active unit and an X socket
+    # file, which a restarted desktop would show as well. The story stays
+    # open across the install, so a failure there is its failure too.
+    ev_begin S7.3.7 "The desktop survives CRI-O and k3s arriving" T3
+    s737_before=$(ctr_pids "$S737_COMMS") || fail "could not list the desktop's processes before the install"
+    ev_text pids-before "EV-PIDS: the desktop's processes before CRI-O and k3s are installed: ps -o pid,ppid,lstart,comm -C $S737_COMMS, in the desktop container" "$s737_before"
+    s737_before_f=$EV_LAST
+    for c in desktop-init Xorg mwm pipewire; do
+        grep -qw -- "$c" <<<"$s737_before" || fail "no $c among the desktop's processes before the install"
+    done
+    ev_pass "before the install: desktop-init, Xorg, mwm and pipewire are running"
+
     # Client pods reach the display through CDI, which only the CRI
     # resolves - so this phase runs k3s on an EXTERNAL CRI-O instead of the
     # bundled containerd. CRI-O scans /etc/cdi, which is where the specs live.
@@ -1232,6 +1248,14 @@ EOF
         || fail "desktop.service died while k3s/CRI-O were installed"
     podman exec desktop test -S /tmp/.X11-unix/X0 \
         || fail "the desktop's X socket vanished during the k3s/CRI-O install"
+    ev_pass "after the install desktop.service is active and the X socket is there"
+    s737_after=$(ctr_pids "$S737_COMMS") || fail "could not list the desktop's processes after the install"
+    ev_text pids-after "EV-PIDS: the desktop's processes after CRI-O and k3s were installed (the same ps)" "$s737_after"
+    ev_diff pids "EV-DIFF: the desktop's processes before and after the install (no differences: the same processes, none restarted)" "$s737_before_f" "$EV_LAST"
+    [ "$s737_after" = "$s737_before" ] \
+        || fail "the desktop's processes changed while CRI-O and k3s were installed (see the diff)"
+    ev_pass "the same desktop-init, Xorg, mwm and audio daemons before and after: pids and start times unchanged"
+    ev_end
     log p2 "quadlet desktop still serving :0 alongside k3s"
 
     log p2 "deploy one plugin release per device; all three resources become allocatable"
@@ -1279,12 +1303,24 @@ EOF
     # how the host directories were labeled, and this phase would pass while
     # proving nothing. Read the type the kernel actually gave it.
     log p2 "the client pod runs confined, and reached the display anyway"
-    pctx=$(k3s kubectl exec x11-client-demo -- cat /proc/self/attr/current 2>/dev/null | tr -d '\0')
+    ev_begin S7.3.3 "Pods are confined and declare no securityContext" T3
+    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, which phase2 applies with only its image pointed at the locally loaded one: a resource request and nothing else - no securityContext, volumes, env or CDI annotation"
+    ev_save demo-spec "EV-STATE: the demo pod as the API server holds it: the pod's securityContext ({} is the API server's empty default), the container's (empty), the volumes (the service-account token's, which the API server adds) and the container's env (empty)" \
+        k3s kubectl get pod x11-client-demo -o jsonpath='pod securityContext: {.spec.securityContext}{"\n"}container securityContext: {.spec.containers[0].securityContext}{"\n"}volumes: {.spec.volumes[*].name}{"\n"}container env: {.spec.containers[0].env}{"\n"}' >/dev/null || true
+    pctx=$(k3s kubectl exec x11-client-demo -- sh -c 'tr -d "\000" < /proc/self/attr/current' 2>/dev/null || true)
+    ev_text demo-label "EV-STATE: /proc/self/attr/current read inside the demo pod: the SELinux context CRI-O gave it" "$pctx"
     case "$pctx" in
         *:container_t:*) log p2 "  client pod context: $pctx" ;;
         "") fail "could not read the client pod's SELinux context" ;;
         *) fail "client pod runs as '$pctx', not container_t - the confined path is untested" ;;
     esac
+    ev_pass "the demo pod runs confined: $pctx"
+    csc=$(k3s kubectl get pod x11-client-demo -o jsonpath='{.spec.containers[0].securityContext}')
+    psc=$(k3s kubectl get pod x11-client-demo -o jsonpath='{.spec.securityContext}')
+    [ -z "$csc" ] && { [ -z "$psc" ] || [ "$psc" = "{}" ]; } \
+        || fail "the demo pod carries a securityContext: pod '$psc', container '$csc'"
+    ev_pass "and declares no securityContext: none on the container, the pod's the API server's empty default"
+    ev_end
     log p2 "phase2 passed"
 }
 
@@ -1362,7 +1398,29 @@ assert_pod_socket() { # $1: path
     log vp "socket $1 present + writable"
 }
 
+# A mountinfo's mount points and filesystem types, sorted: the fields that
+# stay put between two pods (mount ids and devices do not). The type is the
+# field after the " - " separator, whose place varies with the optional
+# fields before it.
+mount_points() {
+    awk '{for (i = 7; i <= NF; i++) if ($i == "-") {print $5, $(i + 1); break}}' | sort
+}
+
 verify_cdi() {
+    # S7.3.1: what the three releases offer, and what a requesting pod gets
+    # against an identical pod that requests nothing.
+    ev_begin S7.3.1 "Resources become allocatable, pods get injected edits" T3
+    alloc=$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}') \
+        || fail "could not read the node's allocatable resources"
+    ev_text allocatable "EV-STATE: the node's allocatable resources (kubectl get node -o jsonpath={.items[0].status.allocatable})" "$alloc"
+    for cap in display audio tools; do
+        grep -q "\"desktop.local/$cap\":\"10\"" <<<"$alloc" \
+            || fail "desktop.local/$cap is not allocatable at 10: $alloc"
+    done
+    ev_pass "three releases, three resources: desktop.local/display, audio and tools allocatable at 10 each"
+    ev_save plugin-logs "EV-LOG-CLIENT: the three plugin releases' logs (kubectl logs -l app.kubernetes.io/name=cdi-device-plugin --prefix): each registered with kubelet, serving its own CDI device" \
+        k3s kubectl logs -l app.kubernetes.io/name=cdi-device-plugin --prefix --tail=40 >/dev/null || true
+
     log vp "apply verifier pod: requests desktop.local/display, declares nothing else"
     k3s kubectl apply -f ci/vm/cdi-verify-pod.yaml
     wait_for 30 4 "verifier pod running" \
@@ -1372,6 +1430,7 @@ verify_cdi() {
     assert_pod_env DISPLAY :0
     assert_pod_env PULSE_SERVER unix:/run/desktop-audio/pulse
     assert_pod_env PIPEWIRE_REMOTE /run/desktop-audio/pipewire-0
+    ev_pass "the verifier pod has DISPLAY=:0, PULSE_SERVER=unix:/run/desktop-audio/pulse and PIPEWIRE_REMOTE=/run/desktop-audio/pipewire-0, none of which its manifest declares"
 
     log vp "the injected X socket is mounted and the display works"
     assert_pod_socket /tmp/.X11-unix/X0
@@ -1380,6 +1439,14 @@ verify_cdi() {
     timeout 20 k3s kubectl exec "$VPOD" -- sh -c 'xdpyinfo >/dev/null' \
         || fail "xdpyinfo could not open the display from the requesting pod"
     log vp "xdpyinfo opened :0 from the pod"
+    ev_pass "its X socket /tmp/.X11-unix/X0 is mounted writable, and xdpyinfo opens :0 with the injected DISPLAY"
+    venv=$(k3s kubectl exec "$VPOD" -- env | sort) || fail "could not read the verifier pod's environment"
+    ev_text verify-env "EV-STATE: the verifier pod's environment (env, sorted)" "$venv"
+    venv_f=$EV_LAST
+    vmnt=$(k3s kubectl exec "$VPOD" -- cat /proc/self/mountinfo | mount_points) \
+        || fail "could not read the verifier pod's mounts"
+    ev_text verify-mounts "EV-STATE: the verifier pod's mounts: mount point and filesystem type from /proc/self/mountinfo, sorted" "$vmnt"
+    vmnt_f=$EV_LAST
 
     # Negative control: without the resource request the SAME image gets
     # none of it. Without this, a stray hostPath or a baked-in env in the
@@ -1395,14 +1462,27 @@ verify_cdi() {
         | k3s kubectl apply -f -
     wait_for 30 4 "control pod running" \
         sh -c "k3s kubectl get pod cdi-control -o jsonpath='{.status.phase}' | grep -q Running"
-    if k3s kubectl exec cdi-control -- printenv DISPLAY >/dev/null 2>&1; then
-        fail "control pod has DISPLAY set without requesting the resource - injection is not what we measured"
-    fi
+    cenv=$(k3s kubectl exec cdi-control -- env | sort) || fail "could not read the control pod's environment"
+    ev_text control-env "EV-STATE: the control pod's environment - the same image and manifest without the resource request (env, sorted)" "$cenv"
+    ev_diff env "EV-DIFF: the control pod's environment against the verifier's: what the request injected (and HOSTNAME, each pod's own name)" "$EV_LAST" "$venv_f"
+    cmnt=$(k3s kubectl exec cdi-control -- cat /proc/self/mountinfo | mount_points) \
+        || fail "could not read the control pod's mounts"
+    ev_text control-mounts "EV-STATE: the control pod's mounts (mount point and filesystem type, sorted)" "$cmnt"
+    ev_diff mounts "EV-DIFF: the control pod's mounts against the verifier's: what the request mounted" "$EV_LAST" "$vmnt_f"
+    for var in DISPLAY PULSE_SERVER PIPEWIRE_REMOTE; do
+        ! grep -q "^$var=" <<<"$cenv" \
+            || fail "control pod has $var without requesting the resource - injection is not what we measured"
+    done
+    for m in /tmp/.X11-unix /run/desktop-audio; do
+        grep -q "^$m " <<<"$vmnt" || fail "the verifier pod has no $m mount"
+        ! grep -q "^$m " <<<"$cmnt" || fail "control pod has the $m mount without requesting the resource"
+    done
     if k3s kubectl exec cdi-control -- test -S /tmp/.X11-unix/X0 2>/dev/null; then
         fail "control pod can see the X socket without requesting the resource"
     fi
     k3s kubectl delete pod cdi-control --wait=true >/dev/null 2>&1 || true
     log vp "control pod saw no DISPLAY and no X socket - the request is the cause"
+    ev_pass "the control pod got none of it: no DISPLAY, PULSE_SERVER or PIPEWIRE_REMOTE, no /tmp/.X11-unix or /run/desktop-audio mount, no X socket"
 
     # The pod readiness probe only gates on Xorg, so the desktop's user
     # pipewire session (which exports BOTH the pulse and the native pipewire
@@ -1418,6 +1498,8 @@ verify_cdi() {
     log vp "CDI mounted the audio sockets; export is live"
     assert_pod_socket /run/desktop-audio/pulse
     assert_pod_socket /run/desktop-audio/pipewire-0
+    ev_pass "its audio sockets are mounted writable, and pactl info answers over them"
+    ev_end
 
     log vp "spawn an xterm from the pod so the screendump shows a client window"
     timeout 15 k3s kubectl exec "$VPOD" -- \
@@ -1427,28 +1509,33 @@ verify_cdi() {
     log vp "verify-cdi passed"
 }
 
-play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default cdi-verify)
+play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default cdi-verify)   $3: seconds (1.5)
     # Same beep-per-path convention as the in-container test, but played from an
     # requesting pod using ONLY the injected env - so success proves the CDI spec
-    # wired that client path, not the desktop image's own local session.
-    local path="${1:?pulse|pipewire|alsa}" pod="${2:-$VPOD}" player freq
+    # wired that client path, not the desktop image's own local session. Prints
+    # the player's command, its own output and its exit status (EV-LOG-CLIENT).
+    local path="${1:?pulse|pipewire|alsa}" pod="${2:-$VPOD}" player freq out
     case "$path" in
         pulse)    freq=440;  player='paplay /tmp/t.wav' ;;
         pipewire) freq=880;  player='pw-play /tmp/t.wav' ;;
         alsa)     freq=1320; player='aplay -q /tmp/t.wav' ;;
         *) fail "unknown audio path '$path'" ;;
     esac
-    gen_tone "$freq" /tmp/tone-pod.wav
+    gen_tone "$freq" /tmp/tone-pod.wav "${3:-1.5}"
     # Stream the WAV in over exec stdin (no kubectl cp -> no tar dependency).
     timeout 20 k3s kubectl exec -i "$pod" -- sh -c 'cat > /tmp/t.wav' \
         < /tmp/tone-pod.wav || fail "could not copy tone into $pod"
     # Retry + hard timeout: the audio client can lag briefly, and a stuck
     # connect must fail rather than hang (see the earlier pacat hang).
     for _ in 1 2 3 4 5; do
-        if timeout 20 k3s kubectl exec "$pod" -- sh -c "$player"; then
+        if out=$(timeout 30 k3s kubectl exec "$pod" -- sh -c "$player" 2>&1); then
+            echo "player in $pod: $player"
+            [ -z "$out" ] || printf '%s\n' "$out"
+            echo "player exit: 0"
             log pa "$pod played ${freq}Hz via $path"
             return 0
         fi
+        echo "player in $pod: $player failed, retrying in 3 s: $out"
         sleep 3
     done
     fail "$pod $path playback failed after 5 tries"
@@ -2655,8 +2742,8 @@ win_wait() { wait_for "${2:-30}" 1 "a window titled $1 on the display" win_up "$
 # The display's windows, from the desktop (F7.5's xwininfo -root -tree).
 win_tree() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree; }
 # EV-SHOT-CLIENT: the toolkit's screenshot run in the pod, its PNG on stdout.
-client_shot() { # [pod]
-    k3s kubectl exec "${1:-$JPOD}" -- sh -c '"$DESKTOP_TOOLS_BIN"/screenshot --to-stdout'
+client_shot() { # [pod]: the toolkit's binary, or the image's own where the pod has no toolkit
+    k3s kubectl exec "${1:-$JPOD}" -- sh -c '"${DESKTOP_TOOLS_BIN:-/usr/libexec/desktop-tools}"/screenshot --to-stdout'
 }
 # A tone WAV put into the pod, and the tone played there by its pulse client
 # in the background. The player's pid lands in /tmp/<tag>.pid, its start and
@@ -3210,6 +3297,14 @@ verify_split() {
     ev_pass "and no toolkit mount"
     ev_end
 
+    # S7.3.2: what each narrow pod holds, kept: its environment, its mounts
+    # and whether xdpyinfo opens the display from it.
+    ev_begin S7.3.2 "Split holds in pods" T3
+    split_probe display-only
+    d_env=$P_ENV d_mnt=$P_MNT d_rc=$P_RC
+    split_probe audio-only
+    a_env=$P_ENV a_mnt=$P_MNT a_rc=$P_RC
+
     log vsp "display-only: has NO audio (env or mount)"
     for var in PULSE_SERVER PIPEWIRE_REMOTE; do
         if k3s kubectl exec display-only -- printenv "$var" >/dev/null 2>&1; then
@@ -3223,6 +3318,14 @@ verify_split() {
         grep -q ' /run/desktop-audio ' /proc/self/mountinfo 2>/dev/null; then
         fail "display-only has the audio mount - the audio device's edits leaked"
     fi
+    grep -qx 'DISPLAY=:0' <<<"$d_env" && [ "$d_rc" = 0 ] \
+        || fail "display-only: DISPLAY '$(grep '^DISPLAY=' <<<"$d_env")', xdpyinfo exit $d_rc"
+    ev_pass "display-only has the display: DISPLAY=:0, and xdpyinfo opens it (exit 0)"
+    ! grep -Eq '^(PULSE_SERVER|PIPEWIRE_REMOTE|DESKTOP_TOOLS_BIN)=' <<<"$d_env" \
+        || fail "display-only has audio or toolkit variables: $(grep -E '^(PULSE_SERVER|PIPEWIRE_REMOTE|DESKTOP_TOOLS_BIN)=' <<<"$d_env" | paste -sd' ')"
+    ! grep -Eq '^(/run/desktop-audio|/opt/desktop-tools/bin) ' <<<"$d_mnt" \
+        || fail "display-only has the audio or the toolkit mount"
+    ev_pass "and no audio or toolkit: no PULSE_SERVER, PIPEWIRE_REMOTE or DESKTOP_TOOLS_BIN, no /run/desktop-audio or /opt/desktop-tools/bin mount"
 
     log vsp "audio-only: has working audio"
     got=$(k3s kubectl exec audio-only -- printenv PULSE_SERVER 2>/dev/null || true)
@@ -3234,6 +3337,9 @@ verify_split() {
     timeout 60 k3s kubectl exec audio-only -- sh -c \
         'until pactl info >/dev/null 2>&1; do sleep 2; done' \
         || fail "audio-only could not talk to the pulse socket"
+    ev_save audio-only-pactl "EV-STATE: pactl info run in the audio-only pod, over the injected PULSE_SERVER" \
+        k3s kubectl exec audio-only -- pactl info >/dev/null || true
+    ev_pass "audio-only has the audio: PULSE_SERVER and PIPEWIRE_REMOTE injected, and pactl info answers over them (the host hears it play next)"
 
     log vsp "audio-only: has NO display (env or mount)"
     if k3s kubectl exec audio-only -- printenv DISPLAY >/dev/null 2>&1; then
@@ -3247,11 +3353,31 @@ verify_split() {
     if timeout 20 k3s kubectl exec audio-only -- sh -c 'xdpyinfo >/dev/null' 2>/dev/null; then
         fail "audio-only opened the X display - it can keylog the session"
     fi
+    ! grep -q '^DISPLAY=' <<<"$a_env" && ! grep -q '^/tmp/.X11-unix ' <<<"$a_mnt" && [ "$a_rc" != 0 ] \
+        || fail "audio-only: DISPLAY '$(grep '^DISPLAY=' <<<"$a_env")', X socket mount '$(grep '^/tmp/.X11-unix ' <<<"$a_mnt")', xdpyinfo exit $a_rc"
+    ev_pass "audio-only has no display: no DISPLAY, no /tmp/.X11-unix mount, and xdpyinfo fails (exit $a_rc)"
+    ev_end
 
+    # The pods stay: the host plays a tone from audio-only and listens
+    # (S7.3.2's EV-AUDIO), then removes them (split-cleanup).
     log vsp "each device grants its own half and nothing more"
-    k3s kubectl delete pod display-only audio-only --wait=true >/dev/null 2>&1 || true
     log vsp "verify-split passed"
 }
+
+# One narrow pod's environment, mounts and xdpyinfo verdict, kept in the open
+# story; the values in P_ENV, P_MNT and P_RC.
+split_probe() { # <pod>
+    local out
+    P_ENV=$(k3s kubectl exec "$1" -- env | sort) || fail "could not read the $1 pod's environment"
+    ev_text "$1-env" "EV-STATE: the $1 pod's environment (env, sorted)" "$P_ENV"
+    P_MNT=$(k3s kubectl exec "$1" -- cat /proc/self/mountinfo | mount_points) || fail "could not read the $1 pod's mounts"
+    ev_text "$1-mounts" "EV-STATE: the $1 pod's mounts: mount point and filesystem type from /proc/self/mountinfo, sorted" "$P_MNT"
+    P_RC=0
+    out=$(timeout 20 k3s kubectl exec "$1" -- xdpyinfo 2>&1) || P_RC=$?
+    ev_text "$1-xdpyinfo" "EV-STATE: xdpyinfo run in the $1 pod: its first lines, then its exit status" "$(printf '%s\n' "$out" | sed -n 1,6p)
+xdpyinfo exit: $P_RC"
+}
+split_cleanup() { k3s kubectl delete pod display-only audio-only --ignore-not-found --wait=true >/dev/null 2>&1 || true; }
 
 pod_state() { # $1: pod - who its container is, for EV-PIDS before and after an event
     local cid pid
@@ -3262,6 +3388,83 @@ pod_state() { # $1: pod - who its container is, for EV-PIDS before and after an 
         || pid="unknown (crictl inspect gave no .info.pid)"
     echo "main process, host pid: $pid"
 }
+
+# The host pid of a pod's main process (its first container's), from CRI-O.
+pod_main_pid() { # <pod>
+    local cid info
+    cid=$(k3s kubectl get pod "$1" -o jsonpath='{.status.containerStatuses[0].containerID}') || return 1
+    [ -n "$cid" ] || return 1
+    info=$(k3s crictl -r unix:///run/crio/crio.sock inspect "${cid#*://}" 2>/dev/null) || return 1
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["pid"])' <<<"$info"
+}
+
+# The windows of the X client a host process holds, as the server sees them:
+# its client base from screenshot --list-clients (the X-Resource extension's
+# view of each connection's peer pid), then every window in
+# xwininfo -root -tree whose id X allocated from that base, each named one
+# with its map state. A window found this way is that process's whatever its
+# title says - and an xterm's shell retitles it (EL's /etc/bashrc). Returns 1
+# when the process holds no X connection.
+x_windows_of() { # <host pid>
+    local clients base info mask tree line wid state
+    clients=$(podman exec -u desktop -e DISPLAY=:0 desktop /usr/libexec/desktop-tools/screenshot --list-clients) || return 1
+    base=$(awk -v want="pid=$1" '$2 == want && !f {sub(/^client-base=/, "", $1); print $1; f = 1}' <<<"$clients")
+    [ -n "$base" ] || return 1
+    info=$(podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo 2>/dev/null) || info=
+    mask=$(awk '/resource-id-mask:/ && !f {print $2; f = 1}' <<<"$info")
+    tree=$(podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree) || return 1
+    echo "X client: client-base=$base pid=$1 (resource-id-mask ${mask:-0x001fffff, assumed})"
+    while read -r line; do
+        wid=${line%% *}
+        state=
+        case "$line" in
+            *'(has no name)'*) ;;
+            *)
+                info=$(podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -id "$wid" 2>/dev/null) || info=
+                state=$(awk '/Map State:/ {print $3}' <<<"$info")
+                ;;
+        esac
+        echo "$line${state:+ map=$state}"
+    done < <(python3 -c '
+import re, sys
+base, mask = int(sys.argv[1], 16), int(sys.argv[2], 16)
+for line in sys.stdin:
+    m = re.match(r"\s*(0x[0-9a-f]+) (.*\S)\s*$", line)
+    if m and int(m.group(1), 16) & ~mask == base:
+        print(m.group(1), m.group(2))
+' "$base" "${mask:-0x001fffff}" <<<"$tree")
+}
+
+# The windows of a pod's main process (the xterm, in the client pods here).
+pod_windows() { # <pod>
+    local pid
+    pid=$(pod_main_pid "$1") || { echo "pod $1: no main process found"; return 1; }
+    echo "pod $1: main process, host pid $pid"
+    x_windows_of "$pid"
+}
+# Whether a pod's main process has a window on the screen (IsViewable).
+pod_window_up() { # <pod>
+    local w
+    w=$(pod_windows "$1") || return 1
+    grep -q ' map=IsViewable$' <<<"$w"
+}
+# The first of a pod's windows on the screen, as "<id> <w> <h> <x> <y>"
+# (absolute position), from a pod_windows listing on stdin.
+viewable_rect() {
+    sed -nE 's/^(0x[0-9a-f]+) .* ([0-9]+)x([0-9]+)\+-?[0-9]+\+-?[0-9]+ +\+(-?[0-9]+)\+(-?[0-9]+) map=IsViewable$/\1 \2 \3 \4 \5/p' | sed -n 1p
+}
+
+# What pipewire-pulse knows of each stream playing now: its sink and its
+# client's application name, binary and pid (in the client's own pid
+# namespace). F7.6's "during" listing.
+stream_apps() {
+    local out
+    out=$(PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 10 pactl list sink-inputs 2>&1) \
+        || { echo "(no answer: the export is down) $out"; return 0; }
+    out=$(grep -E '^Sink Input #|^[[:space:]]+Sink:|application\.(name|process\.binary|process\.id) =' <<<"$out" || true)
+    echo "${out:-(no stream playing)}"
+}
+pod_logs() { k3s kubectl logs "$1" --tail="${2:-100}" 2>&1 || true; }
 
 verify_concurrency() {
     # The display is shareable and CDI imposes no cap, so the property to
@@ -3285,6 +3488,18 @@ verify_concurrency() {
         wait_for 30 4 "client $n running" \
             sh -c "k3s kubectl get pod x11-client-$n -o jsonpath='{.status.phase}' | grep -q Running"
     done
+    # S7.5.7's "before": the three pods as they started, ahead of the
+    # concurrency checks; its "after" and its windows follow S7.3.5.
+    ev_end
+    ev_begin S7.5.7 "Many clients share one desktop" T3
+    declare -A s757_b=() s757_bf=()
+    for n in a b c; do
+        s757_b[$n]=$(pod_state "x11-client-$n") || fail "could not read pod x11-client-$n's state"
+        ev_text "pod-$n-before" "EV-PIDS: pod x11-client-$n's container (restartCount, id, start time) and its main process's host pid, before the shared-display checks" "${s757_b[$n]}"
+        s757_bf[$n]=$EV_LAST
+    done
+    ev_end
+    ev_begin S7.3.5 "Concurrency" T3
     for n in a b c; do
         timeout 20 k3s kubectl exec "x11-client-$n" -- sh -c 'xdpyinfo >/dev/null' \
             || fail "client $n could not open the shared display"
@@ -3326,37 +3541,105 @@ verify_concurrency() {
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
     ev_end
+
+    # S7.5.7: the three windows, each its pod's main xterm - found by its X
+    # client, not by its title - at its own place, none covering another,
+    # while all three pods hold the display. The host shoots the screen next.
+    ev_begin S7.5.7 "Many clients share one desktop" T3
+    ev_text list-clients "EV-STATE: screenshot --list-clients from the desktop while the three pods hold the display (S7.3.5's listing): each X client's resource base and host pid" "$clients"
+    local wins rect rects=""
+    for n in a b c; do
+        wait_for 20 1 "pod x11-client-$n's window on the screen" pod_window_up "x11-client-$n"
+        wins=$(pod_windows "x11-client-$n") || fail "pod x11-client-$n's xterm holds no X connection"
+        ev_text "windows-$n" "EV-STATE: pod x11-client-$n's main process, its X client and the windows X allocated to it in xwininfo -root -tree, each named one with its map state" "$wins"
+        rect=$(viewable_rect <<<"$wins")
+        [ -n "$rect" ] || fail "pod x11-client-$n's xterm has no window on the screen"
+        rects+="$n ${rect#* }"$'\n'
+        ev_pass "pod x11-client-$n's xterm is on the screen: window ${rect%% *}, $(awk '{print $2 "x" $3 " at +" $4 "+" $5}' <<<"$rect")"
+    done
+    ev_save tree "EV-STATE: xwininfo -root -tree with the three windows in it" win_tree >/dev/null || true
+    overlap=$(python3 -c '
+import sys
+r = [l.split() for l in sys.stdin if l.strip()]
+bad = []
+for i, a in enumerate(r):
+    for b in r[i + 1:]:
+        aw, ah, ax, ay = map(int, a[1:5])
+        bw, bh, bx, by = map(int, b[1:5])
+        if ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah:
+            bad.append(a[0] + "/" + b[0])
+print(" ".join(bad))
+' <<<"$rects")
+    [ -z "$overlap" ] || fail "client windows overlap on the screen: $overlap"
+    ev_pass "the three windows are at three places, none covering another"
+    for n in a b c; do
+        st=$(pod_state "x11-client-$n") || fail "could not read pod x11-client-$n's state"
+        ev_text "pod-$n-after" "EV-PIDS: pod x11-client-$n after the shared-display checks" "$st"
+        ev_diff "pod-$n" "EV-DIFF: pod x11-client-$n before and after (empty: the same container)" "${s757_bf[$n]}" "$EV_LAST"
+        grep -q 'restartCount=0 ' <<<"$st" && [ "$st" = "${s757_b[$n]}" ] \
+            || fail "pod x11-client-$n changed or restarted across the checks: '${s757_b[$n]}' -> '$st'"
+    done
+    ev_pass "the three pods are the same containers throughout, restartCount 0"
+    ev_end
     log vs "three concurrent clients on one display, no cap in the way"
     log vs "verify-concurrency passed"
 }
 
 verify_teardown() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    ev_begin S7.3.6 "Teardown seam" T3
+    # A client already running when the plugins go: it holds its mounts, so
+    # its window stays and it keeps the display.
+    log td "a client pod is running when the plugin releases are uninstalled"
+    apply_client x11-client-td 50x6+40+560
+    wait_for 30 4 "x11-client-td running" \
+        sh -c "k3s kubectl get pod x11-client-td -o jsonpath='{.status.phase}' | grep -q Running"
+    wait_for 20 1 "x11-client-td's window on the screen" pod_window_up x11-client-td
+    td_b=$(pod_state x11-client-td) || fail "could not read pod x11-client-td's state"
+    ev_text pod-before "EV-PIDS: the running client pod x11-client-td before the uninstall" "$td_b"
+    td_bf=$EV_LAST
+    ev_save windows-before "EV-STATE: the client pod's main process, its X client and its windows before the uninstall" \
+        pod_windows x11-client-td >/dev/null || true
+    alloc_b=$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' | tr ',' '\n' | sort)
+    ev_text allocatable-before "EV-STATE: the node's allocatable resources before the uninstall, one per line" "$alloc_b"
+    alloc_bf=$EV_LAST
+    cdi_b=$(ls -l --time-style=full-iso /etc/cdi)
+    ev_text cdi-before "EV-STATE: ls -l --time-style=full-iso /etc/cdi before the uninstall" "$cdi_b"
+    cdi_bf=$EV_LAST
+
     log td "helm uninstall one plugin release per capability"
-    for r in display audio; do
+    for r in display audio tools; do
         helm uninstall "$r" >/dev/null || fail "helm uninstall $r failed"
     done
-
     # Removing the plugin must make the node stop offering the resource.
     # kubelet drops the allocatable COUNT to 0 promptly but often keeps the
     # resource key in node status for a while, so assert the count is 0 (or
     # the key is gone), not that the key vanished.
-    for cap in display audio; do
+    for cap in display audio tools; do
         wait_for 30 4 "desktop.local/$cap no longer allocatable" \
             sh -c "v=\$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/$cap}'); [ -z \"\$v\" ] || [ \"\$v\" = 0 ]"
     done
     # The chart-managed workloads must be gone (get returns non-zero once
     # the objects no longer exist).
-    wait_for 20 3 "both plugin daemonsets gone" \
-        sh -c "! k3s kubectl get ds display-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds audio-cdi-device-plugin >/dev/null 2>&1"
+    wait_for 20 3 "the three plugin daemonsets gone" \
+        sh -c "! k3s kubectl get ds display-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds audio-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds tools-cdi-device-plugin >/dev/null 2>&1"
+    alloc_a=$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' | tr ',' '\n' | sort)
+    ev_text allocatable-after "EV-STATE: the node's allocatable resources after the uninstall" "$alloc_a"
+    ev_diff allocatable "EV-DIFF: the node's allocatable resources before and after: the three desktop.local resources withdrawn (gone, or 0)" "$alloc_bf" "$EV_LAST"
+    ev_pass "helm uninstall withdrew desktop.local/display, audio and tools: none is allocatable, and the three plugin daemonsets are gone"
 
     # The CDI spec is HOST state, not chart state: uninstalling must not
     # remove it (nothing in k8s owns it). This is the seam that makes one
     # spec definition serve podman and kubernetes alike.
+    cdi_a=$(ls -l --time-style=full-iso /etc/cdi)
+    ev_text cdi-after "EV-STATE: ls -l --time-style=full-iso /etc/cdi after the uninstall" "$cdi_a"
+    ev_diff cdi "EV-DIFF: /etc/cdi before and after the uninstall (no differences: the host's specs untouched)" "$cdi_bf" "$EV_LAST"
     grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "helm uninstall removed the host display spec - it is host state"
     grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "helm uninstall removed the host audio spec - it is host state"
+    [ "$cdi_a" = "$cdi_b" ] || fail "/etc/cdi changed with the uninstall (see the diff)"
+    ev_pass "/etc/cdi is unchanged, every spec in it with the same size and time: the specs are the host's, not the charts'"
 
     # Same seam from the other side: the desktop is quadlet state, so nothing
     # helm does can touch it. Tearing kubernetes down leaves the display up.
@@ -3364,7 +3647,23 @@ verify_teardown() {
         || fail "the quadlet desktop went down with the helm releases - it is not kubernetes state"
     podman exec desktop test -S /tmp/.X11-unix/X0 \
         || fail "the desktop's X socket vanished on helm uninstall"
-    log td "charts uninstalled; resources withdrawn; host CDI specs and the desktop untouched"
+    ev_pass "the desktop survives: desktop.service active, its X socket there"
+
+    # And the client that was running keeps working: the same container, its
+    # window still on the screen, and the display opens from it anew.
+    td_a=$(pod_state x11-client-td) || fail "could not read pod x11-client-td's state"
+    ev_text pod-after "EV-PIDS: the client pod x11-client-td after the uninstall" "$td_a"
+    ev_diff pod "EV-DIFF: the client pod before and after the uninstall (empty: the same container)" "$td_bf" "$EV_LAST"
+    grep -q 'restartCount=0 ' <<<"$td_a" && [ "$td_a" = "$td_b" ] \
+        || fail "the client pod changed across the uninstall: '$td_b' -> '$td_a'"
+    wins=$(pod_windows x11-client-td) || fail "the client pod's xterm lost its X connection with the uninstall"
+    ev_text windows-after "EV-STATE: the client pod's X client and its windows after the uninstall" "$wins"
+    grep -q ' map=IsViewable$' <<<"$wins" || fail "the client pod's window left the screen with the uninstall"
+    timeout 20 k3s kubectl exec x11-client-td -- sh -c 'xdpyinfo >/dev/null' \
+        || fail "the running client pod can no longer open the display after the uninstall"
+    ev_pass "the client pod that was running keeps working: the same container (restartCount 0), its window still on the screen, and xdpyinfo opens :0 from it after the uninstall"
+    ev_end
+    log td "charts uninstalled; resources withdrawn; host CDI specs, the desktop and a running client untouched"
     log td "verify-teardown passed"
 }
 
@@ -3373,7 +3672,7 @@ verify_record() {
     # plays. Loopback via the sink's monitor source - record it while playing a
     # known tone into the same sink, then confirm the recording carries that
     # tone. Runs in cdi-verify (a client pod) over the injected PULSE_SERVER.
-    local pod=cdi-verify freq=660
+    local pod=${1:-cdi-verify} freq=${2:-660}
     gen_tone "$freq" /tmp/rectone.wav
     timeout 20 k3s kubectl exec -i "$pod" -- sh -c 'cat > /tmp/rt.wav' \
         < /tmp/rectone.wav || fail "could not copy record tone into $pod"
@@ -3402,18 +3701,22 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
-    play-audio-pod) play_audio_pod "${2:-}" "${3:-}" ;;
+    play-audio-pod) play_audio_pod "${2:-}" "${3:-}" "${4:-}" ;;
     verify-cdi) verify_cdi ;;
     verify-split) verify_split ;;
     verify-testclient) verify_testclient ;;
     verify-screenshot) verify_screenshot ;;
     screenshot-pattern-start) screenshot_pattern_start ;;
     screenshot-pattern-stop) screenshot_pattern_stop ;;
-    verify-record) verify_record ;;
+    verify-record) verify_record "${2:-}" "${3:-}" ;;
+    split-cleanup) split_cleanup ;;
+    pod-windows) pod_windows "${2:?pod}" ;;
+    stream-apps) stream_apps ;;
+    pod-logs) pod_logs "${2:?pod}" ;;
     verify-concurrency) verify_concurrency ;;
     verify-teardown) verify_teardown ;;
     verify-privileges) verify_privileges ;;

@@ -38,6 +38,7 @@ import os
 import re
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -373,6 +374,16 @@ class Guest:
 
     def pid_alive(self, pid):
         return self.sh(f"test -d /proc/{int(pid)} && echo yes || echo no").strip() == "yes"
+
+    def fetch(self, path, timeout=60):
+        """A file's bytes from the VM host: sh() reads text, and a PNG is not."""
+        self.run.log("guest", f"fetch {path}")
+        p = subprocess.run(self.ssh + ["sudo cat " + shlex.quote(path)], capture_output=True,
+                           timeout=timeout)
+        if p.returncode != 0:
+            raise RuntimeError(f"could not fetch {path} from the VM (rc={p.returncode}): "
+                               f"{p.stderr.decode('utf-8', 'replace')}")
+        return p.stdout
 
     def close(self):
         # End the multiplexed connection's master rather than leave it to
@@ -845,9 +856,10 @@ class Ctx:
         self.g.desk(self.sink_argv(instance, geometry, word, f"/tmp/op-sink-{instance}", xrm),
                     detach=True)
 
-    def client_sink(self, name, instance, geometry, word, xrm=None):
+    def client_sink(self, name, instance, geometry, word, xrm=None, devices=("display",)):
         """A sink xterm in a client container of its own."""
-        self.g.client_run(name, self.sink_argv(instance, geometry, word, f"/tmp/op-sink-{instance}", xrm))
+        self.g.client_run(name, self.sink_argv(instance, geometry, word, f"/tmp/op-sink-{instance}", xrm),
+                          devices=devices)
 
     def desk_lines(self, path):
         return self.g.desk(["sh", "-c", f"cat {shlex.quote(path)} 2>/dev/null; true"],
@@ -1096,6 +1108,148 @@ def s3_5_3(ctx, st):
         time.sleep(0.3)
         ctx.chord("esc")
     st.check(wait_until(lambda: not ctx.xstate().mapped(menu), 4, 0.3), "Escape took the menu down")
+
+
+# --- stories: client applications (F7.5) -------------------------------------------
+
+def client_record(ctx, name, moment, what):
+    """EV-PIDS for a podman client: its container's id, the host pid of its
+    main process (the application), its restart count and its start time.
+    Returns the values, the file's name and its text."""
+    info = ctx.g.client_inspect(name)
+    text = (f"$ podman inspect op-{name} --format "
+            "'{{.Id}} {{.State.Pid}} {{.RestartCount}} {{.State.StartedAt}}'\n"
+            f"id={info['id']}\npid={info['pid']}\nrestartCount={info['restarts']}\n"
+            f"startedAt={info['started']}\n")
+    return info, ctx.save_state(moment, text, what), text
+
+
+def client_same(ctx, st, name, before, after):
+    """The same container and application before and after: EV-DIFF of the
+    two records, then the checks."""
+    (b, b_name, b_text), (a, a_name, a_text) = before, after
+    ctx.diff_kept("pids", b_name, b_text, a_name, a_text,
+                  "EV-DIFF: the client container before and after (empty: the same container and "
+                  "application, never restarted)")
+    st.check(a["id"] == b["id"] and a["pid"] == b["pid"] and a["started"] == b["started"]
+             and a["restarts"] == 0,
+             "the same container and application throughout: id, the application's host pid and the "
+             "start time unchanged, restartCount 0",
+             f"pid {a['pid']}, started {a['started']}")
+    st.check(ctx.g.pid_alive(a["pid"]), "and the application is still running", f"host pid {a['pid']}")
+    ctx.save_cmd("client-log", f"podman logs op-{name} 2>&1",
+                 "EV-LOG-CLIENT: the client container's own output (podman logs)",
+                 label=f"podman logs op-{name}")
+
+
+# podman exec sessions do not get CDI's env edits (Guest.xprobe), so the
+# client's own screenshot takes DISPLAY and DESKTOP_TOOLS_BIN from the
+# client's pid 1, where CDI put them.
+CLIENT_SHOT = ("set -- $(tr '\\0' '\\n' < /proc/1/environ | grep -E '^(DISPLAY|DESKTOP_TOOLS_BIN)='); "
+               "exec env \"$@\" sh -c 'exec \"$DESKTOP_TOOLS_BIN\"/screenshot --to-stdout'")
+
+
+def client_shot(ctx, name, moment, what):
+    """EV-SHOT-CLIENT: the display as the client captures it from inside its
+    own container, with the toolkit's screenshot (the tools device)."""
+    tmp = f"/tmp/op-client-shot-{name}.png"
+    ctx.g.sh(shlex.join(["podman", "exec", f"op-{name}", "sh", "-c", CLIENT_SHOT]) + f" > {tmp}",
+             label=f"client op-{name}: the toolkit's screenshot --to-stdout")
+    data = ctx.g.fetch(tmp)
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise StoryFailed(f"the client's own screenshot is not a PNG ({len(data)} bytes)")
+    n = ctx.st.name(moment, "png")
+    with open(ctx.st.path(n), "wb") as f:
+        f.write(data)
+    ctx.st.attach(n, what)
+    return struct.unpack(">II", data[16:24])
+
+
+def client_typed(ctx, st, name, instance, text):
+    """Whether the line typed reached the client's sink, read inside its own
+    container; the sink file is kept (EV-STATE)."""
+    got = wait_until(lambda: text in ctx.client_lines(name, f"/tmp/op-sink-{instance}"), 8, 0.5)
+    ctx.save_cmd("sink", f"podman exec op-{name} cat /tmp/op-sink-{instance}",
+                 "EV-STATE: the client-side sink file, read inside the client's own container: every "
+                 "line typed into its window", label=f"the sink of op-{name}")
+    return got
+
+
+def s7_5_1(ctx, st):
+    xs = ctx.xstate()
+    term = ctx.session_xterm(xs)
+    st.check(term is not None, "the session's xterm is on the screen, to hold the keyboard focus first")
+    fx, fy = ctx.free_spot(xs, (300, 200))
+    ctx.client_sink("s751", "s751app", f"40x10+{fx}+{fy}", "s751", devices=("display", "tools"))
+    st.record(f"the client: podman run --device desktop.local/display=all --device desktop.local/tools=all "
+              f"{DESKTOP_IMAGE} xterm -name s751app, a sink: every line typed into it is appended to "
+              "/tmp/op-sink-s751app inside the client's own container. The tools device is there only "
+              "for the client's own screenshot.")
+    xs, cli = ctx.wait_client("s751app")
+    ctx.save_state("tree", xs.text, "EV-STATE: xwininfo -root -tree from the observer (then each "
+                   "top-level window's map state): the client's window s751app in it")
+    info = ctx.one(cli.id)
+    st.check(info.name == "s751app", "the client's window is on the desktop under the client's title",
+             f"WM_NAME '{info.name}', {cli.w}x{cli.h}+{cli.ax}+{cli.ay}")
+    before = client_record(ctx, "s751", "pids-before", "EV-PIDS: the client container before the click: "
+                           "its id, the application's host pid, restart count and start time")
+    # The focus starts elsewhere, so the keys can reach the client only if the
+    # click on it moved the focus there.
+    ctx.click(*xs.parts(term)["drag"])
+    cx, cy = cli.ax + cli.w // 2, cli.ay + cli.h // 2
+    ctx.click(cx, cy)
+    st.record(f"the session's xterm was clicked first, then the client's window at its centre ({cx},{cy})")
+    ctx.type_line("typedintoclient751")
+    st.check(client_typed(ctx, st, "s751", "s751app", "typedintoclient751"),
+             "the line typed after the click reached the client: its sink holds typedintoclient751")
+    ctx.shot("typed", "EV-SHOT: the desktop with the client's window s751app: its word s751 on the first "
+             "row, then the line typed into it, typedintoclient751")
+    w, h = client_shot(ctx, "s751", "client-view", "EV-SHOT-CLIENT: the display as the client captures it "
+                       "from inside its own container (the toolkit's screenshot): its window with the "
+                       "typed line")
+    st.check((w, h) == (ctx.width, ctx.height), "the client's own capture is of the whole screen", f"{w}x{h}")
+    after = client_record(ctx, "s751", "pids-after", "EV-PIDS: the client container after the click and "
+                          "the typing")
+    client_same(ctx, st, "s751", before, after)
+
+
+def s7_5_3(ctx, st):
+    xs = ctx.xstate()
+    term = ctx.session_xterm(xs)
+    st.check(term is not None, "the session's xterm is on the screen, to hold the keyboard focus first")
+    fx, fy = ctx.free_spot(xs, (300, 200))
+    ctx.client_sink("s753", "s753app", f"40x10+{fx}+{fy}", "s753", devices=("display", "tools"))
+    xs, cli = ctx.wait_client("s753app")
+    ctx.save_state("tree", xs.text, "EV-STATE: the window tree: the client's window s753app inside the "
+                   "frame mwm gave it")
+    parts = xs.parts(cli)
+    frame, title = parts["frame"], parts["title"]
+    st.check(frame.id != cli.id and frame.w > cli.w and frame.h > cli.h and title.h > 0,
+             "mwm framed the client's window: it sits in an mwm frame with a title bar",
+             f"frame {frame.w}x{frame.h}+{frame.ax}+{frame.ay}, title bar {title.w}x{title.h}, "
+             f"window {cli.w}x{cli.h}+{cli.ax}+{cli.ay}")
+    before = client_record(ctx, "s753", "pids-before", "EV-PIDS: the client container before the click")
+    ctx.click(*xs.parts(term)["drag"])
+    a, t = parts["swatch"], xs.parts(term)["swatch"]
+    img = ctx.shot("before-click", "EV-SHOT: the session's xterm holds the focus; the client's frame is "
+                   "the inactive #22262d")
+    st.check(img.px(*a) == UNFOCUSED, "before the click the client's frame is the inactive colour #22262d",
+             f"sampled {img.px(*a)} at {a}")
+    cx, cy = cli.ax + cli.w // 2, cli.ay + cli.h // 2
+    ctx.click(cx, cy)
+    img = ctx.shot("after-click", f"EV-SHOT: the client's window clicked at its centre ({cx},{cy}): its "
+                   "frame the active #41637f, the session xterm's #22262d")
+    st.check(img.px(*a) == FOCUSED, "the click on the client's window turned its frame the active colour "
+             "#41637f", f"sampled {img.px(*a)} at {a}")
+    st.check(img.px(*t) == UNFOCUSED, "and the session xterm's frame went to the inactive #22262d",
+             f"sampled {img.px(*t)} at {t}")
+    ctx.type_line("keystoclient753")
+    st.check(client_typed(ctx, st, "s753", "s753app", "keystoclient753"),
+             "the keys typed next went to the client: its sink holds keystoclient753")
+    ctx.shot("typed", "EV-SHOT: the client's window with the line typed into it, keystoclient753")
+    after = client_record(ctx, "s753", "pids-after", "EV-PIDS: the client container after the click and "
+                          "the typing")
+    client_same(ctx, st, "s753", before, after)
 
 
 # --- stories: E11 ----------------------------------------------------------------
@@ -2223,6 +2377,8 @@ STORIES = [
     ("S3.3.2", "Screensaver and DPMS are off, so the screen never blanks", s3_3_2),
     ("S3.5.2", "~/.Xdefaults is honoured because nothing sets RESOURCE_MANAGER", s3_5_2),
     ("S3.5.3", "mwm frame and menu colours are applied", s3_5_3),
+    ("S7.5.1", "A client application's window appears and is usable (podman)", s7_5_1),
+    ("S7.5.3", "A client window gets decoration, focus and keyboard", s7_5_3),
     ("S11.1.2", "Windows can be arranged with the mouse", s11_1_2),
     ("S11.1.3", "Windows can be managed from the keyboard alone", s11_1_3),
     ("S11.2.1", "Text moves between applications by selection and paste, across containers", s11_2_1),
