@@ -17,4 +17,12 @@ xsetroot -solid '#101216' || true
 
 xterm -geometry 100x30+60+60 &
 
+# mwm answers SIGHUP, like SIGTERM, with Xlib calls from inside its handler.
+# A stop signals every process of this container at once (podman stops a
+# container that has no pid namespace of its own with kill --all), so mwm
+# gets its SIGTERM while the server shuts down, and xinit, signalled too,
+# sends it a SIGHUP on the way out. Inside both handlers mwm waits forever on
+# Xlib's lock, until desktop-init's SIGKILL 5 s later. mwm keeps an ignore it
+# inherits, so the SIGHUP never reaches it, and the SIGTERM alone ends it.
+trap '' HUP
 exec /usr/bin/mwm
