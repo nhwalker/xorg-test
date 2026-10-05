@@ -851,6 +851,23 @@ case "$sig" in
 esac
 ev_end
 
+# S6.2.3's AppArmor half: the runner is Ubuntu with AppArmor, where the
+# quadlet's --security-opt apparmor=unconfined has something to undo. (The
+# SELinux half, spc_t, is the VM's: guest:verify_privileges.)
+ev_begin S6.2.3 "SELinux separation off for the desktop, AppArmor unconfined" T2
+aa=$(ev_save inspect-apparmor "EV-STATE: podman inspect desktop --format '{{.AppArmorProfile}}' (the running container)" \
+    podman inspect desktop --format '{{.AppArmorProfile}}') || fail "could not inspect the running container"
+aa_init=$(podman exec desktop cat /run/desktop-init.pid)
+attr=$(ev_save init-attr "EV-STATE: /proc/<desktop-init>/attr/current on the runner: the AppArmor profile desktop-init runs under" \
+    cat "/proc/$aa_init/attr/current") || true
+[ "$(tail -n1 <<<"$aa")" = unconfined ] || fail "podman reports AppArmorProfile '$(tail -n1 <<<"$aa")', want unconfined"
+ev_pass "podman reports AppArmorProfile=unconfined for the running desktop"
+case "$(tail -n1 <<<"$attr")" in
+    unconfined*) ev_pass "desktop-init (pid $aa_init) runs unconfined: $(tail -n1 <<<"$attr")" ;;
+    *) fail "desktop-init runs under '$(tail -n1 <<<"$attr")', not unconfined" ;;
+esac
+ev_end
+
 log "boot oneshots: each one's first line, in the documented order, before 'oneshots done'"
 ev_begin S2.1.1 "Oneshots run in the documented order" T2
 done_n=$(line_in "$boot_log" '^desktop-init: oneshots done')

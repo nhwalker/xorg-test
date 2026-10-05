@@ -816,6 +816,10 @@ guest_ev "$GUEST_EV" verify-privileges \
     || { vm_ssh 'sudo podman inspect desktop --format "{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}"; sudo podman exec desktop sh -c "grep -E \"^(Cap|Seccomp)\" /proc/\$(cat /run/desktop-init.pid)/status"' \
          2>&1 | tee "$ART/privileges-fail.log" || true; fail "privilege assertions failed"; }
 
+log "runtime: the session's process session, no TCP listener, open local access, the udev database"
+guest_ev "$GUEST_EV" verify-runtime \
+    || fail "the running session, X server or udev database is not as specified"
+
 log "logging: both log sinks are bounded, on the running container"
 # Reports the host's DEFAULT log driver alongside the assertion: that default
 # is what this unit would have inherited without LogDriver=, and it is the
@@ -896,9 +900,62 @@ ev_audio_stop "EV-AUDIO: the machine's output after PipeWire was killed and came
 ev_pass "after the recovery a pulse client's $hz Hz tone came out of the machine"
 ev_end
 EV_SIDE=
+
+log "audio daemons: wireplumber alone, then pipewire-pulse alone, each restarts the whole stack"
+guest_ev "$GUEST_EV" verify-audio-restarts \
+    || fail "a single audio daemon's exit did not restart the whole stack"
+EV_SIDE=h-
+ev_begin S2.4.2 "Any daemon exiting restarts the whole stack" T3
+hz=$(freq_for pulse)
+ev_audio_start after-restarts "$hz"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio pulse' \
+    || { audio_capture_stop; fail "a pulse client could not play after the stack's restarts"; }
+ev_audio_stop "EV-AUDIO: the machine's output after the two restarts, while a pulse client played its $hz Hz tone - listen for one beep" 1 0.05 "$hz" \
+    || fail "audio is silent after the stack's restarts"
+ev_pass "after both restarts a pulse client's $hz Hz tone came out of the machine"
+ev_end
+EV_SIDE=
+
+log "audio export: the unprivileged rocky user on the VM host plays through it"
+ev_begin S2.4.7 "Export sockets are connectable by other uids" T3
+ev_audio_start rocky 880
+ev_save as-rocky "EV-STATE: as the unprivileged rocky user on the VM host: id, ls -l /run/desktop-audio, pactl info over the export, then paplay of an 880 Hz tone" \
+    vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-as-rocky 880 3' >/dev/null || true
+rocky=$(ev_payload "$EV_DIR/$EV_LAST")
+ev_audio_stop "EV-AUDIO: the machine's output while rocky's paplay played 880 Hz through the export - listen for one beep" 2 0.05 880 \
+    || fail "rocky's 880 Hz tone was not heard"
+grep -q '^uid=[1-9][0-9]*(rocky)' <<<"$rocky" || fail "the probe did not run as the unprivileged rocky user: $(grep '^uid=' <<<"$rocky")"
+ev_pass "the probe ran as $(grep -o '^uid=[0-9]*(rocky)' <<<"$rocky"), not root"
+grep -q '^Server Name: ' <<<"$rocky" || fail "rocky's pactl info over the export failed"
+ev_pass "rocky's pactl info over the export answered: $(grep '^Server Name: ' <<<"$rocky")"
+grep -q '^paplay exited 0$' <<<"$rocky" || fail "rocky's paplay did not exit 0: $(grep '^paplay exited' <<<"$rocky")"
+ev_pass "rocky's paplay played its 880 Hz tone through the export, heard at the machine's output"
+ev_end
+
 log "a killed X server leaves a postmortem"
 guest_ev "$GUEST_EV" verify-postmortem \
     || fail "postmortem assertions failed"
+
+log "session restart: what goes with a killed X server, what stays, and the VT"
+# The guest moves the console to tty2, kills Xorg and judges what went and
+# what stayed (verify-session-restart); the display is recorded from before
+# the kill until the new session's desktop is back (S2.3.2), then shot
+# (S3.2.5: the desktop on tty1, not a text console).
+EV_SIDE=h-
+ev_begin S2.3.2 "The session restarts after Xorg exits, and the operator gets the desktop back" T3
+ev_video_start session-restart
+ev_end
+EV_SIDE=
+guest_ev "$GUEST_EV" verify-session-restart \
+    || fail "the session restart was not as specified"
+EV_SIDE=h-
+ev_begin S2.3.2 "The session restarts after Xorg exits, and the operator gets the desktop back" T3
+ev_video_stop "EV-VIDEO: the display from before the kill (the console moved to tty2 first) until the new session's desktop is back (index.txt and the guest's notes give the times)"
+ev_end
+ev_begin S3.2.5 "The session activates its VT, so the operator sees it" T3
+ev_shot desktop-back "EV-SHOT: the display once the new session is up: the desktop on tty1, not tty2's text console"
+ev_end
+EV_SIDE=
 
 log "input: type into an xterm with the real virtual keyboard, verify the app got it"
 # Prove the whole input path (QEMU HID -> evdev -> Xorg -> focused app), not
