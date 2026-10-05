@@ -187,6 +187,9 @@ phase_deploy() {
 
     log pd "apply the deploy tree (verbatim README command)"
     rsync -a --chown=root:root deploy/host/ /
+    # S7.2.5's "before": /etc/cdi as the tree leaves it, before the desktop's
+    # first start. Kept now, attached to the story once the spec appears.
+    ls -l --full-time /etc/cdi > /tmp/ev-cdi-before-start.txt 2>&1 || true
     [ -L /etc/systemd/system/getty@tty1.service ] || fail "getty mask did not survive as a symlink"
     systemctl daemon-reload
     systemd-sysusers
@@ -214,11 +217,18 @@ phase_deploy() {
     wait_for 40 3 "desktop-init ready in container" container_running
 
     log pd "stub CDI spec resolved (no NVIDIA in the VM; marker on the init process)"
+    ev_begin S5.4.1 "Stub on a GPU-less host, resolvable by podman" T3
+    ev_copy /etc/cdi/nvidia.yaml nvidia-cdi-spec "EV-CONFIG: /etc/cdi/nvidia.yaml as desktop-cdi-refresh wrote it on this GPU-less VM: the stub, whose only edit is NVIDIA_CDI_STUB=1"
     grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
+    ev_pass "with no toolkit and no NVIDIA hardware, desktop-cdi-refresh wrote the stub spec"
     # /proc/1 is the HOST's systemd under --pid=host; the CDI env edits land
     # on the container's init process, whose (host) pid desktop-init records.
+    ev_save init-environ "EV-STATE: the NVIDIA lines of the container init's environment (/proc/<desktop-init>/environ); NVIDIA_CDI_STUB=1 there means podman resolved --device nvidia.com/gpu=all against the stub" \
+        podman exec desktop sh -c 'tr "\0" "\n" </proc/$(cat /run/desktop-init.pid)/environ | grep NVIDIA' >/dev/null || true
     podman exec desktop sh -c 'tr "\0" "\n" </proc/$(cat /run/desktop-init.pid)/environ | grep -qx NVIDIA_CDI_STUB=1' \
         || fail "stub marker not on the container init process"
+    ev_pass "NVIDIA_CDI_STUB=1 is in the container init's environment"
+    ev_end
 
     log pd "the tree's oneshot wrote both client CDI specs"
     grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
@@ -237,22 +247,50 @@ phase_deploy() {
         || fail "the desktop did not publish screenshot into /var/lib/desktop-container/bin"
     grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
         || fail "desktop-tools-cdi.path did not advertise the toolkit after the desktop published"
+    ev_begin S7.2.5 "Advertised only after provisioning" T3
+    ev_copy /tmp/ev-cdi-before-start.txt cdi-before-first-start "EV-STATE: ls -l --full-time /etc/cdi right after the tree was applied, before the desktop's first start: no desktop-tools.yaml"
+    cdi_before=$EV_LAST
+    if grep -q desktop-tools.yaml /tmp/ev-cdi-before-start.txt; then
+        fail "desktop-tools.yaml existed before the desktop's first start"
+    fi
+    ev_pass "no tools spec before the desktop's first start"
+    ev_save cdi-after-publish "EV-STATE: ls -l --full-time /etc/cdi once the desktop has published its toolkit: desktop-tools.yaml is there" \
+        ls -l --full-time /etc/cdi >/dev/null || true
+    ev_diff cdi "EV-DIFF: /etc/cdi before the first start and after the desktop published; the tools spec is the line that appears" \
+        "$cdi_before" "$EV_LAST"
+    ev_pass "the tools spec is present (kind desktop.local/tools) once the desktop has published"
+    ev_end
 
     log pd "Xorg serves the virtio display, rootless, under the deploy quadlet"
     wait_for 60 4 "X socket" podman exec desktop test -S /tmp/.X11-unix/X0
     podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null \
         || fail "xdpyinfo could not talk to :0"
+    ev_begin S3.2.1 "Xorg runs as the session user" T3
+    ev_save xorg-process "EV-PIDS: the running Xorg (pid, ppid, user, start time, command): its user is desktop" \
+        podman exec desktop ps -o pid,ppid,user,lstart,args -C Xorg >/dev/null || true
     owner=$(podman exec desktop sh -c 'ps -o user= -C Xorg | head -1' || true)
     [ "$owner" = desktop ] || fail "Xorg runs as '${owner:-nobody}', want desktop"
+    ev_pass "the running Xorg's user is desktop"
+    wrapper=$(ev_save xwrapper-config "EV-CONFIG: /etc/X11/Xwrapper.config in the running container: needs_root_rights = no" \
+        podman exec desktop cat /etc/X11/Xwrapper.config) || true
+    grep -qE '^[[:space:]]*needs_root_rights[[:space:]]*=[[:space:]]*no' <<<"$wrapper" \
+        || fail "Xwrapper.config does not set needs_root_rights = no"
+    ev_pass "Xwrapper.config sets needs_root_rights = no"
+    ev_end
     session_up || fail "mwm not running as the session user"
 
     log pd "the HOST owns the seat: a real logind session for the desktop user on seat0"
     # The seat0 assertion the container's logind used to answer, back where
     # it truthfully lives: desktop-session.service (this tree) opens a
     # PAM/logind session on the host, pulled up by the quadlet's Wants=.
+    ev_begin S2.2.1 "The host login session's runtime dir is adopted" T3
     wait_for 15 2 "host login session on seat0" \
         sh -c "loginctl list-sessions --no-pager | grep -Eq 'desktop +seat0'"
+    ev_save loginctl "EV-STATE: loginctl list-sessions on the host: a session for desktop on seat0" \
+        loginctl list-sessions --no-pager >/dev/null || true
     [ -d /run/user/61000 ] || fail "logind did not mount /run/user/61000 on the host"
+    ev_save findmnt "EV-STATE: findmnt /run/user/61000 on the host: logind's tmpfs for the session" \
+        findmnt /run/user/61000 >/dev/null || true
     # And the runtime dir the container session uses IS that dir, live:
     # logind mounted it after the container was created, so only the
     # quadlet's rslave /run/user bind can have carried it inside. Prove the
@@ -260,6 +298,9 @@ phase_deploy() {
     touch /run/user/61000/.host-probe
     podman exec desktop test -e /run/user/61000/.host-probe \
         || { rm -f /run/user/61000/.host-probe; fail "host runtime dir does not propagate into the container: the rslave /run/user bind is broken, desktop-init is running on a fabricated dir"; }
+    ev_save container-ls "EV-STATE: ls -la /run/user/61000 inside the container while the host's probe file exists: .host-probe is listed" \
+        podman exec desktop ls -la /run/user/61000 >/dev/null || true
+    ev_pass "a file created on the host under /run/user/61000 is visible in the container"
     rm -f /run/user/61000/.host-probe
     # Polled, not read once. Every assertion above this one reads LIVE state -
     # pgrep for Xorg and mwm, loginctl for the session - which is current the
@@ -275,16 +316,29 @@ phase_deploy() {
     # here - it just takes the timeout to do it instead of failing instantly.
     wait_for 15 2 "desktop-init to log that it adopted the host session's runtime dir (a standalone fallback never logs this, so a real regression still fails here)" \
         sh -c "podman logs desktop 2>/dev/null | grep -q 'runtime dir /run/user/61000 provided by the host login session'"
+    ev_save desktop-log "EV-LOG-DESKTOP: desktop-init's runtime-dir lines; the standalone fallback would log 'no host login session appeared' instead" \
+        sh -c "podman logs desktop 2>/dev/null | grep -E 'runtime dir|no host login session'" >/dev/null || true
+    ev_pass "desktop-init logged 'runtime dir /run/user/61000 provided by the host login session'"
+    ev_end
 
     log pd "host terminal under SELinux enforcing: desktop-shell account, root-owned trust"
     # This is the path only this phase can prove: sshd reading the key from
     # /etc/ssh/authorized_keys.d (not a home dir) with SELinux enforcing.
-    who=$(ssh -i /etc/desktop-container/host-shell-key -o BatchMode=yes -o ConnectTimeout=5 \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null desktop-shell@127.0.0.1 whoami)
+    ev_begin S5.7.2 "Login works both directions" T3
+    ev_note "the menu half (Host Terminal opens a host shell for the operator) is the operator phase's: artifacts/S11.1.1/ holds its screenshot and sshd's accepted-publickey line"
+    who=$(ev_save ssh-from-host "EV-STATE: ssh -i <key> desktop-shell@127.0.0.1 whoami, run on the host: desktop-shell" \
+        ssh -i /etc/desktop-container/host-shell-key -o BatchMode=yes -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null desktop-shell@127.0.0.1 whoami) || true
+    who=$(tail -n1 <<<"$who")
     [ "$who" = desktop-shell ] || fail "host-side ssh whoami='$who', want desktop-shell"
-    who=$(podman exec -u desktop -e HOME=/home/desktop desktop \
-        ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami)
+    ev_pass "from the host, ssh with the desktop's key logs in as desktop-shell"
+    who=$(ev_save ssh-from-container "EV-STATE: ssh host whoami, run in the desktop container as the session user: desktop-shell" \
+        podman exec -u desktop -e HOME=/home/desktop desktop \
+        ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) || true
+    who=$(tail -n1 <<<"$who")
     [ "$who" = desktop-shell ] || fail "container 'ssh host' whoami='$who', want desktop-shell"
+    ev_pass "from the container, 'ssh host' logs in as desktop-shell"
+    ev_end
 
     log pd "desktop-preflight fully green on the VM"
     ev_begin S5.10.1 "Fully green on a provisioned host" T3
@@ -301,8 +355,21 @@ phase_deploy() {
     log pd "HOST audio: HDA device visible, pulse socket reachable from the host"
     podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop \
         sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
-    PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
+    # S5.6.7 asks that nothing from here to its own story was denied; this
+    # is where "here" starts (ausearch -ts takes a time of day).
+    ev_t0=$(date +%H:%M:%S)
+    ev_begin S4.1.1 "Both sockets are exported" T3
+    ev_save export-dir "EV-STATE: ls -l /run/desktop-audio on the host while the desktop runs: pipewire-0 and pulse, both sockets (type s)" \
+        ls -l /run/desktop-audio >/dev/null || true
+    [ -S /run/desktop-audio/pipewire-0 ] || fail "no pipewire-0 socket in the host's /run/desktop-audio"
+    ev_pass "/run/desktop-audio/pipewire-0 on the host is a socket"
+    [ -S /run/desktop-audio/pulse ] || fail "no pulse socket in the host's /run/desktop-audio"
+    ev_pass "/run/desktop-audio/pulse on the host is a socket"
+    ev_save pactl-info "EV-STATE: pactl info from the host over the exported pulse socket (the server is PipeWire's pulse layer)" \
+        env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
         || fail "pulse socket unreachable from VM host"
+    ev_pass "pactl info over the exported pulse socket succeeds from the host"
+    ev_end
 
     # Assert the labels BEFORE the confined clients below depend on them, so a
     # regression names its cause here instead of surfacing as an unexplained
@@ -348,6 +415,11 @@ phase_deploy() {
         || fail "host cannot EXECUTE $TOOLKIT/screenshot - container_file_t not executable by unconfined_t?"
 
     log pd "HOST display: that binary captures the live desktop from the host"
+    ev_begin S3.2.6 "The X socket is shared through the host directory" T3
+    ev_save x11-unix "EV-STATE: ls -l /tmp/.X11-unix on the host: Xorg's X0 socket, created inside the container, is here" \
+        ls -l /tmp/.X11-unix >/dev/null || true
+    [ -S /tmp/.X11-unix/X0 ] || fail "no X0 socket in the host's /tmp/.X11-unix"
+    ev_pass "the host's /tmp/.X11-unix/X0 is a socket"
     hostshot=/tmp/host-toolkit-shot.png
     rm -f "$hostshot"
     DISPLAY=:0 "$TOOLKIT/screenshot" "$hostshot" \
@@ -357,6 +429,28 @@ phase_deploy() {
     head -c8 "$hostshot" | od -An -tx1 | tr -d ' \n' | grep -qi '^89504e470d0a1a0a' \
         || fail "host screenshot is not a PNG"
     log pd "  host captured $(stat -c%s "$hostshot") bytes with no X client stack installed"
+    ev_copy "$hostshot" host-capture "EV-SHOT-CLIENT (host variant): the desktop as the published screenshot binary captured it from the host, over /tmp/.X11-unix/X0"
+    ev_pass "the published screenshot binary, run on the host, captured :0 ($(stat -c%s "$hostshot") bytes, a PNG)"
+    ev_end
+
+    ev_begin S5.6.7 "The host keeps full access after relabeling" T3
+    ev_save toolkit-exec "EV-STATE: the relabeled (container_file_t) screenshot binary executed by an unconfined host process: its --help, exit 0" \
+        "$TOOLKIT/screenshot" --help >/dev/null \
+        || fail "host cannot EXECUTE $TOOLKIT/screenshot - container_file_t not executable by unconfined_t?"
+    ev_pass "an unconfined host process executes the relabeled toolkit binary"
+    ev_copy "$hostshot" host-capture "EV-SHOT-CLIENT (host variant): the host's capture of :0 through the relabeled X socket (the same capture S3.2.6 keeps)"
+    ev_pass "an unconfined host process connects to the relabeled X socket (it captured :0)"
+    ev_save pactl-info "EV-STATE: pactl info from the host over the relabeled pulse socket" \
+        env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
+        || fail "the host cannot connect to the relabeled pulse socket"
+    ev_pass "an unconfined host process connects to the relabeled pulse socket"
+    avc=$(ev_save avc-since-host-checks "EV-STATE: ausearch -m avc -ts $ev_t0 - every SELinux denial since the host checks began; none" \
+        sh -c "ausearch -m avc -ts $ev_t0 2>&1 || true") || true
+    if grep -q 'type=AVC' <<<"$avc"; then
+        fail "SELinux denied something while the host used the relabeled sockets and toolkit (see the ausearch output)"
+    fi
+    ev_pass "no SELinux denial since the host checks began"
+    ev_end
     rm -f "$hostshot"
 
     # The whole client contract in one command, under podman: a SEPARATE
@@ -390,19 +484,28 @@ phase_deploy() {
     # and confining it needs a policy module of its own). Nothing downstream of
     # it is exempt, which is the asymmetry these commands exist to prove.
     log pd "a CONFINED podman client resolves desktop.local/display=all and opens :0"
-    out=$(podman run --rm \
+    ev_begin S7.1.1 "Each device grants only its own capability" T3
+    # Every probe also prints its whole environment, the two mounts that
+    # matter and its own SELinux label: what the device gave it, and proof
+    # it ran confined (container_t), not as the desktop does.
+    probe_tail='echo "-- env"; env | sort; echo "-- mounts"; grep -E " /tmp/.X11-unix | /run/desktop-audio " /proc/self/mountinfo || echo "(neither)"; echo "-- selinux label"; cat /proc/self/attr/current; echo'
+    out=$(ev_save probe-display "EV-STATE: a confined client given only desktop.local/display=all: DISPLAY, the X socket, xdpyinfo working; no PULSE_SERVER and no audio mount; its label is container_t" \
+        podman run --rm \
         --device desktop.local/display=all \
         localhost/desktop-container:latest sh -c '
             printenv DISPLAY
             test -S /tmp/.X11-unix/X0 && echo SOCKET_OK
             xdpyinfo >/dev/null && echo XDPYINFO_OK
             printenv PULSE_SERVER || echo NO_PULSE
-            grep -q " /run/desktop-audio " /proc/self/mountinfo || echo NO_AUDIO_MOUNT') \
+            grep -q " /run/desktop-audio " /proc/self/mountinfo || echo NO_AUDIO_MOUNT
+            '"$probe_tail") \
         || fail "podman display client failed (see output above)"
     for want in ':0' SOCKET_OK XDPYINFO_OK NO_PULSE NO_AUDIO_MOUNT; do
         echo "$out" | grep -qx "$want" \
             || fail "display client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
     done
+    grep -q ':container_t:' <<<"$out" || fail "the display client did not run confined (no container_t label)"
+    ev_pass "display alone: DISPLAY=:0, the X socket and a working xdpyinfo; no audio env or mount; confined"
     log pd "podman display client opened :0 and got NO audio - the split holds"
 
     # ...and the mirror image. An audio-only client must not be able to see
@@ -410,30 +513,82 @@ phase_deploy() {
     # whole session, which is precisely what a sound-only workload must not
     # be handed.
     log pd "a CONFINED podman client resolves desktop.local/audio=all and gets audio only"
-    out=$(podman run --rm \
+    out=$(ev_save probe-audio "EV-STATE: a confined client given only desktop.local/audio=all: PULSE_SERVER, PIPEWIRE_REMOTE and the pulse socket; no DISPLAY and no X11 mount; its label is container_t" \
+        podman run --rm \
         --device desktop.local/audio=all \
         localhost/desktop-container:latest sh -c '
             printenv PULSE_SERVER
             printenv PIPEWIRE_REMOTE
             test -S /run/desktop-audio/pulse && echo PULSE_SOCKET_OK
             printenv DISPLAY || echo NO_DISPLAY
-            grep -q " /tmp/.X11-unix " /proc/self/mountinfo || echo NO_X11_MOUNT') \
+            grep -q " /tmp/.X11-unix " /proc/self/mountinfo || echo NO_X11_MOUNT
+            '"$probe_tail") \
         || fail "podman audio client failed (see output above)"
     for want in 'unix:/run/desktop-audio/pulse' '/run/desktop-audio/pipewire-0' \
                 PULSE_SOCKET_OK NO_DISPLAY NO_X11_MOUNT; do
         echo "$out" | grep -qx "$want" \
             || fail "audio client missing '$want' (got: $(echo "$out" | tr '\n' ' '))"
     done
+    grep -q ':container_t:' <<<"$out" || fail "the audio client did not run confined (no container_t label)"
+    ev_pass "audio alone: both audio env vars and the pulse socket; no DISPLAY, no X11 mount; confined"
     log pd "podman audio client got the audio sockets and NO display"
 
     # Both together are the union: what a full desktop client asks for.
-    podman run --rm \
+    out=$(ev_save probe-both "EV-STATE: a confined client given both devices: the union of their edits, xdpyinfo working" \
+        podman run --rm \
         --device desktop.local/display=all --device desktop.local/audio=all \
         localhost/desktop-container:latest sh -c '
             test "$DISPLAY" = :0 && test -S /tmp/.X11-unix/X0 \
-              && test -S /run/desktop-audio/pulse && xdpyinfo >/dev/null' \
+              && test -S /run/desktop-audio/pulse && xdpyinfo >/dev/null && echo UNION_OK
+            '"$probe_tail") \
         || fail "requesting both devices did not yield the union of their edits"
+    grep -qx UNION_OK <<<"$out" || fail "requesting both devices did not yield the union of their edits"
+    ev_pass "both devices: the union (display and audio), xdpyinfo working"
     log pd "both devices together give display + audio"
+
+    # ...and none: the control, so nothing above can have come from the
+    # image itself.
+    out=$(ev_save probe-none "EV-STATE: a container given no device: no DISPLAY, no audio env, neither mount (the control)" \
+        podman run --rm localhost/desktop-container:latest sh -c '
+            printenv DISPLAY || echo NO_DISPLAY
+            printenv PULSE_SERVER || echo NO_PULSE
+            grep -q " /tmp/.X11-unix " /proc/self/mountinfo || echo NO_X11_MOUNT
+            grep -q " /run/desktop-audio " /proc/self/mountinfo || echo NO_AUDIO_MOUNT
+            '"$probe_tail") \
+        || fail "the no-device control container failed"
+    for want in NO_DISPLAY NO_PULSE NO_X11_MOUNT NO_AUDIO_MOUNT; do
+        grep -qx "$want" <<<"$out" || fail "a container with no device got something ('$want' missing)"
+    done
+    ev_pass "no device: nothing (no DISPLAY, no audio env, neither mount)"
+    ev_end
+
+    ev_begin S5.5.1 "Display and audio specs are disjoint, rw, directory mounts" T3
+    ev_copy /etc/cdi/desktop-display.yaml display-spec "EV-CONFIG: /etc/cdi/desktop-display.yaml: DISPLAY and the /tmp/.X11-unix directory, rbind rw; nothing about audio"
+    ev_copy /etc/cdi/desktop-audio.yaml audio-spec "EV-CONFIG: /etc/cdi/desktop-audio.yaml: both audio env vars and the /run/desktop-audio directory, rbind rw; nothing about the display"
+    for f in probe-display probe-audio probe-both probe-none; do
+        src=$(ls "$EV_ROOT/S7.1.1/"*"-$f.txt" 2>/dev/null | head -n1 || true)
+        [ -z "$src" ] || ev_copy "$src" "$f" "EV-STATE: the $f client's env and mounts, as S7.1.1 ran it (copied here)"
+    done
+    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml || fail "display spec kind wrong"
+    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml || fail "audio spec kind wrong"
+    ev_pass "the two specs carry the kinds desktop.local/display and desktop.local/audio"
+    if grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' /etc/cdi/desktop-display.yaml \
+        || grep -qE 'DISPLAY=|X11-unix' /etc/cdi/desktop-audio.yaml; then
+        fail "the specs are not disjoint: one carries the other's edits"
+    fi
+    ev_pass "disjoint: neither spec carries the other's env or mount"
+    grep -q 'hostPath: /tmp/.X11-unix$' /etc/cdi/desktop-display.yaml \
+        && grep -q 'hostPath: /run/desktop-audio$' /etc/cdi/desktop-audio.yaml \
+        || fail "the specs do not mount the two directories"
+    grep -q '"rbind", "rw"' /etc/cdi/desktop-display.yaml && grep -q '"rbind", "rw"' /etc/cdi/desktop-audio.yaml \
+        || fail "the spec mounts are not rbind rw"
+    ev_pass "each mounts its directory (not a socket file), rbind and rw"
+    printf 'cdiVersion: 0.5.0\nkind: desktop.local/display\ndevices: []\n' > /etc/cdi/desktop.yaml
+    ev_save legacy-spec "EV-STATE: desktop-client-cdi re-run with a superseded combined /etc/cdi/desktop.yaml in place: it removes it" \
+        deploy/host/usr/local/libexec/desktop-client-cdi >/dev/null || fail "desktop-client-cdi failed when re-run"
+    [ ! -e /etc/cdi/desktop.yaml ] || fail "the superseded combined spec survived a desktop-client-cdi run"
+    ev_pass "the superseded combined spec is removed"
+    ev_end
 
     verify_fixed_layout
 
@@ -904,15 +1059,18 @@ play_audio() { # $1: pulse | pipewire | alsa (inside the desktop container)
     gen_tone "$freq" /tmp/tone.wav
     podman cp /tmp/tone.wav desktop:/tmp/tone.wav
     log pa "play ${freq}Hz tone via $path from an xterm on :0"
-    podman exec desktop rm -f /tmp/audio-ok
+    podman exec desktop rm -f /tmp/audio-ok /tmp/audio-done
     # The xterm is the X11 app doing the playing. Its exit status does not
     # reliably reflect the -e command, so the inner script leaves a marker
-    # only when the player succeeded.
-    podman exec -u desktop -e DISPLAY=:0 -e HOME=/home/desktop \
+    # only when the player succeeded, and another once it has finished.
+    # The window then stays up for a few seconds saying so, which is when
+    # the host takes its screenshot of it (S4.1.2's EV-SHOT): this returns
+    # as soon as the player is done, not when the window closes.
+    podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop \
         -e XDG_RUNTIME_DIR=/run/user/61000 desktop \
         timeout 60 xterm -T "audio-$path" -geometry 80x12+120+320 -e \
-        sh -c "$player && touch /tmp/audio-ok" \
-        || true
+        sh -c "$player; rc=\$?; [ \$rc = 0 ] && touch /tmp/audio-ok; echo; echo \"$path player ($player) finished, exit \$rc\"; touch /tmp/audio-done; sleep 6"
+    wait_for 120 0.5 "the $path player in its xterm to finish" podman exec desktop test -f /tmp/audio-done
     podman exec desktop test -f /tmp/audio-ok \
         || fail "$path player failed inside the xterm"
     log pa "$path played"
@@ -1031,15 +1189,42 @@ play_audio_pod() { # $1: pulse|pipewire|alsa   $2: pod (default cdi-verify)
 
 verify_testclient() {
     log tc "apply a LEAN non-desktop client (no server stack) requesting the resource"
+    ev_begin S7.3.4 "A lean non-desktop image works" T3
     k3s kubectl apply -f ci/vm/testclient-pod.yaml
     wait_for 30 4 "testclient running" \
         sh -c "k3s kubectl get pod x11-testclient -o jsonpath='{.status.phase}' | grep -q Running"
+
+    # Lean: no X server and no window manager in the image, and no audio
+    # daemon running in the pod. The PipeWire daemon packages ARE installed
+    # (pipewire-utils and pipewire-alsa pull them in); nothing starts them,
+    # so the process list, not the package list, is the audio half's proof.
+    pkgs=$(ev_save rpm-qa "EV-STATE: rpm -qa of the lean image, sorted: no X server (xorg-x11-server-*) and no window manager (motif, which ships mwm); the PipeWire packages there are dependencies of pipewire-utils and pipewire-alsa" \
+        k3s kubectl exec x11-testclient -- sh -c 'rpm -qa | sort') \
+        || fail "could not list the lean image's packages"
+    if grep -E '^(xorg-x11-server-|motif-)' <<<"$pkgs"; then
+        fail "the lean image carries an X server or a window manager (above)"
+    fi
+    ev_pass "the lean image has no X server package and no window manager"
+    procs=$(ev_save processes "EV-STATE: every process in the pod, read from /proc (pid, command line): the pod's sleep and this probe; no pipewire, wireplumber or pipewire-pulse" \
+        k3s kubectl exec x11-testclient -- sh -c 'for p in /proc/[0-9]*; do printf "%s %s\n" "${p#/proc/}" "$(tr "\0" " " <"$p/cmdline" 2>/dev/null)"; done') \
+        || fail "could not list the lean client pod's processes"
+    if grep -Eq '(^|[ /])(pipewire|wireplumber|pipewire-pulse)( |$)' <<<"$procs"; then
+        fail "an audio daemon runs in the lean client pod (see the process list)"
+    fi
+    ev_pass "no audio daemon runs in the pod"
+
     # The image ships no Xorg server or session, so a working display here can
     # only come from the CDI spec's injected DISPLAY + X-socket mount.
+    ev_save env "EV-STATE: the pod's environment: DISPLAY, PULSE_SERVER, PIPEWIRE_REMOTE and DESKTOP_TOOLS_BIN, all injected by CDI (ci/vm/testclient-pod.yaml declares no env)" \
+        k3s kubectl exec x11-testclient -- env >/dev/null || true
     got=$(k3s kubectl exec x11-testclient -- printenv DISPLAY 2>/dev/null || true)
     [ "$got" = ":0" ] || fail "testclient DISPLAY='$got', want :0 (CDI injection)"
-    timeout 20 k3s kubectl exec x11-testclient -- sh -c 'xdpyinfo >/dev/null' \
+    ev_pass "the pod's DISPLAY is :0, injected by CDI"
+    ev_save xdpyinfo "EV-STATE: xdpyinfo run in the lean client: the desktop's display :0, opened with the injected env and mount only" \
+        timeout 20 k3s kubectl exec x11-testclient -- xdpyinfo >/dev/null \
         || fail "lean client could not open the display via injected env"
+    ev_pass "xdpyinfo in the lean client opened :0"
+    ev_end
     log tc "lean client opened the display with only injected env"
 }
 
@@ -1117,19 +1302,29 @@ screenshot_pattern_stop() {
 # own staged copy of the screenshot tool - the same binary clients get.
 verify_pod_identity() {
     log pi "every X client reports a real host pid via X-Resource"
-    clients=$(podman exec -u desktop -e DISPLAY=:0 desktop \
-        /usr/libexec/desktop-tools/screenshot --list-clients 2>&1) \
+    ev_begin S3.7.1 "X clients report real host pids" T3
+    clients=$(ev_save list-clients "EV-STATE: screenshot --list-clients from inside the desktop container: every X client with the host pid X-Resource reports, none 0" \
+        podman exec -u desktop -e DISPLAY=:0 desktop \
+        /usr/libexec/desktop-tools/screenshot --list-clients) \
         || fail "screenshot --list-clients failed: $clients"
     echo "$clients" | sed 's/^/== vm-guest(pi): /'
     n=$(echo "$clients" | grep -c '^client-base=' || true)
     [ "$n" -ge 3 ] || fail "only $n X clients listed; expected at least mwm, xterm and the testpattern pod"
+    ev_pass "$n X clients are listed (at least mwm, xterm and the testpattern pod)"
     if echo "$clients" | grep -q ' pid=0$'; then
         fail "an X client reports pid=0: Xorg is not seeing host pids - is --pid=host gone from the quadlet?"
     fi
+    ev_pass "none reports pid=0"
+    pids=$(echo "$clients" | sed -n 's/.* pid=//p' | paste -sd, -)
+    ev_save client-processes "EV-STATE: ps -p <every listed pid> -o pid,user,comm,cgroup on the host: each pid is a live process (the pod's cgroup shows which belong to pods)" \
+        ps -p "$pids" -o pid,user,comm,cgroup >/dev/null || true
+    ev_end
 
     log pi "an X client resolves to the testpattern pod through /proc/<pid>/cgroup"
+    ev_begin S3.7.2 "A client pid resolves to its pod from inside the container" T3
     uid=$(k3s kubectl get pod testpattern -o jsonpath='{.metadata.uid}')
     [ -n "$uid" ] || fail "could not read the testpattern pod UID"
+    ev_text pod-uid "EV-STATE: the testpattern pod's UID, from kubectl (kubelet writes it into the pod's cgroup path, dashes or underscores)" "$uid"
     # kubelet spells the UID two ways depending on cgroup driver: verbatim
     # (cgroupfs) or dashes-to-underscores inside a .slice name (systemd).
     uidu=$(echo "$uid" | tr - _)
@@ -1141,12 +1336,19 @@ verify_pod_identity() {
         esac
     done
     [ -n "$match" ] || fail "no X client's cgroup carries the testpattern pod UID $uid - window-to-pod attribution is broken"
+    ev_save cgroup-on-host "EV-STATE: /proc/$match/cgroup read on the host for the X client pid $match: the path carries the pod UID" \
+        cat "/proc/$match/cgroup" >/dev/null || true
+    ev_pass "X client pid $match's cgroup carries the testpattern pod UID on the host"
 
     # And the same read must work from INSIDE the container: the compositor
     # is the eventual consumer, and it lives in there. Same pid, same file,
     # through the container's own /proc.
+    ev_save cgroup-in-container "EV-STATE: the same /proc/$match/cgroup read from inside the desktop container: the same pod UID" \
+        podman exec desktop cat "/proc/$match/cgroup" >/dev/null || true
     podman exec desktop grep -q -e "$uid" -e "$uidu" "/proc/$match/cgroup" \
         || fail "host pid $match resolves on the host but not inside the container - /proc is not the host's in there"
+    ev_pass "and the same read from inside the desktop container finds it too"
+    ev_end
     log pi "  X client pid $match belongs to pod testpattern ($uid), resolved from inside the container"
     log pi "verify-pod-identity passed"
 }
@@ -1166,23 +1368,46 @@ verify_screenshot() {
     # The toolkit arrived by the real delivery path, not baked into the image.
     # Assert each link before trusting the binary: the desktop published to the
     # host directory, desktop-tools-cdi.path noticed and wrote the spec, and
-    # CDI injected the mount and env into this pod.
+    # CDI injected the mount and env into this pod. (S7.2.4's other half, a
+    # pod that did not ask getting neither, is verify_split's.)
+    ev_begin S7.2.4 "Clients receive it read-only via DESKTOP_TOOLS_BIN" T3
     [ -s /etc/cdi/desktop-tools.yaml ] \
         || fail "no /etc/cdi/desktop-tools.yaml: the .path unit never fired after the desktop published"
+    ev_copy /etc/cdi/desktop-tools.yaml tools-spec "EV-CONFIG: /etc/cdi/desktop-tools.yaml, which the tools device resolves to: DESKTOP_TOOLS_BIN and a read-only bind of the published toolkit"
     local toolkit
+    ev_save testclient-env "EV-STATE: the lean client pod's environment (it requests desktop.local/tools): DESKTOP_TOOLS_BIN is set" \
+        k3s kubectl exec x11-testclient -- env >/dev/null || true
     toolkit=$(k3s kubectl exec x11-testclient -- printenv DESKTOP_TOOLS_BIN 2>/dev/null || true)
     [ -n "$toolkit" ] \
         || fail "the client pod has no DESKTOP_TOOLS_BIN: the tools device injected nothing"
+    ev_pass "the pod that requested desktop.local/tools has DESKTOP_TOOLS_BIN=$toolkit"
+    mnt=$(ev_save testclient-mountinfo "EV-STATE: the pod's mountinfo line for $toolkit: mounted, ro in its mount options (the sixth field)" \
+        k3s kubectl exec x11-testclient -- grep " $toolkit " /proc/self/mountinfo) \
+        || fail "the pod has no mount at $toolkit"
+    opts=$(awk -v m="$toolkit" '$5 == m {print $6; exit}' <<<"$mnt")
+    case ",$opts," in
+        *,ro,*) ;;
+        *) fail "the toolkit mount at $toolkit has options '$opts', not ro" ;;
+    esac
+    ev_pass "the toolkit is mounted at $toolkit with options $opts: read-only"
     k3s kubectl exec x11-testclient -- test -x "$toolkit/screenshot" \
         || fail "no executable screenshot in the injected toolkit at $toolkit"
+    ev_save help "EV-STATE: the injected binary run in the pod with --help: its usage" \
+        k3s kubectl exec x11-testclient -- sh -c "$TOOL --help" >/dev/null \
+        || fail "the injected screenshot binary does not run in the pod"
+    ev_pass "the injected screenshot binary executes in the pod"
     log ss "toolkit delivered to the client at $toolkit (published by the desktop, mounted by CDI)"
 
     # Read-only, as the spec declares: a client must not be able to replace a
     # binary that every other client executes.
-    if k3s kubectl exec x11-testclient -- sh -c "touch $toolkit/.probe" 2>/dev/null; then
+    if ev_save touch-refused "EV-STATE: touch inside the toolkit from the pod: refused (read-only file system), non-zero exit" \
+        k3s kubectl exec x11-testclient -- sh -c "touch $toolkit/.probe" >/dev/null; then
         fail "the injected toolkit is WRITABLE from the client; it must be mounted read-only"
     fi
+    ev_pass "touch inside the toolkit fails: the pod cannot write it"
+    ev_end
     log ss "injected toolkit is read-only from the client"
+    ev_begin S7.4.1 "Captured pixels are the screen" T3
 
     # The display size as the CLIENT POD sees it, through the very display the
     # CDI device injected - not via the desktop, which by this phase is a
@@ -1196,6 +1421,8 @@ verify_screenshot() {
     rm -rf /tmp/screenshots && mkdir -p /tmp/screenshots
     echo "$want" > /tmp/screenshots/geometry.txt
 
+    ev_text display-size "EV-STATE: the display size the client pod reads with xdpyinfo, which every capture below is checked against" "$want"
+
     # --to-stdout: the PNG must arrive on stdout with nothing else mixed in,
     # which is also how it gets out of the pod here.
     k3s kubectl exec x11-testclient -- sh -c "$TOOL --to-stdout" \
@@ -1205,6 +1432,7 @@ verify_screenshot() {
     got=$(png_size /tmp/screenshots/full-stdout.png) \
         || fail "screenshot --to-stdout did not produce a PNG"
     [ "$got" = "$want" ] || fail "--to-stdout captured $got, but the display is $want"
+    ev_pass "--to-stdout wrote a PNG of the whole $want display to stdout"
     log ss "--to-stdout captured the full display at $got"
 
     # File mode must agree with stdout mode.
@@ -1212,6 +1440,7 @@ verify_screenshot() {
         || fail "screenshot to a file failed in the client pod"
     got=$(png_size /tmp/screenshots/full.png) || fail "file-mode output is not a PNG"
     [ "$got" = "$want" ] || fail "file-mode captured $got, but the display is $want"
+    ev_pass "file mode wrote a PNG of the whole $want display"
     log ss "file mode captured the full display at $got"
 
     # Regions. Each is checked for size here and for CONTENT on the host: the
@@ -1231,6 +1460,7 @@ verify_screenshot() {
             || fail "region capture '$1' failed in the client pod"
         got=$(png_size "/tmp/screenshots/$1.png") || fail "region '$1' output is not a PNG"
         [ "$got" = "${2}x${3}" ] || fail "region '$1' is $got, want ${2}x${3}"
+        ev_pass "region '$1' (-x $4 -y $5 -w $2 -h $3) came back ${2}x${3}"
         log ss "region '$1' captured at $got"
     done
 
@@ -1241,24 +1471,30 @@ verify_screenshot() {
         || fail "-w/-h screenshot failed (is -h being parsed as --help?)"
     got=$(png_size /tmp/screenshots/hw.png) || fail "-w/-h output is not a PNG"
     [ "$got" = 160x120 ] || fail "-w 160 -h 120 produced $got, want 160x120"
+    ev_pass "-h is height: -w 160 -h 120 came back 160x120"
     log ss "-h is height: -w 160 -h 120 captured at $got"
 
     # An out-of-bounds region is refused, not clamped, and says what the
     # screen actually is. Exit 2 is the usage-error contract.
     local out rc=0
-    out=$(k3s kubectl exec x11-testclient -- sh -c "$TOOL -w 99999 /tmp/bad.png" 2>&1) || rc=$?
+    out=$(ev_save oversized "EV-STATE: an oversized region (-w 99999) in the pod: refused with exit 2, naming the real screen size $want" \
+        k3s kubectl exec x11-testclient -- sh -c "$TOOL -w 99999 /tmp/bad.png") || rc=$?
     [ "$rc" = 2 ] || fail "an oversized region exited $rc, want 2 (usage error)"
     grep -q "$want" <<<"$out" \
         || fail "the oversized-region error does not name the real screen size ($want): $out"
+    ev_pass "an oversized region exits 2 and names the screen's real size ($want)"
     log ss "oversized region refused with exit 2 naming $want"
 
     # No display granted: the binary must fail cleanly and point at the CDI
     # device, which is the error a mis-specified client pod actually hits.
     rc=0
-    out=$(k3s kubectl exec x11-testclient -- sh -c "env -u DISPLAY $TOOL /tmp/nodisplay.png" 2>&1) || rc=$?
+    out=$(ev_save no-display "EV-STATE: the binary run in the pod with DISPLAY unset: exit 1, and the error names desktop.local/display" \
+        k3s kubectl exec x11-testclient -- sh -c "env -u DISPLAY $TOOL /tmp/nodisplay.png") || rc=$?
     [ "$rc" = 1 ] || fail "screenshot without DISPLAY exited $rc, want 1 (runtime failure)"
     grep -q 'desktop.local/display' <<<"$out" \
         || fail "the no-DISPLAY error does not name the CDI device that grants one: $out"
+    ev_pass "with no DISPLAY it exits 1 and names desktop.local/display"
+    ev_end
     log ss "no DISPLAY: exits 1 pointing at desktop.local/display"
 
     log ss "captured from a client pod with only the injected display; pixels checked on the host"
@@ -1358,6 +1594,11 @@ verify_audio_lifecycle() {
     log al "  pipewire pid $pw_before unchanged, export still reachable"
 
     log al "audio recovers from its own crash"
+    ev_begin S2.4.3 "Stale export sockets are cleared before every audio start" T3
+    ev_save export-before "EV-STATE: ls -li /run/desktop-audio before pipewire is killed (the first column is each file's inode)" \
+        ls -li /run/desktop-audio >/dev/null || true
+    export_before=$EV_LAST
+    ino_before=$(stat -c %i /run/desktop-audio/pulse 2>/dev/null || echo none)
     # The half that had no answer at all before: kill PipeWire and require a
     # NEW one, plus a reachable export - which needs the stale socket files
     # cleared, or the restarted daemon cannot re-bind and every client keeps
@@ -1378,6 +1619,19 @@ verify_audio_lifecycle() {
     wait_for 30 2 \
         "the exported audio socket to be reachable again after a pipewire restart (stale socket files not cleared before the restart?)" \
         audio_reachable
+    ev_save export-after "EV-STATE: ls -li /run/desktop-audio after the restart: new socket files (new inodes)" \
+        ls -li /run/desktop-audio >/dev/null || true
+    ev_diff export "EV-DIFF: the export dir across the pipewire restart; the socket lines change inode" \
+        "$export_before" "$EV_LAST"
+    ino_after=$(stat -c %i /run/desktop-audio/pulse 2>/dev/null || echo none)
+    [ "$ino_after" != none ] && [ "$ino_after" != "$ino_before" ] \
+        || fail "the pulse socket's inode did not change across the restart ($ino_before -> $ino_after): the stale file was not replaced"
+    ev_pass "the pulse socket is a new file after the restart (inode $ino_before -> $ino_after)"
+    ev_save pactl-info "EV-STATE: pactl info from the host over the export, after the restart" \
+        env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
+        || fail "pactl info over the export failed after the restart"
+    ev_pass "pactl info over the export succeeds after the restart (pipewire $pw_before -> $recovered)"
+    ev_end
 
     # And the session must not have been collateral damage in the other
     # direction either - killing audio must not disturb X.
@@ -1393,8 +1647,12 @@ verify_privileges() {
     # way. Without this, restoring --privileged would be invisible: everything
     # else in this suite passes either way, because privileged is a superset.
     log vp "the container is not --privileged"
-    priv=$(podman inspect desktop --format '{{.HostConfig.Privileged}}' 2>/dev/null || echo unknown)
+    ev_begin S6.1.1 "Not privileged; seccomp active" T3
+    priv=$(ev_save inspect-privileged "EV-STATE: podman inspect desktop .HostConfig.Privileged: false" \
+        podman inspect desktop --format '{{.HostConfig.Privileged}}' 2>/dev/null) || priv=unknown
+    priv=$(tail -n1 <<<"$priv")
     [ "$priv" = false ] || fail "podman reports Privileged=$priv, want false"
+    ev_pass "podman reports Privileged=false for the running desktop"
 
     # Seccomp: 0 = disabled, 2 = filtered. --privileged gives 0. This is the
     # largest single piece of attack surface the change takes back, and it is
@@ -1411,8 +1669,12 @@ verify_privileges() {
         || fail "host pid $initpid is not desktop-init: --pid=host not in effect, or stale pid file"
 
     log vp "a seccomp filter is applied to the container init"
+    ev_save init-seccomp "EV-STATE: the Seccomp lines of /proc/<desktop-init>/status: Seccomp 2 means a filter is applied (0 would be none)" \
+        grep -E '^(Name|Pid|Seccomp)' "/proc/$initpid/status" >/dev/null || true
     mode=$(podman exec desktop sh -c "awk '/^Seccomp:/{print \$2}' /proc/$initpid/status" 2>/dev/null || echo "")
     [ "$mode" = 2 ] || fail "desktop-init Seccomp=$mode, want 2 (filter). 0 means no filter - is --privileged back?"
+    ev_pass "desktop-init (host pid $initpid) runs under a seccomp filter (Seccomp: 2)"
+    ev_end
 
     # Capabilities: assert the dangerous ones are ABSENT rather than that the
     # expected ones are present. A list of what we granted would drift with the
@@ -1491,12 +1753,16 @@ verify_privileges() {
     # non-realtime audio still produces the right tone. Without this, the claim
     # that the rlimit replaces the capability would be untested.
     log vp "no rtkit and PipeWire has realtime anyway"
+    ev_begin S4.3.2 "PipeWire holds SCHED_FIFO above priority 1 without rtkit" T3
     # rtkit used to be masked; with no systemd (and no D-Bus) in the image it
     # cannot even be activated. What must hold is the outcome: no rtkit
     # process, and PipeWire on the rlimit path regardless (asserted below).
+    ev_save pgrep-rtkit "EV-STATE: pgrep -a rtkit-daemon on the host (the container shares its pid namespace): empty" \
+        sh -c 'pgrep -a rtkit-daemon || echo "(no rtkit-daemon process)"' >/dev/null || true
     if podman exec desktop pgrep -x rtkit-daemon >/dev/null 2>&1; then
         fail "an rtkit-daemon process is running in the container - it cannot work without SYS_PTRACE/DAC_READ_SEARCH/NET_ADMIN and nothing should be starting it"
     fi
+    ev_pass "no rtkit-daemon process is running"
 
     # The limit must have reached PIPEWIRE, which is not the same thing as
     # having reached the container. With no systemd the delivery is plain
@@ -1567,6 +1833,10 @@ verify_privileges() {
             "grep -n -A 10 'libpipewire-module-rt' /usr/share/pipewire/pipewire.conf" >&2 2>&1 || true
         fail "no PipeWire thread holds SCHED_FIFO above priority 1: PipeWire did not get realtime properly, so masking rtkit cost the audio stack its priorities. The 'why no realtime' block above - just before the standard diagnostics dump - says which cause it is"
     fi
+    ev_save pipewire-threads "EV-STATE: every thread of the PipeWire daemon (ps -L -p <pid> -o pid,tid,cls,rtprio,comm): the data-loop threads are FF (SCHED_FIFO) above priority 1" \
+        podman exec desktop ps -L -p "$pwpid" -o pid,tid,cls,rtprio,comm >/dev/null || true
+    ev_pass "$fifo PipeWire thread(s) hold SCHED_FIFO above priority 1 (RLIMIT_RTPRIO hard limit 95)"
+    ev_end
     log vp "  rtkit masked, RLIMIT_RTPRIO=95, $fifo PipeWire thread(s) on SCHED_FIFO"
 
     log vp "verify-privileges passed"
@@ -1718,10 +1988,12 @@ operator_teardown() {
     log op "operator-teardown done"
 }
 
-apply_client() { # $1: pod name
-    # Reuse the example client (a long-running xterm), renamed and pointed
-    # at the locally-imported image.
+apply_client() { # $1: pod name; $2: xterm geometry (default: the example's)
+    # Reuse the example client (a long-running xterm), renamed, titled after
+    # the pod, placed where asked and pointed at the locally-imported image.
     sed -e "s/name: x11-client-demo/name: $1/" \
+        -e "s/\"CDI demo\"/\"$1\"/" \
+        -e "s/80x24+200+200/${2:-80x24+200+200}/" \
         -e 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
         examples/x11-client-pod.yaml | k3s kubectl apply -f -
 }
@@ -1750,13 +2022,22 @@ verify_split() {
     # screenshot for itself under X11 - but the toolkit must still arrive only
     # where it was asked for, or "one device, one thing" is just a claim about
     # yaml files. display-only requests display alone, so the mount must be
-    # absent and the env var unset.
+    # absent and the env var unset. (S7.2.4's other half, the pod that asks
+    # getting both, is verify_screenshot's.)
+    ev_begin S7.2.4 "Clients receive it read-only via DESKTOP_TOOLS_BIN" T3
+    ev_save display-only-env "EV-STATE: the environment of the display-only pod, which requests desktop.local/display alone: no DESKTOP_TOOLS_BIN" \
+        k3s kubectl exec display-only -- env >/dev/null || true
     if k3s kubectl exec display-only -- printenv DESKTOP_TOOLS_BIN >/dev/null 2>&1; then
         fail "display-only leaked DESKTOP_TOOLS_BIN - the tools device's edits reached a pod that never requested it"
     fi
+    ev_pass "a pod that did not request desktop.local/tools has no DESKTOP_TOOLS_BIN"
+    ev_save display-only-mountinfo "EV-STATE: the display-only pod's mountinfo: the X socket directory is there, /opt/desktop-tools/bin is not" \
+        k3s kubectl exec display-only -- cat /proc/self/mountinfo >/dev/null || true
     if k3s kubectl exec display-only -- sh -c 'grep -q " /opt/desktop-tools/bin " /proc/self/mountinfo' 2>/dev/null; then
         fail "display-only has the toolkit mounted without requesting desktop.local/tools"
     fi
+    ev_pass "and no toolkit mount"
+    ev_end
 
     log vsp "display-only: has NO audio (env or mount)"
     for var in PULSE_SERVER PIPEWIRE_REMOTE; do
@@ -1801,6 +2082,16 @@ verify_split() {
     log vsp "verify-split passed"
 }
 
+pod_state() { # $1: pod - who its container is, for EV-PIDS before and after an event
+    local cid pid
+    k3s kubectl get pod "$1" -o jsonpath='{range .status.containerStatuses[*]}container={.name} restartCount={.restartCount} containerID={.containerID} startedAt={.state.running.startedAt}{"\n"}{end}'
+    cid=$(k3s kubectl get pod "$1" -o jsonpath='{.status.containerStatuses[0].containerID}')
+    pid=$(k3s crictl -r unix:///run/crio/crio.sock inspect "${cid#*://}" 2>/dev/null \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["pid"])' 2>/dev/null) \
+        || pid="unknown (crictl inspect gave no .info.pid)"
+    echo "main process, host pid: $pid"
+}
+
 verify_concurrency() {
     # The display is shareable and CDI imposes no cap, so the property to
     # prove is that several independent clients hold LIVE connections to the
@@ -1810,7 +2101,15 @@ verify_concurrency() {
         --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
     log vs "three clients open the shared display concurrently"
-    for n in a b c; do apply_client "x11-client-$n"; done
+    ev_begin S7.3.5 "Concurrency" T3
+    # Each pod's xterm - its main process, so a live X connection for as
+    # long as the pod runs - gets its own place on the right of the screen,
+    # clear of the session's xterm, so one screendump can show all three.
+    local geom
+    for n in a b c; do
+        case $n in a) geom=50x6+720+60 ;; b) geom=50x6+720+240 ;; c) geom=50x6+720+420 ;; esac
+        apply_client "x11-client-$n" "$geom"
+    done
     for n in a b c; do
         wait_for 30 4 "client $n running" \
             sh -c "k3s kubectl get pod x11-client-$n -o jsonpath='{.status.phase}' | grep -q Running"
@@ -1819,18 +2118,43 @@ verify_concurrency() {
         timeout 20 k3s kubectl exec "x11-client-$n" -- sh -c 'xdpyinfo >/dev/null' \
             || fail "client $n could not open the shared display"
     done
+    ev_pass "three pods requesting desktop.local/display each opened the display (xdpyinfo)"
     # ...and all three at once, not merely one after another: each holds an
     # X connection open while the next one connects.
     timeout 40 k3s kubectl exec x11-client-a -- \
-        sh -c 'xterm -T hold-a -geometry 40x8+40+400 & sleep 25' >/dev/null 2>&1 &
+        sh -c 'xterm -T hold-a -geometry 40x6+40+600 & sleep 25' >/dev/null 2>&1 &
     holder=$!
     sleep 5
     for n in b c; do
         timeout 20 k3s kubectl exec "x11-client-$n" -- sh -c 'xdpyinfo >/dev/null' \
             || { kill "$holder" 2>/dev/null; fail "client $n lost the display while a held it"; }
     done
+    ev_pass "while pod a held a second connection, pods b and c opened the display again"
+
+    # Who holds the display right now, from the server's side: each pod's
+    # UID must be in the cgroup of one of the X clients the server lists.
+    clients=$(ev_save list-clients "EV-STATE: screenshot --list-clients from inside the desktop container while the three pods hold the display: every X client and its host pid" \
+        podman exec -u desktop -e DISPLAY=:0 desktop \
+        /usr/libexec/desktop-tools/screenshot --list-clients) \
+        || fail "screenshot --list-clients failed: $clients"
+    local uid uidu match pid cg table=""
+    for n in a b c; do
+        uid=$(k3s kubectl get pod "x11-client-$n" -o jsonpath='{.metadata.uid}')
+        [ -n "$uid" ] || fail "could not read pod x11-client-$n's UID"
+        uidu=$(echo "$uid" | tr - _)
+        match=""
+        for pid in $(sed -n 's/.* pid=//p' <<<"$clients"); do
+            cg=$(cat "/proc/$pid/cgroup" 2>/dev/null || true)
+            case "$cg" in *"$uid"*|*"$uidu"*) match=$pid; break ;; esac
+        done
+        [ -n "$match" ] || fail "no X client listed belongs to pod x11-client-$n ($uid)"
+        table+="x11-client-$n uid=$uid x-client-pid=$match cgroup=$(head -n1 "/proc/$match/cgroup" 2>/dev/null)"$'\n'
+        ev_pass "pod x11-client-$n holds an X connection: listed client pid $match is in its cgroup"
+    done
+    ev_text pods-to-clients "EV-STATE: each pod's UID and the listed X client whose /proc/<pid>/cgroup carries it" "$table"
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
+    ev_end
     log vs "three concurrent clients on one display, no cap in the way"
     log vs "verify-concurrency passed"
 }
@@ -1907,7 +2231,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -1930,6 +2254,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
     operator-setup) operator_setup ;;
+    pod-state) pod_state "${2:?pod}" ;;
     operator-teardown) operator_teardown ;;
     *) fail "unknown phase $1" ;;
 esac

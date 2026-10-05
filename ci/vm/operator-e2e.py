@@ -676,6 +676,12 @@ class Ctx:
         self.st.write(moment, f"$ {cmd}\n" + (out if out.strip() else "(no output)\n"), what)
         return out
 
+    def diff_kept(self, moment, a_name, a, b_name, b, what):
+        """EV-DIFF of two texts already written to the story as a_name and
+        b_name (Ctx.diff writes both sides itself)."""
+        d = "".join(difflib.unified_diff(a.splitlines(True), b.splitlines(True), a_name, b_name))
+        return self.st.write(moment, d or "(no difference)\n", what, ext="diff")
+
     def diff(self, moment, before, after, what):
         # Rule 1 (Requirements.md, evidence standard): before and after are
         # kept as files beside the diff, never the diff alone.
@@ -1197,6 +1203,8 @@ def arrange(ctx, st, who, wid):
              "after Restore: no difference")
     st.check(normal.rect == before.rect, f"{who}: and it came back where it was",
              f"{before.rect} -> {normal.rect}")
+    ctx.shot(f"{tag}-menu-restored", f"the {who} back at {before.geometry} after Restore in the icon's "
+             "window menu; also how it is before the maximize")
 
     # Maximize, and the same button again to restore.
     xs = ctx.xstate()
@@ -1330,7 +1338,7 @@ def s11_1_3(ctx, st):
     fx, fy = ctx.free_spot(xs, (300, 200))
     ctx.client_sink("keys", "opkeys", f"40x10+{fx}+{fy}", "keys")
     xs, cli = ctx.wait_client("opkeys")
-    ctx.pids("pids-start")
+    pids_start = ctx.pids("pids-start")
     ctx.g.desk(["sh", "-c", ": > /tmp/op-kfocus"])
 
     # The last pointer event of the story: focus the desktop's xterm.
@@ -1429,6 +1437,14 @@ def s11_1_3(ctx, st):
     st.check(wait_until(lambda: not ctx.g.pid_alive(desk_pid), 10, 0.5),
              f"the desktop's xterm process (pid {desk_pid}) exited")
     ctx.shot("alt-f4", "the desktop's xterm closed by Alt+F4; the client's remains")
+    # The session's own xterm is not restarted by anything: none takes its
+    # place, and the session goes on without one (Xorg and mwm, checked at
+    # the end against pids-start).
+    time.sleep(5)
+    st.check(not ctx.xstate().clients("xterm"), "no xterm took its place within 5 s of Alt+F4",
+             f"xterm windows: {[w.id for w in ctx.xstate().clients('xterm')] or 'none'}")
+    ctx.save_state("tree-after-alt-f4", ctx.xstate().text, "`xwininfo -root -tree` 5 s after Alt+F4 "
+                   "(EV-STATE): the client's xterm, and no xterm of the session's")
     where = probe()
     st.record(f"after Alt+F4 the keyboard focus went to: {where or 'no window (the keys were lost)'}")
     if where != "client":
@@ -1439,7 +1455,11 @@ def s11_1_3(ctx, st):
                    "the client xterm's sink: the probe lines typed while it had the focus (EV-LOG-CLIENT)")
     ctx.save_state("sink-desktop", "\n".join(ctx.desk_lines("/tmp/op-kfocus")) + "\n",
                    "the tags the desktop xterm's shell wrote while it had the focus")
-    ctx.pids("pids-end")
+    pids_end = ctx.pids("pids-end")
+    for comm in ("Xorg", "mwm"):
+        was, now = ctx.session_pid(pids_start, comm), ctx.session_pid(pids_end, comm)
+        st.check(was is not None and was == now, f"the session carried on: the same {comm} after Alt+F4",
+                 f"{comm} pid {was} -> {now}")
 
 
 def s11_2_1(ctx, st):
@@ -1836,6 +1856,24 @@ def stream_sink(ctx):
     return None
 
 
+def audio_devices(ctx):
+    """F4.7's device state - what a sound-card hot-plug changes - as one text:
+    /dev/snd on the host and in the container, PipeWire's devices, and
+    pactl's sinks, sources and streams (S7.7.4)."""
+    g = ctx.g
+    parts = [("ls -l /dev/snd    # on the host", g.sh("ls -l /dev/snd 2>&1; true", label="ls -l /dev/snd (host)")),
+             ("ls -l /dev/snd    # in the desktop container",
+              g.sh("podman exec desktop ls -l /dev/snd 2>&1; true", label="ls -l /dev/snd (container)")),
+             ("pw-cli ls Device", g.desk(["pw-cli", "ls", "Device"], check=False)),
+             ("pactl list short sinks", g.desk(["pactl", "list", "short", "sinks"], check=False)),
+             ("pactl list short sources", g.desk(["pactl", "list", "short", "sources"], check=False)),
+             ("pactl list short sink-inputs", g.desk(["pactl", "list", "short", "sink-inputs"], check=False))]
+    text = ""
+    for cmd, out in parts:
+        text += f"$ {cmd}\n" + (out if out.strip() else "(no output)\n") + "\n"
+    return text
+
+
 def audio_snapshot(ctx, moment, what):
     status = wpctl(ctx, "status")
     default = node_name(ctx, "@DEFAULT_AUDIO_SINK@")
@@ -1906,6 +1944,28 @@ def sound_controls(ctx, st, held):
     def volume_is(value):
         return wait_until(lambda: value in wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"), 6, 0.5)
 
+    def after(slug, what):
+        """The state each command left: `wpctl status` and the screen."""
+        audio_snapshot(ctx, f"wpctl-status-{slug}", f"`wpctl status` after {what} (EV-STATE)")
+        ctx.shot(f"after-{slug}", f"the operator's terminal after {what}: the command typed, the prompt back")
+
+    devices = []
+
+    def device_state(slug, what):
+        """F4.7's set at one moment, diffed against the moment before (S7.7.4)."""
+        text = audio_devices(ctx)
+        name = st.write(f"devices-{slug}", text, f"/dev/snd (host and container), pw-cli ls Device and "
+                        f"pactl's sinks, sources and sink-inputs {what} (EV-STATE)")
+        if devices:
+            prev_name, prev_text, prev_what = devices[-1]
+            ctx.diff_kept(f"devices-{slug}", prev_name, prev_text, name, text,
+                          f"EV-DIFF: from {prev_what} to {what}; the sink-inputs line shows which sink "
+                          "the player's stream is on")
+        devices.append((name, text, what))
+
+    # EV-LOG-DESKTOP is bounded by this moment (podman logs --since).
+    since = g.sh("date -u +%Y-%m-%dT%H:%M:%SZ", label="date").strip()
+
     # The application: a client container playing one long, continuous
     # 1100 Hz tone through nothing but desktop.local/audio.
     g.client_run("player", ["paplay", "/tmp/tone.wav"], devices=("audio",), image=TESTCLIENT_IMAGE,
@@ -1916,6 +1976,8 @@ def sound_controls(ctx, st, held):
     held["volume"] = found_at.group(1) if found_at else None
     st.record(f"the built-in output's volume before the operator touched it: {held['volume']}")
     player = g.client_inspect("player")
+    st.write("player-before", json.dumps(player, indent=1, sort_keys=True) + "\n",
+             "EV-PIDS: the player container before the operator's commands: id, pid, start time, restarts")
     pids_before = ctx.pids("pids-start")
     pw_before = ctx.session_pid(pids_before, "pipewire")
 
@@ -1933,21 +1995,27 @@ def sound_controls(ctx, st, held):
         st.check(found, "'New Terminal' opened the operator's terminal")
         ctx.click(*found[0].parts(found[1])["drag"])
         audio_snapshot(ctx, "wpctl-status-start", "`wpctl status` before the operator types anything (EV-STATE)")
+        ctx.shot("terminal-open", "the operator's terminal, opened from the root menu, before any command")
 
         command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 100%", M_B100)
         st.check(volume_is("1.00"), "typed into the terminal, wpctl set the built-in output to 100%")
-        time.sleep(3)
+        after("builtin-100", "set-volume 100% on the built-in output")
+        time.sleep(2)
         command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%", M_B50)
         st.check(volume_is("0.50"), "and then to 50%")
-        time.sleep(3)
+        after("builtin-50", "set-volume 50% on the built-in output")
+        time.sleep(2)
 
         # A USB headset arrives, and the operator chooses where the sound goes.
         before = wp_sinks(wpctl(ctx, "status"))
+        device_state("before-plug", "before the card is plugged")
         st.write("info-usb-before", m.hmp("info usb"), "QEMU's `info usb` before the card is plugged (EV-QEMU)")
-        m.device_add(driver="usb-audio", id="opsnd", audiodev="snd0", bus="xhci.0")
-        held["card"] = ""
-        mark(M_PLUG)
-        new = wait_until(lambda: [i for i in wp_sinks(wpctl(ctx, "status")) if i not in before], 30, 1)
+        with ctx.video("plug", "the display while the USB card is plugged in (QMP device_add): nothing on "
+                       "it changes, and nothing restarts"):
+            m.device_add(driver="usb-audio", id="opsnd", audiodev="snd0", bus="xhci.0")
+            held["card"] = ""
+            mark(M_PLUG)
+            new = wait_until(lambda: [i for i in wp_sinks(wpctl(ctx, "status")) if i not in before], 30, 1)
         st.check(new, "the hot-added card shows up as a new output in wpctl status")
         st.write("info-usb-after", m.hmp("info usb"), "QEMU's `info usb` with the card plugged (EV-QEMU)")
         usb_id = new[0]
@@ -1959,7 +2027,7 @@ def sound_controls(ctx, st, held):
         on_plug = stream_sink(ctx)
         st.record(f"on plug-in, before the operator chose anything, the stream went to {on_plug} "
                   f"(WirePlumber {'moved it by itself' if on_plug == usb_name else 'left it where it was'})")
-        time.sleep(2)
+        device_state("plugged", "with the card plugged, before the operator chose an output")
         if on_plug == usb_name:
             # Already moved: choose the built-in output first, so that both
             # directions of the choice are seen.
@@ -1967,28 +2035,35 @@ def sound_controls(ctx, st, held):
             command(f"wpctl set-default {builtin_id}", M_TO_BUILTIN)
             st.check(wait_until(lambda: stream_sink(ctx) == builtin, 8, 0.5),
                      "wpctl set-default moved the client's stream to the built-in output")
-            time.sleep(3)
+            after("default-builtin", "set-default to the built-in output")
+            device_state("on-builtin", "after set-default to the built-in output")
+            time.sleep(1)
         command(f"wpctl set-default {usb_id}", M_TO_USB)
         st.check(wait_until(lambda: stream_sink(ctx) == usb_name, 8, 0.5),
                  "wpctl set-default moved the client's stream to the USB card",
                  f"the stream is on {stream_sink(ctx)}, the card is {usb_name}")
-        time.sleep(3)
+        after("default-usb", "set-default to the USB card")
+        device_state("on-usb", "after set-default to the USB card")
+        time.sleep(1)
 
         # Volume and mute on the output the stream now plays from.
         command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 100%", M_U100)
         st.check(volume_is("1.00"), "wpctl set the USB card to 100%")
-        time.sleep(3)
+        after("usb-100", "set-volume 100% on the USB card")
+        time.sleep(2)
         command("wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%", M_U50)
         st.check(volume_is("0.50"), "and then to 50%")
-        time.sleep(3)
-        audio_snapshot(ctx, "wpctl-status-volume", "`wpctl status` with the USB card at 50%")
+        after("usb-50", "set-volume 50% on the USB card")
+        time.sleep(2)
         command("wpctl set-mute @DEFAULT_AUDIO_SINK@ 1", M_MUTE)
         st.check(volume_is("MUTED"), "wpctl set-mute 1 muted it")
-        time.sleep(3)
+        after("usb-muted", "set-mute 1 on the USB card")
+        time.sleep(2)
         command("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0", M_UNMUTE)
         st.check(wait_until(lambda: "MUTED" not in wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@"), 6, 0.5),
                  "wpctl set-mute 0 unmuted it")
-        time.sleep(3)
+        after("usb-unmuted", "set-mute 0 on the USB card")
+        time.sleep(2)
         mark(M_END)
     finally:
         m.hmp("stopcapture 0")
@@ -2000,12 +2075,17 @@ def sound_controls(ctx, st, held):
     audio_snapshot(ctx, "wpctl-status-end", "`wpctl status` at the end of the sequence")
 
     player_after = g.client_inspect("player")
+    st.write("player-after", json.dumps(player_after, indent=1, sort_keys=True) + "\n",
+             "EV-PIDS: the player container after every command: the same id, pid, start time and restarts")
     pids_after = ctx.pids("pids-after-controls")
     st.check(player_after == player, "the player was not restarted: same container, pid, start time, "
              "no restarts", f"{player} -> {player_after}")
     st.check(ctx.session_pid(pids_after, "pipewire") == pw_before, "PipeWire was not restarted by any of it",
              f"pipewire pid {pw_before} -> {ctx.session_pid(pids_after, 'pipewire')}")
     analyse_capture(ctx, st, wav, marks, wall)
+    ctx.save_cmd("desktop-log", f"podman logs --since {since} desktop 2>&1 | tail -100",
+                 "EV-LOG-DESKTOP: the desktop's log from the story's start: nothing about the card's "
+                 "arrival or the operator's commands restarted anything", label="podman logs desktop")
 
 
 def analyse_capture(ctx, st, wav, marks, wall):
@@ -2089,8 +2169,9 @@ def analyse_capture(ctx, st, wav, marks, wall):
     st.record(f"the built-in output (QEMU's emulated HDA) read {b_start:.4f} as found, {b100:.4f} at 100% "
               f"and {b50:.4f} at 50%: recorded, not asserted")
     st.check(checker.returncode == 0, "the capture carries the client's 1100 Hz tone")
-    st.check(u50 < 0.5 * u100, "set-volume 50% on the USB card lowered what the machine played, by "
-             "more than 6 dB", f"{u100:.4f} -> {u50:.4f}, {db(u50, u100):+.1f} dB")
+    st.check(-20 <= db(u50, u100) <= -16, "set-volume 50% on the USB card lowered what the machine "
+             "played by about 18 dB (wpctl's cubic scale: 0.5 cubed is -18.1 dB; held to -16..-20 dB)",
+             f"{u100:.4f} -> {u50:.4f}, {db(u50, u100):+.1f} dB")
     st.check(muted < 0.1 * u50, "set-mute 1 silenced it", f"{u50:.4f} -> {muted:.4f}")
     st.check(back > 0.5 * u50, "set-mute 0 brought it back", f"{muted:.4f} -> {back:.4f}")
     for label, b, a, g in moves:

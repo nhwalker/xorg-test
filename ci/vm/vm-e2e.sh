@@ -94,6 +94,38 @@ guest_ev() { # <ev-root or ""> <vm-guest.sh args...>
     return "$rc"
 }
 
+# EV-AUDIO into the open story: wavcapture straight into its directory;
+# ev_audio_stop ends the capture, indexes the WAV and keeps check-audio.py's
+# verdict and level plot beside it (ev_audio_check). Returns check-audio's
+# status, so `ev_audio_stop ... || fail ...` asserts the tone.
+ev_audio_start() { # <moment> <hz>
+    EV_WAV=$(ev_name "$1-$2hz" wav)
+    mon_cmd "wavcapture $EV_DIR/$EV_WAV snd0 44100 16 2"
+    sleep 1
+}
+ev_audio_stop() { # <what> <min seconds> <min peak> <hz>
+    audio_capture_stop
+    if [ -s "$EV_DIR/$EV_WAV" ]; then ev_attach "$EV_WAV" "$1"; else ev_note "no capture was written for: $1"; fi
+    ev_audio_check "${EV_WAV%.wav}" "$EV_WAV" "$2" "$3" "$4"
+}
+
+# EV-AUDIO's verdict and picture for a WAV already in the open story:
+# check-audio.py's report and a level plot at the story's pitch (no
+# spectrogram tool is installed). Returns check-audio's status.
+ev_audio_check() { # <moment> <wav name in the story dir> <min seconds> <min peak> <hz>
+    local rep plot rc=0
+    if [ -z "$EV_DIR" ]; then
+        python3 check-audio.py "$2" "$3" "$4" "$5"
+        return
+    fi
+    rep=$(ev_name "$1-verdict" txt)
+    plot=$(ev_name "$1-level" png)
+    python3 check-audio.py --report "$EV_DIR/$rep" --plot "$EV_DIR/$plot" "$EV_DIR/$2" "$3" "$4" "$5" || rc=$?
+    [ -s "$EV_DIR/$rep" ] && ev_attach "$rep" "check-audio.py's verdict on $2: its duration, peak and dominant frequency (want $5 Hz)"
+    [ -s "$EV_DIR/$plot" ] && ev_attach "$plot" "the level at $5 Hz across $2, one bar per 0.1 s on a -60..0 dBFS scale (the picture of the tone; no spectrogram tool is installed)"
+    return "$rc"
+}
+
 # EV-SHOT into the open story: a QEMU screendump, indexed with what to look for.
 ev_shot() { # <moment> <what>
     [ -n "$EV_DIR" ] || return 0
@@ -134,18 +166,42 @@ screendump() {
     fi
 }
 assert_nonblank() { # $1: screendump basename (as passed to screendump)
+    local f="$ART/$1.png"
+    [ -s "$f" ] || f="$ART/$1.ppm"
+    measure_nonblank "$f" "$1"
+}
+measure_nonblank() { # $1: image file; $2: its name in the log and in S3.5.1
     # A live X server that is drawing nothing produces a solid frame; the
     # grayscale standard deviation collapses to ~0. Real content (the mwm
     # root stipple + a window) is well above the threshold. This turns the
     # screendump from a human-eyeball artifact into a pass/fail signal.
-    local f="$ART/$1.png" sd
-    [ -s "$f" ] || f="$ART/$1.ppm"
-    [ -s "$f" ] || fail "screendump $1 was not produced"
+    # Each measurement is kept for S3.5.1's evidence (s3_5_1_story).
+    local f="$1" sd
+    [ -s "$f" ] || fail "screendump $2 was not produced"
     sd=$(convert "$f" -colorspace Gray -format '%[fx:standard_deviation]' info: 2>/dev/null) \
-        || fail "could not analyze screendump $1 (imagemagick missing?)"
+        || fail "could not analyze screendump $2 (imagemagick missing?)"
+    printf '%s\t%s\t%s\n' "$2" "$f" "$sd" >> "$ART/.nonblank.tsv"
     awk "BEGIN{ exit !($sd > 0.02) }" \
-        || fail "screendump $1 is blank/near-uniform (grayscale stddev=$sd); X is up but rendering nothing"
-    log "render: $1 is non-blank (grayscale stddev=$sd)"
+        || fail "screendump $2 is blank/near-uniform (grayscale stddev=$sd); X is up but rendering nothing"
+    log "render: $2 is non-blank (grayscale stddev=$sd)"
+}
+# S3.5.1: every measurement this run made, each image with its stddev.
+s3_5_1_story() {
+    local name f sd
+    ev_begin S3.5.1 "The server is drawing" T3
+    while IFS=$'\t' read -r name f sd; do
+        if [ -s "$f" ]; then
+            ev_copy "$f" "$name" "EV-SHOT: $name, grayscale standard deviation $sd (a blank or one-colour frame is near 0; the threshold is 0.02)"
+        else
+            ev_note "$name's image is no longer at $f; its measured stddev was $sd"
+        fi
+        if awk "BEGIN{ exit !($sd > 0.02) }"; then
+            ev_pass "$name is drawn: grayscale stddev $sd > 0.02"
+        else
+            ev_fail "$name is blank: grayscale stddev $sd"
+        fi
+    done < "$ART/.nonblank.tsv"
+    ev_end
 }
 # --- screenshot pixel assertions ------------------------------------------
 # The screenshot phase paints a known pattern (screenshot/testpattern) and then
@@ -174,6 +230,7 @@ assert_px() { # $1: image; $2: x; $3: y; $4: expected "r,g,b"; $5: what this pro
     local got
     got=$(px "$1" "$2" "$3") || fail "could not read pixel ($2,$3) of $1"
     [ "$got" = "$4" ] || fail "$5: pixel ($2,$3) of $(basename "$1") is $got, want $4"
+    ev_pass "$5: pixel ($2,$3) of $(basename "$1") is $got"
 }
 
 # assert_pattern checks a full-screen capture against the painted pattern.
@@ -221,42 +278,41 @@ assert_same() { # $1: full capture; $2: region capture; $3: WxH+X+Y
     [ "$diff" = 0 ] \
         || fail "region $(basename "$2") differs from the same crop of the full capture in $diff pixel(s): the region origin is wrong"
     rm -f "$ART/.crop.png"
+    ev_pass "region $(basename "$2") is exactly the $3 crop of the full capture (compare -metric AE: 0 pixels differ)"
     log "region: $(basename "$2") is exactly $3 of the full capture"
 }
 
-# assert_orientation_vs_reference cross-checks the capture against QEMU's own
-# screendump of the same display - a completely independent capture path (the
-# emulator reading its framebuffer vs. our X11 GetImage).
+# orientation_scores cross-checks the capture against QEMU's own screendump of
+# the same display - a completely independent capture path (the emulator
+# reading its framebuffer vs. our X11 GetImage) - and sets ORI_S0..ORI_S3 to
+# the four RMSE scores: upright, flipped, mirrored, rotated 180 degrees. (Not
+# printed: called as $(...), its fail() would end only the subshell.)
 #
 # Scored by margin, not by an absolute threshold: QEMU composites the pointer
-# cursor, which GetImage never returns, so the identity comparison is close to
-# but not exactly zero. What must hold is that it beats every flipped, mirrored
-# and rotated variant by a wide margin.
-assert_orientation_vs_reference() { # $1: capture; $2: reference screendump basename
-    local ref="$ART/$2.png"
-    [ -s "$ref" ] || ref="$ART/$2.ppm"
-    [ -s "$ref" ] || { log "WARNING: no reference screendump $2; skipping the cross-check"; return 0; }
-    local cap_geom ref_geom
+# cursor, which GetImage never returns, so the upright comparison is close to
+# but not exactly zero. What must hold is that it beats every flipped,
+# mirrored and rotated variant by a wide margin (S7.5.6). A missing reference
+# or one of another size fails: it used to skip with a warning, which let the
+# check pass without ever running.
+orientation_scores() { # $1: capture; $2: reference screendump
+    local ref="$2" cap_geom ref_geom
+    [ -s "$ref" ] || fail "no reference screendump at $ref to cross-check the capture against"
     cap_geom=$(identify -format '%wx%h' "$1") || fail "could not read the size of $1"
     ref_geom=$(identify -format '%wx%h' "$ref") || fail "could not read the size of $ref"
-    if [ "$cap_geom" != "$ref_geom" ]; then
-        log "WARNING: capture is $cap_geom but the reference screendump is $ref_geom; skipping the cross-check"
-        return 0
-    fi
-    local s0 s1 s2 s3
-    s0=$(rmse "$1" "$ref" "")           || fail "could not score the capture against the reference screendump"
-    s1=$(rmse "$1" "$ref" "-flip")      || fail "could not score the capture against the flipped screendump"
-    s2=$(rmse "$1" "$ref" "-flop")      || fail "could not score the capture against the mirrored screendump"
-    s3=$(rmse "$1" "$ref" "-rotate 180") || fail "could not score the capture against the rotated screendump"
+    [ "$cap_geom" = "$ref_geom" ] \
+        || fail "the capture is $cap_geom but QEMU's screendump of the same moment is $ref_geom"
+    ORI_S0=$(rmse "$1" "$ref" "")           || fail "could not score the capture against the reference screendump"
+    ORI_S1=$(rmse "$1" "$ref" "-flip")      || fail "could not score the capture against the flipped screendump"
+    ORI_S2=$(rmse "$1" "$ref" "-flop")      || fail "could not score the capture against the mirrored screendump"
+    ORI_S3=$(rmse "$1" "$ref" "-rotate 180") || fail "could not score the capture against the rotated screendump"
     rm -f "$ART/.ref.png"
-    awk -v s0="$s0" -v s1="$s1" -v s2="$s2" -v s3="$s3" '
-        BEGIN {
-            worst = s1; if (s2 < worst) worst = s2; if (s3 < worst) worst = s3;
-            printf "identity=%.6f flipped=%.6f mirrored=%.6f rotated=%.6f\n", s0, s1, s2, s3;
-            exit !(s0 < 0.25 * worst);
-        }' \
-        || fail "the capture matches a flipped/mirrored/rotated QEMU screendump about as well as the upright one: it is not oriented like the real screen"
-    log "orientation: the capture matches QEMU's own screendump far better than any flipped variant"
+}
+# orientation_ok <s0> <s1> <s2> <s3>: the upright score is under a quarter of
+# the best (lowest) score of the three transformed variants.
+orientation_ok() {
+    awk -v s0="$1" -v s1="$2" -v s2="$3" -v s3="$4" 'BEGIN {
+        best = s1; if (s2 < best) best = s2; if (s3 < best) best = s3;
+        exit !(s0 < 0.25 * best) }'
 }
 
 # rmse scores two images, optionally transforming the second first, and prints
@@ -444,21 +500,25 @@ log "audio: record each client path (pulse, pipewire, ALSA) individually"
 # the others. Each guest call blocks until its 1.5s burst finishes, so
 # the capture window brackets it. On failure still stop the capture: the
 # partial WAV is a debugging artifact and stopping finalizes its header.
+ev_begin S4.1.2 "In-container clients use the per-user sockets, and the operator hears them" T3
 for path in pulse pipewire alsa; do
-    audio_capture_start "audio-deploy-$path"
+    hz=$(freq_for "$path")
+    ev_audio_start "audio-$path" "$hz"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio $path" \
         || { audio_capture_stop; fail "guest play-audio $path failed"; }
-    audio_capture_stop
-    python3 check-audio.py "$ART/audio-deploy-$path.wav" 1 0.05 "$(freq_for "$path")" \
+    ev_shot "xterm-$path" "EV-SHOT: the xterm (title audio-$path) on :0 that ran the $path player, still up and showing that it finished with exit 0"
+    ev_audio_stop "EV-AUDIO: the machine's output while the desktop session's $path client played its $hz Hz tone - listen for one beep" 1 0.05 "$hz" \
         || fail "$path audio capture is empty or silent"
+    ev_pass "the $path path ($([ "$path" = alsa ] && echo "ALSA via pipewire-alsa" || echo "$path")) played from an xterm in the session and the machine's output carried its $hz Hz tone"
 done
+ev_end
 
 log "audio lifecycle: independent of the X session, and recovers on its own"
 # Deliberately AFTER the three tone tests: they establish that a healthy
 # stack works, and this one then kills things. It restarts the X session
 # and PipeWire, so anything ordered after it must not assume either kept
 # its pid - the input tests below re-establish their own state anyway.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-audio-lifecycle' \
+guest_ev "$GUEST_EV" verify-audio-lifecycle \
     || fail "audio lifecycle assertions failed"
 
 log "input: type into an xterm with the real virtual keyboard, verify the app got it"
@@ -714,7 +774,7 @@ log "cdi: each device grants ONLY its own capability"
 # The narrow pods are the point of the split: display-only must reach the X
 # display and have no audio at all; audio-only must play sound and be unable
 # to open the display (X11 here would let it keylog the whole session).
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-split' \
+guest_ev "$GUEST_EV" verify-split \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod display-only audio-only; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          2>&1 | tee "$ART/verify-split-fail.log" || true; fail "capability split verification failed"; }
 
@@ -733,25 +793,43 @@ done
 
 log "cdi: a client can RECORD from the desktop audio (loopback via monitor)"
 # Capture direction, not just playback: record the sink monitor while a tone
-# plays and confirm the recording carries it. Checked inside the VM.
+# plays and confirm the recording carries it. Checked inside the VM, then the
+# recording itself comes back here as the story's evidence and is checked
+# again with its verdict and level plot kept.
+ev_begin S4.6.1 "A client can record" T3
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-record' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl exec cdi-verify -- sh -c "pactl info; pactl list short sources"' \
          2>&1 | tee "$ART/record-fail.log" || true; fail "audio record-direction check failed"; }
+recwav=$(ev_name recording-660hz wav)
+vm_ssh 'cat /tmp/rec-pulled.wav' > "$EV_DIR/$recwav" \
+    || fail "could not copy the client's recording out of the VM"
+ev_attach "$recwav" "EV-AUDIO-REC: what the cdi-verify pod recorded with parec from the default sink's monitor while a 660 Hz tone played through the same sink - listen for the beep"
+ev_audio_check recording "$recwav" 0.5 0.02 660 \
+    || fail "the client's recording is silent or not 660 Hz"
+ev_pass "a pod holding only desktop.local/audio recorded the sink's monitor, and the recording carries the 660 Hz tone that played"
+ev_end
 
 log "cdi: a LEAN non-desktop image works with only the injected env/mounts"
 # Proves the CDI contract holds for an ordinary app container (no Xorg
 # server, pipewire daemon, session or WM), not just the desktop image.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-testclient' \
+guest_ev "$GUEST_EV" verify-testclient \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient' \
          2>&1 | tee "$ART/testclient-fail.log" || true; fail "lean client display check failed"; }
+# The guest wrote S7.3.4's packages, processes and xdpyinfo; the host adds
+# what the machine played (h-prefixed files, ci/evlib.py).
+EV_SIDE=h-
+ev_begin S7.3.4 "A lean non-desktop image works" T3
 for path in pulse pipewire alsa; do
-    audio_capture_start "audio-testclient-$path"
+    hz=$(freq_for "$path")
+    ev_audio_start "testclient-$path" "$hz"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path x11-testclient" \
         || { audio_capture_stop; fail "lean client $path playback failed"; }
-    audio_capture_stop
-    python3 check-audio.py "$ART/audio-testclient-$path.wav" 1 0.05 "$(freq_for "$path")" \
+    ev_audio_stop "EV-AUDIO: the machine's output while the lean client pod played its $hz Hz tone over the $path path, with only the injected env - listen for one beep" 1 0.05 "$hz" \
         || fail "lean client $path audio capture is empty or silent"
+    ev_pass "the lean client played over the $path path and the machine's output carried its $hz Hz tone"
 done
+ev_end
+EV_SIDE=
 
 log "screenshot: the injected binary captures the live display from a client pod"
 # The lean client image carries the screenshot binary and no other X client
@@ -761,13 +839,16 @@ log "screenshot: the injected binary captures the live display from a client pod
 # Size and "not blank" alone would pass a capture that is upside down,
 # mirrored, red/blue swapped or shifted; the pattern is what turns this from
 # "it produced a PNG" into "it produced THE SCREEN".
+# S7.5.6's EV-PIDS: the capturing pod as it is before any capture.
+ss_pod_before=$(vm_ssh 'sudo repo/ci/vm/vm-guest.sh pod-state x11-testclient' 2>&1) \
+    || fail "could not read the x11-testclient pod's state: $ss_pod_before"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh screenshot-pattern-start' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod testpattern; echo ---; sudo /usr/local/bin/k3s kubectl logs testpattern' \
          2>&1 | tee "$ART/screenshot-pattern-fail.log" || true; fail "could not paint the test pattern"; }
 # QEMU's own view of the same display, taken while the pattern is up: an
 # independent capture path to cross-check orientation against.
 screendump screenshot-reference
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-screenshot' \
+guest_ev "$GUEST_EV" verify-screenshot \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod x11-testclient; echo ---; sudo cat /etc/cdi/desktop-display.yaml' \
          2>&1 | tee "$ART/screenshot-fail.log" || true; fail "screenshot capture check failed"; }
 vm_ssh 'sudo tar -C /tmp/screenshots -cf - .' | tar -C "$ART" -xf - \
@@ -776,56 +857,118 @@ vm_ssh 'sudo tar -C /tmp/screenshots -cf - .' | tar -C "$ART" -xf - \
 # attributable to its k8s pod from inside the desktop container - the
 # window-to-pod identity chain the host-pid-namespace shape exists for
 # (SO_PEERCRED -> X-Resource pid -> /proc/<pid>/cgroup -> pod UID).
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-pod-identity' \
+guest_ev "$GUEST_EV" verify-pod-identity \
     || fail "pod identity check failed"
 # Down again before the concurrency phase screendumps the display.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh screenshot-pattern-stop' || true
 
+# The guest wrote S7.4.1's sizes and exit codes; the host adds the pixels
+# (h-prefixed files): the seven captures move into the story, and every
+# value read from them is a check.
+EV_SIDE=h-
+ev_begin S7.4.1 "Captured pixels are the screen" T3
+declare -A SS
+ss_what() {
+    case "$1" in
+        full) echo "the whole display in file mode, the test pattern up: a different colour in each corner, a dark blue-grey background, yellow and magenta fiducial lines" ;;
+        full-stdout) echo "the whole display with --to-stdout: identical to the file-mode capture" ;;
+        region) echo "-x 10 -y 20 -w 200 -h 100: the same rectangle of the full capture" ;;
+        tl) echo "-w 64 -h 64 at the origin: the pattern's flat red top-left block, nothing else" ;;
+        straddle) echo "8x8 at +60+60, across the red block's corner: red in one quadrant, background in three" ;;
+        odd) echo "199x40 at +290+0, an odd width: the yellow fiducial at x=300 stays one straight column" ;;
+        hw) echo "-w 160 -h 120 (-h is height, not help)" ;;
+    esac
+}
 for f in full full-stdout region tl straddle odd hw; do
     [ -s "$ART/$f.png" ] || fail "screenshot artifact $f.png was not retrieved"
-    mv "$ART/$f.png" "$ART/screenshot-$f.png"
+    SS[$f]=$(ev_name "screenshot-$f" png)
+    mv "$ART/$f.png" "$EV_DIR/${SS[$f]}"
+    ev_attach "${SS[$f]}" "EV-SHOT-CLIENT: $(ss_what "$f")"
+    SS[$f]=$EV_DIR/${SS[$f]}
 done
+ev_copy "$ART/screenshot-reference.png" screenshot-reference "EV-SHOT: QEMU's own screendump of the same moment, the independent view the capture is scored against (it also shows the pointer, which a capture does not)"
 SS_GEOM=$(cat "$ART/geometry.txt")
 rm -f "$ART/geometry.txt"
 SS_W=${SS_GEOM%x*}
 SS_H=${SS_GEOM#*x}
-[ "$(identify -format '%wx%h' "$ART/screenshot-full.png")" = "$SS_GEOM" ] \
+[ "$(identify -format '%wx%h' "${SS[full]}")" = "$SS_GEOM" ] \
     || fail "the full capture is not the $SS_GEOM the client pod reported"
+ev_pass "the full capture is $SS_GEOM, the size the client pod reported"
 
 # 1. the capture shows the pattern, in the right colours at the right places
-assert_pattern "$ART/screenshot-full.png" "$SS_W" "$SS_H"
+assert_pattern "${SS[full]}" "$SS_W" "$SS_H"
 # 2. stdout mode and file mode are the same bytes for the same static screen
-[ "$(compare -metric AE "$ART/screenshot-full.png" "$ART/screenshot-full-stdout.png" null: 2>&1 || true)" = 0 ] \
+[ "$(compare -metric AE "${SS[full]}" "${SS[full-stdout]}" null: 2>&1 || true)" = 0 ] \
     || fail "--to-stdout and file mode produced different images of the same static screen"
+ev_pass "--to-stdout and file mode gave the same image (compare -metric AE: 0 pixels differ)"
 # 3. every region is exactly the corresponding crop of the full capture
-assert_same "$ART/screenshot-full.png" "$ART/screenshot-region.png"   200x100+10+20
-assert_same "$ART/screenshot-full.png" "$ART/screenshot-tl.png"       64x64+0+0
-assert_same "$ART/screenshot-full.png" "$ART/screenshot-straddle.png" 8x8+60+60
-assert_same "$ART/screenshot-full.png" "$ART/screenshot-odd.png"      199x40+290+0
-assert_same "$ART/screenshot-full.png" "$ART/screenshot-hw.png"       160x120+0+0
+assert_same "${SS[full]}" "${SS[region]}"   200x100+10+20
+assert_same "${SS[full]}" "${SS[tl]}"       64x64+0+0
+assert_same "${SS[full]}" "${SS[straddle]}" 8x8+60+60
+assert_same "${SS[full]}" "${SS[odd]}"      199x40+290+0
+assert_same "${SS[full]}" "${SS[hw]}"       160x120+0+0
 # 4. the top-left region lands exactly on the pattern's flat red block, so a
 #    region origin off by even one pixel shows up as a second colour
-[ "$(identify -format '%k' "$ART/screenshot-tl.png")" = 1 ] \
+[ "$(identify -format '%k' "${SS[tl]}")" = 1 ] \
     || fail "the 64x64+0+0 region is not a single flat colour: its origin is off"
-assert_px "$ART/screenshot-tl.png" 0 0 255,0,0 "top-left region origin"
-assert_px "$ART/screenshot-tl.png" 63 63 255,0,0 "top-left region far corner"
+ev_pass "the 64x64+0+0 region is one flat colour (identify %k: 1)"
+assert_px "${SS[tl]}" 0 0 255,0,0 "top-left region origin"
+assert_px "${SS[tl]}" 63 63 255,0,0 "top-left region far corner"
 # 5. cross-check orientation against QEMU's own framebuffer dump
-assert_orientation_vs_reference "$ART/screenshot-full.png" screenshot-reference
-assert_nonblank screenshot-full
+orientation_scores "${SS[full]}" "$ART/screenshot-reference.png"
+ss_s0=$ORI_S0 ss_s1=$ORI_S1 ss_s2=$ORI_S2 ss_s3=$ORI_S3
+ss_scores="RMSE of the capture against QEMU's screendump (0 is identical; compare -metric RMSE, normalized):
+  upright      $ss_s0
+  flipped      $ss_s1   (convert -flip: upside down)
+  mirrored     $ss_s2   (convert -flop: left-right)
+  rotated 180  $ss_s3
+The upright score must be under a quarter of the lowest of the other three."
+ev_text orientation-scores "the four RMSE scores of the orientation cross-check" "$ss_scores"
+orientation_ok "$ss_s0" "$ss_s1" "$ss_s2" "$ss_s3" \
+    || fail "the capture matches a flipped/mirrored/rotated QEMU screendump about as well as the upright one: it is not oriented like the real screen"
+ev_pass "oriented like the real screen: upright RMSE $ss_s0 against flipped $ss_s1, mirrored $ss_s2, rotated $ss_s3"
+log "orientation: the capture matches QEMU's own screendump far better than any flipped variant"
+measure_nonblank "${SS[full]}" screenshot-full
+ev_end
+EV_SIDE=
+
+ev_begin S7.5.6 "A client's capture matches what the operator sees" T3
+ev_copy "${SS[full]}" client-capture "EV-SHOT-CLIENT: the lean client pod's capture of the display, the test pattern up"
+ev_copy "$ART/screenshot-reference.png" qemu-screendump "EV-SHOT: QEMU's screendump of the same moment: what the operator sees (with the pointer, which the capture lacks)"
+ev_text orientation-scores "the four RMSE scores (the same cross-check S7.4.1 records)" "$ss_scores"
+orientation_ok "$ss_s0" "$ss_s1" "$ss_s2" "$ss_s3" \
+    || fail "the client's capture is no closer to the operator's view than a flipped version of it"
+ev_pass "the client's capture matches QEMU's screendump far better than any flipped, mirrored or rotated version (upright $ss_s0; others $ss_s1, $ss_s2, $ss_s3)"
+ev_text pod-before "EV-PIDS: the capturing pod (x11-testclient) before the captures: restart count, container id, start time and main process pid" "$ss_pod_before"
+ss_pod_after=$(vm_ssh 'sudo repo/ci/vm/vm-guest.sh pod-state x11-testclient' 2>&1) \
+    || fail "could not read the x11-testclient pod's state: $ss_pod_after"
+ev_text pod-after "EV-PIDS: the same pod after every capture and check" "$ss_pod_after"
+[ "$ss_pod_after" = "$ss_pod_before" ] \
+    || fail "the capturing pod changed across the captures (see pod-before and pod-after)"
+ev_pass "the capturing pod was not restarted: same restart count, container id, start time and main process"
+ev_end
 
 log "cdi: concurrent clients share one display"
 # Three requesting pods open the display, and two of them re-open it while
 # the third holds a connection. Proves the shareable-device concurrency the
 # advertised count is there to permit.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-concurrency' \
+guest_ev "$GUEST_EV" verify-concurrency \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo /usr/local/bin/k3s kubectl describe pod x11-client-c' \
          2>&1 | tee "$ART/verify-concurrency-fail.log" || true; fail "concurrency check failed"; }
-screendump concurrent-clients
+EV_SIDE=h-
+ev_begin S7.3.5 "Concurrency" T3
+ev_shot concurrent-clients "EV-SHOT: the three pods' xterms, titled x11-client-a, -b and -c, one above the other on the right of the screen, each its pod's live X connection; bottom left, pod a's second xterm (hold-a), if it has not exited yet"
+ev_end
+EV_SIDE=
 
 log "k8s teardown: uninstall the plugin releases; resources withdrawn, host CDI specs and the desktop survive"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          2>&1 | tee "$ART/teardown-fail.log" || true; fail "k8s teardown check failed"; }
+
+# Every screendump this shard measured, the client's capture among them:
+# this shard is the one that takes all four S3.5.1 names.
+s3_5_1_story
 
 fi # ---- end shard: k8s -----------------------------------------------------------
 

@@ -15,12 +15,16 @@
 #   ev_check <claim> <cmd...>         run cmd; record PASS/FAIL; return its status
 #   ev_pass <claim> / ev_fail <claim> record a check already decided
 #   ev_note <text>                    observed, recorded, deliberately not asserted
-#   ev_save <moment> <what> <cmd...>  save cmd's output (and exit status) as a
-#                                     numbered file; also prints the output, so
-#                                     `out=$(ev_save ...)` both keeps and uses it
+#   ev_save <moment> <what> <cmd...>  save cmd's output, stderr included, and
+#                                     its exit status as a numbered file; also
+#                                     prints that output and returns the status,
+#                                     so `out=$(ev_save ...)` both keeps and uses
+#                                     it (the same with evidence off)
 #   ev_copy <src> <moment> <what>     copy a file in (EV-CONFIG)
 #   ev_text <moment> <what> <text>    write text you already have
 #   ev_diff <moment> <what> <a> <b>   diff -u of two evidence files
+#   $EV_LAST                          the file the last ev_save/ev_copy/ev_text
+#                                     wrote (not set when called inside $(...))
 #   ev_attach <file> <what>           index a file already in the directory
 #   ev_end [reason]                   settle PASS/FAIL, render evidence.md
 #   ev_abort <reason>                 record a failure and end (for fail())
@@ -33,6 +37,7 @@ EV_SIDE="${EV_SIDE:-}"
 EV_SOURCE="${EV_SOURCE:-}"
 EV_STORY=""
 EV_DIR=""
+EV_LAST=""
 EV_LIB_DIR="${EV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 _ev_ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
@@ -103,7 +108,7 @@ ev_save() { # <moment> <what> <cmd...>
     local moment=$1 what=$2 rc=0 name out
     shift 2
     if [ -z "$EV_DIR" ]; then
-        "$@"
+        "$@" 2>&1
         return
     fi
     name=$(ev_name "$moment" txt)
@@ -114,6 +119,7 @@ ev_save() { # <moment> <what> <cmd...>
         printf '[exit %s]\n' "$rc"
     } > "$EV_DIR/$name"
     ev_attach "$name" "$what"
+    EV_LAST=$name
     printf '%s\n' "$out"
     return "$rc"
 }
@@ -124,6 +130,7 @@ ev_text() { # <moment> <what> <text>
     name=$(ev_name "$1" txt)
     printf '%s\n' "$3" > "$EV_DIR/$name"
     ev_attach "$name" "$2"
+    EV_LAST=$name
 }
 
 ev_copy() { # <src> <moment> <what>
@@ -134,6 +141,7 @@ ev_copy() { # <src> <moment> <what>
     name=$(ev_name "$2" "$ext")
     if cp "$src" "$EV_DIR/$name" 2>/dev/null; then
         ev_attach "$name" "$3"
+        EV_LAST=$name
     else
         ev_note "could not copy $src for: $3"
     fi
