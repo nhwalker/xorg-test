@@ -595,7 +595,7 @@ podman logs desktop | grep xorg-monitor-conf  # what layout was applied, if any
 - `ci.yml` static job: shellcheck on every script in this tree, and
   `ci/monitor-layout-tests.sh` for the fixed-layout generator this tree feeds
   (both driver paths, the derived CVT timings against `cvt(1)`, and the
-  rejections). `e2e-vm.yml` then declares a
+  rejections). Every `ci.yml` vm shard then declares a
   layout through this tree's `monitors.conf` on a GPU whose second connector
   QEMU never connects, and asserts the declared output comes up on it anyway.
 - `ci.yml` build-smoke also asserts the SELinux labeler's no-op branch: the
@@ -609,14 +609,16 @@ podman logs desktop | grep xorg-monitor-conf  # what layout was applied, if any
   container's init process (a host pid — the pid-namespace shape is itself
   asserted), `desktop-shell` ssh from the host and from inside the
   container, `desktop-preflight` green, and a service restart.
-- `e2e-vm.yml` phase-deploy: the same flow on a Rocky 9 VM with **SELinux
-  enforcing** and a real KMS display — seat-prep evicting the genuinely
-  running boot getty, rootless Xorg + mwm under this quadlet, real
-  audio over all three client paths, the root-owned `desktop-shell` trust
-  path through a real sshd under enforcing, **confined** podman clients
-  resolving each client CDI device with no `label=disable` anywhere,
-  `desktop-preflight` at 0 FAILs, and a non-blank screendump artifact. It
-  asserts the resulting labels directly (all three directories and a
-  published toolkit binary) before the clients that depend on them run. The
-  desktop then stays up for the k3s phase, which runs confined client pods
-  against it **still enforcing** — nothing in the suite calls `setenforce`.
+- `ci.yml` vm jobs: each shard boots its own Rocky 9 VM and runs
+  phase-deploy first, the same flow with **SELinux enforcing** and a real
+  KMS display — seat-prep evicting the genuinely running boot getty,
+  rootless Xorg + mwm under this quadlet, the root-owned `desktop-shell`
+  trust path through a real sshd under enforcing, **confined** podman
+  clients resolving each client CDI device with no `label=disable`
+  anywhere, `desktop-preflight` at 0 FAILs, and a non-blank screendump
+  artifact. It asserts the resulting labels directly (all three directories
+  and a published toolkit binary) before the clients that depend on them
+  run. The core shard then plays real audio over all three client paths;
+  in the k8s shard the desktop stays up for k3s, which runs confined client
+  pods against it **still enforcing** — nothing in the suite calls
+  `setenforce`.
