@@ -918,7 +918,7 @@ layout_unplug() {
     # disconnected. Nothing about the CRTC configuration may change.
     xr >/dev/null
     layout_set forced-off "after Virtual-1 was forced off under the running server"
-    xorg_log_since "$xl0" > "$T/forced-off-xorg-log.txt" 2>&1 || true
+    xorg_slice "$xl0" "$T/forced-off-xorg-log.txt"
     ev_copy "$T/forced-off-xorg-log.txt" xorg-log-off "EV-LOG-XORG: the Xorg log's lines since just before the force"
     ev_diff_paths xrandr-off "EV-DIFF: xrandr --verbose across the force" "$T/before-xrandr.txt" "$T/forced-off-xrandr.txt"
     ev_diff_paths tree-off "EV-DIFF: the window tree across the force (empty: no window changed)" "$T/before-tree.txt" "$T/forced-off-tree.txt"
@@ -969,7 +969,7 @@ layout_unplug() {
     replugged() { xr_is Virtual-1 connected 1024x768+0+0; }
     wait_for 10 1 "xrandr to report Virtual-1 connected at 1024x768+0+0 again" replugged
     layout_set replugged "after Virtual-1 was set back to detect"
-    xorg_log_since "$xl0" > "$T/replugged-xorg-log.txt" 2>&1 || true
+    xorg_slice "$xl0" "$T/replugged-xorg-log.txt"
     ev_copy "$T/replugged-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the re-plug"
     ev_diff_paths xrandr "EV-DIFF: xrandr --verbose before the force and after the re-plug" "$T/before-xrandr.txt" "$T/replugged-xrandr.txt"
     ev_diff_paths tree "EV-DIFF: the window tree before the force and after the re-plug (empty: no window changed)" "$T/before-tree.txt" "$T/replugged-tree.txt"
@@ -2222,6 +2222,12 @@ desk() { podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home
 # The Xorg log's length now, and its lines after a length taken earlier.
 xorg_log_lines() { podman exec desktop sh -c "wc -l < $XORG_LOG"; }
 xorg_log_since() { podman exec desktop tail -n "+$(( ${1:?line count} + 1 ))" "$XORG_LOG"; }
+# The same slice into a file. An empty slice says so, so that the file cannot
+# be taken for a capture that failed.
+xorg_slice() { # <line count> <file>
+    xorg_log_since "$1" > "$2" 2>&1 || true
+    [ -s "$2" ] || echo "(Xorg logged no line after line $1)" > "$2"
+}
 
 # pid, ppid, start time and name of the named processes in the container.
 ctr_pids() { podman exec desktop ps -o pid,ppid,lstart,comm -C "${1:?comm,comm}"; }
