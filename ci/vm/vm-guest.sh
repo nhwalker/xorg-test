@@ -2868,6 +2868,18 @@ journey_loop_stop() { k3s kubectl exec "$JPOD" -- pkill -f shot-loop.sh 2>/dev/n
 journey_loop_log() { k3s kubectl exec "$JPOD" -- cat /tmp/shot-loop.log 2>/dev/null || true; }
 # EV-LOG-DESKTOP for the toolkit: the publish lines of the desktop container
 # now running (a restart makes a new one, with a log of its own).
+# PipeWire's threads with their scheduling (class, realtime priority, nice)
+# and pw-top's batch view, whose ERR column counts each node's xruns.
+audio_sched() {
+    local pw
+    pw=$(pipewire_pid)
+    echo "== ps -T -p ${pw:-?} -o tid,cls,rtprio,ni,comm (pipewire's threads)"
+    [ -z "$pw" ] || ps -T -p "$pw" -o tid,cls,rtprio,ni,comm 2>&1
+    echo "== pw-top -b -n 2 (the second iteration has the counts; ERR is each node's xruns)"
+    desk timeout 10 pw-top -b -n 2 2>&1 || echo "(pw-top gave no answer)"
+}
+# The desktop container's log since a time (a Unix timestamp), its last 300 lines.
+desktop_log_since() { podman logs --since "${1:?unix time}" desktop 2>&1 | tail -300; }
 desktop_publish_log() {
     podman logs desktop 2>&1 | grep -E 'publish|Text file busy|ETXTBSY' || echo "(no publish line in podman logs desktop)"
 }
@@ -3742,7 +3754,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -3814,6 +3826,8 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     journey-loop-stop) journey_loop_stop ;;
     journey-loop-log) journey_loop_log ;;
     desktop-publish-log) desktop_publish_log ;;
+    audio-sched) audio_sched ;;
+    desktop-log-since) desktop_log_since "${2:-}" ;;
     x-up) x_up ;;
     journey-cleanup) journey_cleanup ;;
     tone-status) tone_status "${2:-}" ;;
