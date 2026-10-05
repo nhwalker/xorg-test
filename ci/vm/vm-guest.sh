@@ -5228,7 +5228,10 @@ sl_cards() { # alsa_card Devices in PipeWire, as snd_probe counts them
     echo "${n:-0}"
 }
 sl_card_up() { [ "$(sl_cards)" -ge 1 ]; }
-sl_played() { podman logs "$SL_CLIENT" 2>&1 | grep -q '^played at '; }
+# The client's log is read whole, then searched: `podman logs | grep -q` under
+# pipefail fails on podman's SIGPIPE once grep has its match.
+sl_clog() { podman logs "$SL_CLIENT" 2>&1 || true; }
+sl_played() { local l; l=$(sl_clog); grep -q '^played at ' <<<"$l"; }
 sl_inspect() { podman inspect "$SL_CLIENT" --format '{{.Id}} pid={{.State.Pid}} started={{.State.StartedAt}} restarts={{.RestartCount}} status={{.State.Status}}'; }
 sl_wpctl() { podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop wpctl status; }
 # The align-device-groups rows of every narrow (audio-only) pass in the log:
@@ -5283,7 +5286,8 @@ soundless() { # before|plugged|realign|played|after
             ev_save client-before "EV-PIDS: the client as it started: id, pid, start, restarts, status" sl_inspect >/dev/null || fail "no client to inspect"
             sl_inspect > /run/ev-sl-client
             ev_save client-log-early "EV-LOG-CLIENT: the client's first tries, with no card's sink to play to" podman logs "$SL_CLIENT" >/dev/null || true
-            podman logs "$SL_CLIENT" 2>&1 | grep -q '^try 1 at ' || fail "the client logged no failed try with no card"
+            clog=$(sl_clog)
+            grep -q '^try 1 at ' <<<"$clog" || fail "the client logged no failed try with no card"
             ! sl_played || fail "the client played with no card"
             ev_pass "the client runs and keeps trying: no card's sink yet"
             ev_end
