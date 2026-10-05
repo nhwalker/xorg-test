@@ -624,16 +624,18 @@ ev_save marker "EV-STATE: ls -l --full-time /run/desktop-init-ready in the conta
 ev_save first-xorg "EV-PIDS: this boot's first Xorg (no session has exited yet), as the host sees it" \
     ps -o pid,user,lstart,args -p "$xpid" >/dev/null || true
 ready=$(podman exec desktop date -r /run/desktop-init-ready +%s.%N)
-# The process's start in wall-clock time: boot time (now less the uptime)
-# plus its start ticks, both from /proc; good to about 20 ms.
+# The process's start in wall-clock time: the boot instant (the realtime
+# clock less CLOCK_BOOTTIME, to the microsecond) plus its start ticks. The
+# kernel floors those ticks, so the real start is at or after this figure,
+# and a marker older than it is older than the process.
 xstart=$(python3 -c '
 import os, sys, time
 st = open("/proc/%s/stat" % sys.argv[1]).read()
 ticks = int(st[st.rindex(")") + 2:].split()[19])
-up = float(open("/proc/uptime").read().split()[0])
-print("%.3f" % (time.time() - up + ticks / os.sysconf("SC_CLK_TCK")))' "$xpid")
+boot = time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
+print("%.6f" % (boot + ticks / os.sysconf("SC_CLK_TCK")))' "$xpid")
 gap=$(python3 -c 'import sys; print("%.3f" % (float(sys.argv[2]) - float(sys.argv[1])))' "$ready" "$xstart")
-ev_note "ready marker mtime $ready; Xorg (pid $xpid) started at $xstart (boot time from /proc/uptime plus its start ticks): $gap s later"
+ev_note "ready marker mtime $ready; Xorg (pid $xpid) started at or after $xstart (boot instant plus its start ticks, floored to 10 ms): $gap s later"
 python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$gap" \
     || fail "the ready marker ($ready) is not older than the first Xorg ($xstart)"
 ev_pass "the ready marker was written $gap s before the first Xorg started"
@@ -670,12 +672,15 @@ own=$(ev_save tty1-before "EV-STATE: stat -c '%U:%G %a %n' /dev/tty1 in the cont
     podman exec desktop stat -c '%U:%G %a %n' /dev/tty1) || fail "no /dev/tty1 in the container"
 [ "${own%% *}" = desktop:tty ] || fail "/dev/tty1 is ${own%% *} before the restart, want desktop:tty"
 ev_pass "before: /dev/tty1 is desktop:tty"
-podman exec -u desktop desktop pkill -u desktop -x mwm || fail "could not end the X session: no mwm to stop"
-ev_note "ended the X session by stopping mwm, its client, as the session user (Xorg was pid $xpid)"
+# SIGKILL, mwm dying: a SIGTERM only opens mwm's "Quit Mwm?" confirmation
+# (its default showFeedback includes kill), and the session stays up - the
+# first run of this check waited 60 s for a restart that never came.
+podman exec -u desktop desktop pkill -KILL -u desktop -x mwm || fail "could not end the X session: no mwm to kill"
+ev_note "ended the X session by killing mwm, its client, with SIGKILL as the session user (Xorg was pid $xpid)"
 x_restarted() { local p; p=$(first_xorg); [ -n "$p" ] && [ "$p" != "$xpid" ] && x_up; }
 ok=0
 for _ in $(seq 30); do x_restarted && { ok=1; break; }; sleep 2; done
-[ "$ok" = 1 ] || fail "no new X session within 60 s of stopping mwm"
+[ "$ok" = 1 ] || fail "no new X session within 60 s of killing mwm"
 own=$(ev_save tty1-after "EV-STATE: the same stat once the X session restarted" \
     podman exec desktop stat -c '%U:%G %a %n' /dev/tty1) || fail "no /dev/tty1 after the restart"
 [ "${own%% *}" = desktop:tty ] || fail "/dev/tty1 is ${own%% *} after the restart, want desktop:tty"
@@ -685,7 +690,7 @@ ev_end
 log "session-leader check: silent through the boot and a restart of each tree"
 ev_begin S2.3.4 "Session leader sanity check never fires in a normal boot" T2
 now_log=$(desktop_log)
-ev_text log "EV-LOG-DESKTOP: the desktop's log after its boot, the audio stack's restart (pipewire killed above) and the X session's (mwm stopped above)" "$now_log"
+ev_text log "EV-LOG-DESKTOP: the desktop's log after its boot, the audio stack's restart (pipewire killed above) and the X session's (mwm killed above)" "$now_log"
 a=$(grep -c '^desktop-init: audio stack exited' <<<"$now_log" || true)
 x=$(grep -c '^desktop-init: session exited' <<<"$now_log" || true)
 [ "$a" -ge 1 ] && [ "$x" -ge 1 ] || fail "the log does not show both trees restarting (audio stack exits: $a, X session exits: $x)"
