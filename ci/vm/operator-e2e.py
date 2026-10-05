@@ -4,6 +4,9 @@ the desktop through its own controls, driven the way that person drives it.
 
 Usage: operator-e2e.py [--only ID[,ID...]] [--qmp SOCK] [--ssh-port PORT]
                        [--ssh-key FILE] [--art DIR]
+       operator-e2e.py --maint STEP [--arg ARG] [--out FILE] [...]
+                       one step of a maintainer journey's operator half
+                       (MAINT_STEPS; ci/vm/maint-e2e.sh calls it)
 
 Run from ci/vm by vm-e2e.sh after the hotplug checks and before phase 2, once
 `vm-guest.sh operator-setup` has started the observer container.
@@ -3222,6 +3225,315 @@ def run_stories(ctx, only=None):
     return results
 
 
+# --- the maintainer's journeys (E10): what the operator sees ------------------------
+# ci/vm/maint-e2e.sh runs the maintainer's commands on the host (the guest
+# writes those, each story's primary side) and calls this driver between
+# them, one step per call (--maint STEP), for what only the screen can show:
+# the menu entry a change is about, chosen the way the operator chooses it,
+# and what it gives. A step writes the VM host's side of its story (the h-
+# files and checks maint-e2e.sh's own screendumps use), appending across
+# calls, and never settles the story's result: evlib reads the h-side checks
+# with the guest's (read_result).
+
+class HostStory(Story):
+    """A maintainer story's h-side, as this driver writes it."""
+
+    def __init__(self, run, sid, title):
+        self.run = run
+        self.sid = sid
+        d = os.path.join(run.art, sid)
+        os.makedirs(d, exist_ok=True)
+        self._tl = open(os.path.join(d, "h-timeline.log"), "a", buffering=1)
+        self._qemu = open(os.path.join(d, "h-qemu.log"), "a", buffering=1)
+        run.story = self
+        evlib.StoryWriter.__init__(self, run.art, sid, title, side="h-")
+
+    def finish(self, error=None, trace=None, checked=False):
+        # A failed check is in h-checks.tsv already; any other failure (a
+        # guest command, a window that never came) goes there now.
+        if error and not checked:
+            evlib.StoryWriter.check(self, False, f"the operator's half stopped: {error}")
+        if trace and not checked:
+            self.write("trace", trace, "the traceback of the operator's half's failure")
+        self._qemu.flush()
+        if (os.path.getsize(self._p("h-qemu.log"))
+                and "h-qemu.log" not in {n for _, n, _ in evlib.read_files(self.dir)}):
+            self.attach("h-qemu.log", "EV-QEMU: every QMP command the operator's half sent: its "
+                        "input events and screendumps")
+        self.run.story = None
+        self._tl.close()
+        self._qemu.close()
+        return "FAIL" if error else "PASS"
+
+
+def story_title(sid):
+    """The title Requirements.md gives the story, as maint-e2e.sh's mt_title reads it."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Requirements.md")
+    m = re.search(r"^\*\*" + re.escape(sid) + r" (.*)\*\*$", open(path, encoding="utf-8").read(), re.M)
+    return m.group(1) if m else sid
+
+
+def maint_state(st):
+    """What a step left for a later one of the same story (a dotfile: not evidence)."""
+    try:
+        with open(st.path(".h-maint.json")) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def maint_save(st, state):
+    with open(st.path(".h-maint.json"), "w") as f:
+        json.dump(state, f, indent=1)
+
+
+def screen_lines(text):
+    return " / ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def host_terminal(ctx, st, moment):
+    """'Host Terminal' from the root menu, and what it gives: ("prompt",
+    whoami's answer, "") when a shell opens on the host, ("failed", "", the
+    window's text) when the wrapper's failure text shows, (None, "", "") when
+    neither comes within 30 s. The window is closed again the way it says:
+    `exit` at a prompt, Enter on the failure text."""
+    def shells():
+        return set(ctx.g.sh("pgrep -u desktop-shell -x bash; true",
+                            label="desktop-shell's shells on the host").split())
+    old = shells()
+    xs, _ = ctx.root_menu("Host Terminal", moment)
+    found = ctx.new_xterm(xs)
+    st.check(found, f"'Host Terminal' opened an xterm ({moment})")
+    xs, t = found
+    seen = {}
+
+    def settled():
+        if shells() - old:
+            return "prompt"
+        text = window_text(ctx, t.id, f"observer: the Host Terminal window's text ({moment})")
+        if "Press Enter to close" in text:
+            seen["text"] = text
+            return "failed"
+        return None
+    what = wait_until(settled, 30, 1)
+    who, text = "", seen.get("text", "")
+    xs = ctx.xstate()
+    if what == "prompt":
+        ctx.g.sh("rm -f /tmp/op-host-whoami")
+        ctx.click(*xs.parts(xs.by_id(t.id))["drag"])
+        # tee: the answer on the screen for the shot, and in a file to read.
+        ctx.type_line("whoami | tee /tmp/op-host-whoami")
+        who = wait_until(lambda: ctx.g.sh("cat /tmp/op-host-whoami 2>/dev/null; true",
+                                          label="cat /tmp/op-host-whoami").strip(), 10, 0.5) or ""
+        ctx.shot(f"{moment}-host-terminal", f"the Host Terminal window ({moment}): a shell on the "
+                 f"host, whoami typed into it and its answer, {who!r}")
+        ctx.type_line("exit")
+    elif what == "failed":
+        ctx.shot(f"{moment}-host-terminal", f"the Host Terminal window ({moment}): the wrapper's "
+                 "failure text, the window still open")
+        ctx.save_state(f"{moment}-window-text", text + "\n", f"EV-STATE: the Host Terminal window's "
+                       f"text ({moment}), selected and read back through CUT_BUFFER0")
+        ctx.click(*xs.parts(xs.by_id(t.id))["drag"])
+        ctx.chord("ret")
+    else:
+        ctx.shot(f"{moment}-host-terminal", f"the Host Terminal window ({moment}) 30 s on: neither "
+                 "a shell on the host nor the failure text")
+    if not ctx.wait_gone(t.id):
+        ctx.g.desk(["pkill", "-u", "desktop", "-f", "xterm -T host"], check=False)
+        ctx.wait_gone(t.id)
+    return what, who, text
+
+
+def m_hostterm_works(ctx, st, arg):
+    """S10.3.5, before the switch: a host where Host Terminal works."""
+    what, who, _ = host_terminal(ctx, st, "before-switch")
+    st.check(what == "prompt" and who == "desktop-shell",
+             "before the switch, 'Host Terminal' opens a shell on the host as desktop-shell",
+             f"{what}: whoami {who!r}")
+
+
+def m_hostterm_refused(ctx, st, arg):
+    """S10.3.5, after the switch and the reboot: the entry fails, visibly."""
+    what, who, text = host_terminal(ctx, st, "after-switch")
+    if what == "failed":
+        st.record("after the switch, the window reads: " + screen_lines(text))
+    st.check(what == "failed", "after the switch and the reboot, 'Host Terminal' shows its failure "
+             "text and stays open until Enter (S5.7.8)",
+             {"prompt": f"it opened a shell on the host as {who!r}",
+              None: "neither a shell nor the failure text within 30 s"}.get(what, ""))
+
+
+def m_hostterm_screen(ctx, st, arg):
+    """S10.3.6: the failure screen, read the way the operator reads it, and
+    the command it gives, handed to the maintainer (--out)."""
+    what, who, text = host_terminal(ctx, st, "first-click")
+    st.check(what == "failed", "'Host Terminal' shows its failure screen",
+             f"it opened a shell on the host as {who!r}" if what == "prompt" else "")
+    st.record("the failure screen reads: " + screen_lines(text))
+    m = re.search(r"enable it on the host:\s*\n\s*(\S.*?)(?:\s{2,}\(.*\))?\s*$", text, re.M)
+    cmd = m.group(1).strip() if m else ""
+    st.check(cmd, "the screen gives a command to run on the host", text[-300:])
+    st.record(f"the command the screen gives the maintainer: {cmd}")
+    if ctx.out:
+        with open(ctx.out, "w") as f:
+            f.write(cmd + "\n")
+
+
+def m_hostterm_prompt(ctx, st, arg):
+    """S10.3.6, once the maintainer ran that command: the next click."""
+    what, who, text = host_terminal(ctx, st, "second-click")
+    if what == "failed":
+        st.record("the second click's window reads: " + screen_lines(text))
+    ok = (what == "prompt" and who == "desktop-shell") or (
+        what == "failed" and "restart desktop.service" in text)
+    st.check(ok, "after the command the screen gave, the next 'Host Terminal' opens a shell on the "
+             "host as desktop-shell, or its screen names what else is needed",
+             {"prompt": f"a shell on the host, whoami {who!r}",
+              "failed": "the failure screen again, naming nothing more",
+              None: "neither a shell nor the failure text within 30 s"}[what])
+
+
+def menu_look(ctx, st, moment):
+    """The root menu, posted the way the operator posts it and measured on
+    the screendump: its size, the width of the 'Refresh' entry's text, and
+    its background (the commonest colour inside it). Unposted again with
+    Escape, nothing chosen."""
+    xs = ctx.xstate()
+    _, _, menu = ctx.post_root_menu(xs)
+    img = ctx.shot(f"{moment}-menu", f"the root menu posted at the pointer ({moment})")
+    ctx.m.button("left", False)
+    rows = img.text_rows(menu.rect())
+    look = {"menu": [menu.w, menu.h], "rows": len(rows), "refresh": None}
+    if len(rows) == len(ROOT_MENU):
+        top, bottom = rows[ROOT_MENU.index("Refresh")]
+        ink = [x for y in range(top, bottom + 1) for x in range(menu.ax + 3, menu.ax + menu.w - 3)
+               if sum(img.px(x, y)) > 450]
+        if ink:
+            look["refresh"] = [min(ink), max(ink), max(ink) - min(ink) + 1]
+    counts = {}
+    for y in range(menu.ay, menu.ay + menu.h, 2):
+        for x in range(menu.ax, menu.ax + menu.w, 2):
+            p = img.px(x, y)
+            counts[p] = counts.get(p, 0) + 1
+    look["bg"] = list(max(counts, key=counts.get))
+    for _ in range(3):
+        xs = ctx.xstate(check=False)
+        if not any(xs.override.get(t.id) == "yes" and t.h > 60 and t.w < ctx.width
+                   for t in xs.mapped_tops()):
+            break
+        ctx.chord("esc", settle=0.4)
+    return look
+
+
+def m_menu_look(ctx, st, moment):
+    """S10.3.7: the root menu at <moment>, against the one before the edits."""
+    state = maint_state(st)
+    look = menu_look(ctx, st, moment)
+    state[moment] = look
+    maint_save(st, state)
+    ctx.save_state(f"{moment}-menu-measures", json.dumps(look, indent=1) + "\n",
+                   f"EV-STATE: the root menu's measures on the screendump ({moment}): its size, its "
+                   "text rows, the 'Refresh' entry's text extent (x0, x1, width) and its commonest "
+                   "colour, the background")
+    st.record(f"the root menu ({moment}): {look['menu'][0]}x{look['menu'][1]}, {look['rows']} text "
+              f"rows, 'Refresh' text {look['refresh'] and look['refresh'][2]} px wide, background "
+              f"{tuple(look['bg'])}")
+    before = state.get("before")
+    if moment == "after-mwmrc":
+        st.check(before and before["refresh"] and look["refresh"]
+                 and look["refresh"][2] > before["refresh"][2] + 40 and look["menu"][0] > before["menu"][0],
+                 "the edited label is on the menu after Restart mwm: the 'Refresh' entry's text and "
+                 "the menu itself are wider",
+                 f"text {before and before['refresh']} -> {look['refresh']}, menu width "
+                 f"{before and before['menu'][0]} -> {look['menu'][0]}")
+    if moment == "after-restart-2":
+        was = state.get("after-xdefaults", {}).get("bg")
+        st.record(f"Mwm*menu*background in ~/.Xdefaults was edited before this Restart mwm: the "
+                  f"menu's background went {tuple(was) if was else '?'} -> {tuple(look['bg'])}, so "
+                  + ("f.restart re-read the resources (README.md says it does not)" if was and look["bg"] != was
+                     else "f.restart did not re-read them"))
+
+
+def m_restart_mwm(ctx, st, arg):
+    """S10.3.7: 'Restart mwm' from the root menu: a new connection from
+    mwm (menu_restart_mwm says why that, not its pid, is the proof), the
+    same X server."""
+    def mwm_sockets():
+        return ctx.g.desk(["sh", "-c", 'for f in /proc/$(pgrep -u desktop -x mwm)/fd/*; do readlink "$f"; done '
+                           '| grep socket: | sort'], check=False).split()
+    table = ctx.pids(f"pids-before-restart-mwm-{arg}")
+    xorg, mwm, socks = ctx.session_pid(table, "Xorg"), ctx.session_pid(table, "mwm"), mwm_sockets()
+    before = ctx.xstate()
+    with ctx.video(f"restart-mwm-{arg}", "Restart mwm chosen from the root menu: the frames go and "
+                   "come back; the windows stay"):
+        ctx.root_menu("Restart mwm", f"restart-mwm-{arg}")
+        ctx.confirm(before, f"restart-mwm-{arg}")
+        renewed = wait_until(lambda: (lambda s: s if s and s != socks else None)(mwm_sockets()), 20, 0.5)
+        time.sleep(2)
+    table = ctx.pids(f"pids-after-restart-mwm-{arg}")
+    st.check(renewed, "Restart mwm replaced mwm's connection to the X server",
+             f"mwm's sockets {socks} -> {mwm_sockets()}")
+    st.record(f"Restart mwm ({arg}): mwm pid {mwm} -> {ctx.session_pid(table, 'mwm')}, Xorg pid "
+              f"{xorg} -> {ctx.session_pid(table, 'Xorg')}")
+    st.check(xorg and ctx.session_pid(table, "Xorg") == xorg,
+             "Restart mwm started no new X session: the Xorg pid is the same")
+    ctx.shot(f"after-restart-mwm-{arg}", "the desktop after Restart mwm")
+
+
+def m_new_xterm(ctx, st, want):
+    """S10.3.7: 'New Terminal' after the ~/.Xdefaults edit, and the
+    background it draws, sampled clear of its text (want: #rrggbb)."""
+    xs, _ = ctx.root_menu("New Terminal", "new-terminal")
+    found = ctx.new_xterm(xs)
+    st.check(found, "'New Terminal' opened an xterm")
+    xs, t = found
+    time.sleep(1)
+    info = ctx.one(t.id)
+    img = ctx.shot("new-terminal", "the xterm 'New Terminal' opened after the ~/.Xdefaults edit; "
+                   "its background is sampled at its bottom-right corner, clear of the text")
+    x, y = info.ax + info.w - 8, info.ay + info.h - 8
+    got = img.px(x, y)
+    rgb = tuple(int(want[i:i + 2], 16) for i in (1, 3, 5))
+    if info.pid:
+        ctx.g.desk(["kill", str(info.pid)], check=False)
+        ctx.wait_gone(t.id)
+    st.check(got == rgb, f"the next xterm draws the edited background {want}",
+             f"pixel ({x},{y}) is {got}, want {rgb}")
+
+
+MAINT_STEPS = {
+    "hostterm-works": ("S10.3.5", m_hostterm_works),
+    "hostterm-refused": ("S10.3.5", m_hostterm_refused),
+    "hostterm-screen": ("S10.3.6", m_hostterm_screen),
+    "hostterm-prompt": ("S10.3.6", m_hostterm_prompt),
+    "menu-look": ("S10.3.7", m_menu_look),
+    "restart-mwm": ("S10.3.7", m_restart_mwm),
+    "new-xterm": ("S10.3.7", m_new_xterm),
+}
+
+
+def run_maint(ctx, step, arg):
+    sid, fn = MAINT_STEPS[step]
+    st = HostStory(ctx.run, sid, story_title(sid))
+    ctx.run.story = ctx.st = st
+    ctx.run.log("story", f"the operator's half: {step} {arg}".rstrip(), echo=True)
+    error = trace = None
+    checked = False
+    try:
+        fn(ctx, st, arg)
+    except StoryFailed as e:
+        error, trace, checked = str(e), traceback.format_exc(), True
+    except Exception as e:                                      # noqa: BLE001
+        error, trace = f"{type(e).__name__}: {e}", traceback.format_exc()
+    if error:
+        ctx.diagnostics()
+    ctx.run.log("story", "FAIL: " + error if error else "PASS", echo=True)
+    st.finish(error, trace, checked)
+    ctx.run.story = ctx.st = None
+    ctx.recover()
+    return 1 if error else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--qmp", default="qmp.sock")
@@ -3229,10 +3541,24 @@ def main():
     ap.add_argument("--ssh-key", default="id_ed25519")
     ap.add_argument("--art", default="artifacts")
     ap.add_argument("--only", default="", help="comma-separated story ids")
+    ap.add_argument("--maint", default="", choices=[""] + sorted(MAINT_STEPS),
+                    help="one step of a maintainer journey's operator half (ci/vm/maint-e2e.sh)")
+    ap.add_argument("--arg", default="", help="the --maint step's argument")
+    ap.add_argument("--out", default="", help="a file the --maint step writes its answer to")
     args = ap.parse_args()
     run = Run(args.art)
     machine = Machine(run, args.qmp)
     ctx = Ctx(run, machine, Guest(run, args.ssh_port, args.ssh_key))
+    ctx.out = args.out
+    if args.maint:
+        try:
+            ctx.measure_screen()
+            ctx.recover()
+            return run_maint(ctx, args.maint, args.arg)
+        finally:
+            machine.close()
+            with contextlib.suppress(Exception):
+                ctx.g.close()
     try:
         ctx.measure_screen()
         ctx.recover()

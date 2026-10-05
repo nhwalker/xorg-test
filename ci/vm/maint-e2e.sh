@@ -35,10 +35,13 @@ mt_unpack() { vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo' || fail "
 # 100x30+60+60 window (S3.5.2's).
 MT_ROOT_RGB=16,18,22
 mt_is_desktop() { # <image>
-    local w="" h=""
+    local w="" h="" c
     read -r w h < <(identify -format '%w %h\n' "$1" 2>/dev/null) || true
     [ -n "$h" ] || return 1
-    [ "$(px "$1" $((w - 12)) $((h - 12)))" = "$MT_ROOT_RGB" ] && [ "$(px "$1" 360 260)" = 22,25,29 ]
+    # MT_ROOT_RGB may name alternatives, "r,g,b|r,g,b": any of them will do.
+    c=$(px "$1" $((w - 12)) $((h - 12)))
+    case "|$MT_ROOT_RGB|" in *"|$c|"*) ;; *) return 1 ;; esac
+    [ "$(px "$1" 360 260)" = 22,25,29 ]
 }
 # Follow a recording (ev_video_start) frame by frame until the desktop has
 # gone from the screen and come back, for up to <seconds>, looking only at
@@ -422,6 +425,194 @@ maint_config() {
     mg upgrade-done || true
 }
 
+# --- F10.3, in the operator's session: Host Terminal off and on, look and feel ------
+# One step of the operator's half (operator-e2e.py --maint): a menu entry
+# chosen through QEMU's own devices and the screen read, into the h- files of
+# the step's story. It looks at X from a confined observer container, which a
+# boot takes away with the desktop.
+mt_op() { # <step> [arg] [out file]
+    python3 operator-e2e.py --qmp "$QMP" --ssh-port "$SSHPORT" --ssh-key id_ed25519 --art "$EV_ROOT" \
+        --maint "$1" --arg "${2:-}" --out "${3:-}"
+}
+mt_observer() { vm_ssh 'sudo repo/ci/vm/vm-guest.sh operator-setup' || fail "the operator's observer could not start"; }
+
+# S10.3.5, then S10.3.6 from the state S10.3.5 should have left.
+mt_hostterm() {
+    local vid t0 lines rc out cmd
+    log "S10.3.5: Host Terminal switched off the documented way, on a host where it works"
+    mg before S10.3.5 on || { mt_failed S10.3.5 "could not record the state before the switch"; return 1; }
+    mg hostterm-before || { mt_failed S10.3.5 "Host Terminal does not work before the switch"; return 1; }
+    mt_op hostterm-works || mt_failed S10.3.5 "before the switch, 'Host Terminal' did not open a shell on the host"
+    mt_open S10.3.5
+    ev_shot before-switch "EV-SHOT: the screen before the switch"
+    EV_VID_FPS=1 ev_video_start switch-reboot
+    vid="$EV_DIR/$EV_VID"
+    mt_close
+    lines=$(wc -l < "$VM_SERIAL")
+    # The step ends in the reboot: exit 1 is the step failing before it.
+    mg_reboot hostterm-switch && rc=0 || rc=$?
+    t0=$(date +%s.%N)
+    if [ "$rc" = 1 ]; then
+        ev_pull
+        mt_open S10.3.5
+        ev_video_stop "EV-VIDEO: the screen while the switch failed"
+        mt_failed S10.3.5 "the switch could not be applied"
+        return 1
+    fi
+    log "the switch's reboot is under way: watching the screen until the desktop is back"
+    if ! mt_wait_screen "$vid" 300; then
+        mt_open S10.3.5
+        ev_video_stop "EV-VIDEO: the screen from before the switch's reboot for 300 s: the desktop never came back"
+        ev_text serial "EV-LOG: the serial console from the reboot on" "$(tail -n +"$((lines + 1))" "$VM_SERIAL")"
+        mt_failed S10.3.5 "300 s after the switch's reboot the desktop is not on the screen"
+        return 1
+    fi
+    sleep 3
+    mt_open S10.3.5
+    ev_video_stop "EV-VIDEO: the screen at 1 fps from before the switch's reboot until the desktop was back; index.txt gives each frame's UTC time"
+    ev_note "time to desktop: $(mt_elapsed "$t0") s from the reboot to the first frame showing the desktop, ${MT_BACK%% *} at ${MT_BACK#* }"
+    if ! mt_screen_check after-reboot "EV-SHOT: the screen after the switch and the reboot: the desktop, the rest of it unaffected"; then
+        mt_failed S10.3.5 "the screen does not show the desktop after the switch and the reboot"
+        return 1
+    fi
+    mt_close
+    vm_ssh 'sudo repo/ci/vm/vm-guest.sh x-up' || { mt_failed S10.3.5 "the desktop is on the screen, but X or mwm does not answer"; return 1; }
+    mt_observer
+    mg after S10.3.5 on off || mt_failed S10.3.5 "the desktop came back other than whole after the switch's reboot"
+    mg hostterm-after || mt_failed S10.3.5 "the host's checks after the switch could not run"
+    mt_op hostterm-refused || mt_failed S10.3.5 "after the switch, 'Host Terminal' did not show its failure text"
+
+    log "S10.3.6: Host Terminal on again, from its own failure screen"
+    mg before S10.3.6 off || { mt_failed S10.3.6 "could not record the state before"; return 1; }
+    mg hostterm-strip || { mt_failed S10.3.6 "could not reach S10.3.5's intended end state"; return 1; }
+    mt_watch S10.3.6 stripped svc S10.3.6 restart || return 1
+    mg after S10.3.6 off stripped || mt_failed S10.3.6 "the desktop came back other than whole"
+    mg hostterm-start-state || { mt_failed S10.3.6 "the start state is not S10.3.5's intended one"; return 1; }
+    out="$PWD/.hostterm-command"
+    rm -f "${out:?}"
+    mt_op hostterm-screen "" "$out" || mt_failed S10.3.6 "the failure screen did not show, or gave no command"
+    cmd=$(cat "$out" 2>/dev/null || true)
+    [ -n "$cmd" ] || { mt_failed S10.3.6 "no command was read off the failure screen"; return 1; }
+    log "the failure screen says to run, on the host: $cmd"
+    mg hostterm-enable "$(printf '%s' "$cmd" | base64 -w0)" || mt_failed S10.3.6 "the screen's command could not be run"
+    mt_op hostterm-prompt || mt_failed S10.3.6 "after the screen's command, 'Host Terminal' still gave no shell on the host"
+    mg hostterm-journal || true
+}
+
+# S10.3.7. The colours are hex without '#': a word starting with one is a
+# comment to the shell that runs a guest step.
+MT_LF_TERM=1f2f22           # XTerm*background, edited from #16191d
+MT_LF_MENU=2f2219           # Mwm*menu*background, edited from #22262d
+MT_LF_ROOT=1b2b17           # the root colour of the rebuilt image: 27,43,23
+mt_look() {
+    log "S10.3.7: the look-and-feel loops, as README.md gives them"
+    mg before S10.3.7 look || { mt_failed S10.3.7 "could not record the state before"; return 1; }
+    mt_op menu-look before || mt_failed S10.3.7 "the root menu could not be measured"
+    log "S10.3.7: ~/.mwmrc edited in the running container, then Restart mwm"
+    mg lf-mwmrc || { mt_failed S10.3.7 "the container's .mwmrc could not be edited"; return 1; }
+    mt_op restart-mwm 1 || mt_failed S10.3.7 "Restart mwm did not restart mwm in the same X session"
+    mt_op menu-look after-mwmrc || mt_failed S10.3.7 "the edited label is not on the root menu after Restart mwm"
+    log "S10.3.7: ~/.Xdefaults edited, the README's new X session, then the next xterm"
+    mg lf-xdefaults "$MT_LF_TERM" "$MT_LF_MENU" || mt_failed S10.3.7 "the container's .Xdefaults could not be edited"
+    mt_op new-xterm "#$MT_LF_TERM" || mt_failed S10.3.7 "the next xterm does not draw the edited background"
+    # What Restart mwm does with the edited Mwm resources, against README.md's
+    # "Resources are not re-read by f.restart": recorded, not judged.
+    mt_op menu-look after-xdefaults || true
+    mt_op restart-mwm 2 || true
+    mt_op menu-look after-restart-2 || true
+    log "S10.3.7: a repo file changed, rebuilt and deployed the way README.md says"
+    MT_LF_RESTARTED=0
+    mt_rebuild || true
+    if [ "$MT_LF_RESTARTED" = 1 ]; then
+        mg after S10.3.7 look rebuilt || mt_failed S10.3.7 "the desktop came back other than whole after the rebuild loop's restart"
+    fi
+}
+# README.md's rebuild block, run as an unprivileged maintainer would run it:
+# rocky, with sudo, as the block's own `sudo` implies, in its checkout with
+# one repo file changed. The build stops the block if it fails.
+mt_rebuild() {
+    local raw line n=0 rc vid t0 built rgb w h f
+    local -a cmds
+    mt_open S10.3.7
+    VM_SSH_TIMEOUT=600 ev_save rebuild-bases "EV-PROCEDURE: harness-only, not a documented step: the bases an earlier documented build leaves in the maintainer's own storage (README.md \"Base image vs application layer\": desktop-container-base, and the screenshot image the Containerfile's tools stage needs), loaded rather than rebuilt: podman load, as rocky" \
+        vm_ssh 'podman load -i /tmp/images-desktop-base.tar && podman load -i /tmp/images-screenshot.tar' >/dev/null \
+        || { mt_failed S10.3.7 "the bases could not be loaded into rocky's storage"; return 1; }
+    ev_save repo-edit "EV-PROCEDURE: the repo-file change the loop starts from (README.md: \"edit the file in image/session/\"): image/session/xinitrc.desktop's root colour, #101216 -> #$MT_LF_ROOT, in rocky's checkout (sed, standing in for an editor)" \
+        vm_ssh "cd repo && cp image/session/xinitrc.desktop /tmp/xinitrc.desktop.orig && sed -i 's/#101216/#$MT_LF_ROOT/' image/session/xinitrc.desktop && { diff -u /tmp/xinitrc.desktop.orig image/session/xinitrc.desktop; grep -q '#$MT_LF_ROOT' image/session/xinitrc.desktop; }" >/dev/null \
+        || { mt_failed S10.3.7 "the repo file could not be edited"; return 1; }
+    raw=$(python3 ../doc-blocks.py ../../README.md "Look and feel" 2) \
+        || { mt_failed S10.3.7 "README.md's \"Look and feel\" has no second command block: $raw"; return 1; }
+    ev_text rebuild-block "EV-PROCEDURE: README.md \"Look and feel\"'s rebuild block, as this run read it; each command follows, run as written by rocky in its checkout" "$raw"
+    mapfile -t cmds < <(python3 ../doc-blocks.py ../../README.md "Look and feel" 2 --commands | cut -f1)
+    for line in "${cmds[@]}"; do
+        n=$((n + 1)) rc=0
+        case "$line" in
+            *"systemctl restart desktop.service"*)
+                ev_shot before-restart "EV-SHOT: the screen right before \`$line\`"
+                ev_video_start rebuild-restart
+                vid="$EV_DIR/$EV_VID"
+                t0=$(date +%s.%N)
+                MT_LF_RESTARTED=1
+                ev_save "rebuild-$n" "EV-PROCEDURE: \`$line\`, as written, by rocky in its checkout: its output and exit status" \
+                    vm_ssh "cd repo && $line" >/dev/null || rc=$?
+                # Whichever image comes back, the old root colour or the
+                # rebuilt one: which it is, is the check below.
+                MT_ROOT_RGB='16,18,22|27,43,23'
+                if [ "$rc" = 0 ] && mt_wait_screen "$vid" 180; then
+                    sleep 2
+                    ev_video_stop "EV-VIDEO: the screen from \`$line\` until the desktop was back; index.txt gives each frame's UTC time"
+                    ev_note "the desktop was back $(mt_elapsed "$t0") s after \`$line\` (${MT_BACK%% *} at ${MT_BACK#* })"
+                    ev_pass "\`$line\` exited 0 and the desktop came back"
+                else
+                    ev_video_stop "EV-VIDEO: the screen for up to 180 s from \`$line\`"
+                    ev_fail "\`$line\` exited $rc, or the desktop did not come back within 180 s"
+                fi
+                MT_ROOT_RGB=16,18,22
+                ;;
+            *)
+                VM_SSH_TIMEOUT=1200 ev_save "rebuild-$n" "EV-PROCEDURE: \`$line\`, as written, by rocky in its checkout: its output and exit status" \
+                    vm_ssh "cd repo && $line" >/dev/null || rc=$?
+                if [ "$rc" != 0 ]; then
+                    ev_fail "\`$line\` exited $rc, so the block stops there: $(tail -n 3 "$EV_DIR/$EV_LAST" | head -n 2 | tr '\n' ' ')"
+                    break
+                fi
+                ev_pass "\`$line\` exited 0"
+                ;;
+        esac
+    done
+    f=$(ev_name rebuilt png)
+    if python3 qmp-tool.py shot "$QMP" "$EV_DIR/$f" >/dev/null && [ -s "$EV_DIR/$f" ]; then
+        ev_attach "$f" "EV-SHOT: the screen after README.md's rebuild loop; the root colour is sampled 12 px in from its bottom-right corner"
+        read -r w h < <(identify -format '%w %h\n' "$EV_DIR/$f" 2>/dev/null) || true
+        rgb=$(px "$EV_DIR/$f" $((w - 12)) $((h - 12)))
+        if [ "$rgb" = 27,43,23 ]; then
+            ev_pass "the rebuilt image's root colour, #$MT_LF_ROOT, is on the screen after README.md's loop"
+        else
+            ev_fail "after README.md's loop the root colour is $rgb, not the rebuilt image's #$MT_LF_ROOT (27,43,23)"
+        fi
+    else
+        ev_fail "no screendump after README.md's loop"
+    fi
+    ev_save rocky-images "EV-STATE: rocky's own podman storage after the loop: its images, and the id of its localhost/desktop-container:latest" \
+        vm_ssh "podman images; podman image inspect --format '{{.Id}} {{.Created}}' localhost/desktop-container:latest" >/dev/null || true
+    built=$(vm_ssh "podman image inspect --format '{{.Id}}' localhost/desktop-container:latest" 2>/dev/null | tail -n 1)
+    mt_close
+    if [ -n "$built" ]; then
+        mg lf-image "$built" || mt_failed S10.3.7 "the image check could not run"
+    else
+        mt_failed S10.3.7 "README.md's build left no localhost/desktop-container:latest in rocky's storage"
+    fi
+}
+
+maint_session() {
+    log "maintainer, host D: provisioned the documented way; Host Terminal switched off and on, and the look-and-feel loops (S10.3.5-S10.3.7)"
+    mt_unpack
+    mt_provision_quiet
+    mt_observer
+    mt_hostterm || true
+    mt_look || true
+}
+
 # --- F10.4: a restart, and a maintenance stop and start ---------------------------
 # What the operator gets back after <command>: the screen recorded from the
 # command until the desktop shows, the time it took, the typing and the
@@ -533,6 +724,7 @@ maint_main() { # <journey>
     case "$1" in
         docpath) maint_docpath ;;
         config) maint_config ;;
+        session) maint_session ;;
         *) fail "no maintainer journey named '$1'" ;;
     esac
     write_manifest

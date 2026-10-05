@@ -995,6 +995,255 @@ mt_upc_tone() { # <hz>: a new tone from the upgrade's client, printed for the VM
     echo "paplay exited $rc"
 }
 
+# --- S10.3.5 and S10.3.6: Host Terminal switched off, and on again from its screen ---
+# The menu entry itself is the operator's half (operator-e2e.py --maint); these
+# steps are the maintainer's commands and what the host says about them.
+MT_QUADLET=/etc/containers/systemd/desktop.container
+MT_HSKEY=/etc/desktop-container/host-shell-key
+MT_HSAK=/etc/ssh/authorized_keys.d/desktop-shell
+
+# The container's own ssh to the host, as the menu entry's wrapper runs it,
+# with BatchMode so that a refusal ends it rather than prompting.
+mt_container_ssh() { # <moment> <when>
+    ev_save "container-ssh-$1" "EV-PROCEDURE: podman exec -u desktop desktop ssh -o BatchMode=yes host whoami ($2): its output and exit status" \
+        podman exec -u desktop desktop ssh -o BatchMode=yes -o ConnectTimeout=10 host whoami
+}
+mt_material() { # <moment> <when>
+    ev_save "material-$1" "EV-STATE: ls -l /etc/desktop-container /etc/ssh/authorized_keys.d ($2)" \
+        ls -l /etc/desktop-container /etc/ssh/authorized_keys.d >/dev/null || true
+    mt_put "$EV_STORY-material-$1" "$EV_LAST"
+}
+
+mt_hostterm_before() {
+    local out rc=0
+    mt_begin S10.3.5
+    out=$(mt_container_ssh on "before the switch") || rc=$?
+    [ "$rc" = 0 ] && [ "$(tail -n 1 <<<"$out")" = desktop-shell ] \
+        || fail "before the switch the container's ssh host whoami did not answer desktop-shell (exit $rc): $out"
+    ev_pass "before the switch, the container's \`ssh host whoami\` answers desktop-shell"
+    install -m 0600 "$MT_HSKEY" "$MT/kept-host-shell-key" || fail "could not keep a copy of the key in use"
+    ev_save kept-key "EV-STATE: the fingerprint of the key in use now; a copy is kept, to try after the switch" \
+        ssh-keygen -lf "$MT/kept-host-shell-key" >/dev/null || true
+    mt_material before "before the switch"
+    ev_end
+}
+
+# The off-switch as deploy/README.md "Host Terminal" gives it (comment out
+# the two lines), then daemon-reload and a reboot, as S10.3.5 runs it. The
+# step ends in the reboot; the VM host watches the screen.
+mt_hostterm_switch() {
+    local before
+    mt_begin S10.3.5
+    ev_text switch-doc "EV-PROCEDURE: the off-switch as deploy/README.md \"Host Terminal\" gives it, quoted; it is a sentence, not a command block, so the harness's sed stands in for the editor" \
+        "$(sed -n '/^- \*\*Always on\.\*\*/,/^$/p' deploy/README.md)"
+    grep -q 'comment out the two' "$EV_DIR/$EV_LAST" || fail "deploy/README.md no longer gives the off-switch as commenting out two lines"
+    ev_copy "$MT_QUADLET" quadlet-before "EV-CONFIG: the quadlet before the switch"
+    before=$EV_LAST
+    ev_save switch "EV-PROCEDURE: the two lines commented out (sed -i -E 's/^(Wants|After)=desktop-host-shell\\.service\$/#&/' $MT_QUADLET)" \
+        sed -i -E 's/^(Wants|After)=desktop-host-shell\.service$/#&/' "$MT_QUADLET" >/dev/null || fail "could not edit the quadlet"
+    ev_copy "$MT_QUADLET" quadlet-after "EV-CONFIG: the quadlet after the switch"
+    ev_diff quadlet "EV-DIFF: the quadlet before (-) and after (+) the switch: the two lines commented out, nothing else" "$before" "$EV_LAST"
+    [ "$(grep -cE '^#(Wants|After)=desktop-host-shell\.service$' "$MT_QUADLET")" = 2 ] \
+        && ! grep -qE '^(Wants|After)=.*desktop-host-shell' "$MT_QUADLET" \
+        || fail "the quadlet's two desktop-host-shell lines are not both commented out"
+    ev_pass "the quadlet's two desktop-host-shell lines are commented out, and no active line names the unit"
+    ev_save daemon-reload "EV-PROCEDURE: systemctl daemon-reload" systemctl daemon-reload >/dev/null || fail "daemon-reload failed"
+    ev_save unit-after "EV-CONFIG: systemctl cat desktop.service after the reload: the unit quadlet generated" \
+        systemctl cat desktop.service >/dev/null || true
+    # The generated file, not systemctl show: desktop-host-shell.service is
+    # still loaded this boot, and its own Before=desktop.service shows up in
+    # desktop.service's After= list until the reboot.
+    ! systemctl cat desktop.service | grep -qE '^(Wants|After)=.*desktop-host-shell' \
+        || fail "the unit quadlet generated still names desktop-host-shell.service in Wants= or After="
+    ev_pass "the unit quadlet generated no longer names desktop-host-shell.service in Wants= or After="
+    mt_put boot-before "$(cat /proc/sys/kernel/random/boot_id)"
+    ev_note "the reboot follows (S10.3.5: the switch, daemon-reload, reboot); the VM host watches the screen"
+    ev_end
+    sync
+    systemctl reboot
+}
+
+# After the reboot: what still lets anyone in as desktop-shell.
+mt_hostterm_after() {
+    local b0 b1 out rc pf f
+    mt_begin S10.3.5
+    b0=$(mt_get boot-before) b1=$(cat /proc/sys/kernel/random/boot_id)
+    [ -n "$b0" ] && [ "$b1" != "$b0" ] || fail "this is not a new boot: boot id $b1, before the reboot ${b0:-unknown}"
+    ev_pass "a new boot: boot id $b0 before the switch's reboot, $b1 now"
+    ev_save hostshell-unit "EV-STATE: systemctl status desktop-host-shell.service, this boot" \
+        systemctl --no-pager status desktop-host-shell.service >/dev/null || true
+    if [ "$(systemctl show -p ActiveEnterTimestampMonotonic --value desktop-host-shell.service)" = 0 ]; then
+        ev_pass "desktop-host-shell.service did not run this boot: nothing pulls it in"
+    else
+        ev_fail "desktop-host-shell.service ran this boot ($(systemctl show -p ActiveState --value desktop-host-shell.service))"
+    fi
+    rc=0
+    out=$(ev_save kept-key-login "EV-PROCEDURE: ssh -i <the key kept from before the switch> desktop-shell@127.0.0.1 whoami, on the host: its output and exit status" \
+        ssh -i "$MT/kept-host-shell-key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 desktop-shell@127.0.0.1 whoami) || rc=$?
+    if [ "$rc" != 0 ]; then
+        ev_pass "the key kept from before the switch is refused (ssh exit $rc)"
+    else
+        ev_fail "the key kept from before the switch still logs in, as $(tail -n 1 <<<"$out"), after the switch and a reboot"
+    fi
+    rc=0
+    out=$(mt_container_ssh off "after the switch and the reboot") || rc=$?
+    if [ "$rc" != 0 ]; then
+        ev_pass "the container's ssh host is refused (exit $rc)"
+    else
+        ev_fail "the container's ssh host still logs in, as $(tail -n 1 <<<"$out"), after the switch and a reboot"
+    fi
+    for f in "$MT_HSKEY" "$MT_HSAK"; do
+        if [ -e "$f" ]; then ev_fail "$f still exists after the switch and a reboot"; else ev_pass "$f does not exist"; fi
+    done
+    pf=$(ev_save preflight-lines "EV-LOG-DESKTOP: podman logs desktop | grep -E 'preflight:|host-shell-setup:', this boot" \
+        sh -c 'podman logs desktop 2>&1 | grep -E "preflight:|host-shell-setup:"') || true
+    if grep -q 'WARN: no host shell material' <<<"$pf"; then
+        ev_pass "the container's preflight WARNs: $(grep -m1 'no host shell material' <<<"$pf" | sed 's/.*preflight: //')"
+    else
+        ev_fail "the container's preflight does not WARN 'no host shell material'; it says: $(grep -m1 'host shell' <<<"$pf" | sed 's/.*preflight: //')"
+    fi
+    mt_material off "after the switch and the reboot"
+    ev_diff material "EV-DIFF: the host-shell material before (-) the switch and after (+) it and the reboot" \
+        "$(mt_get S10.3.5-material-before)" "$(mt_get S10.3.5-material-off)"
+    ev_save sshd-journal "EV-LOG-JOURNAL: journalctl -b -u sshd, this boot: every login tried since" \
+        journalctl -b --no-pager -o short-precise -u sshd >/dev/null || true
+    ev_end
+}
+
+# S10.3.6 starts from S10.3.5's intended end state, which the documented
+# switch does not reach (S10.3.5's evidence): the harness removes the
+# material, a step no document gives, and the VM host restarts the desktop.
+mt_hostterm_strip() {
+    mt_begin S10.3.6
+    mt_material start "what S10.3.5's switch and reboot left"
+    ev_save strip "EV-PROCEDURE: harness-only, not a documented step: S10.3.5's intended end state, rm -f $MT_HSKEY $MT_HSKEY.pub $MT_HSAK" \
+        rm -f "$MT_HSKEY" "$MT_HSKEY.pub" "$MT_HSAK" >/dev/null || fail "could not remove the host-shell material"
+    mt_material stripped "with the material removed"
+    ev_end
+}
+mt_hostterm_start_state() {
+    local pf
+    mt_begin S10.3.6
+    desk_back
+    pf=$(ev_save preflight-lines "EV-LOG-DESKTOP: podman logs desktop | grep -E 'preflight:|host-shell-setup:', the desktop restarted without the material" \
+        sh -c 'podman logs desktop 2>&1 | grep -E "preflight:|host-shell-setup:"') || true
+    grep -q 'WARN: no host shell material' <<<"$pf" || fail "the start state is not S10.3.5's intended one: the container's preflight does not WARN 'no host shell material'"
+    ev_pass "the start state: the desktop restarted without host-shell material, and its preflight WARNs: $(grep -m1 'no host shell material' <<<"$pf" | sed 's/.*preflight: //')"
+    ev_save dotssh-before "EV-STATE: ls -la /home/desktop/.ssh in the container, before the maintainer's command" \
+        podman exec desktop ls -la /home/desktop/.ssh >/dev/null || true
+    mt_put S10.3.6-dotssh-before "$EV_LAST"
+    ev_end
+}
+# The command the failure screen gives, as the operator's half read it off
+# the screen (base64: a step's arguments are single words), run verbatim.
+mt_hostterm_enable() { # <command, base64>
+    local cmd rc=0
+    mt_begin S10.3.6
+    cmd=$(base64 -d <<<"$1") || fail "the command did not decode"
+    ev_text screen-command "EV-PROCEDURE: the command the failure screen gives, as the operator's half read it off the screen" "$cmd"
+    # Read off a screen, so run only if it has the shape the wrapper prints.
+    [[ "$cmd" =~ ^systemctl\ [a-z-]+\ [A-Za-z0-9@._-]+$ ]] || fail "the screen's command is not a systemctl command: $cmd"
+    mt_put since-enable "$(date +%s)"
+    ev_save enable "EV-PROCEDURE: \`$cmd\`, run verbatim on the host as root: its output and exit status" \
+        bash -c "$cmd" >/dev/null || rc=$?
+    if [ "$rc" = 0 ]; then ev_pass "\`$cmd\` exited 0"; else ev_fail "\`$cmd\` exited $rc"; fi
+    ev_save hostshell-unit "EV-STATE: systemctl status desktop-host-shell.service after it" \
+        systemctl --no-pager status desktop-host-shell.service >/dev/null || true
+    mt_material enabled "after the command"
+    ev_save dotssh-after "EV-STATE: ls -la /home/desktop/.ssh in the container, after the command" \
+        podman exec desktop ls -la /home/desktop/.ssh >/dev/null || true
+    ev_diff dotssh "EV-DIFF: the container's ~/.ssh before (-) and after (+) the command" "$(mt_get S10.3.6-dotssh-before)" "$EV_LAST"
+    ev_end
+}
+mt_hostterm_journal() {
+    mt_begin S10.3.6
+    ev_save sshd-journal "EV-LOG-JOURNAL: journalctl -u sshd since the maintainer's command: the second click's login" \
+        journalctl --no-pager -o short-precise -u sshd --since "@$(mt_get since-enable)" >/dev/null || true
+    ev_end
+}
+
+# --- S10.3.7: the look-and-feel loops README.md gives -------------------------------
+# The menu, the xterm and the screen are the operator's half and the VM
+# host's (operator-e2e.py --maint, maint-e2e.sh); these steps are the edits
+# and the commands. Editors are interactive, so sed makes each edit.
+MT_LF_LABEL='Refresh the screen now'
+mt_lf_mwmrc() {
+    local before
+    mt_begin S10.3.7
+    ev_save mwmrc-before "EV-CONFIG: /home/desktop/.mwmrc in the running container, before the edit" \
+        podman exec desktop cat /home/desktop/.mwmrc >/dev/null || fail "there is no ~/.mwmrc in the container"
+    before=$EV_LAST
+    ev_save mwmrc-edit "EV-PROCEDURE: README.md \"Look and feel\": edit /home/desktop/.mwmrc inside the running container; sed, as the desktop user, makes the root menu's \"Refresh\" label \"$MT_LF_LABEL\"" \
+        podman exec -u desktop desktop sed -i "s/^\\( *\\)\"Refresh\"\\( *f\\.refresh\\)/\\1\"$MT_LF_LABEL\"\\2/" /home/desktop/.mwmrc >/dev/null \
+        || fail "the edit failed"
+    ev_save mwmrc-after "EV-CONFIG: ~/.mwmrc after the edit" podman exec desktop cat /home/desktop/.mwmrc >/dev/null || true
+    ev_diff mwmrc "EV-DIFF: ~/.mwmrc before (-) and after (+) the edit: one label" "$before" "$EV_LAST"
+    grep -q "\"$MT_LF_LABEL\" *f\\.refresh" "$EV_DIR/$EV_LAST" || fail "the label was not edited"
+    ev_pass "the root menu in /home/desktop/.mwmrc now labels f.refresh \"$MT_LF_LABEL\""
+    ev_end
+}
+mt_lf_xdefaults() { # <XTerm*background> <Mwm*menu*background>, hex without '#'
+    local before rc x0 x1 x2 term="#$1" menu="#$2"
+    mt_begin S10.3.7
+    ev_save xdefaults-before "EV-CONFIG: /home/desktop/.Xdefaults in the running container, before the edit" \
+        podman exec desktop cat /home/desktop/.Xdefaults >/dev/null || fail "there is no ~/.Xdefaults in the container"
+    before=$EV_LAST
+    ev_save xdefaults-edit "EV-PROCEDURE: an ~/.Xdefaults change (README.md \"Look and feel\"); sed, as the desktop user: XTerm*background $term, Mwm*menu*background $menu" \
+        podman exec -u desktop desktop sed -i -e "s/^\\(XTerm\\*background: *\\)#[0-9a-fA-F]*/\\1$term/" \
+        -e "s/^\\(Mwm\\*menu\\*background: *\\)#[0-9a-fA-F]*/\\1$menu/" /home/desktop/.Xdefaults >/dev/null || fail "the edit failed"
+    ev_save xdefaults-after "EV-CONFIG: ~/.Xdefaults after the edit" podman exec desktop cat /home/desktop/.Xdefaults >/dev/null || true
+    ev_diff xdefaults "EV-DIFF: ~/.Xdefaults before (-) and after (+) the edit: two colours" "$before" "$EV_LAST"
+    grep -q "^XTerm\\*background: *$term" "$EV_DIR/$EV_LAST" && grep -q "^Mwm\\*menu\\*background: *$menu" "$EV_DIR/$EV_LAST" \
+        || fail "the two colours were not both edited"
+    x0=$(podman exec desktop pgrep -u desktop -x Xorg || true)
+    rc=0
+    ev_save session-restart "EV-PROCEDURE: README.md \"Look and feel\": \"an ~/.Xdefaults change needs a new X session (systemctl restart desktop-session.service in the container)\", run as written, in the container: its output and exit status" \
+        podman exec desktop systemctl restart desktop-session.service >/dev/null || rc=$?
+    if [ "$rc" = 0 ]; then
+        ev_pass "the README's \`systemctl restart desktop-session.service\` in the container exited 0"
+    else
+        ev_fail "the README's \`systemctl restart desktop-session.service\` in the container exited $rc: $(mt_saved "$EV_LAST" | head -n 2 | tr '\n' ' ')"
+    fi
+    sleep 3
+    x1=$(podman exec desktop pgrep -u desktop -x Xorg || true)
+    rc=0
+    ev_save session-restart-host "EV-PROCEDURE: the command's other reading, on the host: systemctl restart desktop-session.service, the host's login-session unit of that name: its output and exit status" \
+        systemctl restart desktop-session.service >/dev/null || rc=$?
+    ev_note "on the host, systemctl restart desktop-session.service exited $rc"
+    sleep 5
+    x2=$(podman exec desktop pgrep -u desktop -x Xorg || true)
+    ev_text xorg-pids "EV-PIDS: the session's Xorg: before the README's command, after it in the container, after the host unit's restart" \
+        "before: ${x0:-none}
+after the command in the container: ${x1:-none}
+after the host's unit restart: ${x2:-none}"
+    if [ -n "$x0" ] && { [ "$x1" != "$x0" ] || [ "$x2" != "$x0" ]; }; then
+        ev_pass "a new X session started (Xorg $x0 -> $x1 -> $x2)"
+    else
+        ev_fail "neither reading of the README's command started a new X session: the session's Xorg is pid ${x0:-none} throughout"
+    fi
+    ev_save session-unit "EV-STATE: systemctl status desktop-session.service on the host, after its restart" \
+        systemctl --no-pager status desktop-session.service >/dev/null || true
+    ev_end
+}
+# The image the restarted desktop runs, against the one the README's build
+# made (its id, from the maintainer's own storage, passed in by the VM host).
+mt_lf_image() { # <the built image's id>
+    local running latest
+    mt_begin S10.3.7
+    running=$(ev_save running-image "EV-STATE: podman inspect desktop --format '{{.Image}}': the image the restarted desktop runs" \
+        podman inspect --format '{{.Image}}' desktop) || true
+    latest=$(ev_save root-latest "EV-STATE: root's localhost/desktop-container:latest, the storage desktop.service runs from" \
+        podman image inspect --format '{{.Id}}' localhost/desktop-container:latest) || true
+    ev_note "the README's build made $1; root's localhost/desktop-container:latest is $latest; the desktop runs $running"
+    if [ "$running" = "$1" ]; then
+        ev_pass "the restarted desktop runs the image the README's build made"
+    else
+        ev_fail "the restarted desktop runs $running, not the image the README's build made ($1): the build went to a storage desktop.service does not run from"
+    fi
+    ev_end
+}
+
 # --- F10.4: routine operations ---------------------------------------------------
 
 # The common set and the pids, before a step that changes the desktop.
@@ -1141,6 +1390,16 @@ maint() { # <step> [args]
         route-check) mt_route_check "${2:?orig|alt}" "${3:?pin|tag}" ;;
         upgrade-done) mt_upgrade_done ;;
         upc-tone) mt_upc_tone "${2:?hz}" ;;
+        hostterm-before) mt_hostterm_before ;;
+        hostterm-switch) mt_hostterm_switch ;;
+        hostterm-after) mt_hostterm_after ;;
+        hostterm-strip) mt_hostterm_strip ;;
+        hostterm-start-state) mt_hostterm_start_state ;;
+        hostterm-enable) mt_hostterm_enable "${2:?the command, base64}" ;;
+        hostterm-journal) mt_hostterm_journal ;;
+        lf-mwmrc) mt_lf_mwmrc ;;
+        lf-xdefaults) mt_lf_xdefaults "${2:?XTerm background, hex}" "${3:?Mwm menu background, hex}" ;;
+        lf-image) mt_lf_image "${2:?the id of the image built}" ;;
         before) mt_before "${2:?story}" "${3:?moment}" ;;
         after) mt_after "${2:?story}" "${3:?moment before}" "${4:?moment after}" ;;
         restart) mt_restart ;;

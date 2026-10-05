@@ -15,6 +15,13 @@
 #                  to a second image and back by the digest pin and by
 #                  re-tagging, with a client running throughout (S10.3.1-
 #                  S10.3.4)
+#   maint-session  one host provisioned the same way; Host Terminal switched
+#                  off the documented way and a reboot, then on again from
+#                  its own failure screen; and README.md's look-and-feel
+#                  loops: ~/.mwmrc and Restart mwm, ~/.Xdefaults and a new
+#                  xterm, a repo file rebuilt and deployed (S10.3.5-S10.3.7).
+#                  The menu clicks are operator-e2e.py's (--maint), through
+#                  QEMU's own input devices
 # The gate then holds this workflow's stories (their Coverage lines name
 # it: "(workflow `maintainer.yml`)") to the evidence the run left.
 #
@@ -83,9 +90,17 @@ jobs:
           sudo podman save -o vm-images/images-desktop.tar localhost/desktop-container:latest
           sudo podman save -o vm-images/images-plugin.tar localhost/cdi-device-plugin:latest
           sudo podman save -o vm-images/images-testclient.tar localhost/desktop-testclient:latest
-          sudo podman save -o vm-images/images-desktop-alt.tar localhost/desktop-container:alt
-          sudo chmod 644 vm-images/*.tar
-          for i in desktop-container:latest cdi-device-plugin:latest desktop-testclient:latest desktop-container:alt; do
+          # The shards that need more get it as an artifact of its own:
+          # maint-config the second image, maint-session the bases a
+          # maintainer's earlier build leaves (README.md's rebuild loop
+          # builds on them).
+          mkdir -p vm-images-alt vm-images-bases
+          sudo podman save -o vm-images-alt/images-desktop-alt.tar localhost/desktop-container:alt
+          sudo podman save -o vm-images-bases/images-desktop-base.tar localhost/desktop-container-base:latest
+          sudo podman save -o vm-images-bases/images-screenshot.tar localhost/screenshot:latest
+          sudo chmod 644 vm-images*/*.tar
+          for i in desktop-container:latest cdi-device-plugin:latest desktop-testclient:latest desktop-container:alt \
+                   desktop-container-base:latest screenshot:latest; do
             printf '%s %s\n' "$i" "$(sudo podman image inspect "localhost/$i" --format '{{.Id}}')"
           done | tee vm-images/image-ids.txt
       - name: hand the images to the VM shards
@@ -95,6 +110,20 @@ jobs:
           path: vm-images/
           retention-days: 1
           compression-level: 1
+      - name: hand maint-config its second image
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images-alt
+          path: vm-images-alt/
+          retention-days: 1
+          compression-level: 1
+      - name: hand maint-session the bases
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images-bases
+          path: vm-images-bases/
+          retention-days: 1
+          compression-level: 1
 
   vm:
     name: maintainer (${{ matrix.shard }})
@@ -102,14 +131,21 @@ jobs:
     runs-on: ubuntu-latest
     # maint-docpath: two stock hosts provisioned from nothing, each with a
     # reboot, and a maintenance stop held for two minutes. maint-config: one
-    # host, and about fifteen desktop restarts.
+    # host, and about fifteen desktop restarts. maint-session: one host, a
+    # reboot, three desktop restarts and an image build.
     timeout-minutes: 60
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        shard: [maint-docpath, maint-config]
+        include:
+          - shard: maint-docpath
+            extra: ""
+          - shard: maint-config
+            extra: vm-images-alt
+          - shard: maint-session
+            extra: vm-images-bases
     steps:
       - uses: actions/checkout@v4
       - name: enable kvm access
@@ -140,6 +176,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: vm-images
+          path: ci/vm/
+      - name: fetch what this shard needs beside them
+        if: matrix.extra != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.extra }}
           path: ci/vm/
       - name: run the maintainer's journey (${{ matrix.shard }})
         env:
