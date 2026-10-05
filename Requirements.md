@@ -559,8 +559,8 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T0 · Coverage: ❌ evidence not saved; asserted by `layout-tests` "modesetting", which does not check `PreferredMode`.
 
 **S3.4.3 CVT timings match `cvt(1)`**
-- Requirement: the integer derivation equals cvt's output.
-- Acceptance: verbatim equality for 1920x1080@60 and 1280x1024@60; 59.94 carried. ❌ a wider table exercising every aspect branch (2560x1440, 3840x2160, 1080x1920, 75 Hz, 4:3, 5:4).
+- Requirement: the integer derivation equals, field for field, the Modeline the image's own `cvt(1)` prints (xserver 1.20.11's `xf86CVTMode()`; libxcvt's newer cvt differs from it in hsync start and the back porch floor). The one exception is a value that lands exactly on a rounding step, where cvt's single-precision floats can round the other way: of 6884 modes compared, 3432x1931@60 (one more line of vertical total) and 3104x2328@60 (a clock 0.25 MHz higher). Open: a width that is not a multiple of 8, such as 1366x768: `cvt(1)` changes the mode itself to 1368 wide, while the generator keeps the declared width.
+- Acceptance: field-for-field equality for 1920x1080@60 and 1280x1024@60; 59.94 carried. ❌ a wider table exercising every aspect branch (2560x1440, 3840x2160, 1080x1920, 75 Hz, 4:3, 5:4, 16:10, 15:9, and 1280x768, which only the divisibility check keeps out of 15:9).
 - Evidence: a table of declared mode → generated Modeline → `cvt` output (EV-STATE).
 - Tier: T0 · Coverage: ❌ no wider table, and nothing is saved; `layout-tests` pins 1920x1080@60 and 1280x1024@60 verbatim and checks that 59.94 is carried.
 
@@ -584,7 +584,7 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.4.7 A bad config is rejected whole**
 - Requirement: every validation failure logs `ERROR`, removes the output file, exits 0.
-- Acceptance: `layout-tests` rejection table; ❌ add bad `virtual`, `nvidia-connected` without list, `nvidia-edid` without `=`, digit-leading and illegal-character output names, and a global `watch` line (`README.md` documents it and `preflight-check.sh` accepts it, but the generator reads it as an output name and rejects the whole layout).
+- Acceptance: `layout-tests` rejection table; ❌ add bad `virtual`, `nvidia-connected` without list, `nvidia-edid` without `=`, digit-leading and illegal-character output names, and a `watch` line (a keyword that went with the session-side re-assert loop; the generator reads it as an output name and rejects the whole layout).
 - Evidence: per case: the input, the ERROR line, `ls` showing no output file.
 - Tier: T0 · Coverage: ❌ evidence not saved; the `layout-tests` rejection table lacks the five cases the Acceptance lists and never checks the exit status.
 
@@ -1958,7 +1958,7 @@ not, supposed to happen.
 - Requirement: whatever the maintainer writes in `monitors.conf`, the desktop comes up after the restart, and `podman logs desktop | grep xorg-monitor-conf` or `podman logs desktop | grep preflight:` (both in `deploy/README.md` "Verify") names the problem; every keyword the documentation offers is one the generator accepts.
 - Acceptance: one restart per case, with the desktop visible each time (EV-SHOT): (a) a malformed position gives an `ERROR` line with the line number, and autodetected geometry; (b) an output name that matches no connector gives preflight's WARN naming it; (c) each global keyword named in `README.md` "Fixed monitor layout (KVM video)" or in `monitors.conf`'s comments, with a valid value and beside a valid output line, gives the layout applied. T0 part: the keywords the documents name, the keywords `xorg-monitor-conf.sh` accepts and the keywords `preflight-check.sh` skips are the same set.
 - Evidence: per case, the file (EV-CONFIG), the two log slices and `xrandr --query`; the three keyword lists (EV-DIFF).
-- Tier: T0/T3 · Coverage: ❌. Nothing tests what the maintainer sees (`layout-tests` covers only the generator's rejections, S3.4.7), and the T0 keyword check would fail today: `README.md` advertises a global `watch` line, which `xorg-monitor-conf.sh` rejects together with the whole layout (`mode wants WxH[@Hz], got '5'`) while `preflight-check.sh` still skips it as a keyword.
+- Tier: T0/T3 · Coverage: ❌. Nothing tests what the maintainer sees (`layout-tests` covers only the generator's rejections, S3.4.7), and no T0 check compares the three keyword lists. They agree now: `README.md` and `preflight-check.sh` still named a `watch` keyword that `xorg-monitor-conf.sh` had dropped with its re-assert loop (it rejected the whole layout, `mode wants WxH[@Hz], got '5'`), and both were corrected.
 
 **S10.3.3 Upgrading and rolling back the desktop image**
 - Requirement: the maintainer brings a new desktop image into podman storage, points the unit at it, either by the documented digest pin (`/etc/containers/systemd/desktop.container.d/50-image.conf`, podman ≥ 5.0) or by re-tagging `localhost/desktop-container:latest` (the unit's default), and runs `systemctl restart desktop.service`. The new image runs; the published toolkit becomes the new image's (the "tool versions track the desktop image" claim); the operator gets the desktop back (S10.4.1); running clients behave as S7.8.1 and S7.8.2 require. Pointing back at the previous image and restarting restores it the same way.
