@@ -62,9 +62,16 @@ The desktop image is built in two stages with separate Containerfiles:
   iteration works completely offline:
 
 ```sh
-podman build -t localhost/desktop-container-base:latest -f Containerfile.base .
-podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+sudo podman build -t localhost/desktop-container-base:latest -f Containerfile.base .
+sudo podman build -t localhost/screenshot-base:latest -f Containerfile.screenshot.base .
+sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
+sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
 ```
+
+The desktop image's tools stage copies the screenshot tool out of
+`localhost/screenshot:latest`, so that image is built first, on a base of its
+own. As root: `desktop.service` runs from root's podman storage, and an image
+built in a user's own storage never reaches it.
 
 Nothing in the `deploy/` tree builds or pulls images — provisioning puts a
 prebuilt image in podman's storage. `ci/build-bases.sh` is the reference for
@@ -473,16 +480,20 @@ To change any of it, edit the file in `image/session/` and rebuild the
 application layer — offline, so no base rebuild and no network:
 
 ```sh
-podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
 sudo systemctl restart desktop.service
 ```
 
-For faster iteration, edit `/home/desktop/.mwmrc` inside the running
-container and pick **"Restart mwm"** from the root menu; `f.restart` re-reads
-the menus and bindings in place. Resources are **not** re-read by
-`f.restart`, so an `~/.Xdefaults` change needs a new X session
-(`systemctl restart desktop-session.service` in the container). Either way
-the edit lives only in the container's writable layer — nothing mounts a
+The build is root's for the same reason as above, and it needs the base and
+the screenshot tool's image in root's storage (built as above, or loaded
+there with `podman load`).
+
+For faster iteration, edit `/home/desktop/.mwmrc` or `~/.Xdefaults` inside
+the running container and pick **"Restart mwm"** from the root menu:
+`f.restart` starts mwm again in the same X session, and the new mwm reads its
+menus, bindings and resources afresh. Every client reads `~/.Xdefaults` as it
+starts, so the next xterm has the change too; one already open keeps its
+colours. Either way the edit lives only in the container's writable layer — nothing mounts a
 persistent `/home/desktop`, so `podman rm`/recreate or a k8s pod restart
 drops it. Land the real change in the repo file.
 
