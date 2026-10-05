@@ -1,12 +1,18 @@
 # Weekly from-scratch rebuild of the base image: early warning for
 # Rocky/UBI point-release drift (dnf conflicts fail this loudly before
 # anyone needs a base rebuild), and keeps the GHCR :latest base fresh
-# with security updates.
+# with security updates. Every run keeps S1.1.2's evidence: the build logs
+# and the week's package drift in the desktop base.
 name: base-rebuild
 on:
   schedule:
     - cron: "17 5 * * 1"
   workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the rebuilt bases to GHCR (content tag and latest). Off, the run rebuilds and keeps its evidence and leaves the registry as it is."
+        type: boolean
+        default: true
 permissions:
   contents: read
   packages: write
@@ -22,30 +28,28 @@ jobs:
         # --password-stdin, never -p: an argument would put the token in the
         # process list and in podman's own error output on a failed login.
         run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: rebuild bases from scratch
-        run: |
-          # --pull re-resolves the upstream FROM image even when a local copy
-          # exists, and --no-cache discards every layer cache entry. Together
-          # they are what makes this workflow mean anything: its whole job is
-          # to prove the bases still build from current upstream and to pick up
-          # security updates. Without them it could "succeed" against a stale
-          # cache and report a green that tested nothing.
-          sudo podman build --pull --no-cache -t localhost/desktop-container-base:latest -f Containerfile.base .
-          sudo podman build --pull --no-cache -t localhost/cdi-device-plugin-base:latest -f Containerfile.plugin.base .
-          sudo podman build --pull --no-cache -t localhost/screenshot-base:latest -f Containerfile.screenshot.base .
-      - name: offline app layers still build on the fresh bases
-        run: |
-          # --network=none is the offline gate, not a speed-up: these layers
-          # must build with no network at all, so a dependency can never be
-          # added without also changing a Containerfile.*.base and forcing a
-          # base rebuild. A build that needs the network fails here loudly
-          # instead of drifting.
-          #
-          # Before the desktop image, which stages its tools out of this one.
-          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
-          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
-          sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+      - name: rebuild the bases from scratch, then the app layers offline on them (S1.1.2)
+        # ci/base-rebuild.sh: --pull --no-cache for the three bases, then
+        # --network=none for the three app layers (the offline gate), each
+        # build's log kept, and rpm -qa of the desktop base GHCR held before
+        # this run diffed against the fresh one's.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "base-rebuild.yml (ci/base-rebuild.sh)"
+        run: ci/base-rebuild.sh
+      - name: the evidence is complete
+        if: always()
+        run: python3 ci/evlib.py check artifacts
+      - name: upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-base-rebuild
+          path: artifacts/
+          if-no-files-found: ignore
       - name: push refreshed bases (content tag + latest)
+        # Every scheduled run pushes; a manual run only when asked to.
+        if: github.event_name == 'schedule' || inputs.push
         env:
           PUSH_BASES: "1"
         run: |
