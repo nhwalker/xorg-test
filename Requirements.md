@@ -325,9 +325,9 @@ the same directory also receives the diagnostics the harness already prints
 
 **S2.2.2 Standalone fallback fabricates the runtime dir**
 - Requirement: with no host session unit, desktop-init creates `/run/user/61000` (0700, desktop) after the wait, logs `no host login session appeared; creating ... standalone`, and the desktop works.
-- Acceptance: `systemctl mask --now desktop-session`, restart desktop; the fallback line is logged; audio sockets export; the X session starts (T3). Unmask and restart afterwards. (`disable` is not enough: the quadlet's `Wants=desktop-session.service` starts the unit again whenever `desktop.service` starts.)
+- Acceptance: with the desktop stopped, move the tree's unit file aside, as on a host without it, and `daemon-reload` (`systemctl mask` is refused: the unit file is the tree's own, at `/etc/systemd/system/desktop-session.service`, the path mask's `/dev/null` link would take); start the desktop; the fallback line is logged; the dir is desktop-init's (0700, desktop, no mount); audio sockets export; the X session starts (T3). Put the unit file back and restart afterwards. (`disable` is not enough: the quadlet's `Wants=desktop-session.service` starts the unit again whenever `desktop.service` starts.)
 - Evidence: EV-LOG-DESKTOP (fallback line); `stat` of the dir (EV-STATE); EV-SHOT of the desktop up (T3); EV-AUDIO of a tone (T3).
-- Tier: T2 · Coverage: ❌ the acceptance's own procedure (desktop-session masked on a full deploy, the X session up, T3 EV-SHOT and EV-AUDIO) is not run. Saved: `smoke`'s scratch container of the image, with no host login session at all, logs the fallback line and makes `/run/user/61000` `drwx------ desktop:desktop`, under `artifacts/S2.2.2/` (artifact `evidence-smoke`).
+- Tier: T2/T3 · Coverage: ✅ `guest:standalone_desktop`, in the core shard, moves the unit file aside with the desktop stopped, and logind takes `/run/user/61000` away. desktop-init then logs `no host login session appeared; creating /run/user/61000 standalone` and makes the dir itself: `0700 desktop:desktop`, no mount. The audio export answers (`pactl info` over it from the host: `PulseAudio (on PipeWire 1.4.11)`), X answers and the session's mwm runs. The VM host shoots the screen and hears a pulse client in the session play 440 Hz (1.97 s, peak 0.547). The unit file then goes back as the tree ships it, and the runtime dir is logind's again. Under `artifacts/S2.2.2/` (artifact `evidence-vm-core`): the log, the dir in the container and on the host, the export, the screendump, the recording with check-audio.py's verdict and level plot, and the restored state. `smoke`'s scratch container, with no host login session at all, shows the same fallback and dir, under `artifacts/S2.2.2/` (artifact `evidence-smoke`).
 
 **S2.2.3 tty1 is handed to the session user**
 - Requirement: `/dev/tty1` in the container is owned `desktop:tty` before every session start.
@@ -377,7 +377,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
 - Acceptance: kill mwm as uid desktop (SIGTERM, `kill`'s default: mwm quits without asking, since the image drops `kill` from mwm's `showFeedback`); Xorg pid changes; new mwm; display answers.
 - Evidence: EV-VIDEO; EV-PIDS before/after; EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: 🟡 the acceptance's trigger is asserted at T2, its own EV-VIDEO not taken: `smoke` sends mwm SIGTERM as the session user and saves desktop-init, Xorg and mwm before and after (a new Xorg and mwm, the same desktop-init, the display answering) and the log's clean end (`session exited (rc=0)`, no postmortem), under `artifacts/S2.3.6/` (artifact `evidence-smoke`). "Quit session" is asserted with its video, pid tables and desktop log by `operator-e2e:menu_quit_session` in `artifacts/S11.1.1/`.
+- Tier: T3 · Coverage: ✅ `guest:verify_mwm_exit`, in the core shard, sends mwm SIGTERM (`kill`'s default) as the session user. desktop-init logs `session exited (rc=0); restarting in 3s` and runs no postmortem; Xorg and mwm are new (40291 → 58054, 40301 → 58064) under the same desktop-init, and the display answers 4.5 s after the signal. The VM host records the display throughout. Under `artifacts/S2.3.6/` (artifact `evidence-vm-core`): the pids before and after with their diff, the desktop log from the SIGTERM on, the video (its index.txt timed against the guest's notes) and the new session's screendump. `smoke` asserts the same at T2, under `artifacts/S2.3.6/` (artifact `evidence-smoke`). "Quit session" is asserted with its video, pid tables and desktop log by `operator-e2e:menu_quit_session` in `artifacts/S11.1.1/`.
 
 ### F2.4 Audio supervision
 
@@ -499,7 +499,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: for video/render/input/audio, the container group is renumbered to the host node's gid; collisions move the other group to a free gid ≥ 60000; missing groups are created; root-group and absent nodes are skipped with a log line; the final-state table and `id desktop` are logged; the narrow form touches only the named groups.
 - Acceptance: T1 in a scratch container with fabricated nodes per branch; T3 preflight `desktop user can read` PASS for all three node kinds.
 - Evidence: T1 `getent group` before/after per branch (EV-DIFF); T3 EV-LOG-DESKTOP align table + preflight lines; `ls -ln /dev/dri /dev/input /dev/snd` host and container (EV-STATE).
-- Tier: T1/T3 · Coverage: ❌ no branch test and no evidence saved; the container preflight's `desktop user can read` lines are never asserted, so alignment shows only through rootless Xorg opening DRM and evdev (`guest:phase_deploy`, `e2e` "input: type into an xterm").
+- Tier: T1/T3 · Coverage: 🟡 ✅ the T3 half: `guest:session_groups`, in the core shard. Every group in align-device-groups' final-state table carries the gid of the host node it names: video 39 (`/dev/dri/card0`), render 105 (`/dev/dri/renderD128`), input 104 (`/dev/input/event0`), audio 63 (`/dev/snd/controlC0`). The table ends with `id desktop`, and the container preflight passes `desktop user can read` for `/dev/dri/card0`, `/dev/input/event0` and `/dev/snd/controlC0`. Under `artifacts/S3.2.2/` (artifact `evidence-vm-core`): the align lines, the preflight lines, `ls -ln` of the nodes on the host and in the container, and `getent group` with `id desktop`. ❌ the T1 half: no branch-by-branch test of `align-device-groups.sh` yet.
 
 **S3.2.3 VT nodes are created when the runtime does not expose them**
 - Requirement: `ensure-vt-devices.sh` creates `/dev/tty0` (c 4:0) and `/dev/tty1` (c 4:1), mode 620, `root:tty` (desktop-init then hands `tty1` to the session user), no-op when present.
@@ -611,7 +611,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: an output name with no matching DRM connector yields the WARN line; known names yield the PASS line.
 - Acceptance: `smoke` (DP-1/DP-2 on the runner) asserts the WARN; T3 asserts the PASS.
 - Evidence: EV-LOG-DESKTOP preflight lines; `ls /sys/class/drm/` (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌.
+- Tier: T2/T3 · Coverage: ✅ `smoke` declares DP-1 and DP-2 on a runner that has neither: the preflight WARNs about both (`fixed monitor layout names output(s) DP-1 DP-2 with no matching DRM connector (Virtual-1 )`), under `artifacts/S3.4.11/` (artifact `evidence-smoke`) with the runner's `ls /sys/class/drm`. `guest:layout_declare` declares Virtual-1 and Virtual-2 in the VM: the preflight PASSes both (`fixed monitor layout declares Virtual-1 Virtual-2, all present as DRM connectors`), under `artifacts/S3.4.11/` (artifact `evidence-vm-core`) with the VM's `ls /sys/class/drm`.
 
 **S3.4.12 `desktop-monitors-capture` prints a valid, round-trippable block**
 - Requirement: one line per enabled output; refuses non-root; fails cleanly when the desktop is down; its output through the generator reproduces the geometry.
@@ -643,7 +643,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the theme's screendump stddev stays ≥ 2× the 0.02 threshold.
 - Acceptance: ≥ 0.04 on the deploy screendump.
 - Evidence: the measurement in the index.
-- Tier: T3 · Coverage: ❌ not asserted (`e2e:assert_nonblank` checks > 0.02 only), and the measurement is only in the job log.
+- Tier: T3 · Coverage: ✅ `e2e` keeps `assert_nonblank`'s measurement of the deploy screendump (mwm's root and the deploy-proof xterm) and checks it against twice the render test's 0.02: 0.0510978 ≥ 0.04. The screendump and the measurement are under `artifacts/S3.5.4/` (artifact `evidence-vm-core`).
 
 ### F3.6 Window manager
 
@@ -712,9 +712,9 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.8.6 Foreign seat tags are detected and undone**
 - Requirement: a device attached to another seat is reported by preflight as a WARN until `seat-prep` removes the rule and re-triggers udev.
-- Acceptance: `loginctl attach seat1 <device>`; `udevadm info` shows `ID_SEAT=seat1`; restart `desktop-seat-prep`; rule gone, tag absent; restart desktop; preflight `PASS: no foreign seat tags`.
+- Acceptance: `loginctl attach seat1 <device>`; `udevadm info` shows `ID_SEAT=seat1`; restart the desktop: preflight WARNs; with the desktop stopped (as at boot), restart `desktop-seat-prep`; the rule is gone and no entry in the udev database is tagged for another seat, the device's children (a keyboard's LEDs) included; restart desktop; preflight `PASS: no foreign seat tags`.
 - Evidence: `udevadm info` before/after (EV-DIFF); `ls /etc/udev/rules.d/72-seat-*` before/after; EV-LOG-JOURNAL of `desktop-seat-prep`; EV-LOG-DESKTOP preflight line; the keyboard still types afterwards (EV-SHOT).
-- Tier: T3 · Coverage: ❌ evidence not saved; `smoke` asserts only that `seat-prep` removes a fake empty `72-seat-*` rule, with no real attach, tag check or preflight line.
+- Tier: T3 · Coverage: ✅ `guest:seat_tags`, in the core shard. `loginctl attach seat1` puts the USB keyboard (kvmkbd) on seat1 (`/dev/input/event4` reads `ID_SEAT=seat1`), and the desktop restarted then WARNs about the foreign tag. `desktop-seat-prep`, restarted with the desktop stopped, logs the rule's removal: the rule is gone, and no udev database entry is tagged for another seat. The desktop started after it PASSes the seat check. The keyboard types again: the VM host types `seatok` into a sink xterm through QEMU's keyboard, the sink's shell reads exactly that, and `xinput test` on the USB keyboard's own X device sees the key presses. Under `artifacts/S3.8.6/` (artifact `evidence-vm-core`): the rules directory and `udevadm info` before and after with their diff, the rule loginctl wrote, every foreign-tagged udev entry after the attach and after seat-prep, seat-prep's journal, both preflight lines, `xinput list`, the QMP transcript, the screendump, the xinput test and the sink's file.
 
 ### F3.9 HMI hotplug: keyboards and pointers
 
@@ -903,21 +903,21 @@ event, EV-TIMELINE.
 
 **S4.2.1 Host Pulse clients are routed to the container**
 - Requirement: the host Pulse client drop-in routes an unconfigured host client to the export and never autospawns a daemon.
-- Acceptance: on the VM host **without** `PULSE_SERVER` set, `paplay tone.wav` plays and is captured; a stub `/usr/bin/pulseaudio` that logs every start shows none (without the stub, "no daemon was spawned" cannot fail on a host that has no daemon to spawn).
+- Acceptance: on the VM host **without** `PULSE_SERVER` set, `paplay tone.wav` plays and is captured, and a stub `/usr/bin/pulseaudio` that logs every start shows none. EL9's libpulse does not autospawn unless its client configuration asks it to, so the stub alone could not fail: in a private mount namespace, with the export hidden and `/etc/pulse/client.conf` saying `autospawn = yes`, a client with the drop-in starts no stub, and the control, the drop-in hidden, does.
 - Evidence: EV-AUDIO; `env | grep PULSE` (empty) and `pgrep pulseaudio` (empty) (EV-STATE); the drop-in (EV-CONFIG).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:host_audio`, in the core shard. rocky, with a clean environment and no `PULSE_` variable, plays a 440 Hz tone with `paplay` (exit 0), and the VM host hears it (3.08 s, peak 0.547); the stub `/usr/bin/pulseaudio` records no start, and no pulseaudio runs. In a private mount namespace, the export hidden under an empty tmpfs and `client.conf` saying `autospawn = yes`, rocky's `pactl info` with the drop-in tries only `unix:/run/desktop-audio/pulse` and starts nothing; the control, the drop-in hidden, runs the stub (`/usr/bin/pulseaudio --start`). Under `artifacts/S4.2.1/` (artifact `evidence-vm-core`): the namespace transcript, the probe (the drop-in, `env | grep PULSE`, `pgrep -a pulse`), and the recording with check-audio.py's verdict and level plot.
 
 **S4.2.2 Host ALSA clients are routed through the pulse plugin**
 - Requirement: the ALSA drop-in routes `pcm.!default`/`ctl.!default` to the pulse socket.
-- Acceptance: on the VM host (with `alsa-utils` + `alsa-plugins-pulseaudio`), `aplay tone.wav` plays and is captured at 1320 Hz; `amixer` lists the pulse control.
+- Acceptance: on the VM host (with `alsa-utils` + `alsa-plugins-pulseaudio`), the deploy tree's drop-in loads last in `/etc/alsa/conf.d`, after the package's own `99-pulseaudio-default.conf`, whose server-less `pcm.!default` would otherwise win; `aplay tone.wav`, with libpulse given no default server of its own, plays and is captured at 1320 Hz; `amixer` lists the pulse control; the control, the same aplay with the drop-in hidden, is refused.
 - Evidence: EV-AUDIO; `amixer` output (EV-STATE); the drop-in (EV-CONFIG).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:host_audio`, in the core shard. `/etc/alsa/conf.d` in load order ends with `99-zz-desktop-container.conf`. rocky's `aplay` through ALSA's default, with an empty client config (no default server), exits 0 and the VM host hears 1320 Hz (3.23 s, peak 0.547); `amixer info` names `'pulse'/'PulseAudio'`. With the drop-in hidden (`/dev/null` bound over it in a private mount namespace) the same aplay is refused (`PulseAudio: Unable to connect: Connection refused`). Under `artifacts/S4.2.2/` (artifact `evidence-vm-core`): the packages, `/etc/alsa/conf.d` with each file, the control, the probe, and the recording with its verdict and level plot.
 
 **S4.2.3 A host-local `asound.conf` still wins**
 - Requirement: the drop-in loads before `/etc/asound.conf`, so a host override is honoured.
 - Acceptance: with an `/etc/asound.conf` routing default to `null`, `aplay -D default` produces no capture; remove it.
 - Evidence: EV-AUDIO (silence, analyser fails as expected); the override file.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:host_audio`, in the core shard. With an `/etc/asound.conf` routing default to `null`, rocky's `aplay -D default` of 1320 Hz exits 0 and the VM host hears nothing (peak 0.000; check-audio.py fails, as expected). With the file removed, the same aplay is heard at 1320 Hz (3.20 s, peak 0.547). Under `artifacts/S4.2.3/` (artifact `evidence-vm-core`): the override file, both probes, both recordings with their verdicts and level plots, and `/etc/asound.conf`'s absence afterwards.
 
 ### F4.3 Realtime
 
@@ -1319,8 +1319,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.8.4 The desktop runs with the unit disabled**
 - Requirement: see S2.2.2.
+- Acceptance: `systemctl disable desktop-session` does not take the unit out of the desktop's start (the quadlet's `Wants=`), and `systemctl mask` is refused, the unit file being the tree's own; with the unit file moved aside (S2.2.2's procedure) the desktop runs.
 - Evidence: as S2.2.2.
-- Tier: T2 · Coverage: ❌ as S2.2.2: the fallback is shown only in a scratch container, not with the unit disabled on a full deploy.
+- Tier: T3 · Coverage: ✅ `guest:standalone_desktop`, in the core shard. With the unit disabled and the desktop started, desktop-session still came up (desktop.container's `Wants=`) and the runtime dir was the host's: disabling is not enough. `systemctl mask desktop-session` is refused (exit 1): the unit file is the tree's own, at the path mask's link would take. With the unit file moved aside the desktop runs: X answers and the audio export answers (S2.2.2 has the runtime dir), and the VM host shoots the screen. Each state is under `artifacts/S5.8.4/` (artifact `evidence-vm-core`).
 
 ### F5.9 Accounts, tmpfiles, sysusers
 
@@ -2302,15 +2303,15 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 12 | 0 | 2 | 0 |
-| E2 Boot & supervision | 25 | 22 | 1 | 2 | 0 |
-| E3 Display & session | 62 | 54 | 1 | 4 | 3 |
-| E4 Audio | 23 | 18 | 0 | 4 | 1 |
-| E5 Deploy tree | 50 | 42 | 2 | 5 | 1 |
+| E2 Boot & supervision | 25 | 24 | 0 | 1 | 0 |
+| E3 Display & session | 62 | 57 | 1 | 1 | 3 |
+| E4 Audio | 23 | 21 | 0 | 1 | 1 |
+| E5 Deploy tree | 50 | 43 | 2 | 4 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 39 | 0 | 1 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **201** | **4** | **40** | **6** |
+| **Total** | **251** | **210** | **3** | **32** | **6** |
 
 Regenerate after editing with:
 
