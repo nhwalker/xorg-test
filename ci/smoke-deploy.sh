@@ -1006,6 +1006,7 @@ follower=$!
 sleep 1
 ev_save pids-before "EV-PIDS: every uid-61000 process on the host before the stop" \
     ps -o pid,ppid,sess,tty,lstart,comm -u 61000 >/dev/null || true
+stop_epoch=$(date +%s)
 took=$(ev_save stop "EV-STATE: time systemctl stop desktop.service (podman's stop timeout, after which it would SIGKILL, is 10 s)" \
     bash -c 'TIMEFORMAT="took %R s"; time systemctl stop desktop.service') || fail "systemctl stop desktop.service failed"
 took=$(sed -n 's/^took \([0-9.]*\) s$/\1/p' <<<"$took")
@@ -1043,10 +1044,12 @@ ev_end
 ev_begin S2.5.2 "The X socket is unlinked by the server, not pinned by a mount" T2
 ev_save x11-stopped "EV-STATE: ls -li /tmp/.X11-unix after the stop" ls -li /tmp/.X11-unix >/dev/null || true
 if [ -e /tmp/.X11-unix/X0 ]; then
+    x0_gone=0
     lst=$(ss -xlH 2>/dev/null | grep -F '/tmp/.X11-unix/X0' || true)
     [ -z "$lst" ] || fail "X0 is still served after the stop: $lst"
     ev_pass "after the stop X0 is a dead file: nothing listens on it"
 else
+    x0_gone=1
     ev_pass "after the stop /tmp/.X11-unix/X0 is gone"
 fi
 ev_end
@@ -1058,10 +1061,19 @@ wait_x_up "after the stop and start"
 ev_begin S2.5.2 "The X socket is unlinked by the server, not pinned by a mount" T2
 ev_save x11-started "EV-STATE: ls -li /tmp/.X11-unix after the next start" ls -li /tmp/.X11-unix >/dev/null || true
 [ -S /tmp/.X11-unix/X0 ] || fail "no X0 socket after the start"
-ino_after=$(stat -c %i /tmp/.X11-unix/X0)
 ev_diff x11 "EV-DIFF: /tmp/.X11-unix with the desktop running, then after the stop and the next start" "$x11_running" "$EV_LAST"
-[ "$ino_after" != "$ino_before" ] || fail "X0 has the same inode ($ino_after) as before the stop: not a fresh socket"
-ev_pass "the next start made a fresh X0 (inode $ino_before -> $ino_after)"
+# Not the inode number: this runner's /tmp is ext4, which hands a freed
+# number to the next file made, so a new X0 can carry the old one's
+# (the first run of this check saw exactly that, 533211 both times).
+born=$(stat -c %W /tmp/.X11-unix/X0)
+ev_note "X0 after the start: inode $(stat -c %i /tmp/.X11-unix/X0) (was $ino_before), born $born (epoch s; 0 if the filesystem does not say); the stop began at $stop_epoch"
+if [ "$x0_gone" = 1 ]; then
+    ev_pass "the next start made X0 anew: the stop left none, so this one is the new server's"
+elif [ "$born" -ge "$stop_epoch" ]; then
+    ev_pass "the next start replaced the dead X0: this one was born at or after the stop"
+else
+    fail "X0 after the start predates the stop (born $born, stop at $stop_epoch): the server did not make a fresh socket"
+fi
 ev_save xdpyinfo "EV-STATE: xdpyinfo on :0 in the container after the start" \
     podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null || fail "xdpyinfo failed after the start"
 ev_pass "xdpyinfo answers on it"
