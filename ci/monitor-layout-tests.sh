@@ -130,25 +130,50 @@ cp "$MONITORS_OUT" "$TMP/modesetting.conf"
 ev_end
 
 ev_begin S3.4.3 "CVT timings match cvt(1)" T0
-# Verbatim cvt(1) output for these two modes. Equality, not a pattern: the
-# point is that a monitor with no EDID is handed a timing it will accept.
-has "$TMP/modesetting.conf" 'Modeline "1920x1080_60.00" 173.00  1920 2048 2248 2576  1080 1083 1088 1120 -hsync +vsync' \
-    "1920x1080@60: the Modeline is cvt(1)'s, verbatim"
-has "$TMP/modesetting.conf" 'Modeline "1280x1024_60.00" 109.00  1280 1368 1496 1712  1024 1027 1034 1063 -hsync +vsync' \
-    "1280x1024 (60 Hz by default): the Modeline is cvt(1)'s, verbatim"
+# cvt(1)'s Modeline for each mode, verbatim as the image's own cvt prints it
+# (Rocky 9's xorg-x11-server-Xorg 1.20.11; the runner has no cvt, so the
+# lines are pinned here). Every aspect branch: 16:9 at 50/60/75/85 Hz and at
+# 1440p and 2160p, 5:4 (also with no refresh given: 60), 4:3 twice, 16:10,
+# 15:9, portrait (no standard ratio), and 1280x768, which only the
+# divisibility check keeps out of 15:9. Equality field for field, not a
+# pattern: cvt pads after the name differently, nothing else may differ.
+# The point is that a monitor with no EDID is handed a timing it accepts.
+gpu_conf modesetting
+: > "$TMP/cvt-table"
+while IFS='|' read -r label decl ref; do
+    printf 'DP-1 %s +0+0\n' "$decl" > "$MONITORS_CONF"
+    rc=0
+    "$GEN" > "$TMP/log" 2>&1 || rc=$?
+    gen=$(sed -n 's/^ *\(Modeline .*\)/\1/p' "$MONITORS_OUT" 2>/dev/null)
+    printf '%s\n  generated: %s\n  cvt(1):    %s\n' "$label" "${gen:-(none; the generator exited $rc)}" "$ref" >> "$TMP/cvt-table"
+    if [ "$rc" = 0 ] && [ -n "$gen" ] && [ "$(tr -s ' ' <<<"$gen")" = "$(tr -s ' ' <<<"$ref")" ]; then
+        ok "$label: the generated Modeline is cvt(1)'s, field for field"
+    else
+        fail "$label: the generated Modeline is not cvt(1)'s (exit $rc)"
+    fi
+done <<'EOF'
+1920x1080@60 (16:9)|1920x1080@60|Modeline "1920x1080_60.00"  173.00  1920 2048 2248 2576  1080 1083 1088 1120 -hsync +vsync
+1920x1080@50 (16:9)|1920x1080@50|Modeline "1920x1080_50.00"  141.50  1920 2032 2232 2544  1080 1083 1088 1114 -hsync +vsync
+1920x1080@75 (16:9)|1920x1080@75|Modeline "1920x1080_75.00"  220.75  1920 2064 2264 2608  1080 1083 1088 1130 -hsync +vsync
+1920x1080@85 (16:9)|1920x1080@85|Modeline "1920x1080_85.00"  253.25  1920 2064 2272 2624  1080 1083 1088 1137 -hsync +vsync
+2560x1440@60 (16:9)|2560x1440@60|Modeline "2560x1440_60.00"  312.25  2560 2752 3024 3488  1440 1443 1448 1493 -hsync +vsync
+3840x2160@60 (16:9)|3840x2160@60|Modeline "3840x2160_60.00"  712.75  3840 4160 4576 5312  2160 2163 2168 2237 -hsync +vsync
+1280x1024@60 (5:4)|1280x1024@60|Modeline "1280x1024_60.00"  109.00  1280 1368 1496 1712  1024 1027 1034 1063 -hsync +vsync
+1280x1024 (5:4, no refresh given: 60)|1280x1024|Modeline "1280x1024_60.00"  109.00  1280 1368 1496 1712  1024 1027 1034 1063 -hsync +vsync
+1600x1200@60 (4:3)|1600x1200@60|Modeline "1600x1200_60.00"  161.00  1600 1712 1880 2160  1200 1203 1207 1245 -hsync +vsync
+1024x768@60 (4:3)|1024x768@60|Modeline "1024x768_60.00"   63.50  1024 1072 1176 1328  768 771 775 798 -hsync +vsync
+1920x1200@60 (16:10)|1920x1200@60|Modeline "1920x1200_60.00"  193.25  1920 2056 2256 2592  1200 1203 1209 1245 -hsync +vsync
+1800x1080@60 (15:9)|1800x1080@60|Modeline "1800x1080_60.00"  161.75  1800 1920 2104 2408  1080 1083 1090 1120 -hsync +vsync
+1080x1920@60 (portrait: no standard ratio)|1080x1920@60|Modeline "1080x1920_60.00"  176.50  1080 1168 1280 1480  1920 1923 1933 1989 -hsync +vsync
+1280x768@60 (768 not divisible by 9: no standard ratio)|1280x768@60|Modeline "1280x768_60.00"   79.50  1280 1344 1472 1664  768 771 781 798 -hsync +vsync
+EOF
 log "a fractional refresh is carried through"
 printf 'DP-1 1920x1080@59.94 +0+0\n' > "$MONITORS_CONF"
 run fractional
 has "$MONITORS_OUT" '"1920x1080_59.94"' "a fractional refresh (59.94) is carried into the mode name"
-ev_text cvt-table "EV-STATE: declared mode -> the Modeline the generator wrote -> cvt(1)'s Modeline, pinned in this script" \
-"1920x1080@60
-  generated: $(grep -F 'Modeline "1920x1080_60.00"' "$TMP/modesetting.conf" | sed 's/^ *//')
-  cvt(1):    Modeline \"1920x1080_60.00\" 173.00  1920 2048 2248 2576  1080 1083 1088 1120 -hsync +vsync
-1280x1024 (no refresh: 60)
-  generated: $(grep -F 'Modeline "1280x1024_60.00"' "$TMP/modesetting.conf" | sed 's/^ *//')
-  cvt(1):    Modeline \"1280x1024_60.00\" 109.00  1280 1368 1496 1712  1024 1027 1034 1063 -hsync +vsync
-1920x1080@59.94
-  generated: $(grep -F 'Modeline' "$MONITORS_OUT" | sed 's/^ *//')"
+printf '1920x1080@59.94 (fractional refresh; not in the table above)\n  generated: %s\n' \
+    "$(sed -n 's/^ *\(Modeline .*\)/\1/p' "$MONITORS_OUT")" >> "$TMP/cvt-table"
+ev_copy "$TMP/cvt-table" cvt-table "EV-STATE: declared mode -> the Modeline the generator wrote -> the Modeline the image's cvt(1) prints (Rocky 9, xorg-x11-server-Xorg 1.20.11), pinned in this script"
 ev_end
 
 ev_begin S3.4.4 "Rotation transposes extents" T0
