@@ -428,7 +428,7 @@ jobs:
           ev_check "it reports the missing quadlet as a FAIL" grep -q 'FAIL: quadlet unit missing' <<<"$pf" || f=1
           ev_check "it passes the stub CDI spec this step wrote" grep -q 'PASS: GPU-less host: stub CDI spec' <<<"$pf" || f=1
           ev_check "it passes the desktop-shell account this step created" grep -q 'PASS: desktop-shell account exists' <<<"$pf" || f=1
-          ev_check "it passes the seat state seat-prep converged" grep -q 'PASS: default target is multi-user.target' <<<"$pf" || f=1
+          ev_check "it passes the default target seat-prep set (multi-user.target)" grep -q 'PASS: default target is multi-user.target' <<<"$pf" || f=1
           ev_end
           [ "$f" = 0 ]
 
