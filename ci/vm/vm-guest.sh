@@ -2734,7 +2734,11 @@ verify_runtime() {
     ev_pass "/run/udev is mounted ro: $(awk '{print $4}' <<<"$udev_mnt")"
     [ "${n_data:-0}" -gt 0 ] || fail "the container's /run/udev/data is empty"
     ev_pass "and it holds the host's database: $n_data entries in /run/udev/data"
-    podman logs desktop 2>&1 | grep -q 'preflight: PASS: host udev database mounted at /run/udev' \
+    # Read whole, then searched: `podman logs | grep -q` under pipefail fails
+    # on podman's SIGPIPE once grep has its match.
+    local dlog
+    dlog=$(podman logs desktop 2>&1 || true)
+    grep -q 'preflight: PASS: host udev database mounted at /run/udev' <<<"$dlog" \
         || fail "the preflight did not pass its udev line"
     ev_pass "the container's preflight reports PASS: host udev database mounted at /run/udev"
     ev_end
@@ -2833,7 +2837,9 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
     ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across the restart (Xorg and mwm new, desktop-init the same)" "$p_before" "$EV_LAST"
     ev_save log "EV-LOG-DESKTOP: podman logs desktop from the kill on" \
         sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
-    podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) | grep -q 'desktop-init: session exited (rc=[0-9]*); restarting in 3s' \
+    local since
+    since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) || true)
+    grep -q 'desktop-init: session exited (rc=[0-9]*); restarting in 3s' <<<"$since" \
         || fail "desktop-init did not log 'session exited (rc=N); restarting in 3s' after the kill"
     ev_pass "desktop-init logged the session's exit and its restart in 3 s"
     [ -n "$xorg2" ] && [ "$xorg2" != "$xorg" ] && [ -n "$mwm2" ] && [ "$mwm2" != "$mwm" ] \
@@ -2877,7 +2883,7 @@ x_answers() { podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2
 verify_audio_restarts() {
     log ar "wireplumber alone, then pipewire-pulse alone: each takes the stack down and back"
     ev_begin S2.4.2 "Any daemon exiting restarts the whole stack" T3
-    local victim before after n_lines b a
+    local victim before after n_lines b a since
     for victim in wireplumber pipewire-pulse; do
         wait_for 30 2 "the audio export" audio_reachable
         before=$(audio_trio)
@@ -2895,9 +2901,10 @@ verify_audio_restarts() {
         ev_diff "pids-$victim" "EV-DIFF: the audio daemons across $victim's exit (all three new)" "$b" "$EV_LAST"
         ev_save "log-$victim" "EV-LOG-DESKTOP: podman logs desktop from $victim's kill on" \
             sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
-        podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) | grep -q "start-audio: $victim exited" \
+        since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) || true)
+        grep -q "start-audio: $victim exited" <<<"$since" \
             || fail "start-audio did not log '$victim exited'"
-        podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) | grep -q 'desktop-init: audio stack exited (rc=[0-9]*); restarting in 3s' \
+        grep -q 'desktop-init: audio stack exited (rc=[0-9]*); restarting in 3s' <<<"$since" \
             || fail "desktop-init did not log the audio stack's restart after $victim's exit"
         ev_pass "killing $victim alone: start-audio logged '$victim exited', the stack restarted, all three daemons new ($before -> $after), the export answers"
     done
