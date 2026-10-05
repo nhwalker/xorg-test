@@ -9,6 +9,11 @@ Description=Converge host seat state for the containerized desktop
 # freed; desktop.service still starts (Wants=, not Requires=) and its Xorg
 # will hit the same conflict - this unit's log names the culprit process.
 Before=desktop.service
+# Before EVERY desktop start, not only the boot's first: a desktop stop or
+# restart stops this unit with it, so the next start runs the script again
+# (RemainAfterExit= would otherwise keep it "active" from boot, and a
+# desktop started again would find the seat unchecked).
+PartOf=desktop.service
 
 [Service]
 Type=oneshot

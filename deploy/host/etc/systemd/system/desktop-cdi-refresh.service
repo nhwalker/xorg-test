@@ -9,6 +9,11 @@ Description=Converge the NVIDIA CDI spec for the containerized desktop
 # unit Condition, decides real vs stub, because the no-downgrade logic
 # needs to run even when the GPU stack looks absent.
 Before=desktop.service
+# Before EVERY desktop start (deploy/README.md), not only the boot's first:
+# a desktop stop or restart stops this unit with it, so the next start
+# converges the spec again - a driver or toolkit installed since boot is
+# picked up by restarting the desktop.
+PartOf=desktop.service
 # Reduce the odds of racing the NVIDIA kernel module load on GPU hosts
 # (the script's keep-real-spec rule covers the remainder).
 After=systemd-modules-load.service
