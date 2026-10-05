@@ -449,6 +449,14 @@ jobs:
           EV_ROOT: ${{ github.workspace }}/artifacts
           EV_SOURCE: "ci.yml build-smoke (ci/align-groups-tests.sh)"
         run: ci/align-groups-tests.sh
+      - name: host-shell-setup's cases (S5.7.7's T1 half)
+        # The container side of the Host Terminal in scratch containers of
+        # the image: no key material, a key with no or an empty shell-user,
+        # and both, with the preflight's host-shell row in each.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/host-shell-setup-tests.sh)"
+        run: ci/host-shell-setup-tests.sh
       - name: deploy tree quadlet dry-run + CDI spec checks
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts

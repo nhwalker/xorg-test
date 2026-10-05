@@ -1384,6 +1384,69 @@ cwho=$(ev_save container-after "the container's ssh host after desktop.service r
 ev_pass "after desktop.service restarted, the container logs in again (whoami: desktop-shell)"
 ev_end
 
+# --- the Host Terminal switched off: the container degrades (S5.7.7) ---------
+# The documented off-switch (deploy/README.md, "Host Terminal"): the
+# quadlet's Wants=/After= on desktop-host-shell.service commented out. A
+# restart alone would not do: Wants= starts the key unit again with the
+# desktop. With the unit stopped and its key files deleted, the desktop
+# starts with no key material: host-shell-setup.sh says so, the preflight
+# warns, and the session comes up as ever. Then the quadlet goes back, and
+# the next start makes a fresh key.
+log "Host Terminal off: the desktop starts without key material"
+ev_begin S5.7.7 "Container side degrades gracefully without key material" T2
+QL=/etc/containers/systemd/desktop.container
+cp "$QL" /tmp/ev-desktop.container
+sed -i -e 's/^Wants=desktop-host-shell\.service$/# &/' -e 's/^After=desktop-host-shell\.service$/# &/' "$QL"
+ev_save quadlet-off "EV-CONFIG: the quadlet's lines naming desktop-host-shell, the two dependencies commented out (the documented off-switch)" \
+    grep -n 'desktop-host-shell' "$QL" >/dev/null || true
+! grep -qE '^(Wants|After)=desktop-host-shell\.service$' "$QL" || fail "the off-switch did not take: the quadlet still names desktop-host-shell.service"
+systemctl daemon-reload
+deps=$(ev_save deps-off "EV-STATE: systemctl show -p Wants -p After desktop.service after daemon-reload: no desktop-host-shell.service" \
+    systemctl show -p Wants -p After desktop.service) || fail "systemctl show desktop.service failed"
+! grep -q 'desktop-host-shell' <<<"$deps" || fail "desktop.service still wants, or starts after, desktop-host-shell.service"
+ev_pass "with the two lines commented out and a daemon-reload, desktop.service neither wants nor waits for desktop-host-shell.service"
+systemctl stop desktop.service
+systemctl stop desktop-host-shell.service
+rm -f /etc/desktop-container/host-shell-key /etc/desktop-container/host-shell-key.pub
+ev_save material-off "EV-STATE: ls -l /etc/desktop-container with the unit stopped and its key files deleted" \
+    ls -l /etc/desktop-container >/dev/null || true
+systemctl start desktop.service || fail "desktop.service did not start without the Host Terminal"
+wait_x_up "the Host Terminal off"
+ev_pass "the desktop starts and its X session comes up without key material"
+ks=$(systemctl is-active desktop-host-shell.service 2>/dev/null || true)
+ev_note "desktop-host-shell.service after the start: $ks"
+[ "$ks" != active ] || fail "desktop-host-shell.service ran with the desktop, off-switch notwithstanding"
+[ ! -e /etc/desktop-container/host-shell-key ] || fail "a host-shell key appeared though nothing should have made one"
+ev_pass "nothing made a key: desktop-host-shell.service is $ks and /etc/desktop-container has no host-shell-key"
+off_log=$(desktop_log)
+hs=$(grep -E '^host-shell-setup: |^preflight: (PASS|WARN): .*host shell material' <<<"$off_log" || true)
+ev_text log-off "EV-LOG-DESKTOP: host-shell-setup's lines and the preflight's host-shell row from this start's log" "${hs:-(none)}"
+grep -qx "host-shell-setup: no host shell key at /etc/desktop-container/host-shell-key; the 'Host Terminal' menu entry will not work" <<<"$hs" \
+    || fail "host-shell-setup did not log the missing key"
+grep -qx "host-shell-setup: enable it on the host: start desktop-host-shell.service (see deploy/README.md)" <<<"$hs" \
+    || fail "host-shell-setup did not say how to enable the Host Terminal"
+ev_pass "host-shell-setup logs the missing key and how to enable it"
+grep -q '^preflight: WARN: no host shell material at /etc/desktop-container' <<<"$hs" \
+    || fail "the preflight did not WARN about missing host shell material"
+ev_pass "the preflight WARNs: no host shell material at /etc/desktop-container"
+ev_save ssh-off "EV-STATE: ls -la /home/desktop/.ssh in the container: no config, no key" \
+    podman exec desktop sh -c 'ls -la /home/desktop/.ssh 2>&1 || true' >/dev/null || true
+! podman exec desktop test -e /home/desktop/.ssh/config || fail "the container has an ssh config without key material"
+ev_pass "the container has no ~/.ssh/config"
+cp /tmp/ev-desktop.container "$QL"
+rm -f /tmp/ev-desktop.container
+systemctl daemon-reload
+systemctl restart desktop.service || fail "desktop.service did not restart with the quadlet put back"
+wait_x_up "the Host Terminal back on"
+[ -f /etc/desktop-container/host-shell-key ] || fail "no fresh host-shell key once the quadlet was put back"
+on_log=$(desktop_log)
+ev_text log-on "EV-LOG-DESKTOP: host-shell-setup's lines from the next start, the quadlet put back" \
+    "$(grep -E '^host-shell-setup: ' <<<"$on_log" || echo '(none)')"
+grep -q "^host-shell-setup: host shell configured: 'ssh host' connects to 127.0.0.1 as " <<<"$on_log" \
+    || fail "with the quadlet put back, host-shell-setup did not configure the host shell"
+ev_pass "with the quadlet put back, the next start makes a fresh key and host-shell-setup configures the host shell"
+ev_end
+
 # --- a scratch desktop container: no host mounts, no host session, no VT ------
 # Plain `podman run` of the image with none of the quadlet's mounts or
 # devices: desktop-init's fallbacks are all that stands between it and a
