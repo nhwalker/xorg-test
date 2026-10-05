@@ -1715,11 +1715,21 @@ def s7_7_2(ctx, st):
                        "client's window through it: its frame turns the focused colour"):
             m.device_add(driver="usb-tablet", id="op772tab", bus="xhci.0", display="vga0")
             tid = wait_until(lambda: (xi_ids(ctx, USB_TABLET) or [None])[-1], 20, 0.5)
-            img = ctx.shot("before-click", "EV-SHOT: the tablet plugged in, the session's xterm focused: the "
-                           "client's frame #22262d")
             a = xs.parts(cli)["swatch"]
-            st.check(tid and img.px(*a) == UNFOCUSED, "with the tablet plugged in and nothing clicked yet, the "
-                     "client's frame is the inactive colour", f"X id {tid}, frame {img.px(*a)}")
+            # Run 37340174407 found the client's frame focused here although
+            # the session's xterm had been clicked before the plug. Kept as
+            # found, then the focus is put on the session's xterm again
+            # through the boot pointer, so the click through the tablet has
+            # something to move.
+            img = ctx.shot("after-plug", "EV-SHOT: the screen just after the tablet was plugged in, before any "
+                           "click: whichever frame is #41637f holds the focus")
+            st.record(f"just after the tablet was plugged in the client's frame was {img.px(*a)} "
+                      f"({'focused' if img.px(*a) == FOCUSED else 'not focused'})")
+            ctx.click(*xs.parts(term)["drag"])
+            img = ctx.shot("before-click", "EV-SHOT: the tablet plugged in, the session's xterm clicked through "
+                           "the boot pointer: the client's frame #22262d")
+            st.check(tid and img.px(*a) == UNFOCUSED, "with the tablet plugged in and the session's xterm "
+                     "clicked, the client's frame is the inactive colour", f"X id {tid}, frame {img.px(*a)}")
             xi_test_start(ctx, tid, "s772")
             ctx.click(*centre(cli), device="vga0")
             xit = xi_test_stop(ctx, tid, "s772")

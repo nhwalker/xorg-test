@@ -3270,11 +3270,14 @@ operator_setup() {
     python3 - <<'EOF'
 import math, wave
 rate, amp = 44100, 0.5
-# 441 samples hold whole cycles of both pitches (multiples of 100 Hz), so
-# each file is one such stretch repeated.
+# Each file is one stretch repeated: rate / gcd(freq, rate) samples, the
+# shortest that holds whole cycles of its pitch (441 for 1100 Hz, 735 for
+# 660 Hz). A stretch that cut a cycle short would repeat as a different
+# sound: 441 samples of 660 Hz, repeated, came out at 700 Hz.
 for path, freq, secs in (("/tmp/op-tone-1100.wav", 1100, 150), ("/tmp/op-tone-660-3s.wav", 660, 3)):
+    n = rate // math.gcd(freq, rate)
     cycle = bytearray()
-    for i in range(441):
+    for i in range(n):
         s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
         b = s.to_bytes(2, "little", signed=True)
         cycle += b + b
@@ -3282,7 +3285,7 @@ for path, freq, secs in (("/tmp/op-tone-1100.wav", 1100, 150), ("/tmp/op-tone-66
     w.setnchannels(2)
     w.setsampwidth(2)
     w.setframerate(rate)
-    w.writeframes(bytes(cycle) * (rate * secs // 441))
+    w.writeframes(bytes(cycle) * (rate * secs // n))
     w.close()
 EOF
     log op "operator-setup done"
