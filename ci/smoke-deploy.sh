@@ -1442,15 +1442,12 @@ sampler=$!
 took=$(ev_save stop "EV-STATE: time systemctl stop desktop.service (podman's stop timeout, after which it would SIGKILL, is 10 s)" \
     bash -c 'TIMEFORMAT="took %R s"; time systemctl stop desktop.service') || fail "systemctl stop desktop.service failed"
 took=$(sed -n 's/^took \([0-9.]*\) s$/\1/p' <<<"$took")
-python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 10 else 1)' "${took:-99}" \
-    || fail "systemctl stop desktop.service took ${took:-?} s: not within podman's 10 s stop timeout"
-ev_pass "systemctl stop desktop.service returned in $took s, within the 10 s stop timeout"
+# Everything is saved before anything is judged, so a failed check below
+# still leaves the samples and the followed log that explain it.
 for _ in $(seq 20); do kill -0 "$waiter" 2>/dev/null || break; sleep 0.5; done
 kill "$waiter" 2>/dev/null || true
 wait_out=$(cat "$tmp/wait")
 ev_text podman-wait "EV-STATE: what 'podman wait desktop', started before the stop, printed: the container's exit code" "${wait_out:-(nothing)}"
-[ "$(tail -n 1 <<<"$wait_out")" = 0 ] || fail "podman wait printed '$wait_out', want exit code 0"
-ev_pass "podman wait, started before the stop, reports exit code 0"
 wait "$sampler" 2>/dev/null || true
 ev_copy "$tmp/samples" during-stop "EV-PIDS: every uid-61000 process on the host, sampled every 0.5 s from just before the stop (what outlives the SIGTERM, and for how long)"
 # The last sample any process of the two trees appears in, in seconds after
@@ -1459,17 +1456,6 @@ last=$(awk -v t0="$stop_t0" '
     /^-- / { t = $2 - t0; next }
     $4 ~ /^(Xorg|mwm|xterm|pipewire|wireplumber|pipewire-pulse|start-audio|startx|xinit)$/ { if (t > last) last = t }
     END { printf "%.1f", last }' "$tmp/samples")
-ev_note "the last sample showing any process of the two trees came $last s after the stop began"
-python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 4.0 else 1)' "$last" \
-    || fail "a process of the trees was still there $last s into the stop: it waited for desktop-init's KILL at 5 s"
-ev_pass "every process of both trees was gone within $last s: none waited for desktop-init's KILL at 5 s"
-ev_save unit "EV-STATE: systemctl show of desktop.service after the stop" \
-    systemctl show -p Result,ExecMainCode,ExecMainStatus,ActiveState desktop.service >/dev/null || true
-ev_save pids-after "EV-PIDS: every uid-61000 process on the host after the stop" \
-    sh -c 'ps -o pid,ppid,sess,tty,lstart,comm -u 61000 || echo "(no uid-61000 process left)"' >/dev/null || true
-left=$(pgrep -l -u 61000 -x 'Xorg|mwm|xterm|pipewire|wireplumber|pipewire-pulse' || true)
-[ -z "$left" ] || fail "processes of the desktop's two trees outlived the stop: $left"
-ev_pass "no Xorg, mwm, xterm, pipewire, wireplumber or pipewire-pulse is left on the host"
 sleep 1
 kill "$follower" 2>/dev/null || true
 # k8s-file splits a long write into P (partial) records ended by an F one:
@@ -1479,10 +1465,31 @@ follow=$(awk '{ t = $0; sub(/^[^ ]+ (stdout|stderr) [FP] ?/, "", t); buf = buf t
               END { if (buf != "") print buf }' "$tmp/follow" | tr -d '\r')
 rm -r "$tmp"
 n_term=$(line_in "$follow" '^desktop-init: SIGTERM:')
-[ -n "$n_term" ] || { ev_text follow "EV-LOG-DESKTOP: the desktop's log, followed from before the stop" "$follow"
-                      fail "desktop-init logged no 'SIGTERM:' line on the stop"; }
-after_term=$(sed -n "${n_term},\$p" <<<"$follow")
-ev_text follow-tail "EV-LOG-DESKTOP: the desktop's log, followed (its k8s-file, by descriptor) from before the stop, from desktop-init's 'SIGTERM:' line to the end" "$after_term"
+after_term=""
+if [ -n "$n_term" ]; then
+    after_term=$(sed -n "${n_term},\$p" <<<"$follow")
+    ev_text follow-tail "EV-LOG-DESKTOP: the desktop's log, followed (its k8s-file, by descriptor) from before the stop, from desktop-init's 'SIGTERM:' line to the end" "$after_term"
+else
+    ev_text follow "EV-LOG-DESKTOP: the desktop's log, followed (its k8s-file, by descriptor) from before the stop: no 'SIGTERM:' line in it" "$follow"
+fi
+ev_save unit "EV-STATE: systemctl show of desktop.service after the stop" \
+    systemctl show -p Result,ExecMainCode,ExecMainStatus,ActiveState desktop.service >/dev/null || true
+ev_save pids-after "EV-PIDS: every uid-61000 process on the host after the stop" \
+    sh -c 'ps -o pid,ppid,sess,tty,lstart,comm -u 61000 || echo "(no uid-61000 process left)"' >/dev/null || true
+
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 10 else 1)' "${took:-99}" \
+    || fail "systemctl stop desktop.service took ${took:-?} s: not within podman's 10 s stop timeout"
+ev_pass "systemctl stop desktop.service returned in $took s, within the 10 s stop timeout"
+[ "$(tail -n 1 <<<"$wait_out")" = 0 ] || fail "podman wait printed '$wait_out', want exit code 0"
+ev_pass "podman wait, started before the stop, reports exit code 0"
+ev_note "the last sample showing any process of the two trees came $last s after the stop began"
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 4.0 else 1)' "$last" \
+    || fail "a process of the trees was still there $last s into the stop: it waited for desktop-init's KILL at 5 s"
+ev_pass "every process of both trees was gone within $last s: none waited for desktop-init's KILL at 5 s"
+left=$(pgrep -l -u 61000 -x 'Xorg|mwm|xterm|pipewire|wireplumber|pipewire-pulse' || true)
+[ -z "$left" ] || fail "processes of the desktop's two trees outlived the stop: $left"
+ev_pass "no Xorg, mwm, xterm, pipewire, wireplumber or pipewire-pulse is left on the host"
+[ -n "$n_term" ] || fail "desktop-init logged no 'SIGTERM:' line on the stop"
 if grep -q 'restarting in 3s' <<<"$after_term"; then
     fail "a tree restarted during the shutdown: $(grep 'restarting in 3s' <<<"$after_term")"
 fi
