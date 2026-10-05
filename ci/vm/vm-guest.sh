@@ -795,6 +795,40 @@ EOF
         || fail "Virtual-2 is not enabled on a disconnected connector: $(xr_line Virtual-2)"
     log pd "  Virtual-2 scans out 1024x768+1024+0 with nothing plugged into it"
 
+    # S3.4.12 on the live layout: the capture tool reads it back as a
+    # monitors.conf block, and that block, applied, gives the same geometry.
+    log pd "fixed monitor layout: desktop-monitors-capture reads the live layout back"
+    ev_begin S3.4.12 "desktop-monitors-capture prints a valid, round-trippable block" T3
+    ev_save xrandr-declared "EV-STATE: xrandr --query with the declared two-output layout live" \
+        xr >/dev/null || true
+    xr_declared=$EV_LAST
+    cap=$(ev_save capture "EV-STATE: desktop-monitors-capture on the host, the declared layout live: one line per enabled output" \
+        desktop-monitors-capture) || fail "desktop-monitors-capture failed with the desktop up"
+    lines=$(grep -v '^#' <<<"$cap" | grep . || true)
+    [ "$(grep -c . <<<"$lines")" = 2 ] || fail "the capture printed $(grep -c . <<<"$lines") output line(s), want 2"
+    grep -qE '^Virtual-1 +1024x768@[0-9.]+ +\+0\+0 primary$' <<<"$lines" \
+        || fail "the capture's Virtual-1 line is not 1024x768 at +0+0, primary"
+    grep -qE '^Virtual-2 +1024x768@[0-9.]+ +\+1024\+0$' <<<"$lines" \
+        || fail "the capture's Virtual-2 line is not 1024x768 at +1024+0"
+    ev_pass "the capture prints the two declared outputs: Virtual-1 primary at +0+0, Virtual-2 at +1024+0"
+    ev_note "the refresh the capture reads back: $(grep -oE '@[0-9.]+' <<<"$lines" | sort -u | tr '\n' ' ')(declared @60; xrandr reports the derived mode's actual rate)"
+    printf '%s\n' "$lines" > /etc/desktop-container/monitors.conf
+    systemctl restart desktop.service
+    desktop_up
+    ev_save generated "EV-CONFIG: the 30-monitors.conf the generator wrote from the captured block" \
+        podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf >/dev/null \
+        || fail "the captured block generated no 30-monitors.conf"
+    ev_save xrandr-roundtrip "EV-STATE: xrandr --query after applying the captured block" \
+        xr >/dev/null || true
+    ev_diff roundtrip "EV-DIFF: xrandr with the declared layout and with the captured block applied" \
+        "$xr_declared" "$EV_LAST"
+    dims=$(dpy_dims)
+    [ "$dims" = 2048x768 ] || fail "the captured block gives a $dims screen, not the declared 2048x768"
+    xr_is Virtual-1 connected 1024x768+0+0 || fail "round trip: Virtual-1 is not at 1024x768+0+0: $(xr_line Virtual-1)"
+    xr_is Virtual-2 disconnected 1024x768+1024+0 || fail "round trip: Virtual-2 is not at 1024x768+1024+0: $(xr_line Virtual-2)"
+    ev_pass "the captured block, applied, reproduces the geometry: 2048x768, Virtual-1 at +0+0, Virtual-2 at +1024+0"
+    ev_end
+
     # A connector going down UNDER a running X. The force is real: the kernel
     # reports this connector disconnected to every probe from here on. It
     # arrives without the uevent a physical unplug would carry, which is why
@@ -823,6 +857,15 @@ EOF
     log pd "fixed monitor layout: restore the connector and the shipped (empty) config"
     echo detect > "$conn/status"
     wait_for 10 1 "Virtual-1 connected again" conn_connected "$conn"
+    ev_begin S3.4.12 "desktop-monitors-capture prints a valid, round-trippable block" T3
+    systemctl stop desktop.service
+    rc=0
+    down=$(ev_save desktop-down "EV-STATE: desktop-monitors-capture with desktop.service stopped: exit 1 and the hint" \
+        desktop-monitors-capture) || rc=$?
+    [ "$rc" = 1 ] || fail "with the desktop stopped the capture exited $rc, want 1"
+    grep -q 'is desktop.service running?' <<<"$down" || fail "with the desktop stopped the capture gave no hint"
+    ev_pass "with desktop.service stopped the capture exits 1 with the hint"
+    ev_end
     install -m644 deploy/host/etc/desktop-container/monitors.conf \
         /etc/desktop-container/monitors.conf
     systemctl restart desktop.service
