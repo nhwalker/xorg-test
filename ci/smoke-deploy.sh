@@ -47,10 +47,24 @@ tools_diag() {
 # --- CDI converger branch tests ----------------------------------------------
 FAKEBIN=$(mktemp -d)
 
+# Each leg keeps what the converger printed and the spec it left (S5.4.2).
+# The fake toolkit and /dev/nvidiactl stand in for a GPU host; the leg where
+# a loaded nvidia module alone keeps the real spec needs a /proc/modules
+# override the script does not have yet (Requirements.md, Appendix A).
+cdi_leg() { # <moment> <what the leg does> [VAR=value...]: run the converger, keep its output and spec
+    local moment=$1 what=$2 rc=0
+    shift 2
+    CDI_OUT=$(ev_save "$moment-run" "the converger's output: $what" env "$@" "$CDI") || rc=$?
+    ev_copy "$SPEC" "$moment-spec" "EV-CONFIG: /etc/cdi/nvidia.yaml after: $what"
+    return "$rc"
+}
+ev_begin S5.4.2 "Real generation, transient failure, no-downgrade, recovery to stub" T2
+
 log "cdi converger: stub on a GPU-less host"
 rm -f "$SPEC"
-"$CDI" >/dev/null
+cdi_leg 1-stub "no toolkit, no hardware" || fail "the converger failed on a GPU-less host"
 grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub spec not written"
+ev_pass "no toolkit and no hardware: the stub (NVIDIA_CDI_STUB=1)"
 
 log "cdi converger: real generation with (fake) toolkit + hardware"
 cat > "$FAKEBIN/nvidia-ctk" <<'EOF'
@@ -61,21 +75,30 @@ printf 'cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices:\n  - name: all\n    co
 EOF
 chmod +x "$FAKEBIN/nvidia-ctk"
 touch /dev/nvidiactl
-PATH="$FAKEBIN:$PATH" "$CDI" >/dev/null
+cdi_leg 2-generate "a (fake) toolkit and /dev/nvidiactl: nvidia-ctk generates the real spec" PATH="$FAKEBIN:$PATH" \
+    || fail "the converger failed with a working toolkit"
 grep -q GENERATED "$SPEC" || fail "generation path did not write the real spec"
+ev_pass "toolkit and hardware: the real spec nvidia-ctk generated (GENERATED=1)"
 
 log "cdi converger: transient toolkit failure keeps the real spec"
 printf '#!/bin/sh\nexit 1\n' > "$FAKEBIN/nvidia-ctk"
-PATH="$FAKEBIN:$PATH" "$CDI" 2>&1 | grep -q keeping || fail "no keep on transient failure"
+cdi_leg 3-transient "nvidia-ctk fails while the hardware is still there" PATH="$FAKEBIN:$PATH" || true
+grep -q keeping <<<"$CDI_OUT" || fail "no keep on transient failure"
 grep -q GENERATED "$SPEC" || fail "real spec lost on transient failure"
+ev_pass "a failing nvidia-ctk keeps the real spec (the converger says it is keeping it)"
 
 log "cdi converger: no downgrade while hardware visible; stub after removal"
 rm -f "$FAKEBIN/nvidia-ctk"
-"$CDI" 2>&1 | grep -q keeping || fail "downgraded to stub despite visible hardware"
+cdi_leg 4-no-toolkit "the toolkit gone, /dev/nvidiactl still there" || true
+grep -q keeping <<<"$CDI_OUT" || fail "downgraded to stub despite visible hardware"
 grep -q GENERATED "$SPEC" || fail "real spec lost while hardware visible"
+ev_pass "no toolkit but the hardware visible: the real spec is kept, no downgrade"
 rm -f /dev/nvidiactl
-"$CDI" >/dev/null
+cdi_leg 5-recovered "neither the toolkit nor the hardware" || fail "the converger failed after the hardware went"
 grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub not restored after hardware removal"
+ev_pass "neither toolkit nor hardware: back to the stub"
+ev_note "not tested here: the nvidia module loaded (/proc/modules) with no device node; the script reads /proc/modules directly and has no override a test could use"
+ev_end
 
 # --- client CDI generator branch tests ---------------------------------------
 log "client cdi: defaults write two disjoint specs"
@@ -146,10 +169,30 @@ log "selinux labeler: clean no-op where SELinux is absent"
 if [ -e /sys/fs/selinux/enforce ]; then
     log "  (skipped: this runner HAS SELinux, so the no-op branch is untestable here)"
 else
-    out=$("$SELINUX_LABEL" 2>&1)         || fail "labeler exited non-zero on a host without SELinux: $out"
-    echo "$out" | grep -qi 'no selinux\|selinux disabled'         || fail "labeler did not report the no-op it took (got: $out)"
+    ev_begin S5.6.1 "No-op without SELinux" T2
+    ev_save selinuxfs "EV-STATE: the runner's SELinux state: no /sys/fs/selinux/enforce (the file the labeler checks), and no getenforce" \
+        sh -c 'ls -l /sys/fs/selinux/enforce; ls -ld /sys/fs/selinux; command -v getenforce || echo "(no getenforce on this host)"' >/dev/null || true
     # The no-op must be reached before anything touches the filesystem: the
     # directories do not exist yet on this runner at this point in the script.
+    targets="/tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin"
+    ev_save targets-before "EV-STATE: the directories the labeler would relabel, before it runs" \
+        sh -c "ls -ld $targets 2>&1; true" >/dev/null || true
+    before=$EV_LAST
+    out=$(ev_save labeler "the labeler's output on a host without SELinux: its no-op message, exit 0" "$SELINUX_LABEL") \
+        || fail "labeler exited non-zero on a host without SELinux: $out"
+    ev_pass "the labeler exits 0 on a host without SELinux"
+    echo "$out" | grep -qi 'no selinux\|selinux disabled' \
+        || fail "labeler did not report the no-op it took (got: $out)"
+    ev_pass "it reports the no-op it took"
+    ev_save targets-after "EV-STATE: the same directories after it ran: unchanged" \
+        sh -c "ls -ld $targets 2>&1; true" >/dev/null || true
+    if [ -n "$EV_DIR" ]; then
+        ev_diff targets "EV-DIFF: before and after the labeler; no line may differ" "$before" "$EV_LAST"
+        [ "$(sed 1d "$EV_DIR/$before")" = "$(sed 1d "$EV_DIR/$EV_LAST")" ] \
+            || fail "the labeler changed something on a host without SELinux (see the diff)"
+        ev_pass "it touched nothing: the directories it would label are as they were"
+    fi
+    ev_end
     log "  $out"
 fi
 
@@ -213,6 +256,40 @@ if [ -e "$TOOLS_SPEC" ]; then
 fi
 # the sshd_config.d drop-in is read at sshd start; this runner's sshd predates it
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+
+# S5.3.2: seat-prep's steady state, run the way the host runs it - as its
+# unit - before desktop.service starts. Not after: its last step fails if
+# anything holds the DRM device or the VT, and once the desktop runs, Xorg
+# does. The direct runs above already converged this seat.
+log "seat-prep: the steady state as its unit is silent and changes nothing"
+ev_begin S5.3.2 "Steady state is silent and idempotent" T2
+systemctl start desktop-seat-prep.service \
+    || { systemctl status desktop-seat-prep.service --no-pager >&2 || true
+         fail "desktop-seat-prep.service failed on a seat already converged"; }
+journalctl --sync 2>/dev/null || true
+# The cursor of the newest entry: the slice read below starts after it.
+cursor=$(journalctl -q -n 1 -o cat --show-cursor 2>/dev/null | sed -n 's/^-- cursor: //p')
+[ -n "$cursor" ] || fail "could not read a journal cursor to bound seat-prep's second run"
+logind_before=$(systemctl show -p MainPID --value systemd-logind)
+ev_save restart "EV-STATE: systemctl restart desktop-seat-prep.service, the second run: exit 0" \
+    systemctl restart desktop-seat-prep.service >/dev/null \
+    || fail "the second run of desktop-seat-prep.service did not exit 0"
+ev_pass "the second run, as the unit, exits 0"
+journalctl --sync 2>/dev/null || true
+slice=$(journalctl --after-cursor="$cursor" _SYSTEMD_UNIT=desktop-seat-prep.service -o cat --no-pager 2>/dev/null || true)
+ev_text journal "EV-LOG-JOURNAL: everything desktop-seat-prep.service's own process logged on the second run (journalctl _SYSTEMD_UNIT=desktop-seat-prep.service after a cursor taken just before it)" \
+    "${slice:-(nothing)}"
+# This runner has no fuser (psmisc), and seat-prep says so on every run;
+# that line is about the runner, not about the seat.
+said=$(grep -v 'fuser not available' <<<"$slice" || true)
+[ -z "$said" ] || fail "seat-prep's steady state was not silent: $said"
+ev_pass "and it logs nothing about the seat (the runner's 'fuser not available' line aside)"
+logind_after=$(systemctl show -p MainPID --value systemd-logind)
+ev_text logind "EV-PIDS: systemd-logind's MainPID before and after the second run (seat-prep restarts logind only when it changed something)" \
+    "before: $logind_before"$'\n'"after:  $logind_after"
+[ "$logind_after" = "$logind_before" ] || fail "the steady state restarted logind ($logind_before -> $logind_after)"
+ev_pass "it did not restart logind (MainPID $logind_before)"
+ev_end
 
 log "start desktop.service (generated from the tree's quadlet)"
 systemctl start desktop.service
@@ -491,7 +568,9 @@ wait_xorg_conf() {
 }
 
 log "fixed monitor layout: the shipped default is a genuine no-op"
+ev_begin S3.4.1 "Opt-in: absent or output-less config generates nothing" T2
 [ -f /etc/desktop-container/monitors.conf ] || fail "the tree did not ship monitors.conf"
+ev_copy /etc/desktop-container/monitors.conf shipped-monitors "EV-CONFIG: the monitors.conf the tree ships: comments only, no output lines"
 wait_xorg_conf
 # Captured, not piped into grep -q: this script runs under `set -o pipefail`,
 # and a grep that stops at the first match leaves podman writing into a closed
@@ -501,9 +580,17 @@ case "$gen_log" in
     *xorg-monitor-conf*) ;;
     *) fail "the layout generator never ran" ;;
 esac
+ev_text generator-log "EV-LOG-DESKTOP: the generator's lines in the desktop's log: the no-op" \
+    "$(grep xorg-monitor-conf <<<"$gen_log" || true)"
+grep -q 'no fixed layout' <<<"$gen_log" || fail "the generator did not log its no-op"
+ev_pass "the generator ran and logged that it applied no fixed layout"
+ev_save xorg-conf-d "EV-STATE: ls /etc/X11/xorg.conf.d in the container: 20-gpu.conf, no 30-monitors.conf" \
+    podman exec desktop ls -l /etc/X11/xorg.conf.d >/dev/null || true
 if podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf; then
     fail "a config with no output lines still generated a layout"
 fi
+ev_pass "the shipped comments-only file generated no 30-monitors.conf"
+ev_end
 
 log "fixed monitor layout: a declared layout is applied at the next start"
 cat > /etc/desktop-container/monitors.conf <<'EOF'
@@ -530,17 +617,37 @@ done
 # The restart above is what re-runs xorg-conf.service, so the assertions on
 # the declared layout land here rather than beside the config that set it up.
 wait_xorg_conf
+ev_begin S3.4.8 "The host file reaches the container and is acted on at start" T2
+ev_copy /etc/desktop-container/monitors.conf host-monitors "EV-CONFIG: the layout declared on the host, /etc/desktop-container/monitors.conf: DP-1 and DP-2 side by side"
+ev_save container-view "EV-STATE: the same file read inside the container, and its mount there (ro in the mount options)" \
+    podman exec desktop sh -c 'cat /etc/desktop-container/monitors.conf; echo "-- mount"; grep " /etc/desktop-container " /proc/self/mountinfo' >/dev/null \
+    || fail "the container cannot read /etc/desktop-container/monitors.conf"
+opts=$(podman exec desktop sh -c 'grep " /etc/desktop-container " /proc/self/mountinfo' | awk '{print $6; exit}')
+case ",$opts," in
+    *,ro,*) ;;
+    *) fail "/etc/desktop-container is mounted '$opts' in the container, not read-only" ;;
+esac
+ev_pass "the container sees the host's file, read-only (mount options $opts)"
 mon=$(podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf 2>/dev/null || true)
 if [ -z "$mon" ]; then
     podman logs desktop 2>/dev/null | grep xorg-monitor-conf >&2 || true
     fail "the declared layout produced no /etc/X11/xorg.conf.d/30-monitors.conf"
 fi
+ev_text generated "EV-CONFIG: the 30-monitors.conf the container generated from it at this start" "$mon"
 echo "$mon" | grep -q 'Identifier  "DP-2"' || fail "generated config does not name the declared outputs"
+ev_pass "the generated config names the declared outputs"
 # A runner with no KMS falls through to the modesetting branch, which is the
 # one that has to invent a timing; on a runner with a DRM device it is the
 # same branch, because no runner has an NVIDIA GPU.
 echo "$mon" | grep -q 'Option      "Enable" "true"' || fail "outputs not forced enabled"
 echo "$mon" | grep -q 'Modeline "1920x1080_60.00"' || fail "no derived timing for the declared mode"
+ev_pass "it forces them enabled, with the derived 1920x1080_60.00 timing"
+layout_log=$(podman logs desktop 2>/dev/null | grep 'xorg-monitor-conf: fixed layout' || true)
+ev_text generator-log "EV-LOG-DESKTOP: the generator's 'fixed layout' lines in the desktop's log (one per start that applied a layout)" \
+    "${layout_log:-(none)}"
+[ -n "$layout_log" ] || fail "the generator did not log the fixed layout it applied"
+ev_pass "the desktop's log has the generator's 'fixed layout' line"
+ev_end
 # Put the shipped default back, so nothing after this point sees a layout the
 # tree does not actually ship.
 install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf

@@ -15,8 +15,16 @@
 #   - the two driver paths emit their own mechanism and not the other's.
 #   - a bad config gives up whole, leaving no half-written file behind: the
 #     desktop must still come up.
+#
+# Evidence (Requirements.md, S3.4.1-S3.4.7): with EV_ROOT set, every case
+# keeps its input, the GPU config it ran against, what the generator wrote
+# (or a listing showing it wrote nothing) and its log, under the story it
+# proves; every assertion is a line in that story's checks.
 set -u
 cd "$(dirname "$0")/.." || exit 1
+# shellcheck source=ci/evidence.sh
+. ci/evidence.sh
+[ -z "$EV_ROOT" ] || mkdir -p "$EV_ROOT"
 
 GEN=image/xorg/xorg-monitor-conf.sh
 TMP=$(mktemp -d)
@@ -24,69 +32,146 @@ trap 'rm -rf "$TMP"' EXIT
 fails=0
 
 log()  { echo "== $*"; }
-fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); ev_fail "$*"; }
+ok()   { ev_pass "$*"; }
 
-export MONITORS_CONF="$TMP/monitors.conf"
-export MONITORS_OUT="$TMP/30-monitors.conf"
-export XORG_GPU_CONF="$TMP/20-gpu.conf"
+# The container's own layout, under the temporary directory: the host's
+# monitors.conf, and the xorg.conf.d the two generators write into.
+mkdir -p "$TMP/etc" "$TMP/xorg.conf.d"
+export MONITORS_CONF="$TMP/etc/monitors.conf"
+export MONITORS_OUT="$TMP/xorg.conf.d/30-monitors.conf"
+export XORG_GPU_CONF="$TMP/xorg.conf.d/20-gpu.conf"
 
 gpu_conf() {   # gpu_conf <driver>|none
     if [ "$1" = none ]; then rm -f "$XORG_GPU_CONF"; return; fi
     printf 'Section "Device"\n    Identifier "gpu0"\n    Driver     "%s"\nEndSection\n' \
         "$1" > "$XORG_GPU_CONF"
 }
-run() { "$GEN" > "$TMP/log" 2>&1; }
-has() { grep -qF "$2" "$1" || fail "$3"; }
-hasnt() { grep -qF "$2" "$1" && fail "$3"; return 0; }
+# run <case>: the generator, then the case's evidence. The generator exits 0
+# whatever it decides - a bad layout must not cost the desktop - so a
+# non-zero status is itself a failure.
+run() {
+    local rc=0
+    "$GEN" > "$TMP/log" 2>&1 || rc=$?
+    if [ "$rc" = 0 ]; then ok "$1: the generator exited 0"; else fail "$1: the generator exited $rc"; fi
+    if [ -f "$MONITORS_CONF" ]; then
+        ev_copy "$MONITORS_CONF" "$1-input" "EV-CONFIG: the case's monitors.conf"
+    else
+        ev_text "$1-input" "the case's input" "(no monitors.conf at all)"
+    fi
+    if [ -f "$XORG_GPU_CONF" ]; then
+        ev_copy "$XORG_GPU_CONF" "$1-gpu" "EV-CONFIG: the 20-gpu.conf the case ran against (its Driver line picks the path)"
+    else
+        ev_text "$1-gpu" "the GPU config the case ran against" "(no 20-gpu.conf: no Device section)"
+    fi
+    if [ -f "$MONITORS_OUT" ]; then
+        ev_copy "$MONITORS_OUT" "$1-generated" "EV-CONFIG: the 30-monitors.conf the generator wrote"
+    fi
+    ev_save "$1-ls" "EV-STATE: ls of xorg.conf.d after the run: 30-monitors.conf there or not" \
+        ls -l "$TMP/xorg.conf.d" >/dev/null || true
+    ev_copy "$TMP/log" "$1-log" "the generator's log (EV-LOG-DESKTOP in the container)"
+}
+# has <file> <text> <claim>: the text is in the file.
+has()   { if grep -qF "$2" "$1"; then ok "$3"; else fail "NOT: $3"; fi; }
+hasnt() { if grep -qF "$2" "$1"; then fail "NOT: $3"; else ok "$3"; fi; }
+absent()  { if [ -e "$MONITORS_OUT" ]; then fail "NOT: $1"; else ok "$1"; fi; }
+logged()  { if grep -qF "$1" "$TMP/log"; then ok "$2"; else fail "NOT: $2"; fi; }
 
 # --- opt-in ------------------------------------------------------------------
+ev_begin S3.4.1 "Opt-in: absent or output-less config generates nothing" T0
 log "no config file: nothing generated, Xorg autodetects"
 gpu_conf modesetting
 rm -f "$MONITORS_CONF"
 : > "$MONITORS_OUT"
-run
-[ -e "$MONITORS_OUT" ] && fail "stale generated config not removed when the layout was withdrawn"
+run no-config
+absent "no monitors.conf: the stale generated config is removed"
+logged "no fixed monitor layout configured" "no monitors.conf: the generator logs the no-op"
 
 log "config with no output lines: same, and says so"
 printf '# nothing declared\n' > "$MONITORS_CONF"
 : > "$MONITORS_OUT"
-run
-[ -e "$MONITORS_OUT" ] && fail "generated a config from a file declaring no outputs"
-grep -q "no fixed layout" "$TMP/log" || fail "did not report the no-op"
+run comments-only
+absent "comments only: no config generated, the stale one removed"
+logged "no fixed layout" "comments only: the generator logs the no-op"
+
+log "global lines but no output lines: same"
+printf 'virtual 3840x1080\nnvidia-connected DFP-0,DFP-1\n' > "$MONITORS_CONF"
+: > "$MONITORS_OUT"
+run globals-only
+absent "globals only (virtual, nvidia-connected): no config generated, the stale one removed"
+logged "no fixed layout" "globals only: the generator logs the no-op"
+ev_end
 
 # --- the modesetting path ----------------------------------------------------
+ev_begin S3.4.2 "modesetting emission" T0
 log "modesetting: forced-on outputs, CVT timings, pinned framebuffer"
 gpu_conf modesetting
 cat > "$MONITORS_CONF" <<'EOF'
 DP-1    1920x1080@60   +0+0      primary
 DP-2    1280x1024      +1920+0
 EOF
-run
+run modesetting
+has "$MONITORS_OUT" 'Option      "Enable" "true"' "the outputs are forced enabled"
+[ "$(grep -c '^Section "Monitor"' "$MONITORS_OUT")" = 2 ] \
+    && ok "one Monitor section per declared output (2)" || fail "NOT: one Monitor section per declared output"
+has "$MONITORS_OUT" 'Identifier  "DP-1"' "a Monitor section is named for DP-1"
+has "$MONITORS_OUT" 'Identifier  "DP-2"' "a Monitor section is named for DP-2"
+has "$MONITORS_OUT" 'HorizSync   15.0 - 300.0' "each Monitor section states wide sync ranges, so the EDID's are not needed"
+has "$MONITORS_OUT" 'Option      "PreferredMode" "1920x1080_60.00"' "DP-1 prefers its generated mode"
+has "$MONITORS_OUT" 'Option      "PreferredMode" "1280x1024_60.00"' "DP-2 prefers its generated mode"
+has "$MONITORS_OUT" 'Option      "Position" "1920 0"' "the second output is positioned at +1920+0"
+has "$MONITORS_OUT" 'Option      "Primary" "true"' "the primary output is marked"
+[ "$(grep -c 'Option      "Primary"' "$MONITORS_OUT")" = 1 ] \
+    && ok "exactly one primary" || fail "NOT: exactly one primary"
+has "$MONITORS_OUT" 'Virtual 3200 1080' "the framebuffer is pinned to the layout's extents (3200x1080)"
+has "$MONITORS_OUT" 'Device      "gpu0"' "the Screen section references the GPU device gpu0"
+hasnt "$MONITORS_OUT" 'MetaModes' "no NVIDIA MetaModes on the modesetting path"
+cp "$MONITORS_OUT" "$TMP/modesetting.conf"
+ev_end
+
+ev_begin S3.4.3 "CVT timings match cvt(1)" T0
 # Verbatim cvt(1) output for these two modes. Equality, not a pattern: the
 # point is that a monitor with no EDID is handed a timing it will accept.
-has "$MONITORS_OUT" 'Modeline "1920x1080_60.00" 173.00  1920 2048 2248 2576  1080 1083 1088 1120 -hsync +vsync' \
-    "1920x1080@60 CVT timing does not match cvt(1)"
-has "$MONITORS_OUT" 'Modeline "1280x1024_60.00" 109.00  1280 1368 1496 1712  1024 1027 1034 1063 -hsync +vsync' \
-    "1280x1024 (default 60Hz) CVT timing does not match cvt(1)"
-has "$MONITORS_OUT" 'Option      "Enable" "true"' "outputs are not forced enabled"
-has "$MONITORS_OUT" 'Identifier  "DP-1"' "no Monitor section named for the output"
-has "$MONITORS_OUT" 'Option      "Position" "1920 0"' "second output not positioned"
-has "$MONITORS_OUT" 'Option      "Primary" "true"' "primary output not marked"
-has "$MONITORS_OUT" 'Virtual 3200 1080' "framebuffer not pinned to the layout extents"
-has "$MONITORS_OUT" 'Device      "gpu0"' "Screen section does not reference the GPU device"
-hasnt "$MONITORS_OUT" 'MetaModes' "emitted the NVIDIA mechanism on the modesetting path"
-[ "$(grep -c 'Option      "Primary"' "$MONITORS_OUT")" = 1 ] || fail "more than one primary emitted"
+has "$TMP/modesetting.conf" 'Modeline "1920x1080_60.00" 173.00  1920 2048 2248 2576  1080 1083 1088 1120 -hsync +vsync' \
+    "1920x1080@60: the Modeline is cvt(1)'s, verbatim"
+has "$TMP/modesetting.conf" 'Modeline "1280x1024_60.00" 109.00  1280 1368 1496 1712  1024 1027 1034 1063 -hsync +vsync' \
+    "1280x1024 (60 Hz by default): the Modeline is cvt(1)'s, verbatim"
+log "a fractional refresh is carried through"
+printf 'DP-1 1920x1080@59.94 +0+0\n' > "$MONITORS_CONF"
+run fractional
+has "$MONITORS_OUT" '"1920x1080_59.94"' "a fractional refresh (59.94) is carried into the mode name"
+ev_text cvt-table "EV-STATE: declared mode -> the Modeline the generator wrote -> cvt(1)'s Modeline, pinned in this script" \
+"1920x1080@60
+  generated: $(grep -F 'Modeline "1920x1080_60.00"' "$TMP/modesetting.conf" | sed 's/^ *//')
+  cvt(1):    Modeline \"1920x1080_60.00\" 173.00  1920 2048 2248 2576  1080 1083 1088 1120 -hsync +vsync
+1280x1024 (no refresh: 60)
+  generated: $(grep -F 'Modeline "1280x1024_60.00"' "$TMP/modesetting.conf" | sed 's/^ *//')
+  cvt(1):    Modeline \"1280x1024_60.00\" 109.00  1280 1368 1496 1712  1024 1027 1034 1063 -hsync +vsync
+1920x1080@59.94
+  generated: $(grep -F 'Modeline' "$MONITORS_OUT" | sed 's/^ *//')"
+ev_end
 
-log "modesetting: rotation transposes the extents, not the mode"
-cat > "$MONITORS_CONF" <<'EOF'
+ev_begin S3.4.4 "Rotation transposes extents" T0
+for dir in left right inverted; do
+    log "modesetting: rotate=$dir"
+    cat > "$MONITORS_CONF" <<EOF
 DP-1    1920x1080@60   +0+0       primary
-DP-2    1920x1080@60   +1920+0    rotate=left
+DP-2    1920x1080@60   +1920+0    rotate=$dir
 EOF
-run
-has "$MONITORS_OUT" 'Option      "Rotate" "left"' "rotation not applied"
-has "$MONITORS_OUT" 'Virtual 3000 1920' "rotated output not measured transposed (want 1920+1080 x 1920)"
+    run "rotate-$dir"
+    has "$MONITORS_OUT" "Option      \"Rotate\" \"$dir\"" "rotate=$dir is applied to DP-2"
+    case $dir in
+        left|right) has "$MONITORS_OUT" 'Virtual 3000 1920' \
+            "rotate=$dir: DP-2 is measured transposed, 1080x1920, so the framebuffer is 3000x1920" ;;
+        inverted)   has "$MONITORS_OUT" 'Virtual 3840 1080' \
+            "rotate=inverted keeps DP-2's 1920x1080, so the framebuffer is 3840x1080" ;;
+    esac
+    has "$MONITORS_OUT" 'Modeline "1920x1080_60.00"' "rotate=$dir: the mode itself is not transposed"
+done
+ev_end
 
 # --- the NVIDIA path ---------------------------------------------------------
+ev_begin S3.4.5 "NVIDIA emission" T0
 log "nvidia: one MetaMode, no per-output Monitor sections"
 gpu_conf nvidia
 cat > "$MONITORS_CONF" <<'EOF'
@@ -95,63 +180,67 @@ nvidia-edid DFP-0=/etc/desktop-container/edid-dfp0.bin
 DP-0    2560x1440@60   +0+0      primary
 HDMI-0  1920x1080@60   +2560+0
 EOF
-run
+run nvidia
 has "$MONITORS_OUT" 'Option      "MetaModes" "DP-0: 2560x1440 +0+0, HDMI-0: 1920x1080 +2560+0"' \
-    "MetaMode wrong or missing"
-has "$MONITORS_OUT" 'Option      "ConnectedMonitor" "DFP-0,DFP-2"' "ConnectedMonitor not passed through"
+    "one MetaMode carries the whole layout"
+has "$MONITORS_OUT" 'Option      "ConnectedMonitor" "DFP-0,DFP-2"' "nvidia-connected becomes ConnectedMonitor"
 has "$MONITORS_OUT" 'Option      "CustomEDID" "DFP-0:/etc/desktop-container/edid-dfp0.bin"' \
-    "CustomEDID not passed through"
-has "$MONITORS_OUT" 'Option      "ModeValidation" "AllowNonEdidModes"' "mode validation not relaxed"
-has "$MONITORS_OUT" 'Virtual 4480 1440' "framebuffer not pinned on the nvidia path"
-hasnt "$MONITORS_OUT" 'Section "Monitor"' "emitted Monitor sections the NVIDIA driver ignores"
-hasnt "$MONITORS_OUT" 'Modeline' "invented a timing for a driver that validates its own"
+    "nvidia-edid becomes CustomEDID"
+has "$MONITORS_OUT" 'Option      "ModeValidation" "AllowNonEdidModes"' "mode validation allows non-EDID modes"
+has "$MONITORS_OUT" 'Virtual 4480 1440' "the framebuffer is pinned (4480x1440)"
+hasnt "$MONITORS_OUT" 'Section "Monitor"' "no Monitor sections, which the NVIDIA driver ignores"
+hasnt "$MONITORS_OUT" 'Modeline' "no invented timing for a driver that validates its own"
 
 log "nvidia: ConnectedMonitor and CustomEDID are opt-in"
 cat > "$MONITORS_CONF" <<'EOF'
 DP-0    1920x1080@60   +0+0   primary
 EOF
-run
-hasnt "$MONITORS_OUT" 'ConnectedMonitor' "emitted ConnectedMonitor nobody asked for"
-hasnt "$MONITORS_OUT" 'CustomEDID' "emitted CustomEDID nobody asked for"
+run nvidia-plain
+hasnt "$MONITORS_OUT" 'ConnectedMonitor' "without nvidia-connected, no ConnectedMonitor"
+hasnt "$MONITORS_OUT" 'CustomEDID' "without nvidia-edid, no CustomEDID"
+ev_end
 
 # --- degraded host -----------------------------------------------------------
+ev_begin S3.4.6 "Degraded host: no Device section" T0
 log "no GPU device section: Monitor sections only, and a warning"
 gpu_conf none
 cat > "$MONITORS_CONF" <<'EOF'
 DP-1    1920x1080@60   +0+0   primary
 EOF
-run
-has "$MONITORS_OUT" 'Section "Monitor"' "wrote nothing at all without a Device section"
-hasnt "$MONITORS_OUT" 'Section "Screen"' "wrote a Screen referencing a Device that does not exist"
-grep -q 'framebuffer size is NOT pinned' "$TMP/log" || fail "did not warn about the unpinned framebuffer"
+run no-device
+has "$MONITORS_OUT" 'Section "Monitor"' "the Monitor sections are still written"
+hasnt "$MONITORS_OUT" 'Section "Screen"' "no Screen section referencing a Device that does not exist"
+logged 'framebuffer size is NOT pinned' "the generator warns that the framebuffer is not pinned"
+ev_end
 
 # --- rejections --------------------------------------------------------------
+ev_begin S3.4.7 "A bad config is rejected whole" T0
 log "a bad config is rejected whole, leaving nothing behind"
 gpu_conf modesetting
-while IFS='|' read -r what body; do
-    [ -n "$what" ] || continue
+while IFS='|' read -r slug what body; do
+    [ -n "$slug" ] || continue
     printf '%b\n' "$body" > "$MONITORS_CONF"
     : > "$MONITORS_OUT"
-    run
-    if [ -e "$MONITORS_OUT" ]; then
-        fail "$what: accepted, or left a half-written file"
-    fi
-    grep -q 'ERROR' "$TMP/log" || fail "$what: rejected without saying why"
+    run "reject-$slug"
+    absent "$what: rejected, and no file is left behind"
+    logged 'ERROR' "$what: the generator says why (an ERROR line)"
 done <<'EOF'
-mode without a height|DP-1 1920 +0+0
-position in xrandr --pos form|DP-1 1920x1080 0x0
-unknown flag|DP-1 1920x1080 +0+0 primaryy
-two primaries|DP-1 1920x1080 +0+0 primary\nDP-2 1920x1080 +1920+0 primary
-duplicate output|DP-1 1920x1080 +0+0\nDP-1 1920x1080 +1920+0
-non-numeric refresh|DP-1 1920x1080@sixty +0+0
-implausible mode|DP-1 4x4 +0+0
-virtual smaller than the layout|virtual 1920x1080\nDP-1 1920x1080 +0+0\nDP-2 1920x1080 +1920+0
+no-height|mode without a height|DP-1 1920 +0+0
+xrandr-pos|position in xrandr --pos form|DP-1 1920x1080 0x0
+unknown-flag|unknown flag|DP-1 1920x1080 +0+0 primaryy
+two-primaries|two primaries|DP-1 1920x1080 +0+0 primary\nDP-2 1920x1080 +1920+0 primary
+duplicate|duplicate output|DP-1 1920x1080 +0+0\nDP-1 1920x1080 +1920+0
+bad-refresh|non-numeric refresh|DP-1 1920x1080@sixty +0+0
+implausible|implausible mode|DP-1 4x4 +0+0
+small-virtual|virtual smaller than the layout|virtual 1920x1080\nDP-1 1920x1080 +0+0\nDP-2 1920x1080 +1920+0
+bad-virtual|virtual without a height|virtual 1920\nDP-1 1920x1080 +0+0
+connected-empty|nvidia-connected without a list|nvidia-connected\nDP-1 1920x1080 +0+0
+edid-no-equals|nvidia-edid without =|nvidia-edid DFP-0\nDP-1 1920x1080 +0+0
+digit-name|output name starting with a digit|1DP 1920x1080 +0+0
+bad-char-name|output name with an illegal character|DP/1 1920x1080 +0+0
+watch-line|a watch line, which the generator does not know|watch 5\nDP-1 1920x1080 +0+0
 EOF
-
-log "a fractional refresh is carried through"
-printf 'DP-1 1920x1080@59.94 +0+0\n' > "$MONITORS_CONF"
-run
-has "$MONITORS_OUT" '"1920x1080_59.94"' "fractional refresh lost"
+ev_end
 
 [ "$fails" = 0 ] || { echo "monitor layout tests: $fails failure(s)" >&2; exit 1; }
 echo "monitor layout tests passed"

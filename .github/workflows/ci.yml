@@ -83,7 +83,11 @@ jobs:
         # driver paths and rejections, and the derived CVT timings against the
         # values cvt(1) prints. A wrong Modeline is a black screen on the host
         # that opted in, and nothing downstream would catch it - the config it
-        # lands in is syntactically perfect either way.
+        # lands in is syntactically perfect either way. Each case keeps its
+        # input, output and log under the story it proves (S3.4.1-S3.4.7).
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/monitor-layout-tests.sh)"
         run: ci/monitor-layout-tests.sh
       - name: build args stay global (multi-stage ARG scoping)
         # An ARG declared before the first FROM is global and usable in every
@@ -164,18 +168,78 @@ jobs:
           PUSH_BASES: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '0' }}
         run: sudo -E ci/build-bases.sh
       - name: application layers (offline gate)
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (offline gate)"
         run: |
           # --network=none is the offline gate, not a speed-up: these layers
           # must build with no network at all, so a dependency can never be
           # added without also changing a Containerfile.*.base and forcing a
           # base rebuild. A build that needs the network fails here loudly
-          # instead of drifting.
+          # instead of drifting. --pull=never closes the gap --network=none
+          # leaves: it governs RUN steps only, and podman would still fetch a
+          # FROM or COPY --from image that is not already here (S1.1.1).
           #
           # Before the desktop image: that layer stages the client tools out of
           # this one (Containerfile's `tools` build stage).
-          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
-          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
-          sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S1.1.1 "The application layer builds fully offline" T2
+          for spec in "screenshot Containerfile.screenshot" \
+                      "desktop-container Containerfile" \
+                      "cdi-device-plugin Containerfile.plugin"; do
+            set -- $spec
+            ev_save "build-$1" "EV-STATE: the offline build of $2 - the command line with --network=none --pull=never, every step, and the image id it ends with" \
+              sudo podman build --network=none --pull=never -t "localhost/$1:latest" -f "$2" . \
+              || { ev_abort "$2 did not build with --network=none --pull=never"; exit 1; }
+            ev_pass "$2 built with --network=none --pull=never"
+            ev_save "inspect-$1" "EV-STATE: podman image inspect of the result: its id, layers and creation time" \
+              sudo podman image inspect "localhost/$1:latest" >/dev/null \
+              || { ev_abort "no localhost/$1:latest after its build"; exit 1; }
+          done
+          ev_end
+      - name: the built image's PipeWire patches (S1.2.3, S1.2.4)
+        # The build's own gates are coarse on purpose (a fast signal): one
+        # finds 'desktop-audio' anywhere in pipewire.conf, the other counts
+        # rtkit.enabled over the whole file and skips a missing one. These
+        # read the patched blocks out of the image the build produced and
+        # hold them to what Requirements.md asks, block by block.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (image config)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          img() { sudo podman run --rm --network=none localhost/desktop-container:latest sh -c "$1"; }
+          ev_begin S1.2.3 "PipeWire native socket exported" T2
+          native=$(ev_save protocol-native "EV-CONFIG: the protocol-native module entry of /usr/share/pipewire/pipewire.conf in the built image, up to the next module: its sockets line lists /run/desktop-audio/pipewire-0" \
+            img 'sed -n "/name = libpipewire-module-protocol-native/,/name = libpipewire-module-/p" /usr/share/pipewire/pipewire.conf') \
+            || { ev_abort "could not read pipewire.conf from the built image"; exit 1; }
+          ev_check "the protocol-native entry's uncommented sockets line lists /run/desktop-audio/pipewire-0" \
+            grep -qE '^[[:space:]]*sockets = \[.*name = "/run/desktop-audio/pipewire-0"' <<<"$native" \
+            || { ev_end; exit 1; }
+          ev_end
+          ev_begin S1.2.4 "module-rt takes the rlimit path" T2
+          f=0
+          for conf in pipewire.conf client-rt.conf; do
+            block=$(ev_save "module-rt-${conf%.conf}" "EV-CONFIG: the module-rt entry of /usr/share/pipewire/$conf in the built image, up to the next module" \
+              img "test -f /usr/share/pipewire/$conf || { echo '(no /usr/share/pipewire/$conf in the image)'; exit 1; }
+                   sed -n '/name = libpipewire-module-rt/,/name = libpipewire-module-/p' /usr/share/pipewire/$conf") \
+              || { ev_fail "/usr/share/pipewire/$conf is in the image (a missing file fails, S1.2.4)"; f=1; continue; }
+            for kv in "rlimits.enabled  = true" "rtportal.enabled = false" "rtkit.enabled    = false"; do
+              key=${kv%% *}
+              n=$(grep -cE "^[[:space:]]*${key//./\\.}[[:space:]]*=" <<<"$block" || true)
+              if [ "$n" = 1 ] && grep -qE "^[[:space:]]*${key//./\\.}[[:space:]]*=[[:space:]]*${kv##* }([[:space:]]|$)" <<<"$block"; then
+                ev_pass "$conf: the module-rt block sets ${key} = ${kv##* }, exactly once"
+              else
+                ev_fail "$conf: the module-rt block sets ${key} = ${kv##* } exactly once (found $n setting(s) of it)"; f=1
+              fi
+            done
+          done
+          ev_save pipewire-confs "EV-STATE: the PipeWire config files the image ships (ls /usr/share/pipewire)" \
+            img 'ls -l /usr/share/pipewire' >/dev/null || true
+          ev_end
+          [ "$f" = 0 ]
       - name: deploy tree quadlet dry-run + CDI spec checks
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts
@@ -241,6 +305,30 @@ jobs:
             grep -q -- '--log-opt[= ]max-size=64m' <<<"$exec_line" || f=1
           ev_check "ExecStart requests the GPU (--device nvidia.com/gpu=all)" \
             grep -q -- '--device[= ]nvidia.com/gpu=all' <<<"$exec_line" || f=1
+          ev_end
+          # S5.2.2: every PodmanArgs flag arrives as the arguments it was
+          # written as - split the way systemd splits ExecStart (double
+          # quotes group, as in a shell), not looked for as text.
+          ev_begin S5.2.2 "Every PodmanArgs flag reaches ExecStart intact" T2
+          args=$(python3 -c 'import shlex, sys; print("\n".join(shlex.split(sys.argv[1].split("=", 1)[1])))' "$exec_line") \
+            || { ev_abort "ExecStart did not split as a command line"; exit 1; }
+          ev_text generated-unit "EV-CONFIG: the generated unit (the same one S5.2.1 keeps); its ExecStart line is what is split" "$out"
+          ev_text argv "EV-STATE: ExecStart split into its arguments, one per line" "$args"
+          mapfile -t A <<<"$args"
+          pair() { local i; for ((i = 0; i < ${#A[@]} - 1; i++)); do [ "${A[i]}" = "$1" ] && [[ ${A[i+1]} =~ $2 ]] && return 0; done; return 1; }
+          for one in --pid=host --systemd=false --tty; do
+            ev_check "$one is one argument" grep -qx -- "$one" <<<"$args" || f=1
+          done
+          ev_check "--security-opt apparmor=unconfined arrives as the flag and one value" \
+            pair --security-opt '^apparmor=unconfined$' || f=1
+          for u in rtprio memlock nice; do
+            ev_check "--ulimit $u arrives as the flag and one value ($u=N)" pair --ulimit "^$u=[0-9-]+$" || f=1
+          done
+          n=$(grep -cE '^--device-cgroup-rule=c [0-9]+:\* rwm$' <<<"$args" || true)
+          ev_check "exactly five --device-cgroup-rule arguments, each a whole 'c N:* rwm' rule (found $n)" \
+            test "$n" = 5 || f=1
+          ev_check "no rule was split apart (no lone 'rwm' or 'c' argument)" \
+            bash -c '! grep -qxE "rwm|c" <<<"$1"' _ "$args" || f=1
           ev_end
           [ "$f" = 0 ] || exit 1
           # Unit directives, asserted as DIRECTIVES rather than as strings that
@@ -330,13 +418,17 @@ jobs:
           # report this partially-applied runner - quadlet not installed
           # (FAIL) but the pieces the step applied green (stub CDI spec,
           # desktop-shell account, seat state)
-          pf=$(sudo deploy/host/usr/local/bin/desktop-preflight || true)
-          echo "$pf"
-          echo "$pf" | grep -q 'done: [0-9]* FAIL'
-          echo "$pf" | grep -q 'FAIL: quadlet unit missing'
-          echo "$pf" | grep -q 'PASS: GPU-less host: stub CDI spec'
-          echo "$pf" | grep -q 'PASS: desktop-shell account exists'
-          echo "$pf" | grep -q 'PASS: default target is multi-user.target'
+          ev_begin S5.10.2 "Reports a partially-applied host accurately" T2
+          pf=$(ev_save preflight "EV-STATE: desktop-preflight's full report on this partially applied runner (no quadlet installed; stub CDI spec, desktop-shell account and seat state applied)" \
+            sudo deploy/host/usr/local/bin/desktop-preflight || true)
+          f=0
+          ev_check "the report ends with its FAIL count" grep -q 'done: [0-9]* FAIL' <<<"$pf" || f=1
+          ev_check "it reports the missing quadlet as a FAIL" grep -q 'FAIL: quadlet unit missing' <<<"$pf" || f=1
+          ev_check "it passes the stub CDI spec this step wrote" grep -q 'PASS: GPU-less host: stub CDI spec' <<<"$pf" || f=1
+          ev_check "it passes the desktop-shell account this step created" grep -q 'PASS: desktop-shell account exists' <<<"$pf" || f=1
+          ev_check "it passes the seat state seat-prep converged" grep -q 'PASS: default target is multi-user.target' <<<"$pf" || f=1
+          ev_end
+          [ "$f" = 0 ]
 
       - name: neutralize host AppArmor unix-chkpwd profile
         # Ubuntu's path-attached unix-chkpwd profile confines the CONTAINER's
