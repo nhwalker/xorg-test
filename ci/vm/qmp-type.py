@@ -12,8 +12,12 @@ QEMU qcodes).
 
 Absolute axis values are 0..0x7fff mapped across the screen, so pixel
 coords convert as px / dimension * 0x7fff.
+
+With QMP_TRANSCRIPT=<file> in the environment, every QMP command sent is
+appended to that file with a UTC timestamp (EV-QEMU).
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -22,14 +26,23 @@ sock_path, res, px_x, px_y, text = sys.argv[1:6]
 width, height = (int(v) for v in res.lower().split("x"))
 px_x, px_y = int(px_x), int(px_y)
 ABS_MAX = 0x7FFF
+transcript = None
 
 
 def main():
+    # EV-QEMU: with QMP_TRANSCRIPT set, every command sent is appended there,
+    # timestamped, so the evidence shows the keys came from QEMU's devices.
+    path = os.environ.get("QMP_TRANSCRIPT")
+    global transcript
+    transcript = open(path, "a", buffering=1) if path else None
     s = socket.socket(socket.AF_UNIX)
     s.connect(sock_path)
     f = s.makefile("rw")
 
     def cmd(obj):
+        if transcript:
+            transcript.write(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                             + f".{int(time.time() * 1000) % 1000:03d}Z " + json.dumps(obj) + "\n")
         f.write(json.dumps(obj) + "\n")
         f.flush()
         while True:  # skip async events, wait for the reply
