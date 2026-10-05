@@ -110,7 +110,7 @@ diagnostics() {
     ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin 2>/dev/null || true
     systemctl status desktop-selinux.service --no-pager -l  2>/dev/null | head -20 || true
     echo "---- diagnostics: recent SELinux denials ----"
-    ausearch -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
+    ausearch --input-logs -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
     if command -v k3s >/dev/null; then
         echo "---- diagnostics: k3s state ----"
         k3s kubectl get nodes,pods -A -o wide 2>/dev/null || true
@@ -474,8 +474,8 @@ phase_deploy() {
         env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
         || fail "the host cannot connect to the relabeled pulse socket"
     ev_pass "an unconfined host process connects to the relabeled pulse socket"
-    avc=$(ev_save avc-since-host-checks "EV-STATE: ausearch -m avc -ts $ev_t0 - every SELinux denial since the host checks began; none" \
-        sh -c "ausearch -m avc -ts $ev_t0 2>&1 || true") || true
+    avc_control
+    avc=$(avc_search avc-since-host-checks "$ev_t0" "every SELinux denial since the host checks began; none") || true
     if grep -q 'type=AVC' <<<"$avc"; then
         fail "SELinux denied something while the host used the relabeled sockets and toolkit (see the ausearch output)"
     fi
@@ -607,8 +607,8 @@ phase_deploy() {
     grep -q ':container_t:' <<<"$lbl" || fail "the probe did not run as container_t: $(echo $lbl)"
     grep -q XDPYINFO_OK <<<"$lbl" || fail "the confined probe could not open :0"
     ev_pass "a client runs confined, as $(grep -o '[a-z_]*:[a-z_]*:container_t:[^[:space:]]*' <<<"$lbl" | sed -n 1p), and opens :0"
-    avc=$(ev_save avc "EV-STATE: ausearch -m avc -ts $s712_t0: SELinux's denials since the probes began" \
-        sh -c "ausearch -m avc -ts $s712_t0 2>&1 || true") || true
+    avc_control
+    avc=$(avc_search avc "$s712_t0" "SELinux's denials since the probes began") || true
     ! grep -q 'scontext=[^ ]*:container_t:' <<<"$avc" \
         || fail "SELinux denied a confined client: $(grep -m1 'scontext=[^ ]*:container_t:' <<<"$avc")"
     ev_pass "no AVC denial since the probes began has a container_t subject"
@@ -691,6 +691,29 @@ deploy_proof() {
 # Restores the shipped (empty) monitors.conf and the connector's forced status
 # before returning, so nothing downstream - the screendumps, the testpattern
 # comparison, phase2's client pods - sees a display this function set up.
+# A search for SELinux denials, and its control. ausearch reads its standard
+# input instead of the audit log when that is a pipe (audit-userspace
+# src/ausearch.c: is_pipe(0), unless --input-logs), and this script runs over
+# ssh with no terminal, its stdin one: without --input-logs every search here
+# read an empty pipe and found no denial, whatever the log held (the
+# maintainer journey's S10.5.3 showed it: 31 AVC records in audit.log,
+# "<no matches>"). The control finds auditd's own start record, which every
+# audit log has, so a search that cannot read the log fails the story rather
+# than passing it.
+avc_search() { # <moment> <since HH:MM:SS> <what>: the denials since then, kept and printed
+    ev_save "$1" "EV-STATE: ausearch --input-logs -m avc -ts $2: $3" \
+        sh -c "ausearch --input-logs -m avc -ts $2 2>&1 || true"
+}
+avc_control() {
+    local out
+    ev_note "this script's standard input is a $(stat -L -c %F /proc/self/fd/0): ausearch without --input-logs would read it instead of the audit log"
+    out=$(ev_save avc-control "EV-STATE: the control: ausearch --input-logs -m DAEMON_START, auditd's own start records: the search reads the audit log" \
+        sh -c 'ausearch --input-logs -m DAEMON_START 2>&1 || true') || true
+    grep -q 'type=DAEMON_START' <<<"$out" \
+        || fail "ausearch --input-logs found no DAEMON_START record: the denial search cannot read the audit log"
+    ev_pass "the denial search reads the audit log: it finds auditd's own start record"
+}
+
 dpy_dims() {
     podman exec -u desktop -e DISPLAY=:0 desktop \
         sh -c "xdpyinfo | awk '/dimensions:/{print \$2; exit}'"

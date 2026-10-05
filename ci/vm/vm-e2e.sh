@@ -863,7 +863,7 @@ vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo' || fail "could not unpa
 pd_ev=""
 in_shard core && pd_ev=$GUEST_EV
 guest_ev "$pd_ev" phase-deploy \
-    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
+    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch --input-logs -m avc -ts recent 2>/dev/null | tail -40' \
          2>&1 | tee "$ART/guest-deploy-fail.log" || true; fail "guest phase-deploy failed"; }
 if in_shard core; then
     # E5 on the deployed host: labels and policy, the host-shell key and its
