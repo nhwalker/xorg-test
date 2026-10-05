@@ -2081,16 +2081,17 @@ environment (`README.md` "Look and feel (dark theme)"), so the root menu, the
 window frames, the key bindings, the X selections and a terminal are the
 operator's whole toolset.
 
-How these stories are run (`ci/vm/operator-e2e.py`, a phase of its own
-between the hotplug checks and phase 2), and what that takes for granted:
+How these stories are run (`ci/vm/operator-e2e.py`: in CI the
+`vm (operator)` job, which boots its own VM and runs them right after
+phase-deploy; in a single-VM run of `ci/vm/vm-e2e.sh`, between the hotplug
+checks and phase 2), and what that takes for granted:
 
 - The input is QEMU's: pointer and key events go over QMP to QEMU's own
   devices, never into the X server. Pointer events reach the virtio tablet.
   Key events reach whichever keyboard QEMU activated last: the virtio
-  keyboard after boot, or the USB keyboard `kvmkbd` once the KVM-switch
-  simulation has re-added it (QEMU makes a newly added USB keyboard the
-  active one), which is what happens when the operator stories run after
-  it in the same VM. The harness only looks at X, with `xwininfo` and
+  keyboard after boot, which is the CI case, or the USB keyboard `kvmkbd`
+  once the KVM-switch simulation has re-added it (QEMU makes a newly added
+  USB keyboard the active one), which is the single-VM case. The harness only looks at X, with `xwininfo` and
   `xprop` in an observer container of the lean client image that holds
   `desktop.local/display` and nothing else (the host has no X tools), and
   at QEMU's screendumps. The observer sends no input; its one write is
@@ -2107,7 +2108,9 @@ between the hotplug checks and phase 2), and what that takes for granted:
 - Order matters: S11.1.1's last entry ends the X session and S11.3.1 ends
   by restarting `desktop.service`, so those two run last, in that order.
   The operator-facing F3.3 and F3.5 checks (S3.3.2, S3.3.3, S3.5.2,
-  S3.5.3) run first, on the desktop as the session leaves it.
+  S3.5.3) run first, on the desktop as the session leaves it; the setup
+  before them closes the terminals earlier phases left up (phase-deploy's
+  among them).
 
 **Common set**: EV-SHOT before and after each action, and EV-VIDEO across any
 action with movement; the EV-QEMU transcript of every pointer and key event
