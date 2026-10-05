@@ -254,6 +254,108 @@ jobs:
             img 'ls -l /usr/share/pipewire' >/dev/null || true
           ev_end
           [ "$f" = 0 ]
+      - name: the built image's contents (S1.1.5, S1.1.6, S1.2.1, S1.2.2, S1.2.5, S1.2.7, S1.2.8)
+        # Read out of the images this job just built, in scratch containers
+        # of them (no desktop-init, so nothing is renumbered or published);
+        # each story keeps what it read.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (image contents)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          img() { sudo podman run --rm --network=none localhost/desktop-container:latest sh -c "$1"; }
+          f=0
+          check() { ev_check "$@" || f=1; }             # <claim> <cmd...>: record it and go on
+          same() { [ -n "$1" ] && [ "$1" = "$2" ]; }    # two values, equal and not empty
+
+          ev_begin S1.1.5 "Rocky repos fill gaps only" T2
+          vendors=$(ev_save rpm-vendors "EV-STATE: rpm -qa --qf '%{NAME} %{VENDOR}' in the base image (localhost/desktop-container-base:latest), sorted" \
+            sudo podman run --rm --network=none localhost/desktop-container-base:latest \
+              sh -c "rpm -qa --qf '%{NAME} %{VENDOR}\n' | sort") || f=1
+          check "glibc's vendor is Red Hat, Inc. (UBI's)" grep -qx 'glibc Red Hat, Inc\.' <<<"$vendors"
+          check "xorg-x11-server-Xorg's vendor is Rocky Enterprise Software Foundation" \
+            grep -qx 'xorg-x11-server-Xorg Rocky Enterprise Software Foundation' <<<"$vendors"
+          ev_note "the two rows the acceptance names, as rpm printed them: $(grep -E '^(glibc|xorg-x11-server-Xorg) ' <<<"$vendors" | sed 's/.*/"&"/' | paste -sd' ')"
+          ev_end
+
+          ev_begin S1.1.6 "The client toolkit is staged from the screenshot image" T2
+          staged=$(ev_save staged "EV-STATE: ls -l and sha256sum of the staged /usr/libexec/desktop-tools/screenshot, in a scratch container of the image" \
+            img 'ls -l /usr/libexec/desktop-tools/screenshot && sha256sum /usr/libexec/desktop-tools/screenshot') || f=1
+          check "the staged binary is -rwxr-xr-x (0755)" grep -qE '^-rwxr-xr-x[.+]? .* /usr/libexec/desktop-tools/screenshot$' <<<"$staged"
+          src=$(ev_save source "EV-STATE: sha256sum of /screenshot in localhost/screenshot:latest, the default TOOLS_IMAGE (copied out of a created, never started, container)" \
+            sudo sh -c 'c=$(podman create localhost/screenshot:latest) && podman cp "$c:/screenshot" - | tar -xO | sha256sum; podman rm -f "$c" >/dev/null') || f=1
+          sha_src=$(awk '$2=="-"{print $1}' <<<"$src")
+          check "it is byte-identical to the screenshot image's /screenshot (sha256 ${sha_src:-unread})" \
+            same "$(awk '$2=="/usr/libexec/desktop-tools/screenshot"{print $1}' <<<"$staged")" "$sha_src"
+          # TOOLS_IMAGE is a build argument: a build given another image must
+          # stage that image's /screenshot. A scratch image holding a marker
+          # file stands in for it.
+          other=$(mktemp -d)
+          printf 'not the screenshot tool: a marker staged from TOOLS_IMAGE=localhost/ci-other-tools\n' > "$other/screenshot"
+          printf 'FROM scratch\nCOPY screenshot /screenshot\n' > "$other/Containerfile"
+          if ev_save build-other "EV-STATE: a scratch image whose /screenshot is a marker file, then the desktop image rebuilt with --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest" \
+               sudo sh -c "podman build --network=none --pull=never -t localhost/ci-other-tools:latest '$other' && podman build --network=none --pull=never --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest -t localhost/desktop-container:ci-other-tools -f Containerfile ." >/dev/null; then
+            other_sums=$(ev_save staged-other "EV-STATE: sha256sum of the file that build staged, then of the marker" \
+              sudo sh -c "podman run --rm --network=none localhost/desktop-container:ci-other-tools sha256sum /usr/libexec/desktop-tools/screenshot; sha256sum '$other/screenshot'") || f=1
+            check "built with TOOLS_IMAGE=localhost/ci-other-tools, the image stages that image's /screenshot (the marker)" \
+              same "$(awk '$2=="/usr/libexec/desktop-tools/screenshot"{print $1}' <<<"$other_sums")" \
+                   "$(awk -v m="$other/screenshot" '$2==m{print $1}' <<<"$other_sums")"
+          else
+            ev_fail "the desktop image builds with --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest"; f=1
+          fi
+          sudo podman rmi -f localhost/desktop-container:ci-other-tools localhost/ci-other-tools:latest >/dev/null 2>&1 || true
+          rm -r "$other"
+          ev_end
+
+          ev_begin S1.2.1 "Session user identity" T2
+          ident=$(ev_save identity "EV-STATE: id desktop, getent passwd desktop and getent group video input audio render tty desktop, in a scratch container of the image" \
+            img 'id desktop; getent passwd desktop; getent group video input audio render tty desktop') || f=1
+          idline=$(grep '^uid=' <<<"$ident" || true)
+          check "uid 61000, primary group desktop with gid 61000" grep -q '^uid=61000(desktop) gid=61000(desktop) ' <<<"$idline"
+          sups=$(sed -n 's/^uid=.* groups=//p' <<<"$idline" | tr ',' '\n' | grep -vx '61000(desktop)' \
+                 | sed 's/^[0-9]*(\(.*\))$/\1/' | sort | paste -sd' ')
+          check "its supplementary groups are exactly audio input render tty video (found: ${sups:-none})" \
+            test "$sups" = "audio input render tty video"
+          check "its home is /home/desktop" grep -q '^desktop:x:61000:61000:[^:]*:/home/desktop:' <<<"$ident"
+          ev_end
+
+          ev_begin S1.2.2 "Session dotfiles come from /etc/skel" T2
+          sums=$(ev_save image-sums "EV-STATE: sha256sum of the session user's .mwmrc and .Xdefaults, in a scratch container of the image" \
+            img 'cd /home/desktop && sha256sum .mwmrc .Xdefaults') || f=1
+          repo=$(ev_save repo-sums "EV-STATE: sha256sum of the repo files they are copied from" \
+            sha256sum image/session/mwmrc image/session/Xdefaults) || f=1
+          for pair in ".mwmrc image/session/mwmrc" ".Xdefaults image/session/Xdefaults"; do
+            set -- $pair
+            check "/home/desktop/$1 is byte-identical to $2" \
+              same "$(awk -v n="$1" '$2==n{print $1}' <<<"$sums")" "$(awk -v n="$2" '$2==n{print $1}' <<<"$repo")"
+          done
+          ev_end
+
+          ev_begin S1.2.5 "pipewire-pulse export drop-in installed" T2
+          dropin=$(ev_save drop-in "EV-CONFIG: /etc/pipewire/pipewire-pulse.conf.d/10-desktop-audio-export.conf, in a scratch container of the image" \
+            img 'cat /etc/pipewire/pipewire-pulse.conf.d/10-desktop-audio-export.conf') || f=1
+          addrs=$(sed -n '/server\.address = \[/,/\]/p' <<<"$dropin")
+          check "its server.address list serves \"unix:native\"" grep -qE '^[[:space:]]*"unix:native"' <<<"$addrs"
+          check "and \"unix:/run/desktop-audio/pulse\"" grep -qE '^[[:space:]]*"unix:/run/desktop-audio/pulse"' <<<"$addrs"
+          ev_end
+
+          ev_begin S1.2.7 "Image carries no NVIDIA userspace" T2
+          nv=$(ev_save find "EV-STATE: find /usr/lib64 /usr/lib -name '*nvidia*', in a scratch container of the image (empty)" \
+            img "find /usr/lib64 /usr/lib -name '*nvidia*'") || f=1
+          check "no file under /usr/lib64 or /usr/lib has nvidia in its name" test -z "$nv"
+          rpms=$(ev_save rpm "EV-STATE: rpm -qa | grep -i nvidia, in a scratch container of the image (empty)" \
+            img 'rpm -qa | grep -i nvidia; true') || f=1
+          check "and no installed package does" test -z "$rpms"
+          ev_end
+
+          ev_begin S1.2.8 "Entry point and stop signal" T2
+          cfg=$(ev_save inspect "EV-STATE: podman image inspect --format '{{.Config.StopSignal}} {{.Config.Cmd}}' of the image" \
+            sudo podman image inspect --format '{{.Config.StopSignal}} {{.Config.Cmd}}' localhost/desktop-container:latest) || f=1
+          check "STOPSIGNAL is SIGTERM" grep -q '^SIGTERM ' <<<"$cfg"
+          check "CMD is /usr/local/bin/desktop-init, alone" grep -q ' \[/usr/local/bin/desktop-init\]$' <<<"$cfg"
+          ev_end
+          [ "$f" = 0 ]
       - name: deploy tree quadlet dry-run + CDI spec checks
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts
