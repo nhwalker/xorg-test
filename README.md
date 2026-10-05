@@ -292,11 +292,15 @@ One thing holds the geometry:
      of `Enable` is `ConnectedMonitor`, which needs its *display device*
      names (`DFP-0`, not the RandR name `DP-0`) and so is opt-in via
      `nvidia-connected`; `nvidia-edid` feeds it a saved EDID the same way.
-   - Both paths pin the framebuffer with `Virtual` at the layout's extents.
-     That changes nothing at startup — the enabled outputs already sum to it
-     — and everything if an output fails to come up: restoring it later is
-     then a mode set rather than a screen resize, and a resize is what moves
-     every window on a desktop whose window manager has never heard of RandR.
+   - Both paths also write `Virtual` at the layout's extents. On modesetting
+     that does not hold the screen's size: when the server starts, RandR 1.2
+     sizes the screen to the outputs that came up, and RandR can grow it later
+     up to the driver's own limit, `Virtual` or not. What holds the geometry
+     there is `Enable`: every declared output is up from the start, so the
+     screen starts at the whole layout and a connector event resizes nothing —
+     a resize is what moves every window on a desktop whose window manager has
+     never heard of RandR. (The NVIDIA driver implements RandR itself; CI does
+     not check what it does with `Virtual`.)
 That config is authoritative at server **start**, and nothing re-asserts it
 afterwards. Nothing in this session watches RandR at all — mwm predates it and
 no desktop environment runs here — so a layout that something else moves stays
@@ -328,7 +332,7 @@ Virtual-2 disconnected 1024x768+1024+0
 ```
 
 — an output scanning out at its declared position with nothing plugged into
-it, on a screen pinned to the full 2048x768. It then forces `Virtual-1`'s
+it, on a screen spanning the full 2048x768. It then forces `Virtual-1`'s
 connector down under the running server and asserts the geometry does not
 move. "Monitor was never there" is a strict superset of the hard part
 of "monitor went away".
