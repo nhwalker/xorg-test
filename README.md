@@ -108,8 +108,15 @@ sudo rsync -a --chown=root:root deploy/host/ /
 sudo systemctl daemon-reload
 sudo systemd-sysusers
 sudo systemd-tmpfiles --create
+# a running sshd reads the tree's sshd_config.d drop-in only when it starts or reloads
+sudo systemctl try-reload-or-restart sshd
 sudo systemctl start desktop.service
 ```
+
+The sshd line is for Host Terminal (see "Host terminal from the desktop"):
+its key is trusted through the tree's `sshd_config.d` drop-in, which an sshd
+already running when the tree arrived has not read. It reloads sshd if it is
+running and does nothing if it is not.
 
 See `deploy/README.md` for the full contents, the host prerequisites
 (`deploy/HOST-REQUIRES.md`), the per-host drop-in overrides, and the
