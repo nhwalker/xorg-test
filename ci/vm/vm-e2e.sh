@@ -861,7 +861,7 @@ sleep 3
 guest_ev "$GUEST_EV" verify-audio-x || { audio_capture_stop; fail "audio did not survive an X session restart"; }
 EV_SIDE=h-
 ev_begin S4.5.1 "Audio survives an X session restart" T3
-for _ in $(seq 40); do st=$(gq tone-status s451 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+for _ in $(seq 40); do st=$(gq tone-status s451 2>/dev/null | sed -n 1p || true); [ "${st%% *}" = exited ] && break; sleep 1; done
 ev_save player "EV-LOG-CLIENT: the pulse client's player (paplay, in the desktop container but outside the X session): its exit status, how long it played and from when to when, its pid, its output" \
     gq tone-status s451 >/dev/null || true
 player=$(ev_payload "$EV_DIR/$EV_LAST")
@@ -1493,7 +1493,7 @@ sleep 2
 mid=$(ev_save sink-inputs-mid "EV-STATE: pactl list short sink-inputs mid-playback (the second column is the sink's index)" \
     gq desk pactl list short sink-inputs) || true
 sinks_mid=$(ev_save sinks-mid "EV-STATE: pactl list short sinks mid-playback (index, then name)" gq desk pactl list short sinks) || true
-for _ in $(seq 15); do st=$(gq tone-status newcard 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+for _ in $(seq 15); do st=$(gq tone-status newcard 2>/dev/null | sed -n 1p || true); [ "${st%% *}" = exited ] && break; sleep 1; done
 ev_save player "EV-LOG-CLIENT: the 990 Hz player's status (exited and its code) and its stderr" gq tone-status newcard >/dev/null || true
 ev_audio_stop "EV-AUDIO: the machine's output while a pulse client played 990 Hz on the default sink, the new card's, with the built-in card's sink muted: what is heard came out of the new card - listen for one beep" 1 0.05 990 \
     || heard=no
@@ -1527,7 +1527,7 @@ ev_qemu device-del "EV-QEMU: device_del hotsnd2 under the playing stream, and QE
 t_del=$(date +%s)
 outcome=""
 for _ in $(seq 10); do
-    st=$(gq tone-status longplay 2>/dev/null | head -1)
+    st=$(gq tone-status longplay 2>/dev/null | sed -n 1p || true)
     if [ "${st%% *}" = exited ]; then
         outcome="exited (code ${st#exited }) $(( $(date +%s) - t_del )) s after the removal"
         break
@@ -1545,7 +1545,7 @@ for _ in $(seq 10); do
 done
 ev_save sink-inputs-after "EV-STATE: pactl list short sink-inputs after the removal" gq desk pactl list short sink-inputs >/dev/null || true
 ev_save sinks-after "EV-STATE: pactl list short sinks after the removal" gq desk pactl list short sinks >/dev/null || true
-for _ in $(seq 15); do st=$(gq tone-status longplay 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+for _ in $(seq 15); do st=$(gq tone-status longplay 2>/dev/null | sed -n 1p || true); [ "${st%% *}" = exited ] && break; sleep 1; done
 ev_save player "EV-LOG-CLIENT: the long player's status (exited and its code, or running) and its stderr" gq tone-status longplay >/dev/null || true
 ev_audio_stop "EV-AUDIO: the machine's output from the stream's start, about 3 s before device_del (see notes), to its end: the tone goes on where the stream was moved to a remaining sink, and stops where the player ended - listen across the removal" 1 0.05 660 \
     || ev_note "check-audio's verdict on the capture is not a pass (see its report): judged on the player and the graph instead"
@@ -1886,7 +1886,7 @@ log "client journeys: long-running pods through the desktop's own restarts"
 # the pods share.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh journey-start' || fail "the journey pod did not become Ready"
 gnow() { vm_ssh_quick 'date +%s.%N' 2>/dev/null | tail -1; }
-xorg_pid() { vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | head -1 || true; }
+xorg_pid() { vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | sed -n 1p || true; }
 # Until a new X session answers: an Xorg other than <old pid>, and mwm up.
 x_wait() { # <old Xorg pid>
     local _ p
@@ -1900,7 +1900,7 @@ x_wait() { # <old Xorg pid>
 tone_wait() { # <tag> [pod] [seconds]: until the pod's player has ended
     local st _
     for _ in $(seq "${3:-40}"); do
-        st=$(gq journey-tone-status "$1" "${2:-journey}" 2>/dev/null | head -1)
+        st=$(gq journey-tone-status "$1" "${2:-journey}" 2>/dev/null | sed -n 1p || true)
         [ "${st%% *}" = exited ] && return 0
         sleep 1
     done
@@ -1919,7 +1919,7 @@ pod_same() { # <before file> <after file>
 # The sink-input indexes in a `streams` listing.
 sink_inputs() { awk '/^== pactl list short sink-inputs/ {s = 1; next} /^==/ {s = 0} s && /^[0-9]/ {print $1}' <<<"$1" | paste -sd' '; }
 # One field of a journey-stat line: inode or ctime.
-stat_field() { sed -n "s/.*$2=\([0-9]*\).*/\1/p" <<<"$1" | head -1; }
+stat_field() { sed -n "s/.*$2=\([0-9]*\).*/\1/p" <<<"$1" | sed -n 1p; }
 # "comm=pid ..." for the named daemons in a ctr-pids listing.
 pids_of() { # <ctr-pids output> <comm...>
     local out=$1
@@ -1984,7 +1984,7 @@ si_b=$(sink_inputs "$(ev_out)")
 ev_save player-before "EV-PIDS: the pod's applications before the kill: its player" gq journey-apps >/dev/null || true
 pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 sleep 2
-t_kill=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x Xorg' 2>/dev/null | head -1 || true)
+t_kill=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x Xorg' 2>/dev/null | sed -n 1p || true)
 ev_note "Xorg (pid $x_old) killed (SIGTERM, as the desktop user) at $t_kill, about 5 s into the pod's 20 s tone"
 ev_save streams-during "EV-STATE: the sink-inputs and source-outputs right after the kill, while the X session restarts" \
     gq streams >/dev/null || true
@@ -2108,9 +2108,9 @@ ev_save streams-before "EV-STATE: pactl list short sink-inputs and source-output
 [ -n "$(sink_inputs "$(ev_out)")" ] || { audio_capture_stop; fail "no sink-input for the pod's player before the kill"; }
 ev_save player-before "EV-PIDS: the pod's applications before the kill: its player" gq journey-apps >/dev/null || true
 sleep 1
-t_kill_a=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x pipewire' 2>/dev/null | head -1 || true)
+t_kill_a=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x pipewire' 2>/dev/null | sed -n 1p || true)
 ev_note "pipewire (pid $pw_old) killed at $t_kill_a, about 4 s into the pod's 20 s tone"
-for _ in $(seq 15); do st=$(gq journey-tone-status doomed 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+for _ in $(seq 15); do st=$(gq journey-tone-status doomed 2>/dev/null | sed -n 1p || true); [ "${st%% *}" = exited ] && break; sleep 1; done
 ev_save streams-during "EV-STATE: the sink-inputs and source-outputs just after the kill" gq streams >/dev/null || true
 ev_save player "EV-LOG-CLIENT: the pod's player across the kill: its exit status, when it ended, its pid, and its error" \
     gq journey-tone-status doomed >/dev/null || true
@@ -2135,7 +2135,7 @@ ev_pass "the pod's player exited $rc, ${within} s after the kill, with: $err"
 ev_pass "the tone was heard up to the kill and stopped there"
 pw_new="" ok=no
 for _ in $(seq 60); do
-    pw_new=$(vm_ssh_quick 'sudo podman exec desktop pgrep -x pipewire' 2>/dev/null | head -1 || true)
+    pw_new=$(vm_ssh_quick 'sudo podman exec desktop pgrep -x pipewire' 2>/dev/null | sed -n 1p || true)
     if [ -n "$pw_new" ] && [ "$pw_new" != "$pw_old" ] && gq jx pactl info >/dev/null 2>&1; then ok=yes; break; fi
     sleep 1
 done
@@ -2210,7 +2210,7 @@ grep -q '^alive yes' <<<"$held_b" || fail "the held screenshot is not running be
 gq journey-loop-start >/dev/null || fail "could not start the screenshot loop"
 sleep 2
 ev_save loop-before "EV-PIDS: the screenshot loop's shell in the pod before the restart" gq jx pgrep -f shot-loop.sh >/dev/null || true
-loop_b=$(ev_out | head -1)
+loop_b=$(ev_out | sed -n 1p)
 ev_end
 
 ev_begin S7.8.1 "A desktop.service restart does not recreate client pods" T3
@@ -2248,7 +2248,7 @@ ev_save held-after "EV-PIDS: the held screenshot after the restart: still alive,
     gq journey-held-state >/dev/null || true
 held_a=$(ev_out)
 ev_save loop-after "EV-PIDS: the screenshot loop's shell after the restart" gq jx pgrep -f shot-loop.sh >/dev/null || true
-loop_a=$(ev_out | head -1)
+loop_a=$(ev_out | sed -n 1p)
 gq journey-loop-stop >/dev/null || true
 ev_save loop-log "EV-LOG-CLIENT: the screenshot loop's log across the restart: guest time, try, exit status, the tool's output" \
     gq journey-loop-log >/dev/null || true

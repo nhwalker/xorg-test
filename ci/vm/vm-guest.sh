@@ -2317,16 +2317,25 @@ xi_test_stop() { podman exec desktop pkill -f 'xinput test' 2>/dev/null || true;
 # The host drives the desktop's events and keeps the evidence; these reach
 # into a pod (ci/vm/journey-pod.yaml unless one is named) and look at the
 # display. Files go into a pod through `kubectl exec -i ... cat`, never
-# kubectl cp, which needs a tar the desktop image does not have.
+# kubectl cp, which needs a tar the desktop image does not have. Anything that
+# must keep running starts through journey_run, as a child of the pod's agent:
+# started from a kubectl exec, it would last only as long as the exec (run
+# 37325367423's first xterm never reached the display).
 JPOD=journey
 journey_start() { # [manifest] [pod]
     k3s kubectl apply -f "${1:-ci/vm/journey-pod.yaml}" >/dev/null
     k3s kubectl wait --for=condition=Ready "pod/${2:-$JPOD}" --timeout=180s >/dev/null
 }
 jx_in() { local pod=$1; shift; k3s kubectl exec "$pod" -- "$@"; }
-# An xterm from the pod, in the background; its output in /tmp/<title>.log there.
-journey_xterm() { # <title> [pod]
-    k3s kubectl exec "${2:-$JPOD}" -- sh -c "nohup xterm -T '$1' -geometry 60x6+640+420 > /tmp/$1.log 2>&1 &"
+# Start the script on stdin in the journey pod, as a child of its agent.
+journey_run() { # <name> < script
+    k3s kubectl exec -i "$JPOD" -- sh -c "cat > /tmp/run/.$1 && mv /tmp/run/.$1 /tmp/run/$1.sh"
+}
+# An xterm from the pod; its output in /tmp/<title>.log there.
+journey_xterm() { # <title>
+    journey_run "xterm-$1" <<EOF
+exec xterm -T '$1' -geometry 60x6+640+420 > /tmp/$1.log 2>&1
+EOF
 }
 # The pod's applications, one per line: pid and command line.
 journey_apps() { # [pod]
@@ -2350,10 +2359,18 @@ journey_put() { # <tag> <hz> <seconds> [pod]
     gen_tone "$2" "/tmp/$1.wav" "$3"
     k3s kubectl exec -i "${4:-$JPOD}" -- sh -c "cat > /tmp/$1.wav" < "/tmp/$1.wav"
 }
-journey_tone() { # <tag> <hz> <seconds> [pod]
-    local pod="${4:-$JPOD}"
-    journey_put "$@"
-    k3s kubectl exec "$pod" -- sh -c "rm -f /tmp/$1.rc /tmp/$1.t0 /tmp/$1.t1 /tmp/$1.pid; nohup sh -c 'date +%s.%N > /tmp/$1.t0; paplay /tmp/$1.wav > /tmp/$1.log 2>&1 & echo \$! > /tmp/$1.pid; wait \$!; r=\$?; date +%s.%N > /tmp/$1.t1; echo \$r > /tmp/$1.rc' > /dev/null 2>&1 &"
+journey_tone() { # <tag> <hz> <seconds>
+    journey_put "$1" "$2" "$3"
+    k3s kubectl exec "$JPOD" -- rm -f "/tmp/$1.rc" "/tmp/$1.t0" "/tmp/$1.t1" "/tmp/$1.pid"
+    journey_run "tone-$1" <<EOF
+date +%s.%N > /tmp/$1.t0
+paplay /tmp/$1.wav > /tmp/$1.log 2>&1 &
+echo \$! > /tmp/$1.pid
+wait \$!
+r=\$?
+date +%s.%N > /tmp/$1.t1
+echo \$r > /tmp/$1.rc
+EOF
 }
 # "exited N" and "played S s, from T0 to T1" once the player ended (else
 # "running"), then "pid P", then its output.
@@ -2393,20 +2410,21 @@ journey_tools_ls() { k3s kubectl exec "${1:-$JPOD}" -- sh -c 'ls -li "$DESKTOP_T
 # holds, so writing it into a pipe that nobody reads yet blocks the binary
 # mid-run, its executable mapped, until journey_held_release opens the tap.
 journey_noise() { # an xterm over all of Virtual-1, filled with random hex
-    k3s kubectl exec "$JPOD" -- sh -c "nohup xterm -T noise -geometry 170x58+0+0 -hold -e od -An -tx1 -w56 -N 4000 /dev/urandom > /tmp/noise.log 2>&1 &"
+    journey_run noise <<'EOF'
+exec xterm -T noise -geometry 170x58+0+0 -hold -e od -An -tx1 -w56 -N 4000 /dev/urandom > /tmp/noise.log 2>&1
+EOF
 }
 journey_shot_size() { # the size of a PNG of the display as it is now
     k3s kubectl exec "$JPOD" -- sh -c '"$DESKTOP_TOOLS_BIN"/screenshot --to-stdout | wc -c'
 }
 journey_held_start() {
-    k3s kubectl exec -i "$JPOD" -- sh -c 'cat > /tmp/held.sh' <<'EOF'
-rm -f /tmp/held.pid /tmp/held.rc /tmp/held.go /tmp/held.png /tmp/held.done
+    k3s kubectl exec "$JPOD" -- rm -f /tmp/held.pid /tmp/held.rc /tmp/held.go /tmp/held.png /tmp/held.done
+    journey_run held <<'EOF'
 ( sh -c 'echo $$ > /tmp/held.pid; exec "$DESKTOP_TOOLS_BIN"/screenshot --to-stdout'
   echo $? > /tmp/held.rc ) |
     ( while [ ! -f /tmp/held.go ]; do sleep 0.2; done; cat > /tmp/held.png )
 touch /tmp/held.done
 EOF
-    k3s kubectl exec "$JPOD" -- sh -c 'nohup sh /tmp/held.sh > /tmp/held.log 2>&1 &'
 }
 # The held screenshot as /proc shows it: alive or not, the executable it runs
 # (a replaced file reads "(deleted)") and that executable's inode, then the
@@ -2426,12 +2444,13 @@ journey_held_release() {
         for i in $(seq 100); do [ -f /tmp/held.done ] && break; sleep 0.2; done
         echo "rc $(cat /tmp/held.rc 2>/dev/null || echo none)"
         echo "png-bytes $(wc -c < /tmp/held.png 2>/dev/null || echo 0)"
-        cat /tmp/held.log 2>/dev/null'
+        cat /tmp/run/held.out 2>/dev/null'
 }
 # S7.8.2's loop: the toolkit's screenshot every 0.5 s from the pod, each try
 # logged as "<guest time> <try> <exit status> <its output>".
 journey_loop_start() {
-    k3s kubectl exec -i "$JPOD" -- sh -c 'cat > /tmp/shot-loop.sh' <<'EOF'
+    k3s kubectl exec "$JPOD" -- rm -f /tmp/shot-loop.log
+    journey_run shot-loop <<'EOF'
 i=0
 while :; do
     i=$((i + 1))
@@ -2442,7 +2461,6 @@ while :; do
     sleep 0.5
 done >> /tmp/shot-loop.log 2>&1
 EOF
-    k3s kubectl exec "$JPOD" -- sh -c 'rm -f /tmp/shot-loop.log; nohup sh /tmp/shot-loop.sh > /dev/null 2>&1 &'
 }
 journey_loop_stop() { k3s kubectl exec "$JPOD" -- pkill -f shot-loop.sh 2>/dev/null || true; }
 journey_loop_log() { k3s kubectl exec "$JPOD" -- cat /tmp/shot-loop.log 2>/dev/null || true; }
@@ -2837,14 +2855,14 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     journey-start) journey_start "${2:-}" "${3:-}" ;;
     jx) shift; jx_in "$JPOD" "$@" ;;
     jx-in) shift; jx_in "$@" ;;
-    journey-xterm) journey_xterm "${2:-}" "${3:-}" ;;
+    journey-xterm) journey_xterm "${2:-}" ;;
     journey-apps) journey_apps "${2:-}" ;;
     win-up) win_up "${2:-}" ;;
     win-wait) win_wait "${2:-}" "${3:-}" ;;
     win-tree) win_tree ;;
     client-shot) client_shot "${2:-}" ;;
     journey-put) journey_put "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
-    journey-tone) journey_tone "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    journey-tone) journey_tone "${2:-}" "${3:-}" "${4:-}" ;;
     journey-tone-status) journey_tone_status "${2:-}" "${3:-}" ;;
     streams) streams ;;
     journey-stat) journey_stat "${2:-}" "${3:-}" ;;
