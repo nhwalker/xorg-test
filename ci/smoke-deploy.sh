@@ -65,9 +65,9 @@ tools_diag() {
 FAKEBIN=$(mktemp -d)
 
 # Each leg keeps what the converger printed and the spec it left (S5.4.2).
-# The fake toolkit and /dev/nvidiactl stand in for a GPU host; the leg where
-# a loaded nvidia module alone keeps the real spec needs a /proc/modules
-# override the script does not have yet (Requirements.md, Appendix A).
+# The fake toolkit and /dev/nvidiactl stand in for a GPU host, and a
+# fabricated module list (CDI_PROC_MODULES, Requirements.md, Appendix A)
+# for a loaded nvidia module with no device node yet.
 cdi_leg() { # <moment> <what the leg does> [VAR=value...]: run the converger, keep its output and spec
     local moment=$1 what=$2 rc=0
     shift 2
@@ -111,10 +111,24 @@ grep -q keeping <<<"$CDI_OUT" || fail "downgraded to stub despite visible hardwa
 grep -q GENERATED "$SPEC" || fail "real spec lost while hardware visible"
 ev_pass "no toolkit but the hardware visible: the real spec is kept, no downgrade"
 rm -f /dev/nvidiactl
-cdi_leg 5-recovered "neither the toolkit nor the hardware" || fail "the converger failed after the hardware went"
+# The driver's module loaded and its device node not there yet (the race
+# the rule exists for): a module list with nvidia in it, as /proc/modules
+# prints one, is enough to keep the real spec.
+MODS=$(mktemp)
+{ grep -v '^nvidia' /proc/modules || true; echo 'nvidia 56750080 0 - Live 0x0000000000000000 (POE)'; } > "$MODS"
+ev_save 5-modules "EV-STATE: the fabricated module list the next leg reads (CDI_PROC_MODULES): the runner's /proc/modules with an nvidia line added" \
+    grep -n '^nvidia ' "$MODS" >/dev/null || true
+cdi_leg 5-module "no toolkit, no /dev/nvidiactl, the nvidia module loaded (CDI_PROC_MODULES lists it)" CDI_PROC_MODULES="$MODS" || true
+grep -q keeping <<<"$CDI_OUT" || fail "downgraded to stub despite the nvidia module loaded"
+grep -q GENERATED "$SPEC" || fail "real spec lost while the nvidia module is loaded"
+ev_pass "no toolkit and no device node, but the nvidia module loaded: the real spec is kept, no downgrade"
+rm -f "$MODS"
+ev_save 6-proc-modules "EV-STATE: grep -c '^nvidia ' /proc/modules on the runner: the next leg reads the real list, which has no nvidia module (0)" \
+    grep -c '^nvidia ' /proc/modules >/dev/null || true
+! grep -q '^nvidia ' /proc/modules || fail "this runner has an nvidia module loaded: the leg back to the stub cannot run here"
+cdi_leg 6-recovered "neither the toolkit nor the hardware, and no nvidia module (the runner's own /proc/modules)" || fail "the converger failed after the hardware went"
 grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub not restored after hardware removal"
-ev_pass "neither toolkit nor hardware: back to the stub"
-ev_note "not tested here: the nvidia module loaded (/proc/modules) with no device node; the script reads /proc/modules directly and has no override a test could use"
+ev_pass "neither toolkit nor hardware nor module: back to the stub"
 ev_end
 
 # --- client CDI generator branch tests ---------------------------------------
