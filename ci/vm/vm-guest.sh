@@ -1317,7 +1317,10 @@ ad_unplug() { # S3.10.6: the only enabled output forced off, then back
 # An EDID for a 1024x768@60 monitor (S3.10.7): 1024x768@60 preferred, the
 # size QEMU is asked to enable head 1 at, which a preferred mode must match
 # for virtio-gpu to keep it; 640x480@60 and 800x600@60 established; no
-# continuous-frequency flag, so X adds none of its default modes and lists
+# continuous-frequency flag, so the kernel infers no modes from the range
+# limits. X adds none of its own either: its default modes only when the
+# driver gives none, and modesetting's only on an output with a panel fitter
+# (a "scaling mode" property), which virtio-gpu's connectors lack. Both list
 # exactly these three.
 write_edid() { # <file>
     python3 - "$1" <<'EOF'
@@ -1348,7 +1351,7 @@ EOF
 }
 
 ad_edid() { # prep|on|off|gone: S3.10.7, around the host's plug, shot and unplug
-    local T=$LAYOUT_TMP dbg dims0 v1 xl0 v2modes kedid xedid want=640x480,800x600,1024x768
+    local T=$LAYOUT_TMP dbg dims0 v1 xl0 v2modes kmodes unoffered v1cur kedid xedid want=640x480,800x600,1024x768
     layout_connectors
     dbg=$(ls -d /sys/kernel/debug/dri/*/Virtual-2 2>/dev/null | head -n1 || true)
     ev_begin S3.10.7 "A plugged-in monitor with an EDID exposes modes" T3
@@ -1387,11 +1390,26 @@ $(grep -h 'CONFIG_DRM_LOAD_EDID_FIRMWARE' "/boot/config-$(uname -r)" 2>/dev/null
             [ -n "$kedid" ] && [ "$kedid" = "$(od -An -tx1 -v "$AD7_EDID" | tr -d ' \n')" ] \
                 || fail "Virtual-2's EDID in sysfs is not the injected one ($(( ${#kedid} / 2 )) bytes)"
             ev_pass "the kernel gives the plugged-in Virtual-2 the injected EDID, byte for byte ($(( ${#kedid} / 2 )) bytes)"
+            ev_save modes-kernel "EV-STATE: the modes the kernel offers on Virtual-2, its sysfs modes" \
+                cat "$conn2/modes" >/dev/null || true
+            kmodes=$(sort -u "$conn2/modes" | sort -t x -k1,1n | paste -sd, -)
+            [ "$kmodes" = "$want" ] || fail "the kernel offers Virtual-2 the modes ${kmodes:-none}, not the EDID's $want"
+            ev_pass "the kernel offers Virtual-2 exactly the EDID's modes: $kmodes"
             layout_set ad7-on "with the monitor plugged into Virtual-2"
-            v2modes=$(awk '/^Virtual-2 /{f = 1; next} /^[A-Za-z]/{f = 0} f && /^  [0-9]+x[0-9]+ / {print $1}' "$T/ad7-on-xrandr.txt" \
+            # X's modes for Virtual-2 from the plain query. After its last
+            # output xrandr prints every mode no output offers, and --verbose
+            # prints those just as it prints an output's modes, so they read
+            # as the last output's. The plain query prints an output's modes
+            # three spaces in, and those two in, with their ids.
+            xr > "$T/ad7-on-query.txt" 2>&1 || true
+            ev_copy "$T/ad7-on-query.txt" ad7-on-query "EV-STATE: xrandr --query, with the monitor plugged into Virtual-2 (an output's modes three spaces in; after the last output, two in and with their ids, the modes no output offers)"
+            v2modes=$(awk '/^Virtual-2 /{f = 1; next} /^[^ ]/{f = 0} f && /^   [0-9]+x[0-9]+i? / {print $1}' "$T/ad7-on-query.txt" \
                 | sort -u | sort -t x -k1,1n | paste -sd, -)
-            [ "$v2modes" = "$want" ] || fail "xrandr --verbose lists Virtual-2's modes as ${v2modes:-none}, not the EDID's $want"
-            ev_pass "xrandr --verbose lists exactly the EDID's modes for Virtual-2: $v2modes"
+            [ "$v2modes" = "$want" ] || fail "xrandr lists Virtual-2's modes as ${v2modes:-none}, not the EDID's $want"
+            ev_pass "xrandr lists exactly the EDID's modes for Virtual-2: $v2modes"
+            unoffered=$(awk '/^  [0-9]+x[0-9]+i? \(0x[0-9a-f]+\)/ {print $1 " " $2}' "$T/ad7-on-query.txt" | paste -sd, -)
+            v1cur=$(awk '/^Virtual-1 / {for (i = 2; i <= NF; i++) if ($i ~ /^\(0x[0-9a-f]+\)$/) {print $i; exit}}' "$T/ad7-on-xrandr.txt")
+            [ -z "$unoffered" ] || ev_note "after its last output xrandr lists the modes no output offers: $unoffered; Virtual-1 runs mode ${v1cur:-none}"
             xedid=$(awk '/^Virtual-2 /{f = 1; next} /^[A-Za-z]/{f = 0; e = 0} f && /^\tEDID:/ {e = 1; next}
                          e && /^\t\t[0-9a-f]+$/ {printf "%s", $1; next} {e = 0}' "$T/ad7-on-xrandr.txt")
             [ "$xedid" = "$kedid" ] || fail "X's EDID property for Virtual-2 is not the injected EDID ($(( ${#xedid} / 2 )) bytes)"
