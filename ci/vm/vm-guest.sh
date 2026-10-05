@@ -3001,6 +3001,22 @@ verify_runtime() {
     grep -q 'preflight: PASS: host udev database mounted at /run/udev' <<<"$dlog" \
         || fail "the preflight did not pass its udev line"
     ev_pass "the container's preflight reports PASS: host udev database mounted at /run/udev"
+    # The database is the host's, not a udevd's of the container's own. Under
+    # --pid=host the host's systemd-udevd is in the container's process list
+    # too, so the mount namespaces say whose each udevd is.
+    local init_pid ctr_mnt udevds p
+    init_pid=$(podman exec desktop cat /run/desktop-init.pid 2>/dev/null || true)
+    ctr_mnt=$(readlink "/proc/${init_pid:-0}/ns/mnt" 2>/dev/null || true)
+    [ -n "$ctr_mnt" ] || fail "could not read the container's mount namespace (desktop-init pid '${init_pid}')"
+    udevds=$(for p in $(pgrep -x systemd-udevd; pgrep -x udevd); do
+        printf '%s %s %s\n' "$p" "$(readlink "/proc/$p/ns/mnt" 2>/dev/null)" "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+    done)
+    ev_text udevds "EV-PIDS: every udevd process on the VM host (pid, mount namespace, command line), against the container's mount namespace, desktop-init's: $ctr_mnt" \
+        "${udevds:-(no udevd process)}"
+    if grep -qF " $ctr_mnt " <<<"$udevds"; then
+        fail "a udevd runs in the container's mount namespace: $udevds"
+    fi
+    ev_pass "no udevd runs in the container's mount namespace ($ctr_mnt): $(grep -c . <<<"$udevds" || true) udevd process(es) on the host, none in it"
     ev_end
     log rt "verify-runtime passed"
 }
@@ -3145,12 +3161,13 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
 x_answers() { podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2>&1; }
 
 # Each daemon's own exit restarts the whole stack (Requirements.md S2.4.2;
-# PipeWire's own is S4.5.2's). The host plays a tone through the result.
+# what PipeWire's exit leaves alone is S4.5.2's). The host plays a tone
+# through the result.
 verify_audio_restarts() {
-    log ar "wireplumber alone, then pipewire-pulse alone: each takes the stack down and back"
+    log ar "pipewire, wireplumber, then pipewire-pulse, each alone: each takes the stack down and back"
     ev_begin S2.4.2 "Any daemon exiting restarts the whole stack" T3
     local victim before after n_lines b a since
-    for victim in wireplumber pipewire-pulse; do
+    for victim in pipewire wireplumber pipewire-pulse; do
         wait_for 30 2 "the audio export" audio_reachable
         before=$(audio_trio)
         ev_save "pids-before-$victim" "EV-PIDS: the three audio daemons before $victim is killed" \
