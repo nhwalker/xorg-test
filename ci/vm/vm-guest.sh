@@ -2265,6 +2265,12 @@ kbd_sys() { # the USB keyboard's inputN directory
 kbd_event() { local e; e=$(ls -d "$1"/event* 2>/dev/null | head -n1); [ -n "$e" ] && echo "/dev/input/${e##*/}"; }
 kbd_udev() { udevadm info "$1"; echo; udevadm info "$(kbd_event "$1")"; }
 foreign_tags() { grep -hE '^E:ID_SEAT=' /run/udev/data/* 2>/dev/null | grep -v '=seat0$' | sort -u || true; }
+# The same, entry by entry: the udev database file of each device tagged for
+# another seat (the container preflight reads these files), and its seat.
+foreign_entries() {
+    grep -HE '^E:ID_SEAT=' /run/udev/data/* 2>/dev/null | grep -v '=seat0$' \
+        | sed 's|^/run/udev/data/||; s|:E:ID_SEAT=| ID_SEAT=|' || true
+}
 seat_tags() { # attach|fix
     local sys ev b j0 j pf
     sys=$(kbd_sys) || fail "no 'QEMU QEMU USB Keyboard' input device on the VM host"
@@ -2284,6 +2290,8 @@ seat_tags() { # attach|fix
             ev_save udev-attached "EV-STATE: udevadm info of the keyboard after loginctl attach seat1" kbd_udev "$sys" >/dev/null || true
             ev_diff udev-attach "EV-DIFF: udevadm info across loginctl attach seat1 (ID_SEAT=seat1 appears)" "$b" "$EV_LAST"
             udevadm info -q property -n "$ev" | grep -qx 'ID_SEAT=seat1' || fail "$ev is not tagged ID_SEAT=seat1 after loginctl attach"
+            ev_save tagged-attached "EV-STATE: every udev database entry tagged for a seat other than seat0, after loginctl attach seat1: the keyboard's input device and the devices under it" \
+                foreign_entries >/dev/null || true
             ev_pass "loginctl attach seat1 tagged the keyboard: $ev reads ID_SEAT=seat1 ($(foreign_tags | paste -sd' ' -) in the udev database)"
             systemctl restart desktop.service
             desk_back
@@ -2306,8 +2314,10 @@ seat_tags() { # attach|fix
             ev_save rules-after "EV-STATE: ls -l /etc/udev/rules.d after seat-prep: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is still there after seat-prep"
             ev_save udev-after "EV-STATE: udevadm info of the keyboard after seat-prep" kbd_udev "$sys" >/dev/null || true
+            ev_save tagged-after "EV-STATE: every udev database entry tagged for a seat other than seat0, after seat-prep: none" \
+                foreign_entries >/dev/null || true
             ! udevadm info -q property -n "$ev" | grep -q '^ID_SEAT=' || fail "$ev still carries $(udevadm info -q property -n "$ev" | grep '^ID_SEAT=')"
-            [ -z "$(foreign_tags)" ] || fail "the udev database still has a foreign seat tag: $(foreign_tags | paste -sd' ' -)"
+            [ -z "$(foreign_tags)" ] || fail "the udev database still has a foreign seat tag: $(foreign_entries | paste -sd' ' -)"
             ev_pass "the rule is gone and udev re-read the keyboard: $ev has no ID_SEAT, and no device in the udev database is tagged for another seat"
             systemctl start desktop.service
             desk_back
