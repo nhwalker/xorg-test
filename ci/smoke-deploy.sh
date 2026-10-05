@@ -1401,10 +1401,17 @@ ev_save quadlet-off "EV-CONFIG: the quadlet's lines naming desktop-host-shell, t
     grep -n 'desktop-host-shell' "$QL" >/dev/null || true
 ! grep -qE '^(Wants|After)=desktop-host-shell\.service$' "$QL" || fail "the off-switch did not take: the quadlet still names desktop-host-shell.service"
 systemctl daemon-reload
-deps=$(ev_save deps-off "EV-STATE: systemctl show -p Wants -p After desktop.service after daemon-reload: no desktop-host-shell.service" \
-    systemctl show -p Wants -p After desktop.service) || fail "systemctl show desktop.service failed"
+# The unit quadlet generated, and systemctl show's Wants=, not its After=:
+# while desktop-host-shell.service is loaded, its own Before=desktop.service
+# shows up in desktop.service's After= list as the inverse dependency (run
+# 37376729584), and it orders nothing once nothing pulls the unit in.
+deps=$(ev_save deps-off "EV-STATE: the Wants=/After= lines of the unit quadlet generated (systemctl cat desktop.service), and systemctl show -p Wants desktop.service, after daemon-reload: no desktop-host-shell.service" \
+    sh -c 'systemctl cat desktop.service | grep -E "^(Wants|After)="; systemctl show -p Wants desktop.service') \
+    || fail "systemctl cat/show desktop.service failed"
 ! grep -q 'desktop-host-shell' <<<"$deps" || fail "desktop.service still wants, or starts after, desktop-host-shell.service"
-ev_pass "with the two lines commented out and a daemon-reload, desktop.service neither wants nor waits for desktop-host-shell.service"
+ev_pass "with the two lines commented out and a daemon-reload, the unit quadlet generated neither wants nor orders itself after desktop-host-shell.service"
+ev_save after-show "EV-STATE: systemctl show -p After desktop.service, for the record: it still lists desktop-host-shell.service while that unit is loaded, the inverse of its own Before=desktop.service" \
+    systemctl show -p After desktop.service >/dev/null || true
 systemctl stop desktop.service
 systemctl stop desktop-host-shell.service
 rm -f /etc/desktop-container/host-shell-key /etc/desktop-container/host-shell-key.pub
