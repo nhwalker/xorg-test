@@ -14,6 +14,13 @@ set -euo pipefail
 
 DIR=/etc/desktop-container
 
+# The tree ships shell-user, so a missing one means the tree was not (fully)
+# applied - not a way to turn the feature off. Say so, rather than leave the
+# shell's file-not-found error as the only trace.
+if [ ! -f "$DIR/shell-user" ]; then
+    echo "$DIR/shell-user is missing: the deploy tree ships it (it names the account, normally 'desktop-shell'), so re-apply the tree. To turn the Host Terminal off, use the off-switch in desktop.container instead (deploy/README.md, \"Host Terminal\")." >&2
+    exit 1
+fi
 user=$(tr -d '[:space:]' < "$DIR/shell-user")
 if [ -z "$user" ]; then
     echo "$DIR/shell-user is empty; nothing to do" >&2

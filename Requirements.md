@@ -1270,7 +1270,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Tier: T2 · Coverage: ❌.
 
 **S5.7.5 Empty or missing shell-user / account**
-- Requirement: empty `shell-user` → exit 0, nothing written; account missing → exit 1 with the sysusers hint. A **missing** `shell-user`, which the title names, is not handled today: the script exits 1 at its first read with the shell's file-not-found error, no hint and nothing written; whether that is a defect or the requirement should say so is open.
+- Requirement: empty `shell-user` → exit 0, nothing written; missing `shell-user` → exit 1 with a hint (the tree ships the file: re-apply it, or use the quadlet's off-switch to turn the feature off), nothing written; account missing → exit 1 with the sysusers hint.
 - Acceptance: T1 with a temp `DIR` or T2 before the tree is applied.
 - Evidence: stdout and exit codes; `ls` of the dir after.
 - Tier: T1/T2 · Coverage: ❌.
