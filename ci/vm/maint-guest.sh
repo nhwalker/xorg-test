@@ -1055,7 +1055,7 @@ mt_hostterm_before() {
 # the two lines), then daemon-reload and a reboot, as S10.3.5 runs it. The
 # step ends in the reboot; the VM host watches the screen.
 mt_hostterm_switch() {
-    local before
+    local before unit
     mt_begin S10.3.5
     ev_text switch-doc "EV-PROCEDURE: the off-switch as deploy/README.md \"Host Terminal\" gives it, quoted; it is a sentence, not a command block, so the harness's sed stands in for the editor" \
         "$(sed -n '/^- \*\*Always on\.\*\*/,/^$/p' deploy/README.md)"
@@ -1076,7 +1076,8 @@ mt_hostterm_switch() {
     # The generated file, not systemctl show: desktop-host-shell.service is
     # still loaded this boot, and its own Before=desktop.service shows up in
     # desktop.service's After= list until the reboot.
-    ! systemctl cat desktop.service | grep -qE '^(Wants|After)=.*desktop-host-shell' \
+    unit=$(systemctl cat desktop.service 2>&1 || true)
+    ! grep -qE '^(Wants|After)=.*desktop-host-shell' <<<"$unit" \
         || fail "the unit quadlet generated still names desktop-host-shell.service in Wants= or After="
     ev_pass "the unit quadlet generated no longer names desktop-host-shell.service in Wants= or After="
     mt_put boot-before "$(cat /proc/sys/kernel/random/boot_id)"
@@ -1423,9 +1424,23 @@ mt_seat_stage() {
         n=$((n + 1))
         loginctl attach seat1 "$d" || fail "loginctl attach seat1 $d failed"
     done < "$MT/seat-devs"
+    # Run 37382027299: all seven rules written, only the first device took
+    # the seat. udevd re-reads changed rules only as its event queue starts,
+    # and at most every 3 s, so attaches in a row trigger devices before it
+    # has the later rules. The harness reloads them and re-triggers each
+    # device with its children.
+    udevadm control --reload
+    while read -r d; do udevadm trigger --action=change --parent-match="$d"; done < "$MT/seat-devs"
     udevadm settle || true
-    ev_note "harness-only staging: loginctl attach seat1 for each of the $n devices (S3.8.6's staging, applied to every input device)"
+    ev_note "harness-only staging: loginctl attach seat1 for each of the $n devices (S3.8.6's staging, applied to every input device), then udevadm control --reload and udevadm trigger --action=change --parent-match=<device> for each: attaches in a row outrun udevd's rule reload"
     ev_save rules "EV-CONFIG: the rules loginctl attach wrote" sh -c 'cat /etc/udev/rules.d/72-seat-*.rules' >/dev/null || true
+    local e p bad=""
+    while read -r e; do
+        p=$(udevadm info -q property -n "$e" 2>/dev/null || true)
+        grep -qx 'ID_SEAT=seat1' <<<"$p" || bad="$bad $e"
+    done < "$MT/seat-events"
+    [ -z "$bad" ] || fail "the staging did not take: no ID_SEAT=seat1 on$bad"
+    ev_note "staged: every staged event node carries ID_SEAT=seat1 in the udev database"
     ev_end
 }
 # Harness-only, after a remedy that did not bring input back: what it should
@@ -1471,6 +1486,14 @@ mt_seat_diagnose() {
 # loop fails and recovers.
 MT_SEL_LEAD='SELinux denials from a client container'
 MT_SELC=mt-selclient
+# The client's log, read whole, then searched: this script runs under
+# pipefail, and `podman logs | grep -q` fails on podman's SIGPIPE once grep
+# has its match.
+mt_selc_has() { # <ERE> [since epoch]
+    local l
+    l=$(podman logs ${2:+--since "$2"} "$MT_SELC" 2>/dev/null || true)
+    grep -qE "$1" <<<"$l"
+}
 mt_sel_client() {
     local i
     mt_begin S10.5.3
@@ -1480,8 +1503,8 @@ mt_sel_client() {
         podman run -d --name "$MT_SELC" --device desktop.local/display=all localhost/desktop-container:latest \
         sh -c 'while :; do if xdpyinfo >/dev/null 2>&1; then echo "$(date -u +%H:%M:%S) ok"; else echo "$(date -u +%H:%M:%S) FAIL"; fi; sleep 2; done' >/dev/null \
         || fail "the client did not start"
-    for i in $(seq 15); do podman logs "$MT_SELC" 2>/dev/null | grep -q ' ok$' && break; sleep 1; done
-    podman logs "$MT_SELC" 2>/dev/null | grep -q ' ok$' || fail "the client's loop never opened the display"
+    for i in $(seq 15); do mt_selc_has ' ok$' && break; sleep 1; done
+    mt_selc_has ' ok$' || fail "the client's loop never opened the display"
     ev_save client-id "EV-PIDS: the client: id, pid, restart count, started" \
         podman inspect --format '{{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}} label={{.ProcessLabel}}' "$MT_SELC" >/dev/null || true
     mt_put selc "$(podman inspect --format '{{.Id}}' "$MT_SELC")"
@@ -1499,15 +1522,34 @@ mt_sel_break() {
     mt_put since-break "$(date +%s)"
     ev_save relabel "EV-PROCEDURE: harness-only staging: chcon -R -t tmp_t /tmp/.X11-unix, a host type the policy denies container_t" \
         chcon -R -t tmp_t /tmp/.X11-unix >/dev/null || fail "chcon failed"
-    for i in $(seq 15); do podman logs --since "$(mt_get since-break)" "$MT_SELC" 2>/dev/null | grep -q ' FAIL$' && break; sleep 1; done
+    for i in $(seq 15); do mt_selc_has ' FAIL$' "$(mt_get since-break)" && break; sleep 1; done
     mt_sel_labels during "relabelled"
-    if podman logs --since "$(mt_get since-break)" "$MT_SELC" 2>/dev/null | grep -q ' FAIL$'; then
+    if mt_selc_has ' FAIL$' "$(mt_get since-break)"; then
         ev_pass "the client's loop fails with the directory relabelled"
     else
         ev_fail "the client's loop kept opening the display with /tmp/.X11-unix relabelled tmp_t"
     fi
+    # Run 37382027299: ausearch found nothing 1.5 s and 2.6 s after the first
+    # failure while setroubleshoot reported the denial at 2.9 s; the record
+    # reaches audit.log after a delay. The harness waits for it (up to 60 s)
+    # before the entry's checks, and records how long it took.
+    local t0 avc="" waited=""
+    t0=$(date +%s)
+    for i in $(seq 60); do
+        avc=$(ausearch -m avc -ts recent 2>&1 || true)
+        grep -q 'avc: *denied' <<<"$avc" && { waited=$(( $(date +%s) - t0 )); break; }
+        sleep 1
+    done
     ev_save avc "EV-STATE: ausearch -m avc -ts recent, raw: the denial" sh -c 'ausearch -m avc -ts recent 2>&1; true' >/dev/null || true
-    grep -q 'avc: *denied' "$EV_DIR/$EV_LAST" && ev_pass "an AVC denial is logged" || ev_fail "no AVC denial is logged"
+    ev_save auditd "EV-CONFIG: auditd's flush settings and state (the delay before a record reaches audit.log)" \
+        sh -c 'grep -E "^(flush|freq|write_logs|log_format) *=" /etc/audit/auditd.conf; auditctl -s 2>&1' >/dev/null || true
+    if [ -n "$waited" ]; then
+        ev_pass "an AVC denial is logged: ausearch found it ${waited} s after the client's loop failed"
+    else
+        ev_fail "no AVC denial reached the audit log within 60 s of the client's loop failing"
+        ev_save setroubleshoot "EV-LOG-JOURNAL: setroubleshoot's reports since the relabel" \
+            sh -c "journalctl --no-pager -o short-precise -t setroubleshoot --since @$(mt_get since-break) 2>&1; true" >/dev/null || true
+    fi
     ev_end
 }
 mt_sel_diagnose() {
@@ -1531,9 +1573,9 @@ mt_sel_diagnose() {
     rc=0
     ev_save remedy "EV-PROCEDURE: \`$line\`, the entry's remedy, run verbatim" sh -c "$line" >/dev/null || rc=$?
     [ "$rc" = 0 ] && ev_pass "\`$line\` exited 0" || ev_fail "\`$line\` exited $rc"
-    for i in $(seq 15); do podman logs --since "$(mt_get since-remedy)" "$MT_SELC" 2>/dev/null | grep -q ' ok$' && break; sleep 1; done
+    for i in $(seq 15); do mt_selc_has ' ok$' "$(mt_get since-remedy)" && break; sleep 1; done
     mt_sel_labels after "after the remedy"
-    if podman logs --since "$(mt_get since-remedy)" "$MT_SELC" 2>/dev/null | grep -q ' ok$'; then
+    if mt_selc_has ' ok$' "$(mt_get since-remedy)"; then
         ev_pass "the client's loop opens the display again, the client never restarted"
     else
         ev_fail "the client's loop still fails after \`$line\`"
