@@ -13,23 +13,55 @@ Failure modes this catches:
 Frequency check: a Goertzel scan finds the loudest frequency in the capture
 and requires it to be within TOL_HZ of EXPECTED_HZ. Stdlib only - the CI
 runner has no audio tooling installed.
+
+Evidence options (Requirements.md, EV-AUDIO), anywhere on the command line:
+  --report FILE   also write every line printed here (the verdict) to FILE
+  --plot FILE     draw the level at EXPECTED_HZ (or at the dominant
+                  frequency) over the capture, one bar per 0.1 s on a
+                  -60..0 dBFS scale, as a PNG (needs imagemagick's convert,
+                  which the e2e runner has; the stand-in for a spectrogram
+                  where no spectrogram tool is installed)
 """
 import math
+import os
+import shutil
+import subprocess
 import sys
 import wave
 
 TOL_HZ = 25.0
 
+# --report / --plot, then the positional arguments.
+args, report_path, plot_path = [], None, None
+argv = sys.argv[1:]
+while argv:
+    a = argv.pop(0)
+    if a == "--report" and argv:
+        report_path = argv.pop(0)
+    elif a == "--plot" and argv:
+        plot_path = argv.pop(0)
+    else:
+        args.append(a)
+report = open(report_path, "w") if report_path else None
+
+
+def say(line, err=False):
+    print(line, file=sys.stderr if err else sys.stdout)
+    if report:
+        report.write(line + "\n")
+        report.flush()
+
+
 def die(msg):
-    print(f"check-audio: FAIL: {msg}", file=sys.stderr)
+    say(f"check-audio: FAIL: {msg}", err=True)
     sys.exit(1)
 
-if len(sys.argv) not in (4, 5):
-    die(f"usage: {sys.argv[0]} FILE MIN_SECONDS MIN_PEAK [EXPECTED_HZ]")
+if len(args) not in (3, 4):
+    die(f"usage: {sys.argv[0]} [--report FILE] [--plot FILE.png] FILE MIN_SECONDS MIN_PEAK [EXPECTED_HZ]")
 
-path = sys.argv[1]
-min_sec, min_peak = float(sys.argv[2]), float(sys.argv[3])
-expected_hz = float(sys.argv[4]) if len(sys.argv) == 5 else None
+path = args[0]
+min_sec, min_peak = float(args[1]), float(args[2])
+expected_hz = float(args[3]) if len(args) == 4 else None
 
 try:
     w = wave.open(path, "rb")
@@ -98,7 +130,54 @@ info = (f"check-audio: {path}: {duration:.2f}s @ {rate}Hz, {nch}ch, "
         f"peak={peak_frac:.3f}")
 if dominant is not None:
     info += f", dominant~{dominant:.0f}Hz (want {expected_hz:.0f}Hz)"
-print(info)
+say(info)
+
+
+def level_plot(samples, sr, freq, out):
+    """One bar per 0.1 s: the amplitude at `freq` on a -60..0 dBFS scale,
+    with dashed lines at -20 and -40 dB. Draws no text; the report says
+    what it shows."""
+    step = max(1, int(sr * 0.1))
+    coeff = 2.0 * math.cos(2.0 * math.pi * freq / sr)
+    levels = []
+    for start in range(0, len(samples) - step + 1, step):
+        s1 = s2 = 0.0
+        for x in samples[start:start + step]:
+            s0 = x + coeff * s1 - s2
+            s2, s1 = s1, s0
+        mag = math.sqrt(max(0.0, s1 * s1 + s2 * s2 - coeff * s1 * s2))
+        levels.append(2.0 * mag / step / 32768.0)
+    # Short captures (a 1.5 s beep) get wider bars, so the plot stays readable.
+    bw = max(2, min(8, 400 // max(1, len(levels))))
+    w, h = max(200, len(levels) * bw), 240
+    img = bytearray(b"\x10\x12\x16" * w * h)
+    for i, a in enumerate(levels):
+        db = 20 * math.log10(a) if a > 1e-6 else -120
+        top = int((min(0, max(-60, db)) / -60) * (h - 1))
+        for y in range(top, h):
+            for x in range(bw * i, bw * i + bw - 1):
+                img[(y * w + x) * 3:(y * w + x) * 3 + 3] = b"\x7f\xa8\x60"
+    for db in (-20, -40):
+        y = int(db / -60 * (h - 1))
+        for x in range(0, w, 4):
+            img[(y * w + x) * 3:(y * w + x) * 3 + 3] = b"\x4a\x51\x5c"
+    if not shutil.which("convert"):
+        # No stray PPM left behind: an evidence directory indexes every file.
+        say("check-audio: no plot: imagemagick's convert is not installed here")
+        return
+    ppm = out + ".ppm"
+    with open(ppm, "wb") as f:
+        f.write(f"P6\n{w} {h}\n255\n".encode() + bytes(img))
+    try:
+        subprocess.run(["convert", ppm, out], check=True, timeout=120)
+    finally:
+        os.unlink(ppm)
+    say(f"check-audio: plot {out}: the level at {freq:.0f} Hz, one bar per 0.1 s "
+        f"({len(levels)} bars), -60..0 dBFS, dashed lines at -20 and -40 dB")
+
+
+if plot_path and left:
+    level_plot(left, rate, dominant if expected_hz is None and dominant else (expected_hz or 1000.0), plot_path)
 
 if duration < min_sec:
     die(f"only {duration:.2f}s captured (need >= {min_sec}s) - "
@@ -113,4 +192,4 @@ if expected_hz is not None:
         die(f"dominant frequency {dominant:.0f}Hz is not {expected_hz:.0f}Hz "
             f"(+/-{TOL_HZ:.0f}) - garbled or wrong sample rate?")
 
-print("check-audio: PASS")
+say("check-audio: PASS")

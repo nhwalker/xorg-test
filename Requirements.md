@@ -255,9 +255,9 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T2 · Coverage: ❌ evidence not saved: the gate prints nothing on pass, so the patched block is never recorded; asserted by the build-time `grep -q` gate, outcome by S4.1.1.
 
 **S1.2.4 module-rt takes the rlimit path**
-- Requirement: `rlimits.enabled = true`, `rtportal.enabled = false`, `rtkit.enabled = false` appear exactly once in the `module-rt` block of `pipewire.conf` and `client-rt.conf`.
-- Acceptance: in both `pipewire.conf` and `client-rt.conf` (a missing file fails), the `module-rt` block holds each of the three settings exactly once (the build's gate counts only `rtkit.enabled`, over the whole file, and skips a missing file); runtime outcome S4.3.2.
-- Evidence: the two patched blocks (EV-CONFIG).
+- Requirement: `rlimits.enabled = true`, `rtportal.enabled = false`, `rtkit.enabled = false` appear exactly once in the `module-rt` block of `pipewire.conf` (the daemon), `pipewire-pulse.conf` and `client.conf` (its clients). PipeWire 1.4 ships no `client-rt.conf`.
+- Acceptance: in each of the three files (a missing file fails), the `module-rt` block holds each of the three settings exactly once (the build's gate counts only `rtkit.enabled`, over the whole file, and fails on a missing file); runtime outcome S4.3.2, for the daemon (no story checks a client's threads).
+- Evidence: the three patched blocks (EV-CONFIG).
 - Tier: T2 · Coverage: ❌ evidence not saved: the patched blocks are printed only when the gate fails; asserted by the build's "exactly once" gate, outcome by `guest:verify_privileges`.
 
 **S1.2.5 pipewire-pulse export drop-in installed**
@@ -303,7 +303,7 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T2 · Coverage: ❌.
 
 **S2.1.3 Boot markers**
-- Requirement: `/run/desktop-init.pid` holds desktop-init's own host pid; `/run/desktop-init-ready` is written after the oneshots and the runtime-dir wait, just before the first X session starts, so it never depends on the session (`desktop-init` writes it before its session loop; its header comment's "after the session launch" is off by that much).
+- Requirement: `/run/desktop-init.pid` holds desktop-init's own host pid; `/run/desktop-init-ready` is written after the oneshots and the runtime-dir wait, just before the first X session starts, so it never depends on the session (`desktop-init` writes it before its session loop).
 - Acceptance: the pid resolves on the host to `desktop-init`; the ready marker's mtime precedes the first Xorg's start time.
 - Evidence: `cat /run/desktop-init.pid`, host `cat /proc/<pid>/comm`, `ls -l /run/desktop-init-ready` (EV-STATE).
 - Tier: T2 · Coverage: ❌ evidence not saved; `smoke` and `guest:verify_privileges` check that the pid file names `desktop-init` on the host, but no test makes the X session fail before looking for the ready marker.
@@ -354,9 +354,9 @@ the same directory also receives the diagnostics the harness already prints
 - Evidence: EV-VIDEO of the display through the restart (blank → desktop back); EV-PIDS before/after (Xorg and mwm changed, desktop-init unchanged); EV-LOG-DESKTOP.
 - Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_lifecycle` kills Xorg but waits only for any mwm, not for new Xorg and mwm pids. The restart is proven with saved evidence only for "Quit session" (`operator-e2e:menu_quit_session`, in `artifacts/S11.1.1/`).
 
-**S2.3.3 Session cleanup is scoped by session id, never by uid**
-- Requirement: after a session exits, every pid in that session id is TERMed then KILLed after 5 s; same-uid processes outside it (the audio tree, the host's `desktop-session-lead`, any other uid-61000 process on the host) are untouched. The session id is the one `startx`, `xinit` and Xorg share; xinit starts the X client in a session of its own, which mwm leads (and each xterm's shell leads another), so those end only if they exit on losing the X connection.
-- Acceptance: kill Xorg; within 6 s no process carries the old leader's session id; the old mwm and xterm are gone; PipeWire pid unchanged; host `desktop-session-lead` pid unchanged; a deliberately spawned uid-61000 `sleep` on the host survives.
+**S2.3.3 Session cleanup is scoped by session id and session tag, never by uid**
+- Requirement: after a session exits, every pid in that session id, and every desktop-user process whose environment carries that run's `DESKTOP_SESSION_TAG`, is TERMed then KILLed after 5 s; same-uid processes outside it (the audio tree, the host's `desktop-session-lead`, any other uid-61000 process on the host, processes started by `podman exec`) are untouched. The session id is the one `startx`, `xinit` and Xorg share; xinit starts the X client in a session of its own, which mwm leads (and each xterm's shell leads another), and the tag is what reaches those and whatever was started from them. A process that starts itself with a scrubbed environment escapes the tag, and so the cleanup unless it is in the server's session.
+- Acceptance: start a `nohup sleep` from the session's xterm, then kill Xorg; within 6 s no process carries the old leader's session id or the old tag; the old mwm, xterm and `sleep` are gone; PipeWire pid unchanged; host `desktop-session-lead` pid unchanged; a deliberately spawned uid-61000 `sleep` on the host survives.
 - Evidence: EV-PIDS before/after listing every uid-61000 process on the **host**, the index marking which must persist.
 - Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_lifecycle` asserts only that PipeWire keeps its pid when Xorg is killed, and nothing checks the host's other uid-61000 processes.
 
@@ -584,7 +584,7 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.4.7 A bad config is rejected whole**
 - Requirement: every validation failure logs `ERROR`, removes the output file, exits 0.
-- Acceptance: `layout-tests` rejection table; ❌ add bad `virtual`, `nvidia-connected` without list, `nvidia-edid` without `=`, digit-leading and illegal-character output names, and a global `watch` line (`README.md` documents it and `preflight-check.sh` accepts it, but the generator reads it as an output name and rejects the whole layout).
+- Acceptance: `layout-tests` rejection table; ❌ add bad `virtual`, `nvidia-connected` without list, `nvidia-edid` without `=`, digit-leading and illegal-character output names, and a `watch` line (a keyword that went with the session-side re-assert loop; the generator reads it as an output name and rejects the whole layout).
 - Evidence: per case: the input, the ERROR line, `ls` showing no output file.
 - Tier: T0 · Coverage: ❌ evidence not saved; the `layout-tests` rejection table lacks the five cases the Acceptance lists and never checks the exit status.
 
@@ -1270,7 +1270,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Tier: T2 · Coverage: ❌.
 
 **S5.7.5 Empty or missing shell-user / account**
-- Requirement: empty `shell-user` → exit 0, nothing written; account missing → exit 1 with the sysusers hint. A **missing** `shell-user`, which the title names, is not handled today: the script exits 1 at its first read with the shell's file-not-found error, no hint and nothing written; whether that is a defect or the requirement should say so is open.
+- Requirement: empty `shell-user` → exit 0, nothing written; missing `shell-user` → exit 1 with a hint (the tree ships the file: re-apply it, or use the quadlet's off-switch to turn the feature off), nothing written; account missing → exit 1 with the sysusers hint.
 - Acceptance: T1 with a temp `DIR` or T2 before the tree is applied.
 - Evidence: stdout and exit codes; `ls` of the dir after.
 - Tier: T1/T2 · Coverage: ❌.
@@ -1958,7 +1958,7 @@ not, supposed to happen.
 - Requirement: whatever the maintainer writes in `monitors.conf`, the desktop comes up after the restart, and `podman logs desktop | grep xorg-monitor-conf` or `podman logs desktop | grep preflight:` (both in `deploy/README.md` "Verify") names the problem; every keyword the documentation offers is one the generator accepts.
 - Acceptance: one restart per case, with the desktop visible each time (EV-SHOT): (a) a malformed position gives an `ERROR` line with the line number, and autodetected geometry; (b) an output name that matches no connector gives preflight's WARN naming it; (c) each global keyword named in `README.md` "Fixed monitor layout (KVM video)" or in `monitors.conf`'s comments, with a valid value and beside a valid output line, gives the layout applied. T0 part: the keywords the documents name, the keywords `xorg-monitor-conf.sh` accepts and the keywords `preflight-check.sh` skips are the same set.
 - Evidence: per case, the file (EV-CONFIG), the two log slices and `xrandr --query`; the three keyword lists (EV-DIFF).
-- Tier: T0/T3 · Coverage: ❌. Nothing tests what the maintainer sees (`layout-tests` covers only the generator's rejections, S3.4.7), and the T0 keyword check would fail today: `README.md` advertises a global `watch` line, which `xorg-monitor-conf.sh` rejects together with the whole layout (`mode wants WxH[@Hz], got '5'`) while `preflight-check.sh` still skips it as a keyword.
+- Tier: T0/T3 · Coverage: ❌. Nothing tests what the maintainer sees (`layout-tests` covers only the generator's rejections, S3.4.7), and no T0 check compares the three keyword lists. They agree now: `README.md` and `preflight-check.sh` still named a `watch` keyword that `xorg-monitor-conf.sh` had dropped with its re-assert loop (it rejected the whole layout, `mode wants WxH[@Hz], got '5'`), and both were corrected.
 
 **S10.3.3 Upgrading and rolling back the desktop image**
 - Requirement: the maintainer brings a new desktop image into podman storage, points the unit at it, either by the documented digest pin (`/etc/containers/systemd/desktop.container.d/50-image.conf`, podman ≥ 5.0) or by re-tagging `localhost/desktop-container:latest` (the unit's default), and runs `systemctl restart desktop.service`. The new image runs; the published toolkit becomes the new image's (the "tool versions track the desktop image" claim); the operator gets the desktop back (S10.4.1); running clients behave as S7.8.1 and S7.8.2 require. Pointing back at the previous image and restarting restores it the same way.

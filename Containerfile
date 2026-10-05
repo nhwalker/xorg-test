@@ -83,15 +83,30 @@ RUN sed -i 's|#sockets = \[ { name = "pipewire-0" }, { name = "pipewire-0-manage
         /usr/share/pipewire/pipewire.conf \
     && grep -q 'desktop-audio' /usr/share/pipewire/pipewire.conf
 COPY image/pipewire/pipewire-pulse-export.conf /etc/pipewire/pipewire-pulse.conf.d/10-desktop-audio-export.conf
-# Realtime without RTKit, for the daemon and for RT clients (pipewire-pulse).
+# Realtime without RTKit, for the daemon (pipewire.conf) and for its clients
+# in this container: pipewire-pulse (pipewire-pulse.conf) and native clients
+# such as pw-play (client.conf).
 #
-# rtkit-daemon is masked in this container (it wants SYS_PTRACE,
+# rtkit-daemon cannot run in this container: it wants SYS_PTRACE,
 # DAC_READ_SEARCH and NET_ADMIN - three of the capabilities the quadlet
-# deliberately withholds), and module-rt PREFERS RTKit when PipeWire is built
-# with D-Bus support rather than falling back to it only when direct
-# scheduling fails. Left alone it queries RTKit, finds it masked, and settles
-# for SCHED_FIFO at priority 1. Raising RLIMIT_RTPRIO does not change that on
-# its own, because nothing was asking for the rlimit path.
+# deliberately withholds - and with no systemd or D-Bus in the image nothing
+# could start it anyway. module-rt, built with D-Bus support, tries direct
+# scheduling first, but turns to RTKit as soon as either that or its nice
+# level cannot be had (upstream module-rt.c, 1.4.11). Back when the image ran
+# systemd and masked rtkit-daemon, the daemon left alone queried RTKit, found
+# it masked, and settled for SCHED_FIFO at priority 1; raising RLIMIT_RTPRIO
+# did not change that on its own. With RTKit and the portal switched off,
+# that route is closed: module-rt gets realtime from the rlimits or not at
+# all, and for the daemon the realtime assertion (S4.3.2) catches "not at
+# all".
+#
+# The files are the ones the session loads module-rt from: it starts pipewire
+# and pipewire-pulse (see start-audio), and native clients read client.conf.
+# PipeWire 1.4 ships no client-rt.conf; this list named it, and the loop
+# skipped a missing file, so the clients went unpatched with nothing to say
+# so. A file missing from the list now FAILS the build. The other stock confs
+# that load module-rt (minimal.conf, filter-chain.conf and the like) are not
+# run here and are left alone.
 #
 # This edits the STOCK module-rt args rather than adding a conf.d drop-in. A
 # drop-in was tried first and did NOT reach module-rt - the run with it in
@@ -103,18 +118,22 @@ COPY image/pipewire/pipewire-pulse-export.conf /etc/pipewire/pipewire-pulse.conf
 # same reason.
 #
 # Only the three settings that decide WHERE realtime comes from. rt.prio is
-# deliberately not set here: the stock conf carries an uncommented rt.prio = 60
-# below the insertion point, which wins anyway, and a shadowed duplicate reads
-# as a contradiction to the next person. 60 is under the 95 the rlimit grants,
-# which is all that matters.
+# deliberately not set here: the stock pipewire.conf carries an uncommented
+# rt.prio = 60 below the insertion point, which wins anyway, and a shadowed
+# duplicate reads as a contradiction to the next person. 60 is under the 95
+# the rlimit grants, which is all that matters. The two client confs leave
+# theirs commented out (#rt.prio = 55), and module-rt's built-in default comes
+# from the same build option, so clients ask for 55: also under 95.
 #
 # Targeted by range (the `args = {` inside the module-rt block) rather than by
 # matching a specific setting, so it does not depend on which lines the distro
 # leaves commented out. If it does not apply exactly once, the BUILD fails and
 # prints the block it could not patch - a five-minute signal instead of a
 # thirteen-minute one, and it says what the file actually contains.
-RUN for f in /usr/share/pipewire/pipewire.conf /usr/share/pipewire/client-rt.conf; do \
-        [ -f "$f" ] || continue; \
+RUN for f in /usr/share/pipewire/pipewire.conf /usr/share/pipewire/client.conf \
+             /usr/share/pipewire/pipewire-pulse.conf; do \
+        [ -f "$f" ] || { echo "module-rt patch: $f is not in the image; the PipeWire confs it has:"; \
+                         ls /usr/share/pipewire; exit 1; }; \
         sed -i '/name = libpipewire-module-rt/,/flags/ s/^\([[:space:]]*\)args = {/\1args = {\n\1    rlimits.enabled  = true\n\1    rtportal.enabled = false\n\1    rtkit.enabled    = false/' "$f" \
         && [ "$(grep -c 'rtkit.enabled' "$f")" = 1 ] \
         || { echo "module-rt patch did not apply exactly once to $f; the block reads:"; \

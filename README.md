@@ -266,7 +266,7 @@ attached right now, so the output names come from the running server instead
 of from guesswork. The file ships with the deploy tree as pure comments, and
 that is the off state: with no output lines nothing is generated and Xorg
 autodetects exactly as before. Its comments document every field and the
-global `watch` / `virtual` / `nvidia-*` lines.
+global `virtual` / `nvidia-*` lines.
 
 One thing holds the geometry:
 
@@ -528,7 +528,13 @@ independent trees, each the leader of its own process session:
 Neither can reap the other: `desktop-init` stops a tree by killing every pid
 in *that tree's* session id, and the two sessions are disjoint. (Never by uid
 — in the host pid namespace a uid-wide `pkill` reaches every same-uid process
-on the host, which once killed the e2e's own ssh session.)
+on the host, which once killed the e2e's own ssh session.) The X tree spans
+more than one session — xinit starts mwm in a session of its own, and each
+xterm's shell leads another — so everything the X session starts also carries
+a `DESKTOP_SESSION_TAG` environment variable, new for each run of it, and
+stopping the X tree also takes every desktop-user process that carries that
+run's tag. A process that starts itself with a scrubbed environment (`env -i`)
+outside the server's session is the one way out.
 
 They used to be one tree, and it cost availability in both directions:
 
@@ -1027,13 +1033,15 @@ the container" and "reached the process that needs it" have disagreed
 before.
 
 **And the rlimit alone is still not enough.** With the hard limit at 95,
-`module-rt` *still* went to RTKit and settled for priority 1: when PipeWire is
-built with D-Bus support it prefers RTKit rather than falling back to it only
-when direct scheduling fails. So the Containerfile patches `module-rt`'s stock
-args with `rlimits.enabled = true`, `rtkit.enabled = false` and
-`rtportal.enabled = false`, for the daemon and for RT clients. (A `conf.d`
-drop-in does *not* override module args — one was tried, and `module-rt` went
-on querying RTKit regardless.)
+`module-rt` *still* went to RTKit and settled for priority 1: built with D-Bus
+support, it turns to RTKit as soon as either direct scheduling or its nice
+level cannot be had (upstream `module-rt.c`, 1.4.11). So the Containerfile
+patches `module-rt`'s stock args with `rlimits.enabled = true`,
+`rtkit.enabled = false` and `rtportal.enabled = false`: in `pipewire.conf` for
+the daemon, and in `pipewire-pulse.conf` and `client.conf` for its clients.
+PipeWire 1.4 has no `client-rt.conf`, and a file missing from that list fails
+the build. (A `conf.d` drop-in does *not* override module args — one was
+tried, and `module-rt` went on querying RTKit regardless.)
 
 None of this is visible in any audio test: a non-realtime stream produces
 exactly the same tone at exactly the same frequency. Only the realtime
