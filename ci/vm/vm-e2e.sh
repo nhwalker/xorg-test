@@ -1444,7 +1444,13 @@ snd_diffs on "the card's arrival"
 ev_note "the new card's sink: $usb_sink; the built-in card's: $builtin_sink"
 gq desk pactl set-default-sink "$usb_sink" >/dev/null || fail "pactl set-default-sink $usb_sink failed"
 gq desk pactl set-sink-mute "$builtin_sink" 1 >/dev/null || fail "pactl set-sink-mute $builtin_sink 1 failed"
-ev_save wpctl-selected "EV-STATE: wpctl status with the new card's sink made the default (marked *) and the built-in card's sink muted" \
+# WirePlumber gives a new device 0.40 on wpctl's cubic scale: 0.064 linear,
+# about -24 dB, and the USB card applies it as such. A tone at 0.6 of full
+# scale then peaks near 0.04, under check-audio's silence floor of 0.05 (run
+# 37321986539 measured 0.036). At full volume the question is only which
+# card is heard.
+gq desk pactl set-sink-volume "$usb_sink" 100% >/dev/null || fail "pactl set-sink-volume $usb_sink 100% failed"
+ev_save wpctl-selected "EV-STATE: wpctl status with the new card's sink made the default (marked *) at full volume, and the built-in card's sink muted" \
     gq desk wpctl status >/dev/null || true
 ev_save builtin-mute "EV-STATE: pactl get-sink-mute for the built-in card's sink" gq desk pactl get-sink-mute "$builtin_sink" >/dev/null || true
 heard=yes
