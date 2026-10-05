@@ -266,7 +266,7 @@ attached right now, so the output names come from the running server instead
 of from guesswork. The file ships with the deploy tree as pure comments, and
 that is the off state: with no output lines nothing is generated and Xorg
 autodetects exactly as before. Its comments document every field and the
-global `watch` / `virtual` / `nvidia-*` lines.
+global `virtual` / `nvidia-*` lines.
 
 One thing holds the geometry:
 
