@@ -1621,6 +1621,70 @@ input_sink_check() { # $1: expected text
     log is "the app received the typed text over the real input path: $got"
 }
 
+# --- operator stories (E11) -------------------------------------------------------
+# ci/vm/operator-e2e.py drives the desktop the way the operator does - every
+# pointer and key event through QEMU's devices - and LOOKS at X from here: a
+# container of the lean client image holding only desktop.local/display, in
+# which it runs xwininfo and xprop. The observer sends no input.
+operator_setup() {
+    # phase2 loads the same archive again; a second load of an image that is
+    # already there changes nothing.
+    log op "load the lean client image: the observer, and the sound story's player"
+    podman load -q -i /tmp/images-testclient.tar >/dev/null
+    log op "start the observer: a confined client holding the display device and nothing else"
+    podman rm -f op-observer >/dev/null 2>&1 || true
+    podman run -d --name op-observer --device desktop.local/display=all \
+        localhost/desktop-testclient:latest >/dev/null
+    # podman applies a CDI device's edits to the container's own process,
+    # not to `podman exec` sessions: the X socket mount is there for every
+    # process in the container, but the injected DISPLAY is in PID 1's
+    # environment only. Read it from there, so the spec still says where the
+    # display is; operator-e2e.py passes it to every exec into the observer.
+    disp=$(podman exec op-observer sh -c 'tr "\0" "\n" </proc/1/environ' | sed -n 's/^DISPLAY=//p') \
+        || fail "could not read the observer's environment"
+    [ "$disp" = ":0" ] \
+        || fail "the observer's CDI-injected DISPLAY is '$disp', want :0 (operator-e2e.py assumes :0)"
+    wait_for 20 1 "the observer to read the window tree" \
+        podman exec -e DISPLAY="$disp" op-observer xwininfo -root -tree
+
+    # The input tests' sink terminals idle in a `sleep 60` after their read,
+    # and one may still be up. The operator's first story looks at the
+    # desktop as the session leaves it, so they go first - as the session
+    # user, since container root holds no CAP_KILL (verify_audio_lifecycle).
+    log op "retire the input tests' sink terminals"
+    podman exec -u desktop desktop pkill -u desktop -f 'xterm -T inputtest' || true
+    wait_for 15 1 "the input tests' sink terminals to exit" \
+        sh -c '! podman exec desktop pgrep -u desktop -f "xterm -T inputtest" >/dev/null'
+
+    # One continuous 150 s stream for the sound story, long enough to outlast
+    # every command typed under it. 441 frames hold exactly 11 cycles of
+    # 1100 Hz at 44.1 kHz, so repeating them is seamless.
+    log op "write the sound story's 1100 Hz tone"
+    python3 - /tmp/op-tone-1100.wav <<'EOF'
+import math, sys, wave
+rate, freq, secs, amp = 44100, 1100, 150, 0.5
+cycle = bytearray()
+for i in range(441):
+    s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
+    b = s.to_bytes(2, "little", signed=True)
+    cycle += b + b
+w = wave.open(sys.argv[1], "wb")
+w.setnchannels(2)
+w.setsampwidth(2)
+w.setframerate(rate)
+w.writeframes(bytes(cycle) * (rate * secs // 441))
+w.close()
+EOF
+    log op "operator-setup done"
+}
+
+operator_teardown() {
+    # Every container the stories started is named op-*, the observer too.
+    podman ps -a --format '{{.Names}}' | grep '^op-' | xargs -r podman rm -f -t 2 >/dev/null 2>&1 || true
+    rm -f /tmp/op-tone-1100.wav /tmp/op-host-whoami
+    log op "operator-teardown done"
+}
+
 apply_client() { # $1: pod name
     # Reuse the example client (a long-running xterm), renamed and pointed
     # at the locally-imported image.
@@ -1810,7 +1874,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -1832,5 +1896,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     snd-probe) snd_probe ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
+    operator-setup) operator_setup ;;
+    operator-teardown) operator_teardown ;;
     *) fail "unknown phase $1" ;;
 esac

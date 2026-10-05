@@ -19,9 +19,10 @@ env:
 jobs:
   vm-e2e:
     runs-on: ubuntu-latest
-    # Normal run is ~7 min; keep headroom for a cold Rocky image download
-    # but fail fast on a hang rather than sitting for the old 90 min.
-    timeout-minutes: 30
+    # A normal run is ~15 min, about 5 of them the operator stories (E11);
+    # keep headroom for a cold Rocky image download but fail fast on a hang
+    # rather than sitting for the old 90 min.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: enable kvm access
