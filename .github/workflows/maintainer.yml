@@ -8,6 +8,13 @@
 #                  one and taken on the other); then a restart, and a
 #                  maintenance stop and start (S10.1.1-S10.1.3, S10.4.1,
 #                  S10.4.2)
+#   maint-config   one host provisioned the same way, then its configuration
+#                  changed the documented ways while it runs: the captured
+#                  monitor layout pinned, layouts gone wrong and every global
+#                  keyword, the image removed and loaded back, and an upgrade
+#                  to a second image and back by the digest pin and by
+#                  re-tagging, with a client running throughout (S10.3.1-
+#                  S10.3.4)
 # The gate then holds this workflow's stories (their Coverage lines name
 # it: "(workflow `maintainer.yml`)") to the evidence the run left.
 #
@@ -62,15 +69,24 @@ jobs:
           sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
           sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
           sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
+          # maint-config's upgrade target (S10.3.3): this desktop with another
+          # root colour, which the screen shows, and a toolkit binary with
+          # another checksum (a trailing byte; a Go binary runs unchanged),
+          # which the published copy shows.
+          sudo podman build --network=none -t localhost/desktop-container:alt -f - . <<'EOF'
+          FROM localhost/desktop-container:latest
+          RUN sed -i 's/#101216/#2b1b17/' /etc/X11/xinit/xinitrc.desktop && grep -q '#2b1b17' /etc/X11/xinit/xinitrc.desktop && printf '\n' >> /usr/libexec/desktop-tools/screenshot
+          EOF
           # One archive per image: a multi-image docker-archive collapses into
           # its first image with every tag attached.
           mkdir -p vm-images
           sudo podman save -o vm-images/images-desktop.tar localhost/desktop-container:latest
           sudo podman save -o vm-images/images-plugin.tar localhost/cdi-device-plugin:latest
           sudo podman save -o vm-images/images-testclient.tar localhost/desktop-testclient:latest
+          sudo podman save -o vm-images/images-desktop-alt.tar localhost/desktop-container:alt
           sudo chmod 644 vm-images/*.tar
-          for i in desktop-container cdi-device-plugin desktop-testclient; do
-            printf '%s %s\n' "$i" "$(sudo podman image inspect "localhost/$i:latest" --format '{{.Id}}')"
+          for i in desktop-container:latest cdi-device-plugin:latest desktop-testclient:latest desktop-container:alt; do
+            printf '%s %s\n' "$i" "$(sudo podman image inspect "localhost/$i" --format '{{.Id}}')"
           done | tee vm-images/image-ids.txt
       - name: hand the images to the VM shards
         uses: actions/upload-artifact@v4
@@ -84,15 +100,16 @@ jobs:
     name: maintainer (${{ matrix.shard }})
     needs: images
     runs-on: ubuntu-latest
-    # Two stock hosts provisioned from nothing, each with a reboot, and a
-    # maintenance stop held for two minutes.
+    # maint-docpath: two stock hosts provisioned from nothing, each with a
+    # reboot, and a maintenance stop held for two minutes. maint-config: one
+    # host, and about fifteen desktop restarts.
     timeout-minutes: 60
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        shard: [maint-docpath]
+        shard: [maint-docpath, maint-config]
     steps:
       - uses: actions/checkout@v4
       - name: enable kvm access

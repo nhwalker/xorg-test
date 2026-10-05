@@ -30,13 +30,15 @@ mt_unpack() { vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo' || fail "
 
 # --- the screen ------------------------------------------------------------------
 # The desktop as the operator sees it, in one screendump: the root window's
-# #101216 in the bottom-right corner and the session xterm's #16191d well
-# inside its 100x30+60+60 window (S3.3.3's and S3.5.2's colours).
+# colour in the bottom-right corner (#101216, S3.3.3's; MT_ROOT_RGB when an
+# image with another one runs) and the session xterm's #16191d well inside its
+# 100x30+60+60 window (S3.5.2's).
+MT_ROOT_RGB=16,18,22
 mt_is_desktop() { # <image>
     local w="" h=""
     read -r w h < <(identify -format '%w %h\n' "$1" 2>/dev/null) || true
     [ -n "$h" ] || return 1
-    [ "$(px "$1" $((w - 12)) $((h - 12)))" = 16,18,22 ] && [ "$(px "$1" 360 260)" = 22,25,29 ]
+    [ "$(px "$1" $((w - 12)) $((h - 12)))" = "$MT_ROOT_RGB" ] && [ "$(px "$1" 360 260)" = 22,25,29 ]
 }
 # Follow a recording (ev_video_start) frame by frame until the desktop has
 # gone from the screen and come back, for up to <seconds>, looking only at
@@ -74,7 +76,7 @@ mt_screen_check() { # <moment> <what>
     python3 qmp-tool.py shot "$QMP" "$EV_DIR/$f" >/dev/null && [ -s "$EV_DIR/$f" ] || return 1
     ev_attach "$f" "$2"
     mt_is_desktop "$EV_DIR/$f" || return 1
-    ev_pass "the screen shows the desktop: the root window's #101216 at the bottom-right corner and the session xterm's #16191d inside it ($f)"
+    ev_pass "the screen shows the desktop: the root window's colour ($MT_ROOT_RGB) at the bottom-right corner and the session xterm's #16191d inside it ($f)"
 }
 
 # --- typing and sound ------------------------------------------------------------
@@ -280,6 +282,146 @@ mt_verify() {
     done
 }
 
+# A guest step that restarts the desktop, watched from QEMU's side: the
+# screen recorded from the command until the desktop is back, the time it
+# took, and a look at it once it is.
+mt_watch() { # <story> <moment> <guest step...>
+    local story=$1 moment=$2 vid t0
+    shift 2
+    mt_open "$story"
+    ev_shot "before-$moment" "EV-SHOT: the screen right before '$*' ($moment)"
+    ev_video_start "$moment"
+    vid="$EV_DIR/$EV_VID"
+    mt_close
+    t0=$(date +%s.%N)
+    if ! mg "$@"; then
+        mt_open "$story"
+        ev_video_stop "EV-VIDEO: the screen while '$*' failed"
+        mt_failed "$story" "$moment: '$*' failed"
+        return 1
+    fi
+    if ! mt_wait_screen "$vid" 180; then
+        mt_open "$story"
+        ev_video_stop "EV-VIDEO: the screen for 180 s from '$*': the desktop did not come back"
+        mt_failed "$story" "$moment: 180 s after '$*' the desktop is not back on the screen"
+        return 1
+    fi
+    sleep 2
+    mt_open "$story"
+    ev_video_stop "EV-VIDEO: the screen from '$*' until the desktop was back ($moment); index.txt gives each frame's UTC time"
+    ev_note "$moment: the desktop was back on the screen $(mt_elapsed "$t0") s after the command (${MT_BACK%% *} at ${MT_BACK#* })"
+    if ! mt_screen_check "$moment" "EV-SHOT: the screen once the desktop was back ($moment)"; then
+        mt_failed "$story" "$moment: the screen does not show the desktop"
+        return 1
+    fi
+    mt_close
+}
+# The same wait without a recording, for a boot nothing keeps evidence of.
+mt_wait_quiet() { # <seconds>
+    local end=$((SECONDS + $1)) f=.quiet-shot.png gone=0
+    while [ "$SECONDS" -lt "$end" ]; do
+        if python3 qmp-tool.py shot "$QMP" "$PWD/$f" >/dev/null 2>&1 && [ -s "$f" ]; then
+            if mt_is_desktop "$f"; then
+                [ "$gone" = 0 ] || { rm -f "$f"; return 0; }
+            else
+                gone=1
+            fi
+        fi
+        sleep 3
+    done
+    rm -f "$f"
+    return 1
+}
+# A host provisioned the documented way for a journey that starts after it:
+# mt_provision's steps with no evidence kept (the docpath journey keeps it).
+mt_provision_quiet() {
+    local took
+    guest_ev "" maint packages || fail "the documented package line did not provision the host"
+    guest_ev "" maint image || fail "the desktop image could not be loaded"
+    vm_ssh "sudo repo/ci/vm/vm-guest.sh maint apply skipped" && took=0 || took=$?
+    [ "$took" != 1 ] || fail "deploy/README.md's Apply block failed before its reboot"
+    mt_wait_quiet 300 || fail "300 s after the Apply block's reboot the desktop is not on the screen"
+    vm_ssh 'sudo repo/ci/vm/vm-guest.sh x-up' || fail "the desktop is on the screen, but X or mwm does not answer"
+}
+
+# --- F10.3: a running host's configuration, changed the documented ways -----------
+# A new tone from S10.3.3's client after a switch (S7.8.1), heard.
+mt_upc_heard() { # <moment> <hz>
+    local probe
+    mt_open S10.3.3
+    ev_audio_start "client-$1" "$2"
+    ev_save "client-tone-$1" "EV-LOG-CLIENT: a new tone from the client ($1): its player's output and exit status" \
+        vm_ssh "sudo repo/ci/vm/vm-guest.sh maint upc-tone $2" >/dev/null || true
+    probe=$(ev_payload "$EV_DIR/$EV_LAST")
+    if ev_audio_stop "EV-AUDIO: the machine's output while the client played a new $2 Hz tone ($1)" 2 0.05 "$2" \
+        && grep -q '^paplay exited 0$' <<<"$probe"; then
+        ev_pass "a new $2 Hz tone from the client is heard ($1): the client works against the restarted desktop (S7.8.1)"
+        mt_close
+    else
+        mt_failed S10.3.3 "$1: the client's new tone was not heard, or its player failed"
+    fi
+}
+
+maint_config() {
+    local c route dir want
+    log "maintainer, host C: provisioned the documented way, then its configuration changed the documented ways (F10.3)"
+    mt_unpack
+    mt_provision_quiet
+    log "S10.3.1: capture the autodetected arrangement, paste it, restart"
+    mg before S10.3.1 autodetected || fail "S10.3.1: could not record the state before the capture"
+    mg layout-capture || fail "S10.3.1: the capture could not be pasted"
+    if mt_watch S10.3.1 pinned svc S10.3.1 restart; then
+        mg after S10.3.1 autodetected pinned || mt_failed S10.3.1 "the desktop came back other than whole: see the guest's checks"
+    fi
+    mg layout-pinned || mt_failed S10.3.1 "the pinned layout is not the captured one, or it did not hold"
+    log "S10.3.2: layouts the maintainer gets wrong, and every global keyword the documents offer"
+    for c in malformed unknown virtual nvidia-connected nvidia-edid restore; do
+        mg before S10.3.2 "before-$c" || { mt_failed S10.3.2 "the case $c: could not record the state before it"; continue; }
+        mg layout-case "$c" || { mt_failed S10.3.2 "the case $c could not be written"; continue; }
+        if mt_watch S10.3.2 "$c" svc S10.3.2 restart; then
+            mg after S10.3.2 "before-$c" "after-$c" || mt_failed S10.3.2 "the case $c: the desktop came back other than whole"
+        fi
+        # Run whatever the screen showed: its log slices say what the
+        # maintainer would have read.
+        mg layout-case-check "$c" || mt_failed S10.3.2 "the case $c"
+    done
+    log "S10.3.4: the image the unit names, gone; then loaded back"
+    mg before S10.3.4 running || fail "S10.3.4: could not record the state before the image went"
+    if mg image-gone; then
+        mt_open S10.3.4
+        ev_shot gone "EV-SHOT: the screen with the image gone and the restart failed: no desktop"
+        mt_close
+    else
+        mt_failed S10.3.4 "with the image gone, desktop.service or desktop-preflight did not behave as documented"
+    fi
+    mg image-load || fail "S10.3.4: the image could not be loaded back"
+    if mt_watch S10.3.4 back svc S10.3.4 restart; then
+        mg after S10.3.4 running back || mt_failed S10.3.4 "the desktop came back other than whole: see the guest's checks"
+    fi
+    mg image-back || mt_failed S10.3.4 "after the load and the restart the host is not whole"
+    log "S10.3.3: upgrade to a second image and roll back, by the digest pin and by re-tagging, with a client running"
+    mg upgrade-prep || fail "S10.3.3: the second image or the client could not be set up"
+    for route in pin tag; do
+        for dir in forward back; do
+            want=orig
+            [ "$dir" = back ] || want=alt
+            MT_ROOT_RGB=16,18,22
+            [ "$want" = orig ] || MT_ROOT_RGB=43,27,23
+            mg before S10.3.3 "before-$route-$dir" || { mt_failed S10.3.3 "$route $dir: could not record the state before it"; continue; }
+            mg route "$route" "$dir" || { mt_failed S10.3.3 "$route $dir: the change could not be made"; continue; }
+            if mt_watch S10.3.3 "$route-$dir" svc S10.3.3 restart; then
+                mg after S10.3.3 "before-$route-$dir" "after-$route-$dir" || mt_failed S10.3.3 "$route $dir: the desktop came back other than whole"
+            fi
+            # Whatever the screen showed, which image runs and what the
+            # client sees are the facts that say why.
+            mg route-check "$want" "$route" || { mt_failed S10.3.3 "$route $dir: not the $want image, or the client did not carry on"; continue; }
+            mt_upc_heard "$route-$dir" 550
+        done
+    done
+    MT_ROOT_RGB=16,18,22
+    mg upgrade-done || true
+}
+
 # --- F10.4: a restart, and a maintenance stop and start ---------------------------
 # What the operator gets back after <command>: the screen recorded from the
 # command until the desktop shows, the time it took, the typing and the
@@ -390,6 +532,7 @@ maint_main() { # <journey>
     local bad
     case "$1" in
         docpath) maint_docpath ;;
+        config) maint_config ;;
         *) fail "no maintainer journey named '$1'" ;;
     esac
     write_manifest

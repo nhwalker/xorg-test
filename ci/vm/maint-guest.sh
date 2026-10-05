@@ -628,14 +628,16 @@ mt_quiet() { # start <seconds>|state <moment>|ended|remove
         start)
             mkdir -p "$MT"
             # Nothing of the harness's own may come or go meanwhile: the sink
-            # xterm of an earlier typing check retires now, not mid-run.
+            # xterm of an earlier typing check retires now, not mid-run. The
+            # client's xterm keeps its title (no allowTitleOps), so a prompt
+            # cannot rename it between the two window trees.
             podman exec desktop pkill -f 'xterm -T inputtest' 2>/dev/null || true
             gen_tone 330 /tmp/mt-client.wav "${2:?seconds}"
             podman rm -f "$MT_CLIENT" >/dev/null 2>&1 || true
             ev_save client "EV-PROCEDURE: the client: a confined container given the display and audio devices, an xterm (mt-client) on the screen and a ${2} s 330 Hz tone through PipeWire's pulse server" \
                 podman create --name "$MT_CLIENT" --device desktop.local/display=all --device desktop.local/audio=all \
                 localhost/desktop-container:latest \
-                sh -c 'xterm -T mt-client -geometry 40x6+700+420 & paplay /tmp/mt-client.wav; echo "paplay exited $?"; wait' >/dev/null \
+                sh -c 'xterm -name mt-client -T mt-client -xrm "XTerm*allowTitleOps: false" -geometry 40x6+700+420 & paplay /tmp/mt-client.wav; echo "paplay exited $?"; wait' >/dev/null \
                 || fail "could not create the client"
             podman cp /tmp/mt-client.wav "$MT_CLIENT:/tmp/mt-client.wav" || fail "could not give the client its tone"
             podman start "$MT_CLIENT" >/dev/null || fail "the client did not start"
@@ -687,6 +689,310 @@ mt_quiet() { # start <seconds>|state <moment>|ended|remove
             ;;
     esac
     ev_end
+}
+
+# --- F10.3: changing a running host's configuration -------------------------------
+
+MT_MONCONF=/etc/desktop-container/monitors.conf
+MT_ALT=localhost/desktop-container:alt
+MT_PIN=/etc/containers/systemd/desktop.container.d/50-image.conf
+MT_UPC=mt-upclient
+
+# A service command one of these journeys runs, with its time, in <story>.
+# Its exit status is recorded, not judged: the step after it looks at what
+# the command did (a restart with the image gone is meant to fail).
+mt_svc() { # <story> restart|start|stop
+    local rc=0
+    mt_begin "$1"
+    ev_save "svc-$2" "EV-PROCEDURE: systemctl $2 desktop.service, and how long it took to return (bash's time)" \
+        bash -c "time systemctl $2 desktop.service" >/dev/null || rc=$?
+    ev_note "systemctl $2 desktop.service exited $rc"
+    ev_end
+}
+
+# The first output the capture declared: "<name> <WxH@Hz> <+X+Y>".
+mt_captured() { sed -n 1p "$MT/captured-outputs"; }
+
+# S10.3.1: the documented capture, its stdout pasted into monitors.conf as it
+# is; the VM host then restarts the desktop. Each F10.3 change is bracketed by
+# F10.4's before and after steps (E10's common set: the state, the pids, the
+# logs for the window, every desktop process new after the restart).
+mt_layout_capture() {
+    local rc=0 name
+    mt_begin S10.3.1
+    ev_save xrandr-before "EV-STATE: xrandr --query --verbose, autodetected" xrv >/dev/null || true
+    mt_put S10.3.1-xrv-before "$EV_LAST"
+    ev_save geometry-before "EV-STATE: xrandr --query, autodetected: the arrangement to freeze" xr >/dev/null || true
+    cp "$MT_MONCONF" "$MT/monitors.conf.shipped"
+    desktop-monitors-capture > "$MT/capture.txt" 2> "$MT/capture.err" || rc=$?
+    ev_copy "$MT/capture.txt" capture "EV-PROCEDURE: desktop-monitors-capture's stdout, run as root (deploy/README.md \"Fixed monitor layout\": run it, paste, restart); it exited $rc"
+    [ "$rc" = 0 ] || fail "desktop-monitors-capture exited $rc: $(cat "$MT/capture.err")"
+    grep -vE '^[[:space:]]*(#|$)' "$MT/capture.txt" > "$MT/captured-outputs" || true
+    [ -s "$MT/captured-outputs" ] || fail "the capture declares no output"
+    name=$(mt_captured | awk '{print $1}')
+    mt_put autogeom "$(xr_line "$name" | grep -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+' | head -n1)"
+    cp "$MT/capture.txt" "$MT_MONCONF"
+    ev_copy "$MT_MONCONF" monitors-conf "EV-CONFIG: /etc/desktop-container/monitors.conf after the paste: the capture's stdout, unmodified"
+    [ "$(sha256sum < "$MT/capture.txt")" = "$(sha256sum < "$MT_MONCONF")" ] || fail "monitors.conf is not the capture's stdout"
+    ev_pass "monitors.conf now holds the capture's stdout unmodified, declaring: $(paste -sd';' "$MT/captured-outputs")"
+    ev_end
+}
+
+# S10.3.1 after the restart: pinned where it was, said so by the documented
+# checks, and S3.4.10's live disconnect holds it.
+mt_layout_pinned() {
+    local name mode pos geom gen out conn dims0 dims1 m0 m1
+    mt_begin S10.3.1
+    desk_back
+    gen=$(ev_save generated "EV-CONFIG: /etc/X11/xorg.conf.d/30-monitors.conf in the container, as xorg-monitor-conf generated it from the pasted file" \
+        podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf) || fail "there is no 30-monitors.conf in the container after the restart"
+    ev_save geometry-after "EV-STATE: xrandr --query with the layout pinned" xr >/dev/null || true
+    while read -r name mode pos _; do
+        geom="${mode%%@*}$pos"
+        grep -q "\"$name\"" <<<"$gen" || fail "30-monitors.conf does not name $name"
+        xr_is "$name" connected "$geom" || fail "$name is not at the captured geometry $geom: $(xr_line "$name")"
+        ev_pass "$name is named in 30-monitors.conf and sits at the captured geometry: $(xr_line "$name")"
+    done < "$MT/captured-outputs"
+    ev_save xrandr-after "EV-STATE: xrandr --query --verbose with the layout pinned" xrv >/dev/null || true
+    ev_diff xrandr "EV-DIFF: xrandr --query --verbose autodetected (-) and pinned (+): the mode names may change to cvt(1)'s, as monitors.conf's comments say" \
+        "$(mt_get S10.3.1-xrv-before)" "$EV_LAST"
+    m0=$(grep -m1 '\*' "$EV_DIR/$(mt_get S10.3.1-xrv-before)" | awk '{print $1}')
+    m1=$(grep -m1 '\*' "$EV_DIR/$EV_LAST" | awk '{print $1}')
+    ev_note "the current mode's name: $m0 autodetected, $m1 pinned (the expected change, when there is one, is to the cvt(1) name)"
+    out=$(ev_save log-lines "EV-LOG-DESKTOP: the desktop log's xorg-monitor-conf: and preflight: lines" \
+        sh -c 'podman logs desktop 2>&1 | grep -E "xorg-monitor-conf:|preflight:"') || true
+    grep -q 'preflight: PASS: fixed monitor layout declares' <<<"$out" || fail "the container preflight did not print its fixed-layout PASS line"
+    ev_pass "the container preflight says: $(grep -m1 'preflight: PASS: fixed monitor layout declares' <<<"$out" | sed 's/.*preflight: //')"
+    read -r name mode pos _ <<<"$(mt_captured)"
+    geom="${mode%%@*}$pos"
+    conn=$(ls -d /sys/class/drm/card*-"$name" 2>/dev/null | head -n1)
+    [ -n "$conn" ] || fail "no DRM connector named $name"
+    dims0=$(dpy_dims)
+    echo off > "$conn/status"
+    [ "$(cat "$conn/status")" = disconnected ] || { echo detect > "$conn/status"; fail "forcing $conn off did not take"; }
+    sleep 3
+    ev_save forced-off "EV-STATE: xrandr --query with $name's connector forced off under the running server" xr >/dev/null || true
+    if ! xr_is "$name" disconnected "$geom"; then
+        echo detect > "$conn/status"
+        fail "with $name forced off its geometry moved: $(xr_line "$name")"
+    fi
+    dims1=$(dpy_dims)
+    echo detect > "$conn/status"
+    wait_for 15 1 "$name connected again" xr_is "$name" connected "$geom"
+    [ "$dims0" = "$dims1" ] || fail "the screen went from $dims0 to $dims1 with $name forced off"
+    ev_pass "S3.4.10's live disconnect holds: forced off, $name stays at $geom on a $dims0 screen, and it comes back connected there"
+    ev_end
+}
+
+# S10.3.2: a monitors.conf the maintainer gets wrong, or unusual, one case
+# per restart. The VM host restarts the desktop between this and the check.
+mt_layout_case() { # malformed|unknown|virtual|nvidia-connected|nvidia-edid
+    local name mode pos w h
+    mt_begin S10.3.2
+    read -r name mode pos _ <<<"$(mt_captured)"
+    w=${mode%%x*} h=${mode#*x}
+    h=${h%%@*}
+    case "$1" in
+        malformed) printf '# S10.3.2 (a): a malformed position, on line 2\n%s %s 0+0\n' "$name" "$mode" ;;
+        unknown) printf '# S10.3.2 (b): an output name that matches no connector\nHDMI-9 1024x768@60 +0+0\n' ;;
+        virtual) printf '# S10.3.2 (c): virtual, beside a valid output line\nvirtual %sx%s\n%s %s +0+0\n' "$((w * 2))" "$h" "$name" "$mode" ;;
+        nvidia-connected) printf '# S10.3.2 (c): nvidia-connected, beside a valid output line\nnvidia-connected DFP-0\n%s %s +0+0\n' "$name" "$mode" ;;
+        nvidia-edid) printf '# S10.3.2 (c): nvidia-edid, beside a valid output line\nnvidia-edid DFP-0=/etc/desktop-container/edid-dfp0.bin\n%s %s +0+0\n' "$name" "$mode" ;;
+        restore) cat "$MT/monitors.conf.shipped" ;;
+        *) fail "no layout case named $1" ;;
+    esac > "$MT_MONCONF"
+    ev_copy "$MT_MONCONF" "monitors-conf-$1" "EV-CONFIG: monitors.conf for the case '$1'"
+    ev_end
+}
+mt_layout_case_check() { # the same case, after the restart
+    local name mode pos log pf gen=yes dims
+    mt_begin S10.3.2
+    desk_back
+    read -r name mode pos _ <<<"$(mt_captured)"
+    log=$(ev_save "monconf-$1" "EV-LOG-DESKTOP: podman logs desktop | grep xorg-monitor-conf, the case '$1'" \
+        sh -c 'podman logs desktop 2>&1 | grep xorg-monitor-conf') || true
+    pf=$(ev_save "preflight-$1" "EV-LOG-DESKTOP: podman logs desktop | grep preflight:, the case '$1'" \
+        sh -c 'podman logs desktop 2>&1 | grep preflight:') || true
+    ev_save "xrandr-$1" "EV-STATE: xrandr --query, the case '$1'" xr >/dev/null || true
+    podman exec desktop test -e /etc/X11/xorg.conf.d/30-monitors.conf || gen=no
+    case "$1" in
+        malformed)
+            grep -q "xorg-monitor-conf: ERROR: $MT_MONCONF:2: position wants +X+Y" <<<"$log" \
+                || fail "no ERROR line naming line 2's position: $(echo $log)"
+            [ "$gen" = no ] || fail "a 30-monitors.conf was generated from a malformed file"
+            xr_is "$name" connected "$(mt_get autogeom)" || fail "$name is not at its autodetected geometry: $(xr_line "$name")"
+            ev_pass "(a) a malformed position: the log names the file and line 2 ($(grep -m1 'ERROR' <<<"$log" | sed 's/.*ERROR: //')), nothing is generated, and $name autodetects at $(mt_get autogeom)" ;;
+        unknown)
+            grep -q 'preflight: WARN: fixed monitor layout names output(s) HDMI-9 with no matching DRM connector' <<<"$pf" \
+                || fail "the container preflight does not WARN about HDMI-9: $(grep 'fixed monitor layout' <<<"$pf")"
+            ev_pass "(b) an output name that matches no connector: the container preflight WARNs, naming it: $(grep -m1 'HDMI-9' <<<"$pf" | sed 's/.*preflight: //')" ;;
+        virtual|nvidia-connected|nvidia-edid)
+            grep -q "xorg-monitor-conf: fixed layout [0-9]*x[0-9]*: $name " <<<"$log" || fail "the layout with '$1' was not applied: $(echo $log)"
+            ! grep -q 'xorg-monitor-conf: ERROR' <<<"$log" || fail "'$1' gave an ERROR: $(grep -m1 ERROR <<<"$log")"
+            [ "$gen" = yes ] || fail "no 30-monitors.conf was generated with '$1'"
+            if [ "$1" = virtual ]; then
+                dims=$(dpy_dims)
+                [ "$dims" = "$(grep -m1 '^virtual ' "$MT_MONCONF" | awk '{print $2}')" ] || fail "the screen is $dims, not the declared virtual size"
+            fi
+            ev_pass "(c) '$1' with a valid value beside a valid output line: the layout is applied ($(grep -m1 'fixed layout' <<<"$log" | sed 's/.*xorg-monitor-conf: //'))" ;;
+        restore)
+            [ "$gen" = no ] || fail "the shipped monitors.conf still generated a layout"
+            ev_pass "the shipped monitors.conf is back: nothing generated, the desktop autodetects" ;;
+    esac
+    ev_end
+}
+
+# S10.3.4: the image the unit names, gone; desktop-preflight names it.
+mt_image_gone() {
+    local rc=0 out st
+    mt_begin S10.3.4
+    ev_save stop "EV-PROCEDURE: systemctl stop desktop.service" systemctl stop desktop.service >/dev/null || fail "could not stop the desktop"
+    ev_save rmi "EV-PROCEDURE: podman rmi localhost/desktop-container:latest with the unit stopped: the image the unit names leaves podman's storage" \
+        podman rmi localhost/desktop-container:latest >/dev/null || fail "could not remove the image"
+    ev_save images "EV-STATE: podman images: no desktop image" podman images >/dev/null || true
+    ev_save restart "EV-PROCEDURE: systemctl restart desktop.service with the image gone" systemctl restart desktop.service >/dev/null || rc=$?
+    sleep 10
+    st=$(systemctl show -p ActiveState --value desktop.service)
+    ev_save status-gone "EV-STATE: systemctl status desktop.service, the image gone" systemctl --no-pager status desktop.service >/dev/null || true
+    [ "$st" != active ] || fail "desktop.service is active with its image gone"
+    ev_pass "desktop.service is not active with its image gone: it is $st, and the restart exited $rc"
+    ev_save journal "EV-LOG-JOURNAL: journalctl -u desktop.service since the stop: the error as the maintainer sees it" \
+        journalctl --no-pager -o short-precise -u desktop.service --since "@$(mt_get since-S10.3.4)" >/dev/null || true
+    rc=0
+    out=$(ev_save preflight-gone "EV-STATE: desktop-preflight with the image gone" desktop-preflight) || rc=$?
+    [ "$rc" = 1 ] || fail "desktop-preflight exited $rc with the image gone, want 1"
+    grep -q 'FAIL: image NOT in podman storage: localhost/desktop-container:latest' <<<"$out" || fail "desktop-preflight does not name the missing image"
+    ev_pass "desktop-preflight exits 1, naming it: $(grep -m1 'image NOT in podman storage' <<<"$out" | sed 's/^host-preflight: //')"
+    mt_state gone "with the image gone"
+    mt_state_diff running gone "the image removed"
+    ev_end
+}
+mt_image_load() {
+    mt_begin S10.3.4
+    ev_save load "EV-PROCEDURE: podman load -i /tmp/images-desktop.tar: the image back in podman's storage, as the preflight's line says (\"podman pull/load it\")" \
+        podman load -i /tmp/images-desktop.tar >/dev/null || fail "could not load the image"
+    ev_end
+}
+mt_image_back() {
+    local rc=0 out
+    mt_begin S10.3.4
+    desk_back
+    out=$(ev_save preflight-back "EV-STATE: desktop-preflight with the image loaded and the desktop restarted" desktop-preflight) || rc=$?
+    [ "$rc" = 0 ] || fail "desktop-preflight still FAILs: $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+    ev_pass "loading the image and restarting was the whole fix: the desktop is back and desktop-preflight reports 0 FAILs"
+    mt_state_diff gone back "the image loaded, the desktop restarted"
+    ev_end
+}
+
+# S10.3.3: the image's facts: "<id> <digest> <sha256 of its toolkit binary>".
+mt_image_facts() { # <reference>
+    printf '%s %s %s\n' "$(podman image inspect --format '{{.Id}}' "$1")" "$(podman image inspect --format '{{.Digest}}' "$1")" \
+        "$(podman run --rm --network=none "$1" sha256sum /usr/libexec/desktop-tools/screenshot | awk '{print $1}')"
+}
+# A command in the upgrade's client, with the environment CDI gave its main
+# process (a podman exec does not inherit it).
+MT_UPC_ENV='eval "$(tr "\0" "\n" < /proc/1/environ | grep -E "^(DISPLAY|DESKTOP_TOOLS_BIN|PULSE_SERVER|PIPEWIRE_REMOTE)=" | sed "s/^/export /")"; '
+mt_upc() { podman exec "$MT_UPC" sh -c "$MT_UPC_ENV$1"; }
+mt_upc_d() { podman exec -d "$MT_UPC" sh -c "$MT_UPC_ENV$1"; }
+mt_upgrade_prep() {
+    local orig alt
+    mt_begin S10.3.3
+    ev_save load-alt "EV-PROCEDURE: the second image into podman's storage (podman load): this desktop with another root colour, #2b1b17, and a toolkit binary with another checksum, built for this test" \
+        podman load -i /tmp/images-desktop-alt.tar >/dev/null || fail "could not load the second image"
+    orig=$(mt_image_facts localhost/desktop-container:latest) alt=$(mt_image_facts "$MT_ALT")
+    mt_put img-orig "$orig"
+    mt_put img-alt "$alt"
+    ev_text images "EV-STATE: the two images: id, digest, and the sha256 of /usr/libexec/desktop-tools/screenshot in each" \
+        "first, localhost/desktop-container:latest: $orig
+second, $MT_ALT: $alt"
+    [ "${orig%% *}" != "${alt%% *}" ] || fail "the two images are the same image"
+    [ "${orig##* }" != "${alt##* }" ] || fail "the two images' toolkit binaries have the same checksum"
+    ev_pass "two images, different ids and different toolkit checksums"
+    podman rm -f "$MT_UPC" >/dev/null 2>&1 || true
+    ev_save client "EV-PROCEDURE: the client that runs through every switch (S7.8.1, S7.8.2): sleep infinity in a confined container given the display, audio and tools devices" \
+        podman run -d --name "$MT_UPC" --device desktop.local/display=all --device desktop.local/audio=all \
+        --device desktop.local/tools=all localhost/desktop-container:latest sleep infinity >/dev/null || fail "the client did not start"
+    mt_put upc "$(podman inspect --format '{{.Id}}' "$MT_UPC")"
+    ev_end
+}
+mt_route() { # pin|tag forward|back
+    local dg id
+    mt_begin S10.3.3
+    case "$1:$2" in
+        pin:forward)
+            dg=$(mt_get img-alt | awk '{print $2}')
+            mkdir -p "$(dirname "$MT_PIN")"
+            printf '[Container]\nImage=localhost/desktop-container@%s\n' "$dg" > "$MT_PIN"
+            ev_copy "$MT_PIN" pin "EV-CONFIG: the documented digest pin (deploy/README.md \"Overriding the image reference\"), naming the second image by digest"
+            ev_save daemon-reload "EV-PROCEDURE: systemctl daemon-reload" systemctl daemon-reload >/dev/null || fail "daemon-reload failed" ;;
+        pin:back)
+            rm -f "$MT_PIN"
+            ev_save daemon-reload "EV-PROCEDURE: the pin removed, then systemctl daemon-reload" systemctl daemon-reload >/dev/null || fail "daemon-reload failed" ;;
+        tag:forward)
+            ev_save tag "EV-PROCEDURE: podman tag $MT_ALT localhost/desktop-container:latest: the unit's default name, moved to the second image" \
+                podman tag "$MT_ALT" localhost/desktop-container:latest >/dev/null || fail "podman tag failed" ;;
+        tag:back)
+            id=$(mt_get img-orig | awk '{print $1}')
+            ev_save tag "EV-PROCEDURE: podman tag <the first image's id> localhost/desktop-container:latest: moved back" \
+                podman tag "$id" localhost/desktop-container:latest >/dev/null || fail "podman tag failed" ;;
+        *) fail "no route $1 $2" ;;
+    esac
+    ev_save "unit-$1-$2" "EV-CONFIG: systemctl cat desktop.service ($1, $2)" systemctl cat desktop.service >/dev/null || true
+    ev_end
+}
+mt_route_check() { # orig|alt pin|tag
+    local id dg sum running pub out rc=0 n inside
+    mt_begin S10.3.3
+    desk_back
+    read -r id dg sum <<<"$(mt_get "img-$1")"
+    running=$(ev_save "image-$2-$1" "EV-STATE: podman inspect desktop --format '{{.Image}}' ($2, the $1 image wanted)" \
+        podman inspect --format '{{.Image}}' desktop) || true
+    [ "$running" = "$id" ] || fail "the desktop runs $running, not the $1 image ($id)"
+    pub=$(ev_save "toolkit-$2-$1" "EV-STATE: sha256sum /var/lib/desktop-container/bin/screenshot ($2, $1): the toolkit the desktop published" \
+        sha256sum /var/lib/desktop-container/bin/screenshot) || true
+    [ "${pub%% *}" = "$sum" ] || fail "the published toolkit is not the $1 image's (${pub%% *}, want $sum)"
+    ev_pass "$2 route, the $1 image: the desktop runs it ($id) and published its toolkit (sha256 $sum)"
+    out=$(ev_save "preflight-$2-$1" "EV-STATE: desktop-preflight ($2, $1)" desktop-preflight) || rc=$?
+    [ "$rc" = 0 ] || fail "desktop-preflight FAILs ($2, $1): $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+    if [ -e "$MT_PIN" ]; then
+        grep -q 'PASS: quadlet drop-ins present .* (podman merges them)' <<<"$out" || fail "desktop-preflight does not report the drop-in"
+        ev_pass "desktop-preflight: 0 FAILs, and its drop-in line: $(grep -m1 'drop-ins present' <<<"$out" | sed 's/^host-preflight: //')"
+    else
+        ev_pass "desktop-preflight: 0 FAILs"
+    fi
+    # The client: the same container, never restarted, and new apps of its
+    # work against the new desktop (S7.8.1); the toolkit it sees is the one
+    # just published, and it runs (S7.8.2).
+    [ "$(podman inspect --format '{{.Id}} {{.RestartCount}}' "$MT_UPC")" = "$(mt_get upc) 0" ] \
+        || fail "the client is not the same container, or it restarted: $(podman inspect --format '{{.Id}} {{.RestartCount}}' "$MT_UPC")"
+    n=$(( $(mt_get upc-n 2>/dev/null || echo 0) + 1 ))
+    mt_put upc-n "$n"
+    mt_upc_d "exec xterm -name upclient$n -T upclient$n -xrm 'XTerm*allowTitleOps: false' -geometry 30x3+720+300" || true
+    wait_for 20 1 "the client's new xterm, upclient$n, on the screen" win_up "upclient$n"
+    inside=$(mt_upc 'sha256sum "$DESKTOP_TOOLS_BIN"/screenshot' 2>/dev/null | awk '{print $1}')
+    [ "$inside" = "$sum" ] || fail "the client sees a toolkit of sha256 $inside, not the $1 image's"
+    rc=0
+    mt_upc '"$DESKTOP_TOOLS_BIN"/screenshot --to-stdout' > "$MT/upc-shot.png" 2>"$MT/upc-shot.err" || rc=$?
+    [ "$rc" = 0 ] && [ -s "$MT/upc-shot.png" ] || fail "the client's screenshot failed (exit $rc): $(head -c 300 "$MT/upc-shot.err")"
+    ev_copy "$MT/upc-shot.png" "client-shot-$2-$1" "EV-SHOT: the client's own screenshot through the republished toolkit ($2, $1)"
+    ev_save "client-$2-$1" "EV-PIDS: the client container ($2, $1): the same id, restart count 0" \
+        podman inspect --format '{{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}}' "$MT_UPC" >/dev/null || true
+    ev_pass "the client is the same container, restart count 0; its new xterm upclient$n is on the screen, and the toolkit it sees is the one published, sha256 $sum, which runs"
+    ev_end
+}
+mt_upgrade_done() {
+    mt_begin S10.3.3
+    podman rm -f "$MT_UPC" >/dev/null 2>&1 || true
+    ev_note "the client removed; the desktop runs the first image, with no pin"
+    ev_end
+}
+mt_upc_tone() { # <hz>: a new tone from the upgrade's client, printed for the VM host
+    local rc=0
+    gen_tone "$1" "/tmp/upc-$1.wav" 3
+    podman cp "/tmp/upc-$1.wav" "$MT_UPC:/tmp/upc-$1.wav"
+    echo "== paplay of a $1 Hz tone from the client, through the restarted desktop's pulse server"
+    mt_upc "paplay /tmp/upc-$1.wav" || rc=$?
+    echo "paplay exited $rc"
 }
 
 # --- F10.4: routine operations ---------------------------------------------------
@@ -822,12 +1128,25 @@ maint() { # <step> [args]
         checklist) mt_checklist "${2:?readme|deploy}" ;;
         checklist-play) mt_checklist_play "${2:?pw-play|paplay|aplay}" "${3:?written|met|container}" ;;
         quiet) mt_quiet "${2:?start|state|ended|remove}" "${3:-}" ;;
+        svc) mt_svc "${2:?story}" "${3:?restart|start|stop}" ;;
+        layout-capture) mt_layout_capture ;;
+        layout-pinned) mt_layout_pinned ;;
+        layout-case) mt_layout_case "${2:?case}" ;;
+        layout-case-check) mt_layout_case_check "${2:?case}" ;;
+        image-gone) mt_image_gone ;;
+        image-load) mt_image_load ;;
+        image-back) mt_image_back ;;
+        upgrade-prep) mt_upgrade_prep ;;
+        route) mt_route "${2:?pin|tag}" "${3:?forward|back}" ;;
+        route-check) mt_route_check "${2:?orig|alt}" "${3:?pin|tag}" ;;
+        upgrade-done) mt_upgrade_done ;;
+        upc-tone) mt_upc_tone "${2:?hz}" ;;
         before) mt_before "${2:?story}" "${3:?moment}" ;;
         after) mt_after "${2:?story}" "${3:?moment before}" "${4:?moment after}" ;;
         restart) mt_restart ;;
         stop) mt_stop ;;
         held) mt_held ;;
         start) mt_start ;;
-        *) fail "maint: packages, image, apply, firstboot, host-play, selinux, checklist-tools, checklist, checklist-play, quiet, before, after, restart, stop, held or start" ;;
+        *) fail "maint: no step named '${1:-}' (see the case above)" ;;
     esac
 }

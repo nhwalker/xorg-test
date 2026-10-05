@@ -104,11 +104,22 @@ jobs:
           fi
           ev_end
           exit "$rc"
+      - name: monitors.conf's global keywords agree, three ways (S10.3.2's static half)
+        # The keywords monitors.conf documents and README.md names, the ones
+        # xorg-monitor-conf.sh accepts, and the ones the container's
+        # preflight skips when it reads output names: one set. The
+        # self-test first plants a keyword in README.md that nothing
+        # accepts, which the check must name.
+        env:
+          EV_SOURCE: "ci.yml static (ci/layout-keywords.py)"
+        run: |
+          python3 ci/layout-keywords.py self-test
+          python3 ci/layout-keywords.py check --evidence artifacts
       - name: python syntax (VM harness, evidence library)
         # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/script-list.py ci/preflight-rows.py ci/doc-blocks.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/script-list.py ci/preflight-rows.py ci/doc-blocks.py ci/layout-keywords.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the

@@ -839,9 +839,10 @@ write_manifest
 vm_transfer() {
 log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
+# Every image archive the workflow handed over: ci.yml's three, and
+# maintainer.yml's second desktop image for maint-config's upgrade.
 scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null repo.tgz \
-    images-desktop.tar images-plugin.tar images-testclient.tar \
+    -o UserKnownHostsFile=/dev/null repo.tgz images-*.tar \
     rocky@127.0.0.1:/tmp/
 }
 vm_transfer
