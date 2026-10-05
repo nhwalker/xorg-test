@@ -16,9 +16,18 @@ CONTAINER=${DESKTOP_CONTAINER:-desktop}
 DPY=${DESKTOP_DISPLAY:-:0}
 
 [ "$(id -u)" = 0 ] || { echo "desktop-monitors-capture: run as root (podman storage is root-only)" >&2; exit 2; }
-command -v podman >/dev/null || { echo "desktop-monitors-capture: podman not installed" >&2; exit 2; }
 
-if ! q=$(podman exec -u desktop -e "DISPLAY=$DPY" "$CONTAINER" xrandr --query 2>&1); then
+# DESKTOP_XRANDR_CMD: a command whose output stands in for the desktop's
+# `xrandr --query`. Tests only (canned text); unset, the tool asks the
+# running desktop.
+if [ -n "${DESKTOP_XRANDR_CMD:-}" ]; then
+    query() { sh -c "$DESKTOP_XRANDR_CMD"; }
+else
+    command -v podman >/dev/null || { echo "desktop-monitors-capture: podman not installed" >&2; exit 2; }
+    query() { podman exec -u desktop -e "DISPLAY=$DPY" "$CONTAINER" xrandr --query; }
+fi
+
+if ! q=$(query 2>&1); then
     echo "desktop-monitors-capture: cannot query the desktop's display:" >&2
     echo "$q" >&2
     echo "desktop-monitors-capture: is desktop.service running? (systemctl status desktop.service)" >&2
