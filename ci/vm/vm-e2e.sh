@@ -857,8 +857,9 @@ log "input: type into an xterm with the real virtual keyboard, verify the app go
 # Prove the whole input path (QEMU HID -> evdev -> Xorg -> focused app), not
 # just that a device enumerates. A sink xterm runs `read`; we click it to
 # focus (mwm is click-to-focus) and type via QMP input-send-event. Runs
-# BEFORE the hotplug test: a rootless-X session cannot take a hotplugged
-# input device via logind, so the boot-time keyboard is the working one.
+# BEFORE the hotplug tests, so it is the boot-time keyboard on a desktop
+# nothing has changed yet. (Xorg does adopt a hot-added keyboard: S3.9.2
+# checks that xinput lists it.)
 res=$(vm_ssh 'sudo podman exec -u desktop -e DISPLAY=:0 desktop \
     sh -c "xdpyinfo | awk \"/dimensions:/{print \\\$2; exit}\""')
 [ -n "$res" ] || fail "could not read display resolution for input injection"
