@@ -1464,7 +1464,10 @@ follow=$(awk '{ t = $0; sub(/^[^ ]+ (stdout|stderr) [FP] ?/, "", t); buf = buf t
                 if ($3 == "F") { print buf; buf = "" } }
               END { if (buf != "") print buf }' "$tmp/follow" | tr -d '\r')
 rm -r "$tmp"
-n_term=$(line_in "$follow" '^desktop-init: SIGTERM:')
+# Not anchored: podman signals every process at once, so desktop-init's line
+# can follow another writer's unfinished one (xinit's "waiting for X server
+# to shut down "), and the rejoined record then holds both.
+n_term=$(line_in "$follow" 'desktop-init: SIGTERM:')
 after_term=""
 if [ -n "$n_term" ]; then
     after_term=$(sed -n "${n_term},\$p" <<<"$follow")
