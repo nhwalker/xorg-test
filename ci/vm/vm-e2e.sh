@@ -26,10 +26,19 @@ mkdir -p "$ART"
 # parallel. "all" runs every part in one VM, in the order below (local runs).
 SHARD=${1:-all}
 case "$SHARD" in
-    all|core|operator|k8s) ;;
-    *) echo "usage: $0 [all|core|operator|k8s]" >&2; exit 2 ;;
+    all|core|operator|k8s|soundless) ;;
+    *) echo "usage: $0 [all|core|operator|k8s|soundless]" >&2; exit 2 ;;
 esac
 in_shard() { [ "$SHARD" = all ] || [ "$SHARD" = "$1" ]; }
+# The soundless shard boots a different machine - no intel-hda, so no sound
+# card at all - and so is never part of "all": its VM is not the others'.
+# The guest's steps learn which machine they are on from EV_PROFILE.
+PROFILE=""
+HDA=(-device intel-hda -device "hda-duplex,audiodev=snd0")
+if [ "$SHARD" = soundless ]; then
+    PROFILE=soundless
+    HDA=()
+fi
 
 # Evidence (Requirements.md, "Evidence standard"). Host-side stories write
 # $ART/<story>/ directly. Guest phases write /var/tmp/ev/<story>/ in the VM,
@@ -100,7 +109,7 @@ trap ev_finish EXIT
 guest_ev() { # <ev-root or ""> <vm-guest.sh args...>
     local root=$1 rc=0
     shift
-    vm_ssh "sudo EV_ROOT=$root EV_SOURCE='$EV_SOURCE' repo/ci/vm/vm-guest.sh $*" || rc=$?
+    vm_ssh "sudo EV_ROOT=$root EV_SOURCE='$EV_SOURCE' EV_PROFILE=$PROFILE repo/ci/vm/vm-guest.sh $*" || rc=$?
     [ -z "$root" ] || ev_pull
     return "$rc"
 }
@@ -770,7 +779,7 @@ qemu-system-x86_64 \
     -vnc "unix:$VNC1,display=vga0,head=1" \
     -device virtio-keyboard-pci -device virtio-tablet-pci \
     -device qemu-xhci,id=xhci -device usb-kbd,id=kvmkbd,bus=xhci.0 \
-    -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
+    -audiodev none,id=snd0 "${HDA[@]}" \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$SSHPORT-:22" -device virtio-net-pci,netdev=n0 \
     -monitor "unix:$MON,server,nowait" \
     -qmp "unix:$QMP,server,nowait" \
@@ -831,6 +840,15 @@ scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
 # artifact zip and NOWHERE else, so a red run showed only "guest phase-deploy
 # failed" and finding out why meant downloading it. The artifact is still
 # written; the job log just stops being useless.
+if [ "$SHARD" = soundless ]; then
+    # On a stock VM the host's audio group and the image's are both gid 63,
+    # so a check that the container's group follows the host's nodes could
+    # not fail. Renumbered before the tree is applied, and before any sound
+    # node exists, the host's group differs from the image's (S2.4.6).
+    vm_ssh 'sudo groupmod -g 1063 audio && getent group audio' > "$ART/soundless-audio-group.txt" 2>&1 \
+        || fail "could not renumber the host's audio group"
+    log "soundless profile: the host's audio group is now $(cat "$ART/soundless-audio-group.txt")"
+fi
 log "phase deploy: the declarative tree on a stock host (SELinux enforcing)"
 # The one host-setup path there is: the deploy tree applied over a stock
 # Rocky host - the boot getty seat-prep must evict, the root-owned
@@ -914,6 +932,56 @@ if in_shard core; then
     EV_SIDE=
 fi
 guest_ev "$pd_ev" layout-restore || fail "fixed monitor layout: the shipped config did not restore autodetection"
+if [ "$SHARD" = soundless ]; then
+    # S2.4.6, S4.7.10 and S7.7.9 on a host that booted with no sound card:
+    # a client started first, then a usb-audio card, then the stack's next
+    # start, which aligns the container's audio group to the card's nodes.
+    log "soundless host: a card arrives after boot, the stack's next start aligns to it, and it plays"
+    SL6_T="Audio gid is re-aligned before every audio start"
+    SL10_T="A card that arrives after a soundless boot is openable"
+    SL9_T="A client that started on a soundless host plays once a card arrives, without restarting"
+    guest_ev "$GUEST_EV" soundless before || fail "S2.4.6: the soundless host is not as it should be, or the client did not start"
+    EV_SIDE=h-
+    ev_begin S2.4.6 "$SL6_T" T3
+    ev_copy "$ART/soundless-audio-group.txt" renumber "EV-STATE: the harness's groupmod -g 1063 audio on the host before the tree was applied, and getent group audio after it"
+    ev_qemu sl-plug "EV-QEMU: device_add usb-audio,id=slsnd,audiodev=snd0,bus=xhci.0 (the first sound card this VM has) and QEMU's reply (empty: accepted)" \
+        "device_add usb-audio,id=slsnd,audiodev=snd0,bus=xhci.0" >/dev/null || fail "S2.4.6: QEMU refused the usb-audio card"
+    ev_end
+    EV_SIDE=
+    guest_ev "$GUEST_EV" soundless plugged || fail "S2.4.6: the card's nodes are not as they should be before the stack restarts"
+    # The client tries once a second: it plays once the stack is back with
+    # the card, so the capture is running before the stack is restarted.
+    EV_SIDE=h-
+    ev_begin S7.7.9 "$SL9_T" T3
+    ev_audio_start client 550
+    ev_end
+    EV_SIDE=
+    guest_ev "$GUEST_EV" soundless realign || { audio_capture_stop; fail "S2.4.6: the stack's next start did not align the audio group, or the card did not come up"; }
+    guest_ev "$GUEST_EV" soundless played || { audio_capture_stop; fail "S7.7.9: the client never played its tone"; }
+    EV_SIDE=h-
+    ev_begin S7.7.9 "$SL9_T" T3
+    ev_audio_stop "EV-AUDIO: the machine's output from before the stack's restart until after the client played: its 550 Hz tone, played by the client that started before the card existed" 3 0.02 550 \
+        || fail "S7.7.9: the client's 550 Hz tone was not heard"
+    ev_pass "the client's 550 Hz tone is heard through the card that arrived after it started"
+    ev_end
+    for st in "S2.4.6:770:the session user's tone through the realigned card" "S4.7.10:990:a tone through the card that arrived after the soundless boot"; do
+        sid=${st%%:*} rest=${st#*:}
+        hz=${rest%%:*} what=${rest#*:}
+        ttl=$SL6_T
+        [ "$sid" = S4.7.10 ] && ttl=$SL10_T
+        ev_begin "$sid" "$ttl" T3
+        ev_audio_start "tone" "$hz"
+        gq tone-start "sl$hz" "$hz" 4 - >/dev/null || { audio_capture_stop; fail "$sid: could not start the $hz Hz player"; }
+        for _ in $(seq 15); do st2=$(gq tone-status "sl$hz" 2>/dev/null | sed -n 1p || true); [ "${st2%% *}" = exited ] && break; sleep 1; done
+        ev_save "player-$hz" "EV-LOG-CLIENT: the $hz Hz player (paplay as the session user in the desktop container): its exit status, how long it played, its output" \
+            gq tone-status "sl$hz" >/dev/null || true
+        ev_audio_stop "EV-AUDIO: $what ($hz Hz)" 3 0.02 "$hz" || fail "$sid: the $hz Hz tone was not heard"
+        ev_pass "$what is heard ($hz Hz)"
+        ev_end
+    done
+    EV_SIDE=
+    guest_ev "$GUEST_EV" soundless after || fail "S7.7.9: the client restarted or is not the same container"
+fi
 if in_shard core; then
     # S3.10.5-S3.10.7 under autodetection. QEMU itself plugs a monitor into
     # Virtual-2 and takes it away again (vnc_head, through the VNC server on
