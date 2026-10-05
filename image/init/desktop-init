@@ -54,8 +54,7 @@
 # and Xorg. Everything started in the X session therefore also carries
 # DESKTOP_SESSION_TAG, unique to that run of it, and stopping the X tree
 # takes the leader's sid AND every desktop-user process whose environment
-# holds the tag (see tree_members): the clients first, the server's session
-# once they are gone (see stop_tree). The audio stack carries no tag.
+# holds the tag (see tree_members). The audio stack carries no tag.
 #
 # Signals: podman stop sends SIGTERM (STOPSIGNAL in the Containerfile).
 # CAP_KILL is deliberately NOT granted - in the host pid namespace it would
@@ -150,47 +149,17 @@ tagged_pids() { # $1: DESKTOP_SESSION_TAG value
         | sed -n 's|^/proc/\([0-9]*\)/environ$|\1|p'
 }
 
-tree_clients() { # $1: session leader pid, $2: the tree's DESKTOP_SESSION_TAG
-    # The tagged processes outside the leader's own session: for the X
-    # tree, its clients (mwm, the xterms and whatever runs in them), never
-    # startx, xinit or the server. Empty without a tag.
-    local leader="${1:-}" tag="${2:-}"
-    [ -n "$leader" ] && [ -n "$tag" ] || return 0
-    comm -23 <(tagged_pids "$tag" | sort) \
-        <(ps -eo pid=,sess= | awk -v s="$leader" '$2==s{print $1}' | sort)
-}
-
 stop_tree() { # $1: session leader pid, $2: the tree's DESKTOP_SESSION_TAG (optional)
     # TERM the tree, then KILL stragglers. Root's own pid never appears
     # here (desktop-init is in neither session and carries no tag), so no
     # self-kill.
-    #
-    # The clients get their TERM first, and the leader's session (startx,
-    # xinit, Xorg) only once they are gone or 2 s have passed. mwm makes
-    # Xlib calls from its signal handlers. TERMed along with the server, it
-    # was still in XSync when xinit, TERMed too, sent it a HUP: inside both
-    # handlers at once, mwm sat in XSync until the KILL below, and a
-    # `systemctl stop` took 5.2 s. TERMed while the server still answers,
-    # mwm quits at once, and xinit takes the server down by itself.
-    local leader="${1:-}" tag="${2:-}" pids polls=5 waited=0
+    local leader="${1:-}" tag="${2:-}" pids
     [ -n "$leader" ] || return 0
-    pids=$(tree_clients "$leader" "$tag")
-    if [ -n "$pids" ]; then
-        # shellcheck disable=SC2086
-        as_desktop kill -TERM $pids 2>/dev/null || true
-        while [ "$waited" -lt 10 ] && [ -n "$(tree_clients "$leader" "$tag")" ]; do
-            sleep 0.2
-            waited=$((waited + 1))
-        done
-        # What this wait took comes out of the 5 s below: the KILL still
-        # comes at most 5 s after the first TERM.
-        polls=$((5 - (waited + 4) / 5))
-    fi
     pids=$(tree_members "$leader" "$tag")
     [ -n "$pids" ] || return 0
     # shellcheck disable=SC2086
     as_desktop kill -TERM $pids 2>/dev/null || true
-    for _ in $(seq "$polls"); do
+    for _ in 1 2 3 4 5; do
         pids=$(tree_members "$leader" "$tag")
         [ -n "$pids" ] || return 0
         sleep 1

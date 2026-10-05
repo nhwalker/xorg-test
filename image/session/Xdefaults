@@ -71,11 +71,11 @@ Mwm*feedback*foreground:                #d7dae0
 ! --- Confirmations ----------------------------------------------------------
 ! mwm's default showFeedback is "all", and its "kill" member means: on SIGTERM,
 ! post a "QUIT Mwm?" dialog and keep running. Nobody answers that here: a
-! plain `kill` of mwm left the session up instead of ending it (S2.3.6), and
-! desktop-init's stop, which signals the session's clients first and its
-! server after (see stop_tree), needs mwm to quit on that signal. Dropping
-! only "kill" keeps the rest: "Restart mwm" and "Quit session" still ask
-! first (S11.1.1).
+! plain `kill` of mwm left the session up instead of ending it (S2.3.6), and a
+! stop, which signals mwm along with every other process of the container,
+! needs it to quit on that signal (see xinitrc.desktop for the SIGHUP that
+! comes with it). Dropping only "kill" keeps the rest: "Restart mwm" and
+! "Quit session" still ask first (S11.1.1).
 Mwm*showFeedback:                       -kill
 
 ! --- xterm ------------------------------------------------------------------
