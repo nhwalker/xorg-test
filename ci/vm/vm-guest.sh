@@ -1746,13 +1746,23 @@ verify_audio_lifecycle() {
     pm=$(ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log from just before the kill (podman logs --since $since): the session's exit, the postmortem, the new session" \
         podman logs --since "$since" desktop) || true
     pm=$(tr -d '\r' <<<"$pm")
-    rc=$(sed -n 's/^desktop-init: session exited (rc=\([0-9]*\)).*/\1/p' <<<"$pm" | head -1)
-    [ -n "$rc" ] && [ "$rc" != 0 ] || fail "desktop-init did not log a nonzero session exit after the SIGKILL (rc='$rc')"
-    ev_pass "desktop-init logged the session's abnormal exit (rc=$rc)"
-    grep -q '^postmortem: X session ended abnormally' <<<"$pm" || fail "no postmortem header after the SIGKILL"
+    # xinit exits 0 when its server dies, so the session's rc says nothing
+    # here: desktop-init reads the server's log, says the server did not shut
+    # down cleanly, and only then runs the postmortem. In that order, the
+    # session's exit line last.
+    line_of() { grep -n "$1" <<<"$pm" | head -1 | cut -d: -f1; }
+    n_unclean=$(line_of '^desktop-init: the X server did not shut down cleanly')
+    n_pm=$(line_of '^postmortem: X session ended abnormally')
+    n_exit=$(line_of '^desktop-init: session exited (rc=')
+    [ -n "$n_unclean" ] || fail "desktop-init did not log that the killed X server did not shut down cleanly"
+    ev_pass "desktop-init logged that the X server did not shut down cleanly (line $n_unclean)"
+    [ -n "$n_pm" ] && [ "$n_pm" -gt "$n_unclean" ] \
+        || fail "no postmortem header after desktop-init's 'did not shut down cleanly' line"
     grep -q '^postmortem: ---- tail of ' <<<"$pm" && grep -q '^postmortem: ---- end of Xorg log ----' <<<"$pm" \
         || fail "the postmortem did not print the Xorg log's tail"
-    ev_pass "the postmortem ran: its header and the tail of the killed server's log"
+    ev_pass "then the postmortem ran (line $n_pm): its header and the tail of the killed server's log"
+    [ -n "$n_exit" ] && [ "$n_exit" -gt "$n_pm" ] || fail "desktop-init did not log the session's exit after the postmortem"
+    ev_pass "then desktop-init logged the session's exit (line $n_exit): $(sed -n "${n_exit}p" <<<"$pm")"
     ev_end
 
     log al "verify-audio-lifecycle passed"
