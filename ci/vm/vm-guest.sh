@@ -2013,6 +2013,56 @@ verify_postmortem() {
     log al "verify-postmortem passed"
 }
 
+# oci_spec_path prints the path of the desktop container's OCI runtime spec:
+# the config.json podman wrote and crun started the container from, with the
+# mounts, masked paths and device-cgroup entries exactly as it got them.
+oci_spec_path() {
+    local p
+    p=$(podman inspect desktop --format '{{.OCIConfigPath}}' 2>/dev/null) || p=
+    if [ -z "$p" ] || [ ! -f "$p" ]; then
+        p=$(podman inspect desktop --format '{{.StaticDir}}' 2>/dev/null)/config.json || return 1
+    fi
+    [ -f "$p" ] || return 1
+    printf '%s\n' "$p"
+}
+
+# spec_sys prints what an OCI spec puts at /sys and below: one
+# "mount <destination> <type> <source> <options>" line per mount, then a
+# "masked <path>" and a "readonly <path>" line per such path.
+spec_sys() { # <config.json>
+    python3 -c '
+import json, sys
+spec = json.load(open(sys.argv[1]))
+def under(p):
+    return p == "/sys" or p.startswith("/sys/")
+for m in spec.get("mounts", []):
+    if under(m.get("destination", "")):
+        print("mount", m["destination"], m.get("type") or "-", m.get("source") or "-",
+              ",".join(m.get("options") or []) or "-")
+linux = spec.get("linux", {})
+for p in linux.get("maskedPaths") or []:
+    if under(p):
+        print("masked", p)
+for p in linux.get("readonlyPaths") or []:
+    if under(p):
+        print("readonly", p)
+' "$1"
+}
+
+# spec_devices prints an OCI spec's device-cgroup list in order, one
+# "allow|deny <type> <major>:<minor> <access>" line per entry (* for any).
+spec_devices() { # <config.json>
+    python3 -c '
+import json, sys
+spec = json.load(open(sys.argv[1]))
+def num(v):
+    return "*" if v is None or v < 0 else str(v)
+for d in spec.get("linux", {}).get("resources", {}).get("devices") or []:
+    print("allow" if d.get("allow") else "deny", d.get("type") or "a",
+          num(d.get("major")) + ":" + num(d.get("minor")), d.get("access") or "-")
+' "$1"
+}
+
 # The names of the capabilities in a hex mask (CapEff and friends), one per
 # line, from linux/capability.h's numbering. No capsh needed.
 cap_names() { # <hex mask>
@@ -2124,8 +2174,23 @@ verify_privileges() {
     # text says which of the two the device cgroup refused.
     log vp "the device cgroup admits the five majors and nothing else"
     ev_begin S6.1.4 "Device cgroup is bounded" T3
-    ev_save cgroup-rules "EV-CONFIG: the device-cgroup rules the container was started with (podman inspect .HostConfig.DeviceCgroupRules); under cgroup v2 the kernel holds them as a BPF program, which is not readable as a list" \
-        podman inspect desktop --format '{{json .HostConfig.DeviceCgroupRules}}' >/dev/null || true
+    # The rules themselves: the quadlet's flags, and the device list of the
+    # OCI spec crun ran the container from. Under cgroup v2 crun compiles that
+    # list into a BPF program, which the kernel does not show as a list (and
+    # podman inspect has no field for the rules), so the spec is the readable
+    # form.
+    ev_save cgroup-rules "EV-CONFIG: the quadlet's device-cgroup rules (its --device-cgroup-rule flags)" \
+        grep -o -- '--device-cgroup-rule="[^"]*"' /etc/containers/systemd/desktop.container >/dev/null || true
+    spec=$(oci_spec_path) \
+        || fail "could not find the desktop container's OCI spec (podman inspect's OCIConfigPath, or config.json in its StaticDir)"
+    devs=$(ev_save spec-devices "EV-STATE: the device list of the container's OCI spec ($spec), in order: what crun compiled into the cgroup v2 BPF program. Podman's defaults come first; 'm' alone lets mknod make a node, not open it" \
+        spec_devices "$spec") \
+        || fail "could not read the device list of the OCI spec $spec"
+    for major in 13 116 226 4 5; do
+        awk -v m="$major:*" '$1 == "allow" && $2 == "c" && $3 == m && $4 ~ /r/ && $4 ~ /w/ {f = 1} END {exit !f}' <<<"$devs" \
+            || fail "the OCI spec's device list does not allow c $major:* for reading and writing: the quadlet's rule did not reach it"
+    done
+    ev_pass "the OCI spec's device list carries the quadlet's five rules: c 13:*, 116:*, 226:*, 4:* and 5:*, read and write"
     # One real minor per allowed major, read off the host's own nodes: an
     # evdev node, an ALSA control, a DRM render node (card0 if none), tty2
     # and ptmx - none of which an open with no read disturbs.
@@ -2168,17 +2233,23 @@ $(basename "$f") $((0x$(stat -c %t "$f"))) $((0x$(stat -c %T "$f")))"
     # the only one nothing else here would notice: a writable /sys is how a
     # container reaches host tunables (sysfs writes to kernel objects it does
     # not own), and the desktop never needs it - Xorg reads DRM through
-    # /dev/dri, not through sysfs writes. The quadlet's Mount= makes /sys a
-    # NON-recursive ro bind, so there is no /sys/fs/cgroup (or any other
-    # host sysfs submount) in the container at all; the mount itself is the
-    # thing to check. Read it from the container's OWN mount namespace: under
-    # --pid=host, /proc/1/mounts is the HOST's mount table (whose /sys is
-    # legitimately rw) - reading it here failed this assertion for two runs
-    # while the container's /sys was already ro, which the in-container
-    # preflight had been reporting all along.
-    log vp "/sys is read-only"
+    # /dev/dri, not through sysfs writes. Read it from the container's OWN
+    # mount namespace: under --pid=host, /proc/1/mounts is the HOST's mount
+    # table (whose /sys is legitimately rw) - reading it here failed this
+    # assertion for two runs while the container's /sys was already ro, which
+    # the in-container preflight had been reporting all along.
+    #
+    # Non-recursive: the quadlet's Mount= binds /sys without its submounts, so
+    # none of the host's (securityfs, bpf, pstore, selinuxfs, its cgroup2 ...)
+    # comes along. Podman still mounts its own there, from the OCI spec it
+    # starts the container with: a read-only cgroup2 at /sys/fs/cgroup and
+    # empty read-only tmpfs masks over its masked paths (/sys/firmware,
+    # /sys/fs/selinux) - run 37328302222 found exactly those three. So every
+    # mount under the container's /sys must be one the spec accounts for, in
+    # the form the spec gives it, and none of the host's own may be there.
+    log vp "/sys is read-only, and none of the host's mounts under it is in the container"
     ev_begin S6.1.5 "/sys is read-only and non-recursive" T3
-    sys_mounts=$(ev_save sys-mounts "EV-STATE: the container's own mount table (desktop-init's /proc/<pid>/mounts) filtered to /sys and below: one ro line, nothing under it" \
+    sys_mounts=$(ev_save sys-mounts "EV-STATE: the container's own mount table (desktop-init's /proc/<pid>/mounts) filtered to /sys and below" \
         podman exec desktop sh -c 'awk "\$2 == \"/sys\" || \$2 ~ \"^/sys/\"" "/proc/$(cat /run/desktop-init.pid)/mounts"') || true
     sysopts=$(awk '$2 == "/sys" {print $4}' <<<"$sys_mounts")
     [ -n "$sysopts" ] \
@@ -2188,13 +2259,67 @@ $(basename "$f") $((0x$(stat -c %t "$f"))) $((0x$(stat -c %T "$f")))"
         *) fail "/sys is mounted '$sysopts', want ro - a writable /sys is one of the six grants --privileged bundles and nothing here needs it" ;;
     esac
     ev_pass "/sys is mounted ro ($sysopts) in the container's own mount table"
-    sub=$(awk '$2 ~ "^/sys/" {print $2}' <<<"$sys_mounts" | paste -sd' ')
-    [ -z "$sub" ] || fail "something is mounted under the container's /sys: $sub"
-    ev_save sys-fs "EV-STATE: /sys/fs inside the container, and what /sys/fs/cgroup and /sys/fs/selinux hold there: the bare mountpoint directories, empty" \
+    spec=$(oci_spec_path) \
+        || fail "could not find the desktop container's OCI spec (podman inspect's OCIConfigPath, or config.json in its StaticDir)"
+    spec_sys=$(ev_save spec-sys "EV-CONFIG: what the container's OCI spec ($spec, the file crun started it from) puts at /sys and below: its mounts (destination, type, source, options), then its masked and read-only paths" \
+        spec_sys "$spec") \
+        || fail "could not read the /sys entries of the OCI spec $spec"
+    host_sys=$(ev_save host-sys "EV-STATE: the VM host's own mounts under /sys (its /proc/self/mounts): what a recursive bind would have carried into the container" \
+        awk '$2 ~ "^/sys/"' /proc/self/mounts) || true
+    masks=
+    while read -r path type opts; do
+        [ -n "$path" ] || continue
+        case ",$opts," in
+            *,ro,*) ;;
+            *) fail "$path ($type) under the container's /sys is mounted '$opts', not ro" ;;
+        esac
+        if [ "$path" = /sys/fs/cgroup ]; then
+            grep -Eq '^mount /sys/fs/cgroup cgroup2? ' <<<"$spec_sys" \
+                || fail "a $type is mounted at /sys/fs/cgroup in the container, and the OCI spec mounts nothing there"
+            [ "$type" = cgroup2 ] || fail "/sys/fs/cgroup in the container is a $type, want the spec's cgroup2"
+            ev_pass "/sys/fs/cgroup holds the container's own cgroup2, as its OCI spec asks, read-only ($opts)"
+        elif grep -qxF "masked $path" <<<"$spec_sys"; then
+            [ "$type" = tmpfs ] || fail "$path is one of the OCI spec's masked paths, but is mounted as $type, not podman's tmpfs mask"
+            masks="$masks $path"
+        elif grep -qxF "readonly $path" <<<"$spec_sys"; then
+            ev_pass "$path is one of the OCI spec's read-only paths, bound onto itself read-only ($type, $opts)"
+        else
+            fail "$path ($type) is mounted under the container's /sys, and the OCI spec neither mounts, masks nor write-protects it: a host submount came along"
+        fi
+    done < <(awk '$2 ~ "^/sys/" {print $2, $3, $4}' <<<"$sys_mounts")
+    if [ -n "$masks" ]; then
+        # shellcheck disable=SC2086 # one argument per masked path
+        mask_ls=$(ev_save masks "EV-STATE: podman's masks under /sys, listed inside the container: empty directories" \
+            podman exec desktop sh -c 'for d; do echo "$d: $(ls -A "$d" | wc -l) entries"; done' sh $masks) || true
+        for m in $masks; do
+            grep -qxF "$m: 0 entries" <<<"$mask_ls" \
+                || fail "podman's mask over $m is not empty: $(grep -F "$m: " <<<"$mask_ls" || echo 'no listing')"
+        done
+        ev_pass "podman's masks over$masks are empty read-only tmpfs mounts, as the OCI spec's masked paths ask"
+    fi
+    # The host's own: none of them may be in the container. At /sys/fs/cgroup
+    # the container has its own cgroup2, checked above; a host cgroup2 carried
+    # in would make it two there.
+    carried=
+    n_host=0
+    while read -r _ path type _; do
+        [ -n "$path" ] || continue
+        n_host=$((n_host + 1))
+        n=$(awk -v p="$path" -v t="$type" '$2 == p && $3 == t' <<<"$sys_mounts" | wc -l)
+        if [ "$path" = /sys/fs/cgroup ] && [ "$type" = cgroup2 ]; then
+            [ "$n" -le 1 ] || carried="$carried $path ($type)"
+        elif [ "$n" -gt 0 ]; then
+            carried="$carried $path ($type)"
+        fi
+    done <<<"$host_sys"
+    [ "$n_host" -gt 0 ] || fail "the VM host shows no mounts under /sys, so their absence from the container proves nothing"
+    [ -z "$carried" ] || fail "the host's own mounts under /sys reached the container:$carried"
+    ev_pass "none of the VM host's $n_host mounts under /sys ($(awk '{print $3}' <<<"$host_sys" | sort -u | paste -sd' ')) is in the container: the bind is non-recursive"
+    ev_save sys-fs "EV-STATE: /sys/fs inside the container, and how many entries /sys/fs/cgroup (the container's own cgroup tree) and /sys/fs/selinux (podman's mask) hold there" \
         podman exec desktop sh -c 'ls -la /sys/fs; for d in /sys/fs/cgroup /sys/fs/selinux; do echo "$d: $(ls -A "$d" 2>/dev/null | wc -l) entries"; done' >/dev/null || true
-    n_cg=$(podman exec desktop sh -c 'ls -A /sys/fs/cgroup 2>/dev/null | wc -l' 2>/dev/null || echo "?")
-    [ "$n_cg" = 0 ] || fail "/sys/fs/cgroup in the container is not an empty directory ($n_cg entries): the host's cgroup tree reached the container"
-    ev_pass "nothing is mounted under /sys: /sys/fs/cgroup is an empty directory, the bind is non-recursive"
+    ev_text cgroupns "EV-STATE: desktop-init's cgroup namespace and the VM host's (pid 1): if they differ, /sys/fs/cgroup in the container shows only the container's own cgroup subtree" \
+        "desktop-init (host pid $initpid): $(readlink "/proc/$initpid/ns/cgroup" 2>&1)
+host pid 1: $(readlink /proc/1/ns/cgroup 2>&1)"
     ev_end
 
     # S6.2.1: the host's pids are visible (the init pid check above) but
@@ -2518,7 +2643,14 @@ journey_apps() { # [pod]
     k3s kubectl exec "${1:-$JPOD}" -- pgrep -a -f 'xterm|paplay|shot-loop|screenshot' || true
 }
 # Whether a window with that title is on the display, seen from the desktop.
-win_up() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree 2>/dev/null | grep -qF "\"$1\""; }
+# The tree is read whole before it is searched: piped into grep -q under
+# pipefail, xwininfo dies of SIGPIPE once grep has its match, and the found
+# window reads as missing (run 37327333528's journey-1).
+win_up() {
+    local tree
+    tree=$(podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree 2>/dev/null) || return 1
+    grep -qF "\"$1\"" <<<"$tree"
+}
 win_wait() { wait_for "${2:-30}" 1 "a window titled $1 on the display" win_up "$1"; }
 # The display's windows, from the desktop (F7.5's xwininfo -root -tree).
 win_tree() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree; }
