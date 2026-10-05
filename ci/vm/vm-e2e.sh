@@ -140,6 +140,16 @@ ev_shot() { # <moment> <what>
     sleep 2
     if [ -s "$EV_DIR/$name" ]; then ev_attach "$name" "$2"; else ev_note "screendump $1 was not produced"; fi
 }
+# EV-SHOT of one head of the virtio-vga into the open story (qmp-tool.py
+# shot): head 0 is Virtual-1's scanout, head 1 Virtual-2's. Echoes the
+# image's "<width>x<height> <grayscale stddev>"; returns 1 without an image.
+ev_shot_head() { # <moment> <head> <what>
+    local name
+    name=$(ev_name "$1" png)
+    python3 qmp-tool.py shot "$QMP" "$EV_DIR/$name" vga0 "$2" >/dev/null && [ -s "$EV_DIR/$name" ] || return 1
+    ev_attach "$name" "$3"
+    convert "$EV_DIR/$name" -colorspace Gray -format '%wx%h %[fx:standard_deviation]' info: 2>/dev/null
+}
 # hotplug_probe echoes "<container input nodes> <Xorg input adds>", always as
 # two integers. Defaults to "0 0" rather than letting an ssh hiccup produce an
 # empty string that the arithmetic comparisons below would choke on.
@@ -713,12 +723,79 @@ in_shard core && pd_ev=$GUEST_EV
 guest_ev "$pd_ev" phase-deploy \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
          2>&1 | tee "$ART/guest-deploy-fail.log" || true; fail "guest phase-deploy failed"; }
+
+log "fixed monitor layout: declared across a connector QEMU never connects, then unplugged and restored"
+# vm-guest.sh's layout steps, one call each, so this side can look at the
+# display between them. Every shard runs them, as phase deploy always did;
+# only core records their stories, and only core adds what QEMU sees.
+guest_ev "$pd_ev" layout-declare || fail "fixed monitor layout: the declared layout did not come up"
+if in_shard core; then
+    # S3.4.9: one screendump per head while the declared layout is live. An
+    # xterm placed on Virtual-2's half gives that head something X drew.
+    EV_SIDE=h-
+    ev_begin S3.4.9 "A declared output comes up on a disconnected connector" T3
+    vm_ssh 'sudo podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop xterm -T head2-proof -geometry 60x12+1200+200'
+    sleep 3
+    for head in 0 1; do
+        if [ "$head" = 0 ]; then what="Virtual-1, the connected output: the session's xterm on it"
+        else what="Virtual-2, the disconnected output: the head2-proof xterm X drew at +1200+200"; fi
+        shot=$(ev_shot_head "head$head" "$head" "EV-SHOT: QEMU's screendump of the virtio-vga's head $head - $what") \
+            || fail "no screendump of head $head"
+        read -r size sd <<<"$shot"
+        [ "$size" = 1024x768 ] || fail "head $head's screendump is $size, want the declared 1024x768"
+        awk "BEGIN{ exit !($sd > 0.02) }" || fail "head $head is blank (grayscale stddev $sd): X does not draw there"
+        ev_pass "head $head scans out 1024x768 and X draws on it (grayscale stddev $sd)"
+    done
+    ev_end
+    EV_SIDE=
+fi
+guest_ev "$pd_ev" layout-roundtrip || fail "fixed monitor layout: the captured block did not round-trip"
+if in_shard core; then
+    # The video of the live disconnect and re-plug: S3.4.10 holds it, and
+    # S3.10.1-S3.10.3 cite it.
+    EV_SIDE=h-
+    ev_begin S3.4.10 "A live disconnect does not move the geometry" T3
+    ev_video_start live-disconnect
+fi
+guest_ev "$pd_ev" layout-unplug || fail "fixed monitor layout: the live disconnect or the re-plug moved something"
+if in_shard core; then
+    ev_video_stop "EV-VIDEO: head 0 across Virtual-1's forced disconnect and its re-plug (the guest's notes give both times); nothing on it should move"
+    ev_end
+    EV_SIDE=
+fi
+guest_ev "$pd_ev" layout-restore || fail "fixed monitor layout: the shipped config did not restore autodetection"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh deploy-proof' || fail "could not put the deploy-proof xterm up"
 write_manifest
 screendump desktop-deploy
 assert_nonblank desktop-deploy
 
 # ---- shard: core -------------------------------------------------------------
 if in_shard core; then
+
+log "sshd: the deploy tree's drop-in keeps stock home-dir key logins working"
+# Every vm_ssh since phase deploy reloaded sshd has needed this; here it is
+# looked at: the drop-in, what sshd makes of it, and a login that used the
+# home-dir key after the reload.
+ev_begin S5.7.6 "The sshd drop-in keeps stock key logins working" T3
+ev_save drop-in "EV-CONFIG: the sshd_config.d drop-in the deploy tree installed: the stock path first, then the root-owned one" \
+    vm_ssh_quick 'cat /etc/ssh/sshd_config.d/40-desktop-container.conf' >/dev/null \
+    || fail "the deploy tree's sshd drop-in is missing"
+eff=$(ev_save sshd-config "EV-STATE: sshd -T's authorizedkeysfile: what sshd makes of its config with the drop-in in place" \
+    vm_ssh_quick 'sudo sshd -T | grep -i "^authorizedkeysfile"') || fail "sshd -T failed"
+grep -qix 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u' <<<"$eff" \
+    || fail "sshd's AuthorizedKeysFile is '$eff', want the stock .ssh/authorized_keys first and /etc/ssh/authorized_keys.d/%u after it"
+ev_pass "sshd reads both paths, the stock home-dir one first: $eff"
+login=$(ev_save login "EV-STATE: a fresh ssh login as rocky, its home-dir key file, and from sshd's journal this boot: the reload, then the newest accepted key login for rocky" \
+    vm_ssh_quick 'echo "logged in as $(id -un)"; ls -l ~/.ssh/authorized_keys; sudo journalctl -u sshd -b --no-pager -o short-iso | grep -m1 "Received SIGHUP"; sudo journalctl -u sshd -b --no-pager -o short-iso | grep "Accepted publickey for rocky" | tail -1') \
+    || fail "ssh as rocky failed with the drop-in active"
+grep -qx 'logged in as rocky' <<<"$login" || fail "the login did not land as rocky"
+hup=$(grep -m1 'Received SIGHUP' <<<"$login" | cut -d' ' -f1)
+acc=$(grep 'Accepted publickey for rocky' <<<"$login" | tail -1 | cut -d' ' -f1)
+[ -n "$hup" ] || fail "sshd's journal shows no reload this boot, so the drop-in may not be what it runs with"
+[ -n "$acc" ] && [[ ! "$acc" < "$hup" ]] \
+    || fail "no key login for rocky accepted after sshd's reload at $hup (newest: ${acc:-none})"
+ev_pass "rocky's home-dir key was accepted after sshd reloaded with the drop-in (reload $hup, login $acc)"
+ev_end
 
 log "privileges: the desktop container runs with less than --privileged"
 guest_ev "$GUEST_EV" verify-privileges \
@@ -759,6 +836,22 @@ log "audio lifecycle: independent of the X session, and recovers on its own"
 # its pid - the input tests below re-establish their own state anyway.
 guest_ev "$GUEST_EV" verify-audio-lifecycle \
     || fail "audio lifecycle assertions failed"
+# S4.5.2's EV-AUDIO: the recovered stack plays, heard at the machine's
+# output - before S2.3.5's step kills Xorg.
+EV_SIDE=h-
+ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T3
+hz=$(freq_for pulse)
+ev_audio_start after-recovery "$hz"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio pulse' \
+    || { audio_capture_stop; fail "a pulse client could not play after pipewire's recovery"; }
+ev_audio_stop "EV-AUDIO: the machine's output after PipeWire was killed and came back on its own, while a pulse client played its $hz Hz tone - listen for one beep" 1 0.05 "$hz" \
+    || fail "audio is silent after pipewire's recovery"
+ev_pass "after the recovery a pulse client's $hz Hz tone came out of the machine"
+ev_end
+EV_SIDE=
+log "a killed X server leaves a postmortem"
+guest_ev "$GUEST_EV" verify-postmortem \
+    || fail "postmortem assertions failed"
 
 log "input: type into an xterm with the real virtual keyboard, verify the app got it"
 # Prove the whole input path (QEMU HID -> evdev -> Xorg -> focused app), not
@@ -1215,6 +1308,10 @@ log "cdi: a client can RECORD from the desktop audio (loopback via monitor)"
 # plays and confirm the recording carries it. Checked inside the VM, then the
 # recording itself comes back here as the story's evidence and is checked
 # again with its verdict and level plot kept.
+ev_begin S7.6.2 "A client records" T3
+ev_save pod-before "EV-PIDS: the cdi-verify pod's container (restartCount, id, start time) and its main process's host pid, before it records" \
+    gq pod-state cdi-verify >/dev/null || true
+pod_before=$EV_LAST
 ev_begin S4.6.1 "A client can record" T3
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-record' \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl exec cdi-verify -- sh -c "pactl info; pactl list short sources"' \
@@ -1226,6 +1323,20 @@ ev_attach "$recwav" "EV-AUDIO-REC: what the cdi-verify pod recorded with parec f
 ev_audio_check recording "$recwav" 0.5 0.02 660 \
     || fail "the client's recording is silent or not 660 Hz"
 ev_pass "a pod holding only desktop.local/audio recorded the sink's monitor, and the recording carries the 660 Hz tone that played"
+ev_end
+ev_begin S7.6.2 "A client records" T3
+ev_save pod-after "EV-PIDS: the cdi-verify pod's container and its main process's host pid, after it recorded" \
+    gq pod-state cdi-verify >/dev/null || true
+ev_diff pod "EV-DIFF: the cdi-verify pod across the recording (empty: the same container, not restarted)" "$pod_before" "$EV_LAST"
+pb=$(ev_payload "$EV_DIR/$pod_before")
+pa=$(ev_payload "$EV_DIR/$EV_LAST")
+ev_copy "$ART/S4.6.1/$recwav" recording-660hz "EV-AUDIO-REC: what the cdi-verify pod recorded with parec from the default sink's monitor while a 660 Hz tone played (taken in S4.6.1) - listen for the beep"
+ev_audio_check recording "$EV_LAST" 0.5 0.02 660 \
+    || fail "the client's recording is silent or not 660 Hz"
+ev_pass "the pod's recording carries the 660 Hz tone that played through the sink it monitored"
+grep -q 'restartCount=0 ' <<<"$pa" || fail "the cdi-verify pod has restarted: $pa"
+[ -n "$pb" ] && [ "$pb" = "$pa" ] || fail "the cdi-verify pod changed across the recording: '$pb' -> '$pa'"
+ev_pass "the same container before and after (id, start time and host pid unchanged), restartCount 0"
 ev_end
 
 log "cdi: a LEAN non-desktop image works with only the injected env/mounts"

@@ -611,6 +611,18 @@ log "  pipewire pid $pw_before is in the audio tree (sid $leader), not the X ses
 # "may signal any process on the host"), so root in here cannot signal the
 # session user's processes at all. desktop-init has the same constraint and
 # solves it the same way, via setpriv. Same-uid signaling needs no capability.
+#
+# S4.5.2's T2 half: the X session's pids are kept too (X is waited for here,
+# not just at "E2 on the first boot" below), and the re-exported socket must
+# answer pactl info - a socket file alone passes when it is stale.
+ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T2
+wait_x_up "before the audio recovery"
+ev_save pids-before "EV-PIDS: Xorg, mwm and the three audio daemons before pipewire is killed" \
+    podman exec desktop ps -o pid,ppid,lstart,comm -C Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+x_rec_before=$(podman exec desktop sh -c 'pgrep -x Xorg; pgrep -x mwm' 2>/dev/null | paste -sd' ' || true)
+[ "$(wc -w <<<"$x_rec_before")" -ge 2 ] || fail "no Xorg and mwm to compare across the audio crash (found: '$x_rec_before')"
+rec_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sleep 1
 podman exec -u desktop desktop pkill -u desktop -x pipewire 2>/dev/null || true
 pw_after=""
 for _ in $(seq 30); do
@@ -630,7 +642,28 @@ done
 [ "$sock" = 1 ] \
     || { podman logs desktop 2>&1 | tail -40 >&2 || true
          fail "pipewire restarted as $pw_after but /run/desktop-audio/pulse was not re-exported: stale socket files were not cleared before the restart"; }
-log "  pipewire recovered on its own ($pw_before -> $pw_after) and re-exported its socket"
+ev_pass "pipewire came back on its own as a new process ($pw_before -> $pw_after) and the pulse socket is back in /run/desktop-audio"
+answers=0
+for _ in $(seq 15); do
+    podman exec -u desktop -e PULSE_SERVER=unix:/run/desktop-audio/pulse desktop pactl info >/dev/null 2>&1 \
+        && { answers=1; break; }
+    sleep 2
+done
+ev_save pactl-info "EV-STATE: pactl info over the re-exported socket (PULSE_SERVER=unix:/run/desktop-audio/pulse), as the session user" \
+    podman exec -u desktop -e PULSE_SERVER=unix:/run/desktop-audio/pulse desktop pactl info >/dev/null || true
+[ "$answers" = 1 ] \
+    || fail "pipewire restarted as $pw_after and the socket file is there, but pactl info over it fails: the export is dead"
+ev_pass "the re-exported socket answers pactl info"
+ev_save pids-after "EV-PIDS: Xorg, mwm and the three audio daemons after the recovery" \
+    podman exec desktop ps -o pid,ppid,lstart,comm -C Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before pipewire was killed" \
+    podman logs --since "$rec_since" desktop >/dev/null || true
+x_rec_after=$(podman exec desktop sh -c 'pgrep -x Xorg; pgrep -x mwm' 2>/dev/null | paste -sd' ' || true)
+[ "$x_rec_after" = "$x_rec_before" ] \
+    || fail "the X session's pids changed across the audio crash ($x_rec_before -> $x_rec_after): killing audio disturbed X"
+ev_pass "Xorg and mwm kept their pids across the audio crash ($x_rec_before)"
+ev_end
+log "  pipewire recovered on its own ($pw_before -> $pw_after) and re-exported a socket that answers"
 
 log "host login session: enabled by the tree, active, real seat bookkeeping"
 # desktop-session.service ships pre-enabled (a .wants symlink the rsync must
