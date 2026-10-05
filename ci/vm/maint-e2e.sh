@@ -137,6 +137,7 @@ mt_tone() { # <story> <tag> <hz>
     fi
     ev_fail "the session's $3 Hz pulse tone was not heard"
     mt_close
+    mg audio-diag "$1" || true
     return 1
 }
 

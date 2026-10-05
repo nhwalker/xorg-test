@@ -351,6 +351,27 @@ first login: ${first:-(none this boot)}"
         podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) || true
     [ "$(tail -n1 <<<"$who")" = desktop-shell ] || fail "ssh host from the container answered '$(tail -n1 <<<"$who")', want desktop-shell"
     ev_pass "Host Terminal's path works: ssh host from the container is desktop-shell"
+    # HOST-REQUIRES.md: "No PipeWire/PulseAudio daemon" on the host, the
+    # container owning /dev/snd. The documented line's packages bring user
+    # units for one, and the desktop user's own host login session is where
+    # they would start, in the runtime dir the container's PipeWire serves.
+    ev_save user-audio "EV-STATE: the desktop user's host user manager, its PipeWire and WirePlumber units, and who listens on the runtime dir's audio sockets (ss -xlp)" \
+        sh -c 'systemctl --user -M desktop@ --no-pager list-units --all "pipewire*" "wireplumber*" 2>&1; echo "== ss -xlp"; ss -xlp | grep -E "/run/user/61000/(pipewire-0|pulse/native)"' >/dev/null || true
+    act=$(systemctl --user -M desktop@ list-units --state=active,listening --no-legend --plain 'pipewire*' 'wireplumber*' 2>/dev/null | awk '{print $1}' | paste -sd' ')
+    if [ -z "$act" ]; then
+        ev_pass "the desktop user's host session runs no PipeWire or WirePlumber unit: the runtime dir's audio sockets are the container's alone"
+    else
+        ev_fail "the desktop user's host session runs $act: a host audio server on the paths the container's PipeWire serves (HOST-REQUIRES.md: no daemon on the host)"
+    fi
+    ev_end
+}
+
+# After a tone that was not heard, in <story>: every audio server on the
+# host and in the container, who listens where, and the container's graph.
+mt_audio_diag() { # <story>
+    mt_begin "$1"
+    ev_save audio-diag "EV-STATE: after a tone that was not heard: every pipewire, wireplumber, pipewire-pulse and pulseaudio process with its user and cgroup, the listeners on /run/user/61000 and /run/desktop-audio, and the container's PipeWire graph (wpctl status)" \
+        sh -c 'for p in $(pgrep -x "pipewire|wireplumber|pipewire-pulse|pulseaudio"); do printf "%s %s | %s\n" "$p" "$(ps -o user=,args= -p "$p")" "$(cut -d: -f3 /proc/$p/cgroup)"; done; echo "== ss -xlp"; ss -xlp | grep -E "/run/user/61000|/run/desktop-audio"; echo "== wpctl status in the container"; podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop wpctl status 2>&1 | head -60' >/dev/null || true
     ev_end
 }
 
@@ -1757,6 +1778,7 @@ maint() { # <step> [args]
         route-check) mt_route_check "${2:?orig|alt}" "${3:?pin|tag}" ;;
         upgrade-done) mt_upgrade_done ;;
         upc-tone) mt_upc_tone "${2:?hz}" ;;
+        audio-diag) mt_audio_diag "${2:?story}" ;;
         hostterm-before) mt_hostterm_before ;;
         hostterm-switch) mt_hostterm_switch ;;
         hostterm-after) mt_hostterm_after ;;
