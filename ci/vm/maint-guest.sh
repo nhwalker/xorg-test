@@ -478,9 +478,9 @@ mt_judge() { # <command> <comment> <exit status> <output file>
             else
                 printf 'FAIL\tno layout is declared, yet the line did not say the file is missing\n'
             fi ;;
-        "DISPLAY=:0 xrandr")
+        "DISPLAY=:0 xrandr"|"podman exec -u desktop -e DISPLAY=:0 desktop xrandr")
             mt_shows "$f" ' connected' "a connected output" '^ +[0-9]+x[0-9]+' "its modes" ;;
-        "DISPLAY=:0 glxinfo -B")
+        "DISPLAY=:0 glxinfo -B"|"podman exec -u desktop -e DISPLAY=:0 desktop glxinfo -B")
             mt_shows "$f" 'OpenGL renderer string: .*(NVIDIA|llvmpipe)' "the renderer, NVIDIA or llvmpipe" ;;
         "fgconsole")
             mt_shows "$f" '^1$' "VT 1" ;;
@@ -488,7 +488,7 @@ mt_judge() { # <command> <comment> <exit status> <output file>
             mt_shows "$f" '^desktop$' "desktop, not root" ;;
         "podman logs desktop | grep align")
             mt_shows "$f" 'align' "the gid alignment lines" ;;
-        "podman exec -u desktop desktop wpctl status")
+        "podman exec -u desktop desktop wpctl status"|"podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop wpctl status")
             mt_shows "$f" '\[alsa\]' "a sound device (an ALSA device in PipeWire's list)" ;;
         "pw-play /usr/share/sounds/alsa/Front_Center.wav"|"paplay /usr/share/sounds/alsa/Front_Center.wav"|"aplay /usr/share/sounds/alsa/Front_Center.wav")
             if [ "$rc" = 0 ]; then printf 'PASS\texited 0 (whether it was heard is the VM host'"'"'s check, made afterwards)\n'
