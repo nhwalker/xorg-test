@@ -12,6 +12,9 @@ IMG=Rocky-9-GenericCloud.qcow2
 DISK=disk.qcow2
 MON=mon.sock
 QMP=qmp.sock
+# A second QMP monitor for EV-VIDEO alone (qmp-tool.py video): QMP serves one
+# client at a time, and a recorder on the first would hold up everything else.
+QMPV=qmpv.sock
 SSHPORT=2222
 mkdir -p "$ART"
 
@@ -79,6 +82,7 @@ ev_pull() {
 # Whatever happened, leave every story directory rendered and the guest's
 # half copied back: a red run must be as reviewable as a green one.
 ev_finish() {
+    [ -z "${EV_VID_PID:-}" ] || kill "$EV_VID_PID" 2>/dev/null || true
     ev_pull
     python3 ../evlib.py render "$ART" >/dev/null 2>&1 || true
 }
@@ -154,6 +158,236 @@ snd_probe() {
     read -r nodes devs <<<"$out"
     echo "${nodes:-0} ${devs:-0}"
 }
+# --- hotplug evidence (Requirements.md F3.9 and F4.7 common sets) ---------------
+# One of vm-guest.sh's read-only probes (desk, ctr-pids, xorg-log-lines,
+# xorg-log-since), so the commands here need no quoting through ssh.
+gq() { vm_ssh_quick "sudo repo/ci/vm/vm-guest.sh $*"; }
+
+# EV-QEMU into the open story: one monitor command and QEMU's reply, through
+# QMP (qmp-tool.py). device_add and device_del answer with an empty reply when
+# they accept; returns 1 when QEMU says Error.
+ev_qemu() { # <moment> <what> <monitor command>
+    ev_save "$1" "$2" python3 qmp-tool.py hmp "$QMP" "$3"
+}
+
+# EV-VIDEO into the open story: screendumps at 2 fps on the video monitor (a
+# QMP socket of its own, so the hotplug commands never queue behind a frame)
+# until ev_video_stop, which indexes the frames and a gif of them. The
+# recorder keeps the directory it started in; reopen that story before
+# ev_video_stop, which attaches to the open one.
+EV_VID="" EV_VID_PID=""
+ev_video_start() { # <moment>
+    EV_VID="" EV_VID_PID=""
+    [ -n "$EV_DIR" ] || return 0
+    EV_VID=$(ev_name "$1" "")
+    python3 qmp-tool.py video "$QMPV" "$EV_DIR/$EV_VID" 2 &
+    EV_VID_PID=$!
+    sleep 1
+}
+ev_video_stop() { # <what>
+    [ -n "$EV_VID_PID" ] || return 0
+    sleep 1
+    kill "$EV_VID_PID" 2>/dev/null || true
+    wait "$EV_VID_PID" 2>/dev/null || true
+    EV_VID_PID=""
+    ev_attach "$EV_VID/" "EV-VIDEO raw frames at 2 fps; index.txt gives each frame's UTC time, to read against timeline.log"
+    if convert -delay 50 -loop 0 "$EV_DIR/$EV_VID"/frame-*.png -resize 50% "$EV_DIR/$EV_VID.gif" 2>/dev/null; then
+        ev_attach "$EV_VID.gif" "$1"
+    else
+        ev_note "the frames in $EV_VID/ could not be assembled into a gif"
+    fi
+}
+
+# A saved command's output, without ev_save's "$ command" and "[exit N]" lines.
+ev_payload() { sed '1d;$d' "$1"; }
+
+# F3.9's common set into the open story as <moment>-* files: QEMU's USB
+# devices, /dev/input on the host and in the container, the kernel's input
+# devices and xinput. Each file's name lands in IN_USB IN_HOST IN_CTR IN_DEV
+# IN_XI; input_keep makes them the "before" side (B_*) of input_diffs.
+input_set() { # <moment> <when>
+    ev_save "$1-info-usb" "EV-QEMU: info usb, $2" python3 qmp-tool.py hmp "$QMP" "info usb" >/dev/null || true
+    IN_USB=$EV_LAST
+    ev_save "$1-host-input" "EV-STATE: ls -l /dev/input on the VM host, $2" vm_ssh_quick 'ls -l /dev/input' >/dev/null || true
+    IN_HOST=$EV_LAST
+    ev_save "$1-ctr-input" "EV-STATE: ls -l /dev/input inside the desktop container, $2" \
+        vm_ssh_quick 'sudo podman exec desktop ls -l /dev/input' >/dev/null || true
+    IN_CTR=$EV_LAST
+    ev_save "$1-devices" "EV-STATE: /proc/bus/input/devices on the VM host, $2" \
+        vm_ssh_quick 'cat /proc/bus/input/devices' >/dev/null || true
+    IN_DEV=$EV_LAST
+    ev_save "$1-xinput" "EV-STATE: xinput list as the session user, $2" gq desk xinput list >/dev/null || true
+    IN_XI=$EV_LAST
+}
+input_keep() { B_USB=$IN_USB B_HOST=$IN_HOST B_CTR=$IN_CTR B_DEV=$IN_DEV B_XI=$IN_XI; }
+# The set another story took (its names still in IN_*), copied into the open
+# story as the "before" side.
+input_import() { # <story> <moment> <when>
+    ev_copy "$ART/$1/$IN_USB" "$2-info-usb" "EV-QEMU: info usb, $3 (taken in $1)"; B_USB=$EV_LAST
+    ev_copy "$ART/$1/$IN_HOST" "$2-host-input" "EV-STATE: ls -l /dev/input on the VM host, $3 (taken in $1)"; B_HOST=$EV_LAST
+    ev_copy "$ART/$1/$IN_CTR" "$2-ctr-input" "EV-STATE: ls -l /dev/input inside the desktop container, $3 (taken in $1)"; B_CTR=$EV_LAST
+    ev_copy "$ART/$1/$IN_DEV" "$2-devices" "EV-STATE: /proc/bus/input/devices on the VM host, $3 (taken in $1)"; B_DEV=$EV_LAST
+    ev_copy "$ART/$1/$IN_XI" "$2-xinput" "EV-STATE: xinput list as the session user, $3 (taken in $1)"; B_XI=$EV_LAST
+}
+input_diffs() { # <moment> <event>
+    ev_diff "$1-info-usb" "EV-DIFF: info usb across $2" "$B_USB" "$IN_USB"
+    ev_diff "$1-host-input" "EV-DIFF: /dev/input on the VM host across $2" "$B_HOST" "$IN_HOST"
+    ev_diff "$1-ctr-input" "EV-DIFF: /dev/input in the container across $2" "$B_CTR" "$IN_CTR"
+    ev_diff "$1-devices" "EV-DIFF: /proc/bus/input/devices across $2" "$B_DEV" "$IN_DEV"
+    ev_diff "$1-xinput" "EV-DIFF: xinput list across $2" "$B_XI" "$IN_XI"
+}
+
+# Kernel input device names (N: Name="...") in a saved
+# /proc/bus/input/devices, one per line, sorted, repeats kept.
+dev_names() { sed -n 's/^N: Name="\(.*\)"$/\1/p' "$1" | sort; }
+# The event nodes of the devices with that name, from the same file.
+dev_events() { # <file> <name>
+    awk -v n="N: Name=\"$2\"" '
+        $0 == n { on = 1 }
+        /^$/ { on = 0 }
+        on && /^H: Handlers=/ { sub(/^H: Handlers=/, ""); for (i = 1; i <= NF; i++) if ($i ~ /^event[0-9]+$/) print $i }' "$1" \
+        | paste -sd' '
+}
+# The device names in xinput list's output (stdin), and how many entries a
+# saved one has for a name.
+xi_names() { sed -n 's/^.*↳ \(.*[^[:space:]]\)[[:space:]]*id=[0-9].*$/\1/p'; }
+xi_count() { xi_names < "$1" | grep -cxF -- "$2" || true; }
+# Poll until xinput lists fewer than <count> entries for the name (10 s at
+# most): the judgement is the story's, on the picture taken after.
+xi_wait_gone() { # <name> <count before>
+    local n
+    for _ in $(seq 10); do
+        n=$(gq desk xinput list 2>/dev/null | xi_names | grep -cxF -- "$1" || true)
+        [ "${n:-0}" -lt "$2" ] && return 0
+        sleep 1
+    done
+}
+
+# S3.9.2: did Xorg adopt each device the kernel gained? From another story's
+# files: /proc/bus/input/devices and xinput list before and after, and the
+# Xorg log's lines since. Either xinput gains an entry for the name, or the
+# log has both of Xorg's "adding" lines for it.
+xi_judge_added() { # <story> <devices before> <devices after> <xinput before> <xinput after> <xorg log> <event>
+    local src="$ART/$1" db da xb xa xl names name nb na logged
+    ev_copy "$src/$2" devices-before "EV-STATE: /proc/bus/input/devices before $7 (taken in $1)"; db=$EV_LAST
+    ev_copy "$src/$3" devices-after "EV-STATE: /proc/bus/input/devices after $7 (taken in $1)"; da=$EV_LAST
+    ev_copy "$src/$4" xinput-before "EV-STATE: xinput list before $7 (taken in $1)"; xb=$EV_LAST
+    ev_copy "$src/$5" xinput-after "EV-STATE: xinput list after $7 (taken in $1)"; xa=$EV_LAST
+    ev_diff xinput "EV-DIFF: xinput list across $7" "$xb" "$xa"
+    ev_copy "$src/$6" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before $7 (taken in $1)"; xl=$EV_LAST
+    names=$(comm -13 <(dev_names "$EV_DIR/$db") <(dev_names "$EV_DIR/$da") | sort -u)
+    [ -n "$names" ] || fail "no new device in /proc/bus/input/devices across $7"
+    while IFS= read -r name; do
+        nb=$(xi_count "$EV_DIR/$xb" "$name")
+        na=$(xi_count "$EV_DIR/$xa" "$name")
+        logged=no
+        grep -qF "Adding input device $name (" "$EV_DIR/$xl" \
+            && grep -qF "XINPUT: Adding extended input device \"$name\"" "$EV_DIR/$xl" && logged=yes
+        ev_note "'$name': xinput entries $nb -> $na; both of Xorg's adding lines in the log: $logged"
+        if [ "$na" -gt "$nb" ]; then
+            ev_pass "xinput list gained an entry for '$name' ($nb -> $na)"
+        elif [ "$logged" = yes ]; then
+            ev_pass "the Xorg log has 'Adding input device $name' and 'XINPUT: Adding extended input device \"$name\"' (xinput list: $nb -> $na)"
+        else
+            fail "Xorg did not adopt '$name' after $7: xinput list has $nb -> $na entries for it, and the log lacks its 'Adding input device' and 'XINPUT: Adding extended input device' lines"
+        fi
+    done <<<"$names"
+}
+# S3.9.4: the removed device left xinput list, and Xorg logged its removal.
+xi_judge_removed() { # <story> <xinput before> <xinput after> <xorg log> <name>
+    local src="$ART/$1" xb xa xl nb na
+    ev_copy "$src/$2" xinput-before "EV-STATE: xinput list before the removal (taken in $1)"; xb=$EV_LAST
+    ev_copy "$src/$3" xinput-after "EV-STATE: xinput list after the removal, polled until '$5' left or 10 s passed (taken in $1)"; xa=$EV_LAST
+    ev_diff xinput "EV-DIFF: xinput list across the removal" "$xb" "$xa"
+    ev_copy "$src/$4" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the removal (taken in $1)"; xl=$EV_LAST
+    nb=$(xi_count "$EV_DIR/$xb" "$5")
+    na=$(xi_count "$EV_DIR/$xa" "$5")
+    [ "$nb" -gt 0 ] || fail "xinput list had no '$5' before the removal, so its leaving would prove nothing"
+    [ "$na" -lt "$nb" ] || fail "'$5' did not leave xinput list after the removal ($nb -> $na entries)"
+    ev_pass "'$5' left xinput list: $nb -> $na entries"
+    grep -qF "removing device $5" "$EV_DIR/$xl" \
+        || fail "the Xorg log has no 'removing device $5' since the removal"
+    ev_pass "the Xorg log records the removal: $(grep -F "removing device $5" "$EV_DIR/$xl" | head -1 | sed 's/^ *//')"
+}
+
+# F4.7's common set into the open story as <moment>-* files: QEMU's USB
+# devices, /dev/snd on the host and in the container, the graph as wpctl,
+# pw-cli and pactl show it, the default sink, and the three daemons. Names in
+# SN_*; snd_keep and snd_import set the "before" side (SB_*) of snd_diffs.
+# shellcheck disable=SC2034  # the SN_* names are read through eval below
+snd_set() { # <moment> <when>
+    ev_save "$1-info-usb" "EV-QEMU: info usb, $2" python3 qmp-tool.py hmp "$QMP" "info usb" >/dev/null || true
+    SN_USB=$EV_LAST
+    ev_save "$1-host-snd" "EV-STATE: ls -l /dev/snd on the VM host, $2" vm_ssh_quick 'ls -l /dev/snd' >/dev/null || true
+    SN_HOST=$EV_LAST
+    ev_save "$1-ctr-snd" "EV-STATE: ls -l /dev/snd inside the desktop container, $2" \
+        vm_ssh_quick 'sudo podman exec desktop ls -l /dev/snd' >/dev/null || true
+    SN_CTR=$EV_LAST
+    ev_save "$1-wpctl" "EV-STATE: wpctl status as the session user, $2" gq desk wpctl status >/dev/null || true
+    SN_WP=$EV_LAST
+    ev_save "$1-pw-devices" "EV-STATE: pw-cli ls Device as the session user, $2" gq desk pw-cli ls Device >/dev/null || true
+    SN_PW=$EV_LAST
+    ev_save "$1-sinks" "EV-STATE: pactl list short sinks, $2" gq desk pactl list short sinks >/dev/null || true
+    SN_SINKS=$EV_LAST
+    ev_save "$1-sources" "EV-STATE: pactl list short sources, $2" gq desk pactl list short sources >/dev/null || true
+    SN_SOURCES=$EV_LAST
+    ev_save "$1-sink-inputs" "EV-STATE: pactl list short sink-inputs, $2" gq desk pactl list short sink-inputs >/dev/null || true
+    SN_INPUTS=$EV_LAST
+    ev_save "$1-default-sink" "EV-STATE: pactl get-default-sink, $2" gq desk pactl get-default-sink >/dev/null || true
+    SN_DEF=$EV_LAST
+    ev_save "$1-pids" "EV-PIDS: the three audio daemons in the desktop container, $2" \
+        gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    SN_PIDS=$EV_LAST
+}
+# Each kind in the set, and the slug its files are named by.
+declare -A SND_SLUG=([USB]=info-usb [HOST]=host-snd [CTR]=ctr-snd [WP]=wpctl [PW]=pw-devices
+                     [SINKS]=sinks [SOURCES]=sources [INPUTS]=sink-inputs [DEF]=default-sink [PIDS]=pids)
+SND_KINDS="USB HOST CTR WP PW SINKS SOURCES INPUTS DEF PIDS"
+snd_keep() { local k; for k in $SND_KINDS; do eval "SB_$k=\$SN_$k"; done; }
+# The set another story took (its names still in SN_*), copied into the open
+# story as the "before" side.
+snd_import() { # <story> <moment> <when>
+    local k f
+    for k in $SND_KINDS; do
+        eval "f=\$SN_$k"
+        ev_copy "$ART/$1/$f" "$2-${SND_SLUG[$k]}" "EV-STATE (or EV-QEMU, EV-PIDS): ${SND_SLUG[$k]}, $3 (taken in $1)"
+        eval "SB_$k=\$EV_LAST"
+    done
+}
+snd_diffs() { # <moment> <event>
+    local k a b
+    for k in $SND_KINDS; do
+        eval "b=\$SB_$k a=\$SN_$k"
+        ev_diff "$1-${SND_SLUG[$k]}" "EV-DIFF: ${SND_SLUG[$k]} across $2" "$b" "$a"
+    done
+}
+# The three audio daemons' pids on one line, for a before/after comparison.
+audio_pids() {
+    vm_ssh_quick 'sudo podman exec desktop sh -c "pgrep -x pipewire; pgrep -x wireplumber; pgrep -x pipewire-pulse"' \
+        2>/dev/null | paste -sd' ' || true
+}
+# Poll (10 s at most) until the default sink is one of the sinks there are:
+# the judgement is S4.7.5's, on the picture taken after.
+snd_wait_default() {
+    local d s
+    for _ in $(seq 10); do
+        d=$(gq desk pactl get-default-sink 2>/dev/null || true)
+        s=$(gq desk pactl list short sinks 2>/dev/null | awk '{print $2}' || true)
+        [ -n "$d" ] && grep -qxF -- "$d" <<<"$s" && return 0
+        sleep 1
+    done
+}
+# alsa_card device.name values in a saved pw-cli ls Device, sorted; and the
+# whole block of the object with one of them.
+pw_card_names() { grep -o 'device.name = "alsa_card[^"]*"' "$1" | sed 's/.*= "\(.*\)"$/\1/' | sort; }
+pw_block() { # <file> <device.name>
+    awk -v n="device.name = \"$2\"" '
+        /^\[exit [0-9]+\]$/ { next }
+        /^[[:space:]]*id [0-9]+, type / { if (blk != "" && index(blk, n)) print blk; blk = $0; next }
+        blk != "" { blk = blk "\n" $0 }
+        END { if (blk != "" && index(blk, n)) print blk }' "$1"
+}
+
 screendump() {
     # -f png needs QEMU >= 7.1. Monitor errors are invisible (socat output
     # is discarded), so check the file materialized and fall back to the
@@ -401,13 +635,14 @@ qemu-system-x86_64 \
     -enable-kvm -cpu host -m 6144 -smp 3 \
     -drive "file=$DISK,if=virtio" \
     -drive "file=seed.img,if=virtio,format=raw" \
-    -device virtio-vga,max_outputs=2 -display none \
+    -device virtio-vga,max_outputs=2,id=vga0 -display none \
     -device virtio-keyboard-pci -device virtio-tablet-pci \
     -device qemu-xhci,id=xhci -device usb-kbd,id=kvmkbd,bus=xhci.0 \
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$SSHPORT-:22" -device virtio-net-pci,netdev=n0 \
     -monitor "unix:$MON,server,nowait" \
     -qmp "unix:$QMP,server,nowait" \
+    -qmp "unix:$QMPV,server,nowait" \
     -serial "file:$ART/serial.log" \
     -daemonize -pidfile qemu.pid
 
@@ -561,11 +796,21 @@ log "input hotplug: add a virtio keyboard while X runs"
 # its own /dev, a tmpfs populated at creation, so nodes the host gained later
 # never appeared inside. The quadlet now bind-mounts /dev/input; this is what
 # holds that in place.
+#
+# Evidence: F3.9's common set before and after (input_set), the Xorg log's
+# lines since just before the event, and the counts. S3.9.2 then reads the
+# same files for Xorg's side.
+ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
+input_set before-pci "before device_add virtio-keyboard-pci"
+input_keep
+xl0=$(gq xorg-log-lines 2>/dev/null || echo 0)
 before_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
 read -r before_nodes before_adds <<<"$(hotplug_probe)"
 log "  before: host=$before_host container-nodes=$before_nodes xorg-adds=$before_adds"
 
-mon_cmd "device_add virtio-keyboard-pci,id=hotkbd"
+ev_qemu device-add-pci "EV-QEMU: device_add virtio-keyboard-pci,id=hotkbd and QEMU's reply (empty: accepted)" \
+    "device_add virtio-keyboard-pci,id=hotkbd" >/dev/null \
+    || fail "QEMU refused device_add virtio-keyboard-pci"
 
 after_host=$before_host after_nodes=$before_nodes after_adds=$before_adds
 for _ in $(seq 20); do
@@ -575,15 +820,32 @@ for _ in $(seq 20); do
     sleep 1
 done
 log "  after:  host=$after_host container-nodes=$after_nodes xorg-adds=$after_adds"
+# Xorg adds a device after the node appears; give it a moment before the
+# "after" picture, which S3.9.2 judges.
+sleep 2
+input_set after-pci "after the virtio keyboard was added"
+input_diffs pci "the virtio keyboard's arrival"
+ev_save xorg-log-pci "EV-LOG-XORG: the Xorg log's lines since just before the add" \
+    gq xorg-log-since "$xl0" >/dev/null || true
+PCI_XLOG=$EV_LAST PCI_B_DEV=$B_DEV PCI_A_DEV=$IN_DEV PCI_B_XI=$B_XI PCI_A_XI=$IN_XI
 
 [ "$after_host" -gt "$before_host" ] \
     || fail "hotplugged keyboard never appeared on the VM host ($before_host -> $after_host)"
+ev_pass "the VM host gained an input node: $before_host -> $after_host event nodes"
 [ "$after_nodes" -gt "$before_nodes" ] \
     || fail "the new input node never reached the container ($before_nodes -> $after_nodes): the /dev/input bind mount is missing or not live"
-# Recorded, not asserted: "Adding input device" is logged when Xorg BEGINS
+ev_pass "the container gained it too: $before_nodes -> $after_nodes event nodes in its /dev/input"
+# Recorded, not asserted here: "Adding input device" is logged when Xorg BEGINS
 # handling a device, including ones it then ignores, so an increment is
-# suggestive rather than proof that the device works.
+# suggestive rather than proof that the device works. S3.9.2 asks for more.
 log "  note: xorg-adds $before_adds -> $after_adds (log lines, not proof of a working device)"
+ev_text counter-pci "the counter line for this add, as xorg-input-count.txt records it" \
+    "hotplug-add     host $before_host -> $after_host / container-nodes $before_nodes -> $after_nodes / xorg-adds $before_adds -> $after_adds"
+ev_end
+
+ev_begin S3.9.2 "Keyboard plug-in is adopted by Xorg" T3
+xi_judge_added S3.9.1 "$PCI_B_DEV" "$PCI_A_DEV" "$PCI_B_XI" "$PCI_A_XI" "$PCI_XLOG" "the virtio keyboard's add"
+ev_end
 
 log "KVM switch simulation: remove the keyboard and bring it back"
 # What a USB KVM without HID emulation does on every switch: the devices are
@@ -592,15 +854,35 @@ log "KVM switch simulation: remove the keyboard and bring it back"
 # device does not work" but "input is dead until desktop.service restarts",
 # which is far worse and only shows up on the FIRST switch back.
 #
-# Asserted on the node counts, in both directions. The removal half matters as
-# much as the addition: a stale node that never disappears is exactly what a
-# snapshot /dev looks like, and it would let the re-add half pass for the wrong
-# reason.
+# Asserted on the node counts, in both directions, and on the removed device's
+# own nodes. The removal half matters as much as the addition: a stale node
+# that never disappears is exactly what a snapshot /dev looks like, and it
+# would let the re-add half pass for the wrong reason.
+#
+# Stories: S3.9.6 holds the whole cycle (the video, the X pids, the typing
+# after); S3.9.3 and S3.9.4 the removal, the container's and Xorg's side; and
+# S3.9.1 again for the USB re-add, its second vehicle.
+ev_begin S3.9.6 "The session accepts input after a keyboard cycle" T3
+ev_save pids-before "EV-PIDS: Xorg and mwm in the desktop container before the cycle" \
+    gq ctr-pids Xorg,mwm >/dev/null || true
+x_pids_before=$(vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | paste -sd' ' || true)
+ev_video_start kvm-cycle
+
+ev_begin S3.9.3 "Keyboard plug-out removes the node from the container" T3
+input_set base "before device_del kvmkbd"
+input_keep
+xl1=$(gq xorg-log-lines 2>/dev/null || echo 0)
 kvm_base_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
 read -r kvm_base_nodes _ <<<"$(hotplug_probe)"
 log "  base:    host=$kvm_base_host container-nodes=$kvm_base_nodes"
+# The keyboard's own nodes, from the kernel's table: the event handlers of
+# the device named for QEMU's USB keyboard.
+kvm_nodes=$(dev_events "$EV_DIR/$B_DEV" "QEMU QEMU USB Keyboard")
+[ -n "$kvm_nodes" ] || fail "no 'QEMU QEMU USB Keyboard' in /proc/bus/input/devices before the switch: the boot-time USB keyboard is missing"
+ev_note "the USB keyboard's event node(s) before the switch: $kvm_nodes"
 
-mon_cmd "device_del kvmkbd"
+ev_qemu device-del "EV-QEMU: device_del kvmkbd (the KVM switches away) and QEMU's reply (empty: accepted)" \
+    "device_del kvmkbd" >/dev/null || fail "QEMU refused device_del kvmkbd"
 kvm_off_host=$kvm_base_host kvm_off_nodes=$kvm_base_nodes
 for _ in $(seq 20); do
     kvm_off_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
@@ -609,14 +891,40 @@ for _ in $(seq 20); do
     sleep 1
 done
 log "  switched away: host=$kvm_off_host container-nodes=$kvm_off_nodes"
+# Xorg's side of the removal (S3.9.4) is polled: xinput may lag the node.
+xi_wait_gone "QEMU QEMU USB Keyboard" "$(xi_count "$EV_DIR/$B_XI" "QEMU QEMU USB Keyboard")"
+input_set off "after device_del kvmkbd"
+input_diffs off "the keyboard's removal"
+ev_save xorg-log-off "EV-LOG-XORG: the Xorg log's lines since just before the removal" \
+    gq xorg-log-since "$xl1" >/dev/null || true
+OFF_XLOG=$EV_LAST OFF_B_XI=$B_XI OFF_A_XI=$IN_XI
+
 [ "$kvm_off_host" -lt "$kvm_base_host" ] \
     || fail "device_del kvmkbd did not remove the node on the VM host ($kvm_base_host -> $kvm_off_host)"
+ev_pass "the VM host lost the keyboard's node: $kvm_base_host -> $kvm_off_host event nodes"
 [ "$kvm_off_nodes" -lt "$kvm_base_nodes" ] \
     || fail "the container still sees the removed keyboard ($kvm_base_nodes -> $kvm_off_nodes): its /dev/input is a stale snapshot, so a KVM switch would leave a dead node behind"
+left=""
+for n in $kvm_nodes; do
+    grep -qE " $n\$" "$EV_DIR/$IN_CTR" && left="$left $n"
+done
+[ -z "$left" ] || fail "the removed keyboard's node(s)$left are still in the container's /dev/input"
+want=$(( kvm_base_nodes - $(wc -w <<<"$kvm_nodes") ))
+[ "$kvm_off_nodes" = "$want" ] \
+    || fail "the container has $kvm_off_nodes event nodes after the removal, want $want (the $kvm_base_nodes before, less the keyboard's $(wc -w <<<"$kvm_nodes"))"
+ev_pass "the keyboard's own node(s) ($kvm_nodes) are gone from the container, and its count is back to the value without the keyboard: $kvm_base_nodes -> $kvm_off_nodes"
+ev_end
+
+ev_begin S3.9.4 "Keyboard plug-out is seen by Xorg" T3
+xi_judge_removed S3.9.3 "$OFF_B_XI" "$OFF_A_XI" "$OFF_XLOG" "QEMU QEMU USB Keyboard"
+ev_end
 
 # Safe to re-add immediately: USB removal completes without waiting on the
 # guest, so the id is free by the time the removal shows up in /dev.
-mon_cmd "device_add usb-kbd,id=kvmkbd,bus=xhci.0"
+ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
+input_import S3.9.3 switched-away "after device_del kvmkbd (the KVM switched away)"
+ev_qemu device-add-usb "EV-QEMU: device_add usb-kbd,id=kvmkbd,bus=xhci.0 (the KVM switches back) and QEMU's reply (empty: accepted)" \
+    "device_add usb-kbd,id=kvmkbd,bus=xhci.0" >/dev/null || fail "QEMU refused to re-add the USB keyboard"
 kvm_on_host=$kvm_off_host kvm_on_nodes=$kvm_off_nodes
 for _ in $(seq 20); do
     kvm_on_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
@@ -625,25 +933,49 @@ for _ in $(seq 20); do
     sleep 1
 done
 log "  switched back: host=$kvm_on_host container-nodes=$kvm_on_nodes"
+sleep 2
+input_set back "after the USB keyboard was re-added (the KVM switched back)"
+input_diffs back "the USB keyboard's return"
 [ "$kvm_on_host" -ge "$kvm_base_host" ] \
     || fail "the keyboard never came back on the VM host ($kvm_off_host -> $kvm_on_host)"
+ev_pass "the VM host has the keyboard's node again: $kvm_off_host -> $kvm_on_host event nodes"
 [ "$kvm_on_nodes" -ge "$kvm_base_nodes" ] \
     || fail "the re-added keyboard never reached the container ($kvm_off_nodes -> $kvm_on_nodes): a KVM switch would leave input dead until desktop.service restarts"
+ev_pass "the re-added USB keyboard reached the container: $kvm_off_nodes -> $kvm_on_nodes event nodes, at least the $kvm_base_nodes before the switch"
+ev_text counter-kvm "the counter line for the KVM cycle, as xorg-input-count.txt records it" \
+    "kvm-cycle       host $kvm_base_host -> $kvm_off_host -> $kvm_on_host / container-nodes $kvm_base_nodes -> $kvm_off_nodes -> $kvm_on_nodes"
+ev_end
 
-# Session health after the cycle. NOT proof that the re-added virtio keyboard
-# is carrying these keystrokes - QEMU always provides a PS/2 keyboard too, and
-# input-send-event goes to whatever the input core has. What it does prove is
-# that a remove/re-add cycle did not wedge the X session or its input stack,
-# which is the other way a KVM switch could ruin the desktop.
+# Session health after the cycle. NOT proof that the re-added keyboard is
+# carrying these keystrokes - QEMU always provides a PS/2 keyboard too, and
+# input-send-event goes to whatever the input core has (S3.9.5 asks for
+# that). What it does prove is that a remove/re-add cycle did not wedge the
+# X session or its input stack, which is the other way a KVM switch could
+# ruin the desktop.
+ev_begin S3.9.6 "The session accepts input after a keyboard cycle" T3
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
 sleep 2
-python3 qmp-type.py "$QMP" "$res" 550 395 kvmok
+qlog=$(ev_name qmp-input txt)
+QMP_TRANSCRIPT="$EV_DIR/$qlog" python3 qmp-type.py "$QMP" "$res" 550 395 kvmok
+ev_attach "$qlog" "EV-QEMU: every QMP command sent after the cycle - the pointer to the sink xterm's centre (550,395 on $res), a click to focus it, then k v m o k Return"
 sleep 2
+ev_shot after-cycle "EV-SHOT: the sink xterm (title inputtest) right after kvmok was typed, the keyboard cycle behind it"
+ev_video_stop "EV-VIDEO: the display across the whole cycle - removal, re-add, then the sink xterm opening and kvmok typed into it (index.txt and timeline.log give the times)"
+ev_save sink-file "EV-LOG-CLIENT: what the sink xterm's shell read (/tmp/inputproof in the desktop container); must be exactly 'kvmok'" \
+    vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null; echo' >/dev/null || true
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check kvmok' \
     || { vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null' \
          2>&1 | tee "$ART/input-proof-kvm.txt" || true
          fail "the session stopped accepting input after a remove/re-add cycle"; }
+ev_pass "after the cycle, the focused xterm's shell read 'kvmok'"
+ev_save pids-after "EV-PIDS: Xorg and mwm in the desktop container after the cycle" \
+    gq ctr-pids Xorg,mwm >/dev/null || true
+x_pids_after=$(vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | paste -sd' ' || true)
+[ -n "$x_pids_before" ] && [ "$x_pids_before" = "$x_pids_after" ] \
+    || fail "Xorg's pid changed across the keyboard cycle ($x_pids_before -> $x_pids_after): the session restarted rather than carried on"
+ev_pass "Xorg kept its pid across the cycle ($x_pids_before): the session carried on, it did not restart"
 log "  the session still accepts input after a full switch cycle"
+ev_end
 
 printf 'hotplug-add     host %s -> %s / container-nodes %s -> %s / xorg-adds %s -> %s\n' \
     "$before_host" "$after_host" "$before_nodes" "$after_nodes" "$before_adds" "$after_adds" \
@@ -668,11 +1000,23 @@ log "audio hotplug: plug and unplug a USB sound card while the desktop runs"
 # Asserted in BOTH directions, like the input cycle: a node that never
 # disappears is exactly what a snapshot /dev looks like, and it would let the
 # add half pass for the wrong reason.
+#
+# Stories: S4.7.1 and S4.7.2 the plug-in (the container's node, WirePlumber's
+# device), S4.7.4 and S4.7.5 the plug-out, S4.7.6 the built-in card after the
+# cycle. F4.7's common set is taken three times (snd_set): base, plugged in,
+# unplugged.
+snd_t0=$(vm_ssh_quick 'date -u +%Y-%m-%dT%H:%M:%SZ')
+ev_begin S4.7.1 "Sound card plug-in reaches the container" T3
+snd_set base "before device_add usb-audio"
+snd_keep
+SND_BASE_PIDS=$SN_PIDS SND_BASE_PW=$SN_PW SND_BASE_DEF=$SN_DEF
 read -r snd_base_nodes snd_base_devs <<<"$(snd_probe)"
 snd_base_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
+audio_pids_base=$(audio_pids)
 log "  base:      host=$snd_base_host container-nodes=$snd_base_nodes wireplumber-devices=$snd_base_devs"
 
-mon_cmd "device_add usb-audio,id=hotsnd,audiodev=snd0,bus=xhci.0"
+ev_qemu device-add "EV-QEMU: device_add usb-audio,id=hotsnd,audiodev=snd0,bus=xhci.0 and QEMU's reply (empty: accepted)" \
+    "device_add usb-audio,id=hotsnd,audiodev=snd0,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-audio"
 snd_on_host=$snd_base_host snd_on_nodes=$snd_base_nodes snd_on_devs=$snd_base_devs
 for _ in $(seq 30); do
     snd_on_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
@@ -682,14 +1026,38 @@ for _ in $(seq 30); do
     sleep 1
 done
 log "  plugged in: host=$snd_on_host container-nodes=$snd_on_nodes wireplumber-devices=$snd_on_devs"
+snd_set on "with the USB sound card plugged in"
+snd_diffs on "the card's arrival"
+SND_ON_PW=$SN_PW SND_ON_DEF=$SN_DEF
 [ "$snd_on_host" -gt "$snd_base_host" ] \
     || fail "device_add usb-audio did not create a card on the VM host ($snd_base_host -> $snd_on_host): QEMU never attached it, so nothing below means anything"
+ev_pass "the VM host gained a card: $snd_base_host -> $snd_on_host controlC* nodes"
 [ "$snd_on_nodes" -gt "$snd_base_nodes" ] \
     || fail "the hot-added sound card never reached the container ($snd_base_nodes -> $snd_on_nodes): its /dev/snd is a stale snapshot, so a USB headset plugged in after boot stays invisible until desktop.service restarts"
+ev_pass "the container gained it too: $snd_base_nodes -> $snd_on_nodes controlC* nodes in its /dev/snd"
+ev_text counter-snd-on "the counts so far (the full line, with the unplug, is in xorg-input-count.txt and S4.7.4)" \
+    "snd-hotplug     host $snd_base_host -> $snd_on_host / container-nodes $snd_base_nodes -> $snd_on_nodes / wp-devices $snd_base_devs -> $snd_on_devs"
+ev_end
+
+ev_begin S4.7.2 "Sound card plug-in reaches WirePlumber" T3
+ev_copy "$ART/S4.7.1/$SND_BASE_PW" pw-devices-before "EV-STATE: pw-cli ls Device before the card was added (taken in S4.7.1)"
+pwb=$EV_LAST
+ev_copy "$ART/S4.7.1/$SND_ON_PW" pw-devices-after "EV-STATE: pw-cli ls Device with the card plugged in (taken in S4.7.1)"
+pwa=$EV_LAST
+ev_diff pw-devices "EV-DIFF: pw-cli ls Device across the card's arrival" "$pwb" "$pwa"
+new_cards=$(comm -13 <(pw_card_names "$EV_DIR/$pwb") <(pw_card_names "$EV_DIR/$pwa") | paste -sd' ')
+ev_text new-device "the new Device object, quoted whole from pw-cli ls Device: ${new_cards:-none}" \
+    "$(for c in $new_cards; do pw_block "$EV_DIR/$pwa" "$c"; done)"
 [ "$snd_on_devs" -gt "$snd_base_devs" ] \
     || fail "the container has the new /dev/snd node but WirePlumber never added a device ($snd_base_devs -> $snd_on_devs): the node arrived and the uevent did not (Network=host), or the session user cannot open it (audio gid alignment)"
+[ -n "$new_cards" ] || fail "pw-cli ls Device counts $snd_base_devs -> $snd_on_devs alsa_card devices but names no new one"
+ev_pass "WirePlumber added an alsa_card Device for the card: $snd_base_devs -> $snd_on_devs, the new one $new_cards"
+ev_end
 
-mon_cmd "device_del hotsnd"
+ev_begin S4.7.4 "Sound card plug-out removes the node from the container" T3
+snd_import S4.7.1 plugged "with the card plugged in"
+ev_qemu device-del "EV-QEMU: device_del hotsnd and QEMU's reply (empty: accepted)" \
+    "device_del hotsnd" >/dev/null || fail "QEMU refused device_del hotsnd"
 snd_off_host=$snd_on_host snd_off_nodes=$snd_on_nodes snd_off_devs=$snd_on_devs
 for _ in $(seq 30); do
     snd_off_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
@@ -702,23 +1070,70 @@ for _ in $(seq 30); do
     sleep 1
 done
 log "  unplugged: host=$snd_off_host container-nodes=$snd_off_nodes wireplumber-devices=$snd_off_devs"
+# A default sink is re-selected after the device goes (S4.7.5): poll for a
+# default that is one of the sinks left before taking the picture.
+snd_wait_default
+snd_set off "after device_del hotsnd"
+snd_diffs off "the card's removal"
+SND_OFF_PW=$SN_PW SND_OFF_DEF=$SN_DEF SND_OFF_SINKS=$SN_SINKS
 [ "$snd_off_host" -lt "$snd_on_host" ] \
     || fail "device_del hotsnd did not remove the card on the VM host ($snd_on_host -> $snd_off_host)"
-[ "$snd_off_nodes" -lt "$snd_on_nodes" ] \
-    || fail "the container still sees the removed sound card ($snd_on_nodes -> $snd_off_nodes): its /dev/snd is a stale snapshot, and the add half above passed for the wrong reason"
+ev_pass "the VM host lost the card: $snd_on_host -> $snd_off_host controlC* nodes"
+[ "$snd_off_nodes" = "$snd_base_nodes" ] \
+    || fail "the container has $snd_off_nodes controlC* nodes after the card was unplugged, want the $snd_base_nodes from before it was plugged in: its /dev/snd is a stale snapshot, and the add half passed for the wrong reason"
+ev_pass "the container's controlC* count is back to its baseline: $snd_base_nodes -> $snd_on_nodes -> $snd_off_nodes"
+ev_text counter-snd "the counter line for the cycle, as xorg-input-count.txt records it" \
+    "snd-hotplug     host $snd_base_host -> $snd_on_host -> $snd_off_host / container-nodes $snd_base_nodes -> $snd_on_nodes -> $snd_off_nodes / wp-devices $snd_base_devs -> $snd_on_devs -> $snd_off_devs"
+ev_end
+
+ev_begin S4.7.5 "Sound card plug-out removes the WirePlumber device and a default sink is re-selected" T3
+ev_copy "$ART/S4.7.1/$SND_ON_PW" pw-devices-plugged "EV-STATE: pw-cli ls Device with the card plugged in (taken in S4.7.1)"
+pwa=$EV_LAST
+ev_copy "$ART/S4.7.4/$SND_OFF_PW" pw-devices-unplugged "EV-STATE: pw-cli ls Device after the card was unplugged (taken in S4.7.4)"
+pwo=$EV_LAST
+ev_diff pw-devices "EV-DIFF: pw-cli ls Device across the card's removal" "$pwa" "$pwo"
+ev_copy "$ART/S4.7.1/$SND_BASE_DEF" default-sink-base "EV-STATE: pactl get-default-sink before the card was plugged in (taken in S4.7.1)"
+ev_copy "$ART/S4.7.1/$SND_ON_DEF" default-sink-plugged "EV-STATE: pactl get-default-sink with the card plugged in (taken in S4.7.1)"
+ev_copy "$ART/S4.7.4/$SND_OFF_DEF" default-sink-unplugged "EV-STATE: pactl get-default-sink after the card was unplugged (taken in S4.7.4)"
+ev_copy "$ART/S4.7.4/$SND_OFF_SINKS" sinks-unplugged "EV-STATE: pactl list short sinks after the card was unplugged (taken in S4.7.4)"
 [ "$snd_off_devs" -le "$snd_base_devs" ] \
     || fail "WirePlumber still lists $snd_off_devs alsa devices after the card was unplugged (baseline $snd_base_devs): the node went away but the graph kept a phantom device"
+[ "$snd_off_devs" = "$snd_base_devs" ] \
+    || fail "WirePlumber lists $snd_off_devs alsa devices after the unplug, want the $snd_base_devs from before the plug-in"
+ev_pass "WirePlumber's alsa_card Device count is back to its baseline: $snd_base_devs -> $snd_on_devs -> $snd_off_devs"
+def_off=$(ev_payload "$ART/S4.7.4/$SND_OFF_DEF" | head -1)
+sinks_off=$(ev_payload "$ART/S4.7.4/$SND_OFF_SINKS" | awk '{print $2}')
+[ -n "$def_off" ] && grep -qxF -- "$def_off" <<<"$sinks_off" \
+    || fail "after the unplug the default sink is '$def_off', which is not one of the sinks left: $(echo $sinks_off)"
+ev_pass "a default sink is re-selected among the sinks left: $def_off (with the card plugged in it was $(ev_payload "$ART/S4.7.1/$SND_ON_DEF" | head -1))"
+ev_end
 
 # Health after the cycle, the audio counterpart of the input-sink check: the
-# built-in card must still play. A remove/re-add that wedges WirePlumber is
-# the other way this could ruin the desktop.
-audio_capture_start "audio-after-hotplug"
+# built-in card must still play, and the three daemons must be the ones from
+# before the cycle. A remove/re-add that wedges WirePlumber, or one the
+# supervisor answers with a restart, is the other way this could ruin the
+# desktop.
+ev_begin S4.7.6 "The built-in card plays after a cycle" T3
+ev_copy "$ART/S4.7.1/$SND_BASE_PIDS" pids-before "EV-PIDS: the three audio daemons before the card was plugged in (taken in S4.7.1)"
+pb=$EV_LAST
+ev_save pids-after "EV-PIDS: the three audio daemons after the plug/unplug cycle" \
+    gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+ev_diff pids "EV-DIFF: the audio daemons across the cycle (empty: none restarted)" "$pb" "$EV_LAST"
+ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before the card was plugged in" \
+    vm_ssh_quick "sudo podman logs --since '$snd_t0' desktop" >/dev/null || true
+hz=$(freq_for pulse)
+ev_audio_start after-cycle "$hz"
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio pulse' \
     || { audio_capture_stop; fail "audio stopped working after a sound-card hotplug cycle"; }
-audio_capture_stop
-python3 check-audio.py "$ART/audio-after-hotplug.wav" 1 0.05 "$(freq_for pulse)" \
+ev_audio_stop "EV-AUDIO: the machine's output after the plug/unplug cycle while a pulse client played its $hz Hz tone on the built-in card - listen for one beep" 1 0.05 "$hz" \
     || fail "audio is silent after a sound-card hotplug cycle"
+ev_pass "after the cycle the built-in card played the pulse client's $hz Hz tone"
+audio_pids_after=$(audio_pids)
+[ -n "$audio_pids_base" ] && [ "$audio_pids_base" = "$audio_pids_after" ] \
+    || fail "the audio daemons changed across the hotplug cycle ($audio_pids_base -> $audio_pids_after): the stack restarted rather than carried on"
+ev_pass "pipewire, wireplumber and pipewire-pulse kept their pids across the cycle ($audio_pids_base)"
 log "  the built-in card still plays after a full plug/unplug cycle"
+ev_end
 
 printf 'snd-hotplug     host %s -> %s -> %s / container-nodes %s -> %s -> %s / wp-devices %s -> %s -> %s\n' \
     "$snd_base_host" "$snd_on_host" "$snd_off_host" \

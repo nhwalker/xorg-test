@@ -2048,6 +2048,22 @@ input_sink_check() { # $1: expected text
     log is "the app received the typed text over the real input path: $got"
 }
 
+# --- read-only probes for the host's hotplug evidence -------------------------------
+# What vm-e2e.sh saves before and after a QEMU device_add or device_del (the
+# F3.9 and F4.7 stories), kept here so the host's ssh commands stay unquoted.
+XORG_LOG=/home/desktop/.local/share/xorg/Xorg.0.log
+
+# A command as the session user, with its runtime dir and display (see the
+# podman flag conventions at the top): xinput, wpctl, pw-cli, pactl.
+desk() { podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop -e DISPLAY=:0 desktop "$@"; }
+
+# The Xorg log's length now, and its lines after a length taken earlier.
+xorg_log_lines() { podman exec desktop sh -c "wc -l < $XORG_LOG"; }
+xorg_log_since() { podman exec desktop tail -n "+$(( ${1:?line count} + 1 ))" "$XORG_LOG"; }
+
+# pid, ppid, start time and name of the named processes in the container.
+ctr_pids() { podman exec desktop ps -o pid,ppid,lstart,comm -C "${1:?comm,comm}"; }
+
 # --- operator stories (E11) -------------------------------------------------------
 # ci/vm/operator-e2e.py drives the desktop the way the operator does - every
 # pointer and key event through QEMU's devices - and LOOKS at X from here: a
@@ -2357,7 +2373,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -2381,6 +2397,10 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     input-sink-check) input_sink_check "${2:-}" ;;
     operator-setup) operator_setup ;;
     pod-state) pod_state "${2:?pod}" ;;
+    desk) shift; desk "$@" ;;
+    xorg-log-lines) xorg_log_lines ;;
+    xorg-log-since) xorg_log_since "${2:-}" ;;
+    ctr-pids) ctr_pids "${2:-}" ;;
     operator-teardown) operator_teardown ;;
     *) fail "unknown phase $1" ;;
 esac
