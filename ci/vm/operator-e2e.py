@@ -235,6 +235,7 @@ class Machine:
         self.run = run
         self.qmp = QMP(qmp_path, run)
         self.width = self.height = None
+        self._last_abs = {}         # the last absolute position sent, per device
 
     @staticmethod
     def abs_value(p, dim):
@@ -259,10 +260,26 @@ class Machine:
         return args
 
     def pointer(self, x, y, log=True, device=None):
+        vx, vy = self.abs_value(x, self.width), self.abs_value(y, self.height)
+        key = device or ""
+        if self._last_abs.get(key, (vx, vy)) == (vx, vy):
+            # The guest's input core drops an absolute value equal to the
+            # device's last one. A move to where this device already was would
+            # leave X's pointer wherever another device had taken it, and the
+            # click after it would land there: S7.7.2's click on the session's
+            # xterm in run 37345104044 went to bare root that way. So first
+            # one unit off, as an event of its own: a USB tablet reports only
+            # its latest position at each poll.
+            self.qmp.cmd("input-send-event", self._to([
+                {"type": "abs", "data": {"axis": "x", "value": vx - 1 if vx else vx + 1}},
+                {"type": "abs", "data": {"axis": "y", "value": vy}},
+            ], device), note=f"pointer one unit off ({x},{y}) first, so that the move to it registers", log=log)
+            time.sleep(0.05)
         self.qmp.cmd("input-send-event", self._to([
-            {"type": "abs", "data": {"axis": "x", "value": self.abs_value(x, self.width)}},
-            {"type": "abs", "data": {"axis": "y", "value": self.abs_value(y, self.height)}},
+            {"type": "abs", "data": {"axis": "x", "value": vx}},
+            {"type": "abs", "data": {"axis": "y", "value": vy}},
         ], device), note=f"pointer to ({x},{y})" + (f" through {device}'s device" if device else ""), log=log)
+        self._last_abs[key] = (vx, vy)
 
     def button(self, button, down, device=None):
         self.qmp.cmd("input-send-event", self._to([
@@ -1436,10 +1453,18 @@ def s3_9_11(ctx, st):
                  f"EV-QEMU: query-mice after mouse_set {usb[-1]['index']}: the USB mouse current")
         st.check(any(mm["index"] == usb[-1]["index"] and mm.get("current") for mm in mice),
                  "mouse_set made the hot-added USB mouse QEMU's current mouse")
+        # The relative motion starts in the middle of the session's xterm and
+        # stays inside it, so the mouse's click lands there. In run
+        # 37345104044 it went up and left from the sink onto bare root, where
+        # a click makes mwm post its root menu, and that held the next
+        # story's first click.
+        ctx.move(*centre(term))
+        time.sleep(0.3)
         xi_test_start(ctx, mid, "mouse")
-        with ctx.video("mouse", "EV-VIDEO: the pointer moved by the hot-added USB mouse's relative motion"):
+        with ctx.video("mouse", "EV-VIDEO: the pointer moved by the hot-added USB mouse's relative motion "
+                       "inside the session's xterm, then its click there"):
             for _ in range(12):
-                m.rel(-20, -10)
+                m.rel(-5, 4)
                 time.sleep(0.05)
             m.button("left", True)
             time.sleep(0.05)
@@ -1528,14 +1553,18 @@ def kvm_plug(ctx):
     return builtin
 
 
-def kvm_cycle(ctx, st, prefix=""):
+def kvm_cycle(ctx, st, prefix="", on_away=None, on_back=None):
     """The switch: keyboard, tablet and sound card deleted back to back,
-    then added back. Writes the counter table; returns (away, back, base)."""
+    then added back. on_away runs right after the deletions, on_back right
+    after the additions (S3.11.2's video link). Writes the counter table;
+    returns (away, back, base)."""
     m = ctx.m
     base = (*node_counts(ctx), *snd_counts(ctx), len(xi_ids(ctx, USB_KBD)), len(xi_ids(ctx, USB_TABLET)))
     m.device_del("kvmkbd")
     m.device_del("kvmtab")
     m.device_del("kvmsnd")
+    if on_away:
+        on_away()
     away = wait_until(lambda: not xi_ids(ctx, USB_KBD) and not xi_ids(ctx, USB_TABLET)
                       and snd_counts(ctx)[2] < base[4], 30, 0.5)
     away_c = (*node_counts(ctx), *snd_counts(ctx), len(xi_ids(ctx, USB_KBD)), len(xi_ids(ctx, USB_TABLET)))
@@ -1544,6 +1573,8 @@ def kvm_cycle(ctx, st, prefix=""):
     m.device_add(driver="usb-kbd", id="kvmkbd", bus="xhci.0")
     m.device_add(driver="usb-tablet", id="kvmtab", bus="xhci.0", display="vga0")
     m.device_add(driver="usb-audio", id="kvmsnd", audiodev="snd0", bus="xhci.0")
+    if on_back:
+        on_back()
     back = wait_until(lambda: (*node_counts(ctx), *snd_counts(ctx), len(xi_ids(ctx, USB_KBD)),
                                len(xi_ids(ctx, USB_TABLET))) == base, 40, 1)
     back_c = (*node_counts(ctx), *snd_counts(ctx), len(xi_ids(ctx, USB_KBD)), len(xi_ids(ctx, USB_TABLET)))
@@ -1651,6 +1682,128 @@ def s3_11_1(ctx, st):
             with contextlib.suppress(Exception):
                 m.device_del(dev)
         wait_xi(ctx, USB_TABLET, 0, 10)
+
+
+def s3_11_2(ctx, st):
+    """S3.11.1 under a declared two-monitor layout, with Virtual-1 forced down
+    while the KVM's devices are away and set back to detect as they return:
+    the screen stays 2048x768 and no window moves at any step."""
+    g, m = ctx.g, ctx.m
+    conn = g.sh("ls -d /sys/class/drm/card*-Virtual-1 | head -n1", label="Virtual-1's sysfs connector").strip()
+
+    def dims():
+        return g.desk(["sh", "-c", "xdpyinfo | awk '/dimensions:/{print $2; exit}'"], check=False).strip()
+
+    def v1():
+        out = g.desk(["xrandr", "--query"], check=False)
+        return next((x for x in out.splitlines() if x.startswith("Virtual-1 ")), "")
+
+    def windows(xs):
+        return sorted(l.strip() for l in xs.text.splitlines() if re.match(r'\s+0x[0-9a-f]+ "[^"]*": \("', l))
+
+    def f310(moment, when):
+        st.write(f"{moment}-f310",
+                 g.sh("grep -H . /sys/class/drm/card*-*/status", check=False, label="sysfs status") + "\n"
+                 + g.desk(["xrandr", "--query", "--verbose"], check=False),
+                 f"F3.10's common set {when}: every connector's sysfs status, then xrandr --query --verbose")
+
+    seen = {}
+    try:
+        g.sh("repo/ci/vm/vm-guest.sh monitors-set two", timeout=240, label="declare two monitors, restart the desktop")
+        ctx.measure_screen()
+        st.check(dims() == "2048x768", "the declared layout is live: the screen is 2048x768", dims())
+        builtin = kvm_plug(ctx)
+        st.check(builtin, "the built-in card's sink is the default before the KVM's card arrives", f"{builtin}")
+        st.check(wait_xi(ctx, USB_TABLET, 1) and wait_until(lambda: snd_counts(ctx)[2] >= 2, 30, 1),
+                 "the KVM's tablet and sound card are plugged in beside its keyboard")
+        xs0 = ctx.xstate()
+        ctx.save_state("tree-before", xs0.text, "EV-STATE: the window tree before the switch")
+        f310("before", "before the switch")
+        w0 = windows(xs0)
+        xorg, pw = ctx.pid_of("Xorg"), ctx.pid_of("pipewire")
+        pids = ctx.pids("pids-before")
+
+        def away():
+            g.sh(f"echo off > {conn}/status", label="force Virtual-1 off with the devices")
+            st.record(f"Virtual-1 forced off at {stamp()}, with the keyboard, tablet and sound card")
+
+        def back():
+            g.sh(f"echo detect > {conn}/status", label="Virtual-1 back to detect with the devices")
+            st.record(f"Virtual-1 set back to detect at {stamp()}, as the devices returned")
+
+        def away_state():
+            g.desk(["xrandr", "--query"], check=False)           # a query makes X probe
+            xs = ctx.xstate()
+            seen["away"] = (dims(), v1(), windows(xs))
+            ctx.save_state("tree-away", xs.text, "EV-STATE: the window tree with the devices away and Virtual-1 off")
+            f310("away", "with the devices away and Virtual-1 forced off")
+
+        def away_then_state():
+            away()
+            time.sleep(3)
+            away_state()
+
+        with ctx.video("kvm-cycle", "EV-VIDEO: the display while the keyboard, tablet and sound card leave "
+                       "together with Virtual-1's link, and return together: nothing on it moves"):
+            ok_away, ok_back, _ = kvm_cycle(ctx, st, on_away=away_then_state, on_back=back)
+            wait_until(lambda: v1().startswith("Virtual-1 connected "), 15, 1)
+        xs1 = ctx.xstate()
+        ctx.save_state("tree-after", xs1.text, "EV-STATE: the window tree after the switch")
+        f310("after", "after the switch")
+        st.check(ok_away, "with the three deleted back to back, every count dropped")
+        st.check(ok_back, "with the three added back, every count returned to its value before")
+        d_away, v1_away, w_away = seen.get("away", ("", "", []))
+        st.check(d_away == "2048x768" and v1_away.startswith("Virtual-1 disconnected ") and "1024x768+0+0" in v1_away,
+                 "while away the screen stayed 2048x768 and Virtual-1 read disconnected, still at 1024x768+0+0",
+                 f"{d_away}; {v1_away}")
+        st.check(w_away == w0, "while away no window moved or resized", f"{len(w0)} windows")
+        st.check(dims() == "2048x768" and v1().startswith("Virtual-1 connected ") and "1024x768+0+0" in v1(),
+                 "after the return the screen is 2048x768 and Virtual-1 reads connected at 1024x768+0+0", v1())
+        st.check(windows(xs1) == w0, "after the return no window moved or resized", f"{len(w0)} windows")
+        pids2 = ctx.pids("pids-after")
+        st.check(ctx.session_pid(pids2, "Xorg") == ctx.session_pid(pids, "Xorg") == xorg
+                 and ctx.session_pid(pids2, "pipewire") == pw,
+                 "Xorg and PipeWire kept their pids through the switch", f"Xorg {xorg}, pipewire {pw}")
+        # Then the operator types, clicks and hears, as in S3.11.1, on
+        # Virtual-1's half (QEMU's screendump shows head 0, Virtual-1).
+        ctx.desk_sink("op3112", "40x10+300+300", "s3112")
+        xs, sink = ctx.wait_client("op3112")
+        tid = (xi_ids(ctx, USB_TABLET) or [None])[-1]
+        xi_test_start(ctx, tid, "kvmtab")
+        ctx.click(*centre(sink), device="vga0")
+        xit = xi_test_stop(ctx, tid, "kvmtab")
+        st.write("xinput-test-tablet", xit or "(no output)\n",
+                 f"EV-STATE: xinput test on the returned tablet's own X device (id {tid}) while it clicked")
+        st.check(xi_events(xit)[1] >= 1, "the returned tablet clicks: its own X device saw the button press")
+        kid = (xi_ids(ctx, USB_KBD) or [None])[-1]
+        xi_test_start(ctx, kid, "kvmkbd")
+        ctx.type_line("afterkvm3112")
+        xit = xi_test_stop(ctx, kid, "kvmkbd")
+        st.write("xinput-test-keyboard", xit or "(no output)\n",
+                 f"EV-STATE: xinput test on the returned keyboard's own X device (id {kid}) while the line was typed")
+        got = wait_until(lambda: "afterkvm3112" in ctx.desk_lines("/tmp/op-sink-op3112"), 8, 0.5)
+        ctx.save_cmd("sink", "podman exec desktop cat /tmp/op-sink-op3112",
+                     "EV-STATE: the sink xterm's file: the line typed after the switch", label="the sink")
+        st.check(got and xi_events(xit)[3] >= 12, "the line typed after the switch came through the returned "
+                 "keyboard and landed in the sink the returned tablet clicked",
+                 f"{xi_events(xit)[3]} key presses on the keyboard's own device")
+        ctx.shot("typed", "EV-SHOT: head 0 (Virtual-1) with the sink xterm and the line typed after the switch")
+        st.check(tone_to(ctx, st, "builtin-tone", builtin, "/tmp/op-tone-660-3s.wav", 660,
+                         f"EV-AUDIO: the machine's output while a client played 660 Hz to the built-in sink by "
+                         f"name ({builtin}), after the switch - listen for one beep"),
+                 "after the switch a client's tone sent to the built-in sink by name is heard, and its paplay "
+                 "exits 0")
+    finally:
+        for dev in ("kvmtab", "kvmsnd"):
+            with contextlib.suppress(Exception):
+                m.device_del(dev)
+        wait_xi(ctx, USB_TABLET, 0, 10)
+        with contextlib.suppress(Exception):
+            g.sh(f"echo detect > {conn}/status", check=False, label="Virtual-1 back to detect")
+        g.sh("repo/ci/vm/vm-guest.sh monitors-set shipped", timeout=240, check=False,
+             label="the shipped monitors.conf back, restart the desktop")
+        with contextlib.suppress(Exception):
+            ctx.measure_screen()
 
 
 def s7_7_1(ctx, st):
@@ -2973,6 +3126,8 @@ STORIES = [
     ("S11.2.1", "Text moves between applications by selection and paste, across containers", s11_2_1),
     ("S11.1.1", "Every root-menu action does what its label says when chosen with the mouse", s11_1_1),
     ("S11.3.1", "The operator can set the volume, mute, and choose the output from the desktop", s11_3_1),
+    # Last: it declares a two-monitor layout and restarts the desktop twice.
+    ("S3.11.2", "Composite cycle with the video link down at the same time", s3_11_2),
 ]
 
 

@@ -15,6 +15,9 @@ QMP=qmp.sock
 # A second QMP monitor for EV-VIDEO alone (qmp-tool.py video): QMP serves one
 # client at a time, and a recorder on the first would hold up everything else.
 QMPV=qmpv.sock
+# QEMU's VNC server bound to the virtio-vga's head 1 (vnc-head.py): how a
+# monitor is plugged into Virtual-2 and taken away (S3.10.5, S3.10.7).
+VNC1=vnc-head1.sock
 SSHPORT=2222
 mkdir -p "$ART"
 
@@ -185,6 +188,12 @@ gqw() { vm_ssh "sudo repo/ci/vm/vm-guest.sh $*"; }
 # they accept; returns 1 when QEMU says Error.
 ev_qemu() { # <moment> <what> <monitor command>
     ev_save "$1" "$2" python3 qmp-tool.py hmp "$QMP" "$3"
+}
+# EV-QEMU into the open story: QEMU plugs a WIDTHxHEIGHT monitor into the
+# virtio-vga's head 1, or takes it away for 0x0 (vnc-head.py), and its
+# answer. Returns 1 unless QEMU says it forwarded the request.
+vnc_head() { # <moment> <width> <height> <what>
+    ev_save "$1" "$4" python3 vnc-head.py "$VNC1" "$2" "$3" >/dev/null
 }
 
 # EV-VIDEO into the open story: screendumps at 2 fps on the video monitor (a
@@ -744,12 +753,21 @@ cloud-localds seed.img user-data meta-data
 # Everything else on the display is unaffected: with no layout declared, X
 # autodetects and never enables a disconnected output, so the second
 # connector is inert for the rest of the suite.
+#
+# One frontend is attached all the same: a VNC server bound to head 1, which
+# nothing talks to until the monitor stories under autodetection (S3.10.5,
+# S3.10.7). There vnc-head.py asks it for a size with SetDesktopSize, and
+# QEMU does what it does for any frontend that reports one: it enables head
+# 1 with an EDID of that size and tells the guest, which sees a monitor
+# plugged in. 0x0 takes it away. With no VNC client connected the server
+# only re-arms its refresh timer every 3 s.
 log "boot VM (KVM, virtio-vga with 2 connectors, virtio input, intel-hda)"
 qemu-system-x86_64 \
     -enable-kvm -cpu host -m 6144 -smp 3 \
     -drive "file=$DISK,if=virtio" \
     -drive "file=seed.img,if=virtio,format=raw" \
     -device virtio-vga,max_outputs=2,id=vga0 -display none \
+    -vnc "unix:$VNC1,display=vga0,head=1" \
     -device virtio-keyboard-pci -device virtio-tablet-pci \
     -device qemu-xhci,id=xhci -device usb-kbd,id=kvmkbd,bus=xhci.0 \
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -867,9 +885,85 @@ guest_ev "$pd_ev" layout-unplug || fail "fixed monitor layout: the live disconne
 if in_shard core; then
     ev_video_stop "EV-VIDEO: head 0 across Virtual-1's forced disconnect and its re-plug (the guest's notes give both times); nothing on it should move"
     ev_end
+    # S7.7.3: the client's own view before, while Virtual-1 was off and after
+    # the re-plug, compared over its window and over the whole screen.
+    ev_begin S7.7.3 "Client windows stay put across a monitor plug-out and re-plug (layout declared)" T3
+    s773_view() { ls "$EV_ROOT/S7.7.3/"*"-client-view-$1.png" 2>/dev/null | sed -n 1p; }
+    s773_rect=$(awk '/Absolute upper-left X/ {x = $NF} /Absolute upper-left Y/ {y = $NF} /^ *Width:/ {w = $NF} /^ *Height:/ {h = $NF} END {if (w) printf "%dx%d+%d+%d", w, h, x, y}' \
+        "$(ls "$EV_ROOT/S7.7.3/"*-xwininfo-before.txt 2>/dev/null | sed -n 1p)")
+    [ -n "$s773_rect" ] || fail "S7.7.3: no window rectangle in the client's xwininfo"
+    for s773_m in during after; do
+        s773_a=$(s773_view before) s773_b=$(s773_view "$s773_m")
+        [ -n "$s773_a" ] && [ -n "$s773_b" ] || fail "S7.7.3: the client's own screenshot before or $s773_m is missing"
+        convert "$s773_a" -crop "$s773_rect" +repage "${ART:?}/.s773-a.png" \
+            && convert "$s773_b" -crop "$s773_rect" +repage "${ART:?}/.s773-b.png" \
+            || fail "S7.7.3: could not cut the client's window out of its screenshots"
+        s773_win_ae=$(compare -metric AE "${ART:?}/.s773-a.png" "${ART:?}/.s773-b.png" null: 2>&1 | awk '{print $1}' || true)
+        s773_all_ae=$(compare -metric AE "$s773_a" "$s773_b" null: 2>&1 | awk '{print $1}' || true)
+        rm -f "${ART:?}/.s773-a.png" "${ART:?}/.s773-b.png"
+        ev_note "the client's own view, before against $s773_m: ${s773_win_ae:-?} pixels differ over its window ($s773_rect), ${s773_all_ae:-?} over the whole screen"
+        [ "${s773_win_ae:-x}" = 0 ] || fail "S7.7.3: the client's own view of its window differs before and $s773_m (${s773_win_ae:-?} pixels)"
+        ev_pass "the client's own view of its window ($s773_rect) is the same before and $s773_m: 0 pixels differ (over the whole screen: ${s773_all_ae:-?})"
+    done
+    ev_end
     EV_SIDE=
 fi
 guest_ev "$pd_ev" layout-restore || fail "fixed monitor layout: the shipped config did not restore autodetection"
+if in_shard core; then
+    # S3.10.5-S3.10.7 under autodetection. QEMU itself plugs a monitor into
+    # Virtual-2 and takes it away again (vnc_head, through the VNC server on
+    # head 1); the guest's steps run one at a time so that this side can
+    # plug, unplug, shoot and record between them.
+    log "monitors under autodetection: a plug-in, the only output's plug-out, an EDID's modes"
+    EV_SIDE=h-
+    S5_T="Monitor plug-in without a layout is detected and does not reflow"
+    S6_T="Monitor plug-out without a layout is characterised"
+    S7_T="A plugged-in monitor with an EDID exposes modes"
+    ev_begin S3.10.5 "$S5_T" T3; ev_video_start ad-plugin; ev_end
+    guest_ev "$GUEST_EV" autodetect plugin before || fail "S3.10.5: the state before the plug-in is not what it should be"
+    ev_begin S3.10.5 "$S5_T" T3
+    vnc_head vnc-plug 1024 768 "EV-QEMU: vnc-head.py 1024 768: QEMU asked, through its VNC server on head 1, to plug a 1024x768 monitor into Virtual-2, and its answer" \
+        || fail "S3.10.5: QEMU did not take the request to plug a monitor into head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect plugin on || fail "S3.10.5: the plugged-in monitor was not detected as it should be, or something moved"
+    ev_begin S3.10.5 "$S5_T" T3
+    vnc_head vnc-unplug 0 0 "EV-QEMU: vnc-head.py 0 0: QEMU asked to take the monitor away from head 1, and its answer" \
+        || fail "S3.10.5: QEMU did not take the request to unplug head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect plugin off || fail "S3.10.5: Virtual-2 did not go back to disconnected"
+    ev_begin S3.10.5 "$S5_T" T3
+    ev_video_stop "EV-VIDEO: head 0 while QEMU plugged a monitor into Virtual-2 and took it away, no layout declared (the notes give the times): nothing on it should move"
+    ev_end
+    ev_begin S3.10.6 "$S6_T" T3; ev_video_start ad-unplug; ev_end
+    guest_ev "$GUEST_EV" autodetect unplug || fail "S3.10.6: X did not live through its only output's plug-out as it should"
+    ev_begin S3.10.6 "$S6_T" T3
+    ev_video_stop "EV-VIDEO: head 0 while Virtual-1, the only enabled output, was forced off and set back to detect"
+    ev_end
+    ev_begin S3.10.7 "$S7_T" T3; ev_video_start ad-edid; ev_end
+    guest_ev "$GUEST_EV" autodetect edid prep || fail "S3.10.7: the EDID could not be injected"
+    ev_begin S3.10.7 "$S7_T" T3
+    vnc_head vnc-plug 1024 768 "EV-QEMU: vnc-head.py 1024 768: QEMU asked, through its VNC server on head 1, to plug a 1024x768 monitor into Virtual-2, and its answer" \
+        || fail "S3.10.7: QEMU did not take the request to plug a monitor into head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect edid on || fail "S3.10.7: the monitor's EDID or modes were not the injected ones, or it would not enable"
+    ev_begin S3.10.7 "$S7_T" T3
+    shot=$(ev_shot_head head1-enabled 1 "EV-SHOT: QEMU's screendump of head 1, Virtual-2's scanout, enabled at 1024x768 by xrandr --auto at +0+0: the desktop's top-left 1024x768") \
+        || fail "S3.10.7: no screendump of head 1"
+    [ "${shot%% *}" = 1024x768 ] || fail "S3.10.7: head 1's screendump is ${shot%% *}, not 1024x768"
+    awk -v s="${shot#* }" 'BEGIN { exit !(s > 0.01) }' || fail "S3.10.7: head 1's screendump is blank (grayscale stddev ${shot#* })"
+    ev_pass "QEMU's head 1 shows Virtual-2's scanout: a ${shot%% *} image, not blank (grayscale stddev ${shot#* })"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect edid off || fail "S3.10.7: Virtual-2 would not turn off"
+    ev_begin S3.10.7 "$S7_T" T3
+    vnc_head vnc-unplug 0 0 "EV-QEMU: vnc-head.py 0 0: QEMU asked to take the monitor away from head 1, and its answer" \
+        || fail "S3.10.7: QEMU did not take the request to unplug head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect edid gone || fail "S3.10.7: Virtual-2 did not withdraw cleanly"
+    ev_begin S3.10.7 "$S7_T" T3
+    ev_video_stop "EV-VIDEO: head 0 while Virtual-2 got its EDID, was plugged in, enabled with xrandr --auto, turned off and taken away: Virtual-1 should not change"
+    ev_end
+    EV_SIDE=
+fi
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh deploy-proof' || fail "could not put the deploy-proof xterm up"
 write_manifest
 screendump desktop-deploy
