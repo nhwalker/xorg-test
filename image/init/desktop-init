@@ -48,6 +48,14 @@
 # terms, and neither can reap the other: the sid scoping that makes
 # stop_tree() safe is also what keeps the two apart.
 #
+# The X tree is more than one session, though. xinit starts its client
+# (xinitrc, which execs mwm) in a session of its own, and every xterm's
+# shell leads another, so the leader's sid alone selects only startx, xinit
+# and Xorg. Everything started in the X session therefore also carries
+# DESKTOP_SESSION_TAG, unique to that run of it, and stopping the X tree
+# takes the leader's sid AND every desktop-user process whose environment
+# holds the tag (see tree_members). The audio stack carries no tag.
+#
 # Signals: podman stop sends SIGTERM (STOPSIGNAL in the Containerfile).
 # CAP_KILL is deliberately NOT granted - in the host pid namespace it would
 # mean "can signal any process on the host" - so this root process cannot
@@ -83,6 +91,10 @@ as_desktop() {
 }
 
 session_pid=""
+# DESKTOP_SESSION_TAG of the current X session: "<desktop-init pid>.<run>",
+# new for every run of the session in this container.
+session_tag=""
+session_n=0
 audio_pid=""
 audio_sup_pid=""
 shutting_down=0
@@ -93,7 +105,7 @@ shutting_down=0
 # SIGTERM handler cannot see it. Same reasoning as /run/desktop-init.pid.
 AUDIO_LEADER_PID=/run/desktop-audio-leader.pid
 
-tree_members() { # $1: session leader pid
+tree_members() { # $1: session leader pid, $2: the tree's DESKTOP_SESSION_TAG (optional)
     # Every pid in that leader's SESSION (setsid made it a session leader,
     # and the sid survives the leader's death for orphans). NEVER scope
     # this by uid: in the host pid namespace a uid-wide pkill reaches
@@ -109,22 +121,44 @@ tree_members() { # $1: session leader pid
     # Taking the sid as an argument is what keeps the X session and the
     # audio stack from reaping each other: they are separate sessions, so
     # stopping one selects none of the other's pids.
-    local leader="${1:-}"
+    #
+    # With a tag, the tree is also every process that carries it: the X
+    # client's own session (mwm and the xterms), the xterms' shells, and
+    # anything started from those - nohup'd or setsid'd included - which
+    # the leader's sid does not reach. Still not uid-scoped: the uid only
+    # decides whose environ can be read, and the tag decides membership.
+    local leader="${1:-}" tag="${2:-}"
     [ -n "$leader" ] || return 0
-    ps -eo pid=,sess= | awk -v s="$leader" '$2==s{print $1}'
+    {
+        ps -eo pid=,sess= | awk -v s="$leader" '$2==s{print $1}'
+        [ -z "$tag" ] || tagged_pids "$tag"
+    } | sort -un
 }
 
-stop_tree() { # $1: session leader pid
+tagged_pids() { # $1: DESKTOP_SESSION_TAG value
+    # Read AS the desktop user, which can always read its own processes'
+    # /proc/<pid>/environ; every other uid's is unreadable to it and is
+    # skipped, so only processes the kill (also as the desktop user) can
+    # reach are ever selected. /proc/<pid>/environ is the environment the
+    # process was started with, so one that execs with a scrubbed
+    # environment (env -i) carries no tag; outside the leader's session,
+    # that is the one way out of this selection.
+    as_desktop grep -lzxF "DESKTOP_SESSION_TAG=$1" /proc/[0-9]*/environ 2>/dev/null \
+        | sed -n 's|^/proc/\([0-9]*\)/environ$|\1|p'
+}
+
+stop_tree() { # $1: session leader pid, $2: the tree's DESKTOP_SESSION_TAG (optional)
     # TERM the tree, then KILL stragglers. Root's own pid never appears
-    # here (desktop-init is in neither session), so no self-kill.
-    local leader="${1:-}" pids
+    # here (desktop-init is in neither session and carries no tag), so no
+    # self-kill.
+    local leader="${1:-}" tag="${2:-}" pids
     [ -n "$leader" ] || return 0
-    pids=$(tree_members "$leader")
+    pids=$(tree_members "$leader" "$tag")
     [ -n "$pids" ] || return 0
     # shellcheck disable=SC2086
     as_desktop kill -TERM $pids 2>/dev/null || true
     for _ in 1 2 3 4 5; do
-        pids=$(tree_members "$leader")
+        pids=$(tree_members "$leader" "$tag")
         [ -n "$pids" ] || return 0
         sleep 1
     done
@@ -168,7 +202,7 @@ on_term() {
     # three seconds after we took it down. A background child inherits no
     # TERM trap, so this is an outright kill of the loop.
     [ -n "$audio_sup_pid" ] && kill -TERM "$audio_sup_pid" 2>/dev/null
-    stop_tree "$session_pid"
+    stop_tree "$session_pid" "$session_tag"
     stop_tree "$(cat "$AUDIO_LEADER_PID" 2>/dev/null || true)"
     exit 0
 }
@@ -286,7 +320,12 @@ run_session() {
     # setsid -c: fresh session with fd 0's tty (tty1) as controlling tty -
     # what StandardInput=tty used to arrange, and what lets Xorg -keeptty
     # take the VT. env -i: no PAM to build the environment, so state it.
+    # DESKTOP_SESSION_TAG marks everything this run of the session starts
+    # (see tree_members); it is new for every run.
+    session_n=$((session_n + 1))
+    session_tag="$$.$session_n"
     setsid -c env -i \
+        DESKTOP_SESSION_TAG="$session_tag" \
         HOME=/home/$DESK_USER USER=$DESK_USER LOGNAME=$DESK_USER \
         SHELL=/bin/bash PATH=/usr/local/bin:/usr/bin:/usr/sbin \
         XDG_RUNTIME_DIR="$RUNDIR" XDG_SESSION_TYPE=x11 \
@@ -315,10 +354,11 @@ while :; do
     run_session
     rc=$?
     [ "$shutting_down" = 1 ] && exit 0
-    # Orphans from the dead session (xterm, mwm) must not survive into the
-    # next iteration. The audio stack is NOT among them: it is a session of
-    # its own, which is the point - stop_tree selects by sid.
-    stop_tree "$session_pid"
+    # Orphans from the dead session (xterm, mwm, and whatever was started
+    # from them) must not survive into the next iteration. The audio stack
+    # is NOT among them: it is a session of its own and carries no tag,
+    # which is the point - stop_tree selects by sid and by tag.
+    stop_tree "$session_pid" "$session_tag"
     if [ "$rc" != 0 ]; then
         SERVICE_RESULT=exit-code EXIT_CODE=exited EXIT_STATUS=$rc \
             /usr/local/bin/session-postmortem || true
