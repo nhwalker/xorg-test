@@ -3447,11 +3447,16 @@ def m_menu_look(ctx, st, moment):
                  f"text {before and before['refresh']} -> {look['refresh']}, menu width "
                  f"{before and before['menu'][0]} -> {look['menu'][0]}")
     if moment == "after-restart-2":
+        # The colour ~/.Xdefaults gives the menu now, the edit's.
         was = state.get("after-xdefaults", {}).get("bg")
-        st.record(f"Mwm*menu*background in ~/.Xdefaults was edited before this Restart mwm: the "
-                  f"menu's background went {tuple(was) if was else '?'} -> {tuple(look['bg'])}, so "
-                  + ("f.restart re-read the resources (README.md says it does not)" if was and look["bg"] != was
-                     else "f.restart did not re-read them"))
+        want = ctx.g.desk(["sh", "-c", "sed -n 's/^Mwm\\*menu\\*background: *#//p' /home/desktop/.Xdefaults"],
+                          check=False).strip()
+        rgb = tuple(int(want[i:i + 2], 16) for i in (0, 2, 4)) if re.fullmatch(r"[0-9a-fA-F]{6}", want) else None
+        st.check(rgb is not None and tuple(look["bg"]) == rgb,
+                 f"after Restart mwm the root menu draws the edited Mwm*menu*background #{want}: f.restart "
+                 "read ~/.Xdefaults again, in the same X session",
+                 f"background {tuple(was) if was else '?'} before Restart mwm, {tuple(look['bg'])} after; "
+                 f"~/.Xdefaults gives #{want}")
 
 
 def m_restart_mwm(ctx, st, arg):

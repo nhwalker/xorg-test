@@ -854,6 +854,8 @@ mt_layout_case_check() { # the same case, after the restart
             ! grep -q 'xorg-monitor-conf: ERROR' <<<"$log" || fail "'$1' gave an ERROR: $(grep -m1 ERROR <<<"$log")"
             [ "$gen" = yes ] || fail "no 30-monitors.conf was generated with '$1'"
             if [ "$1" = virtual ]; then
+                ev_save "xorg-size-$1" "EV-LOG-XORG: the Xorg log's lines on the screen's size and the outputs' initial modes, the case '$1'" \
+                    podman exec desktop grep -iE 'virtual|pitch|screen size|initial mode|using initial' "$XORG_LOG" >/dev/null || true
                 dims=$(dpy_dims)
                 [ "$dims" = "$(grep -m1 '^virtual ' "$MT_MONCONF" | awk '{print $2}')" ] || fail "the screen is $dims, not the declared virtual size"
             fi
@@ -1208,7 +1210,7 @@ mt_lf_mwmrc() {
     ev_end
 }
 mt_lf_xdefaults() { # <XTerm*background> <Mwm*menu*background>, hex without '#'
-    local before rc x0 x1 x2 term="#$1" menu="#$2"
+    local before term="#$1" menu="#$2"
     mt_begin S10.3.7
     ev_save xdefaults-before "EV-CONFIG: /home/desktop/.Xdefaults in the running container, before the edit" \
         podman exec desktop cat /home/desktop/.Xdefaults >/dev/null || fail "there is no ~/.Xdefaults in the container"
@@ -1220,38 +1222,12 @@ mt_lf_xdefaults() { # <XTerm*background> <Mwm*menu*background>, hex without '#'
     ev_diff xdefaults "EV-DIFF: ~/.Xdefaults before (-) and after (+) the edit: two colours" "$before" "$EV_LAST"
     grep -q "^XTerm\\*background: *$term" "$EV_DIR/$EV_LAST" && grep -q "^Mwm\\*menu\\*background: *$menu" "$EV_DIR/$EV_LAST" \
         || fail "the two colours were not both edited"
-    x0=$(podman exec desktop pgrep -u desktop -x Xorg || true)
-    rc=0
-    ev_save session-restart "EV-PROCEDURE: README.md \"Look and feel\": \"an ~/.Xdefaults change needs a new X session (systemctl restart desktop-session.service in the container)\", run as written, in the container: its output and exit status" \
-        podman exec desktop systemctl restart desktop-session.service >/dev/null || rc=$?
-    if [ "$rc" = 0 ]; then
-        ev_pass "the README's \`systemctl restart desktop-session.service\` in the container exited 0"
-    else
-        ev_fail "the README's \`systemctl restart desktop-session.service\` in the container exited $rc: $(mt_saved "$EV_LAST" | head -n 2 | tr '\n' ' ')"
-    fi
-    sleep 3
-    x1=$(podman exec desktop pgrep -u desktop -x Xorg || true)
-    rc=0
-    ev_save session-restart-host "EV-PROCEDURE: the command's other reading, on the host: systemctl restart desktop-session.service, the host's login-session unit of that name: its output and exit status" \
-        systemctl restart desktop-session.service >/dev/null || rc=$?
-    ev_note "on the host, systemctl restart desktop-session.service exited $rc"
-    sleep 5
-    x2=$(podman exec desktop pgrep -u desktop -x Xorg || true)
-    ev_text xorg-pids "EV-PIDS: the session's Xorg: before the README's command, after it in the container, after the host unit's restart" \
-        "before: ${x0:-none}
-after the command in the container: ${x1:-none}
-after the host's unit restart: ${x2:-none}"
-    if [ -n "$x0" ] && { [ "$x1" != "$x0" ] || [ "$x2" != "$x0" ]; }; then
-        ev_pass "a new X session started (Xorg $x0 -> $x1 -> $x2)"
-    else
-        ev_fail "neither reading of the README's command started a new X session: the session's Xorg is pid ${x0:-none} throughout"
-    fi
-    ev_save session-unit "EV-STATE: systemctl status desktop-session.service on the host, after its restart" \
-        systemctl --no-pager status desktop-session.service >/dev/null || true
+    ev_note "README.md \"Look and feel\": a client reads ~/.Xdefaults as it starts, so the next xterm has the change, and Restart mwm makes mwm read its resources afresh, in the same X session; the VM host opens the xterm and picks Restart mwm"
     ev_end
 }
 # The image the restarted desktop runs, against the one the README's build
-# made (its id, from the maintainer's own storage, passed in by the VM host).
+# made (its id, from root's storage, where the README's build now puts it, passed
+# in by the VM host).
 mt_lf_image() { # <the built image's id>
     local running latest
     mt_begin S10.3.7
@@ -1549,6 +1525,21 @@ mt_sel_break() {
         ev_fail "no AVC denial reached the audit log within 60 s of the client's loop failing"
         ev_save setroubleshoot "EV-LOG-JOURNAL: setroubleshoot's reports since the relabel" \
             sh -c "journalctl --no-pager -o short-precise -t setroubleshoot --since @$(mt_get since-break) 2>&1; true" >/dev/null || true
+        # Run 37384618550: setroubleshoot reported the denial while ausearch
+        # found nothing for 60 s. Does auditd hold the record unwritten?
+        # A rotation makes it write out what it holds.
+        ev_save audit-log "EV-STATE: /var/log/audit/audit.log's size and time and its AVC record count, before a rotation" \
+            sh -c 'stat -c "%s bytes, modified %y" /var/log/audit/audit.log; grep -c "type=AVC" /var/log/audit/audit.log' >/dev/null || true
+        ev_save audit-rotate "EV-PROCEDURE: harness-only diagnosis: service auditd rotate (auditd writes out what it holds and starts a new log)" \
+            service auditd rotate >/dev/null || true
+        sleep 2
+        avc=$(ausearch -m avc -ts recent 2>&1 || true)
+        ev_text avc-after-rotate "EV-STATE: ausearch -m avc -ts recent after the rotation" "$avc"
+        if grep -q 'avc: *denied' <<<"$avc"; then
+            ev_note "after service auditd rotate, ausearch finds the denial: auditd had the record and had not written it to audit.log"
+        else
+            ev_note "after service auditd rotate, ausearch still finds no denial"
+        fi
     fi
     ev_end
 }

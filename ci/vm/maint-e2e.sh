@@ -523,14 +523,12 @@ mt_look() {
     mg lf-mwmrc || { mt_failed S10.3.7 "the container's .mwmrc could not be edited"; return 1; }
     mt_op restart-mwm 1 || mt_failed S10.3.7 "Restart mwm did not restart mwm in the same X session"
     mt_op menu-look after-mwmrc || mt_failed S10.3.7 "the edited label is not on the root menu after Restart mwm"
-    log "S10.3.7: ~/.Xdefaults edited, the README's new X session, then the next xterm"
+    log "S10.3.7: ~/.Xdefaults edited, then the next xterm and Restart mwm, as README.md says"
     mg lf-xdefaults "$MT_LF_TERM" "$MT_LF_MENU" || mt_failed S10.3.7 "the container's .Xdefaults could not be edited"
     mt_op new-xterm "#$MT_LF_TERM" || mt_failed S10.3.7 "the next xterm does not draw the edited background"
-    # What Restart mwm does with the edited Mwm resources, against README.md's
-    # "Resources are not re-read by f.restart": recorded, not judged.
-    mt_op menu-look after-xdefaults || true
-    mt_op restart-mwm 2 || true
-    mt_op menu-look after-restart-2 || true
+    mt_op menu-look after-xdefaults || mt_failed S10.3.7 "the root menu could not be measured before Restart mwm"
+    mt_op restart-mwm 2 || mt_failed S10.3.7 "Restart mwm did not restart mwm in the same X session"
+    mt_op menu-look after-restart-2 || mt_failed S10.3.7 "after Restart mwm the root menu does not draw the edited Mwm*menu*background"
     log "S10.3.7: a repo file changed, rebuilt and deployed the way README.md says"
     MT_LF_RESTARTED=0
     mt_rebuild || true
@@ -545,9 +543,9 @@ mt_rebuild() {
     local raw line n=0 rc vid t0 built rgb w h f
     local -a cmds
     mt_open S10.3.7
-    VM_SSH_TIMEOUT=600 ev_save rebuild-bases "EV-PROCEDURE: harness-only, not a documented step: the bases an earlier documented build leaves in the maintainer's own storage (README.md \"Base image vs application layer\": desktop-container-base, and the screenshot image the Containerfile's tools stage needs), loaded rather than rebuilt: podman load, as rocky" \
-        vm_ssh 'podman load -i /tmp/images-desktop-base.tar && podman load -i /tmp/images-screenshot.tar' >/dev/null \
-        || { mt_failed S10.3.7 "the bases could not be loaded into rocky's storage"; return 1; }
+    VM_SSH_TIMEOUT=600 ev_save rebuild-bases "EV-PROCEDURE: harness-only, not a documented step: the images an earlier documented build leaves in root's storage (README.md \"Base image vs application layer\", as root: desktop-container-base, and the screenshot image the Containerfile's tools stage needs), loaded rather than rebuilt: sudo podman load" \
+        vm_ssh 'sudo podman load -i /tmp/images-desktop-base.tar && sudo podman load -i /tmp/images-screenshot.tar' >/dev/null \
+        || { mt_failed S10.3.7 "the bases could not be loaded into root's storage"; return 1; }
     ev_save repo-edit "EV-PROCEDURE: the repo-file change the loop starts from (README.md: \"edit the file in image/session/\"): image/session/xinitrc.desktop's root colour, #101216 -> #$MT_LF_ROOT, in rocky's checkout (sed, standing in for an editor)" \
         vm_ssh "cd repo && cp image/session/xinitrc.desktop /tmp/xinitrc.desktop.orig && sed -i 's/#101216/#$MT_LF_ROOT/' image/session/xinitrc.desktop && { diff -u /tmp/xinitrc.desktop.orig image/session/xinitrc.desktop; grep -q '#$MT_LF_ROOT' image/session/xinitrc.desktop; }" >/dev/null \
         || { mt_failed S10.3.7 "the repo file could not be edited"; return 1; }
@@ -604,14 +602,14 @@ mt_rebuild() {
     else
         ev_fail "no screendump after README.md's loop"
     fi
-    ev_save rocky-images "EV-STATE: rocky's own podman storage after the loop: its images, and the id of its localhost/desktop-container:latest" \
-        vm_ssh "podman images; podman image inspect --format '{{.Id}} {{.Created}}' localhost/desktop-container:latest" >/dev/null || true
-    built=$(vm_ssh "podman image inspect --format '{{.Id}}' localhost/desktop-container:latest" 2>/dev/null | tail -n 1)
+    ev_save root-images "EV-STATE: root's podman storage after the loop: its images, and the id of its localhost/desktop-container:latest, the one the README's build made" \
+        vm_ssh "sudo podman images; sudo podman image inspect --format '{{.Id}} {{.Created}}' localhost/desktop-container:latest" >/dev/null || true
+    built=$(vm_ssh "sudo podman image inspect --format '{{.Id}}' localhost/desktop-container:latest" 2>/dev/null | tail -n 1)
     mt_close
     if [ -n "$built" ]; then
         mg lf-image "$built" || mt_failed S10.3.7 "the image check could not run"
     else
-        mt_failed S10.3.7 "README.md's build left no localhost/desktop-container:latest in rocky's storage"
+        mt_failed S10.3.7 "README.md's build left no localhost/desktop-container:latest in root's storage"
     fi
 }
 
