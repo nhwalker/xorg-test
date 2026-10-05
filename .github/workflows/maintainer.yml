@@ -1,0 +1,172 @@
+# The maintainer's journeys (Requirements.md E10). Each shard boots its own
+# stock Rocky 9 VM (ci/vm/vm-e2e.sh maint-<journey>), nothing installed and
+# nothing deployed, and drives the documents' own procedures on it
+# (ci/vm/maint-e2e.sh), read out of the documents and run as written:
+#   maint-docpath  deploy/HOST-REQUIRES.md's package line, then
+#                  deploy/README.md's Apply block, its reboot included, on
+#                  two stock hosts (the optional restorecon line skipped on
+#                  one and taken on the other); then a restart, and a
+#                  maintenance stop and start (S10.1.1-S10.1.3, S10.4.1,
+#                  S10.4.2)
+# The gate then holds this workflow's stories (their Coverage lines name
+# it: "(workflow `maintainer.yml`)") to the evidence the run left.
+#
+# Weekly, on demand, and on the pull requests that change what the journeys
+# run - the documents whose commands they execute, and the journeys
+# themselves - rather than on every pull request: a journey provisions hosts
+# from nothing and reboots them, on the runners every pull request waits for.
+# The deploy tree itself is ci.yml's to test on every pull request.
+name: maintainer
+on:
+  schedule:
+    # Tuesdays, the morning after base-rebuild.yml refreshes the bases.
+    - cron: "41 5 * * 2"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - README.md
+      - deploy/README.md
+      - deploy/HOST-REQUIRES.md
+      - ci/doc-blocks.py
+      - ci/vm/maint-*.sh
+      - .github/workflows/maintainer.yml
+permissions:
+  contents: read
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+jobs:
+  # Named apart from ci.yml's checks, which run on the same pull requests.
+  images:
+    name: maintainer images
+    # ci.yml's images job: the same images, built the same way, handed to
+    # every shard.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: ghcr login (base cache)
+        # --password-stdin, never -p: an argument would put the token in the
+        # process list and in podman's own error output on a failed login.
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: build images (reuse GHCR bases when possible)
+        env:
+          PUSH_BASES: "0"
+        run: |
+          sudo -E ci/build-bases.sh
+          # The offline gate, as in ci.yml; the screenshot image first, since
+          # the desktop image stages the client tools out of it.
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
+          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+          sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+          sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
+          # One archive per image: a multi-image docker-archive collapses into
+          # its first image with every tag attached.
+          mkdir -p vm-images
+          sudo podman save -o vm-images/images-desktop.tar localhost/desktop-container:latest
+          sudo podman save -o vm-images/images-plugin.tar localhost/cdi-device-plugin:latest
+          sudo podman save -o vm-images/images-testclient.tar localhost/desktop-testclient:latest
+          sudo chmod 644 vm-images/*.tar
+          for i in desktop-container cdi-device-plugin desktop-testclient; do
+            printf '%s %s\n' "$i" "$(sudo podman image inspect "localhost/$i:latest" --format '{{.Id}}')"
+          done | tee vm-images/image-ids.txt
+      - name: hand the images to the VM shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images
+          path: vm-images/
+          retention-days: 1
+          compression-level: 1
+
+  vm:
+    name: maintainer (${{ matrix.shard }})
+    needs: images
+    runs-on: ubuntu-latest
+    # Two stock hosts provisioned from nothing, each with a reboot, and a
+    # maintenance stop held for two minutes.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [maint-docpath]
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable kvm access
+        run: |
+          test -e /dev/kvm || { echo "no /dev/kvm on runner"; exit 1; }
+          sudo chmod 666 /dev/kvm
+      - name: install qemu + tools
+        # Retries and a transfer timeout, as in ci.yml: a stalled mirror
+        # otherwise hangs silently until the job's cap.
+        run: |
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS update -q
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat imagemagick
+      - name: cache rocky cloud image
+        id: rocky
+        uses: actions/cache@v4
+        with:
+          path: ci/vm/Rocky-9-GenericCloud.qcow2
+          key: rocky9-genericcloud-v1
+      - name: download rocky cloud image
+        if: steps.rocky.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o ci/vm/Rocky-9-GenericCloud.qcow2 \
+            https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+      - name: fetch the images built once for every shard
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-images
+          path: ci/vm/
+      - name: run the maintainer's journey (${{ matrix.shard }})
+        env:
+          EV_SOURCE: "maintainer.yml vm (${{ matrix.shard }})"
+        run: ci/vm/vm-e2e.sh "${{ matrix.shard }}"
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-vm-${{ matrix.shard }}
+          path: ci/vm/artifacts/
+          if-no-files-found: ignore
+
+  coverage-gate:
+    name: maintainer coverage-gate
+    # ci.yml's gate, for this workflow's stories only: every story directory
+    # complete, and every story whose Coverage line names maintainer.yml and
+    # is marked ✅ backed by passing evidence from this run.
+    needs: vm
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: gather every shard's evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: evidence-*
+          path: evidence/
+      - name: check it against Requirements.md
+        run: |
+          rc=0
+          python3 ci/evlib.py gate --workflow maintainer.yml --requirements Requirements.md \
+            --report coverage-gate.md --json coverage-gate.json evidence/ || rc=$?
+          cat coverage-gate.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: upload the gate's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-gate
+          path: |
+            coverage-gate.md
+            coverage-gate.json
+          if-no-files-found: ignore
