@@ -743,7 +743,11 @@ class Ctx:
 
     @contextlib.contextmanager
     def video(self, moment, what, fps=2.0):
-        """EV-VIDEO: screendumps at fps for the duration of the block."""
+        """EV-VIDEO: screendumps at fps for the duration of the block. QEMU
+        writes each frame as a PPM, its raw pixels, and the frames become
+        PNGs after the block: QEMU compresses a PNG screendump in its main
+        loop, where its sound cards run, and an emulated HDA codec drops
+        audio when that loop falls behind (qmp-tool.py's video says more)."""
         name = self.st.name(moment, "")
         frames = self.st.path(name)
         os.makedirs(frames, exist_ok=True)
@@ -754,12 +758,14 @@ class Ctx:
             while not stop.is_set():
                 t0 = time.monotonic()
                 i += 1
+                ppm = os.path.abspath(os.path.join(frames, f"frame-{i:04d}.ppm"))
                 try:
-                    self.m.screendump(os.path.join(frames, f"frame-{i:04d}.png"), log=False)
+                    self.m.qmp.cmd("screendump", {"filename": ppm, "format": "ppm"}, log=False)
                 except Exception as e:                         # noqa: BLE001
                     index.append(f"frame {i:04d} failed: {e}")
                     return
-                index.append(f"frame-{i:04d}.png {stamp()}")
+                index.append(f"frame-{i:04d}.png {stamp()} (QEMU wrote it in "
+                             f"{1000 * (time.monotonic() - t0):.0f} ms)")
                 stop.wait(max(0.0, 1.0 / fps - (time.monotonic() - t0)))
 
         t = threading.Thread(target=loop, daemon=True)
@@ -771,11 +777,17 @@ class Ctx:
             time.sleep(0.6)
             stop.set()
             t.join(30)
+            for f in sorted(os.listdir(frames)):
+                if f.endswith(".ppm"):
+                    ppm = os.path.join(frames, f)
+                    subprocess.run(["convert", ppm, ppm[:-4] + ".png"], check=False, timeout=60)
+                    os.unlink(ppm)
             self.run.log("video", f"stop {name} ({len(index)} frames)")
             with open(os.path.join(frames, "index.txt"), "w") as f:
                 f.write("\n".join(index) + "\n")
             self.st.attach(name + "/", f"EV-VIDEO raw frames at {fps:g} fps; index.txt has each "
-                           "frame's timestamp, to read against timeline.log")
+                           "frame's timestamp, to read against timeline.log, and how long QEMU took "
+                           "to write it")
             gif = name + ".gif"
             pngs = sorted(p for p in os.listdir(frames) if p.endswith(".png"))
             if pngs:

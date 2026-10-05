@@ -2761,12 +2761,12 @@ journey_put() { # <tag> <hz> <seconds> [pod]
     gen_tone "$2" "/tmp/$1.wav" "$3"
     k3s kubectl exec -i "${4:-$JPOD}" -- sh -c "cat > /tmp/$1.wav" < "/tmp/$1.wav"
 }
-journey_tone() { # <tag> <hz> <seconds>
+journey_tone() { # <tag> <hz> <seconds> [sink: PULSE_SINK, a sink by name]
     journey_put "$1" "$2" "$3"
     k3s kubectl exec "$JPOD" -- rm -f "/tmp/$1.rc" "/tmp/$1.t0" "/tmp/$1.t1" "/tmp/$1.pid"
     journey_run "tone-$1" <<EOF
 date +%s.%N > /tmp/$1.t0
-paplay /tmp/$1.wav > /tmp/$1.log 2>&1 &
+${4:+PULSE_SINK='$4' }paplay /tmp/$1.wav > /tmp/$1.log 2>&1 &
 echo \$! > /tmp/$1.pid
 wait \$!
 r=\$?
@@ -2789,6 +2789,27 @@ journey_tone_status() { # <tag> [pod]
     echo "pid $(k3s kubectl exec "$pod" -- cat "/tmp/$1.pid" 2>/dev/null || echo unknown)"
     k3s kubectl exec "$pod" -- cat "/tmp/$1.log" 2>/dev/null || true
 }
+# A client records <source> for <seconds> into /tmp/<tag>.wav: the session
+# user in the desktop container (rec-source), or a process of its own in the
+# journey pod (journey-rec). SIGINT ends parecord, which then finishes the
+# WAV; --preserve-status reports parecord's own exit status, not timeout's.
+rec_source() { # <source> <seconds> <tag>
+    local rc=0
+    podman exec desktop rm -f "/tmp/${3:?tag}.wav"
+    echo "\$ parecord -d $1 /tmp/$3.wav, as the session user in the desktop container, ended by SIGINT after $2 s"
+    desk timeout --preserve-status -s INT "${2:?seconds}" parecord -d "${1:?source}" "/tmp/$3.wav" 2>&1 || rc=$?
+    echo "parecord exited $rc"
+    podman exec desktop ls -l "/tmp/$3.wav" 2>&1 || true
+}
+journey_rec() { # <source> <seconds> <tag>
+    local rc=0
+    k3s kubectl exec "$JPOD" -- rm -f "/tmp/${3:?tag}.wav"
+    echo "\$ parecord -d $1 /tmp/$3.wav, a new process in the journey pod, ended by SIGINT after $2 s"
+    k3s kubectl exec "$JPOD" -- timeout --preserve-status -s INT "${2:?seconds}" parecord -d "${1:?source}" "/tmp/$3.wav" 2>&1 || rc=$?
+    echo "parecord exited $rc"
+    k3s kubectl exec "$JPOD" -- ls -l "/tmp/$3.wav" 2>&1 || true
+}
+journey_file() { k3s kubectl exec "$JPOD" -- cat "${1:?path}"; }
 # The audio graph's client streams through the export (F7.6's common set).
 streams() {
     local t
@@ -3757,7 +3778,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -3815,7 +3836,10 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     win-tree) win_tree ;;
     client-shot) client_shot "${2:-}" ;;
     journey-put) journey_put "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
-    journey-tone) journey_tone "${2:-}" "${3:-}" "${4:-}" ;;
+    journey-tone) journey_tone "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    rec-source) rec_source "${2:-}" "${3:-}" "${4:-}" ;;
+    journey-rec) journey_rec "${2:-}" "${3:-}" "${4:-}" ;;
+    journey-file) journey_file "${2:-}" ;;
     journey-tone-status) journey_tone_status "${2:-}" "${3:-}" ;;
     streams) streams ;;
     journey-stat) journey_stat "${2:-}" "${3:-}" ;;
