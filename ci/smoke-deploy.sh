@@ -923,6 +923,31 @@ own=$(ev_save tty1-after "EV-STATE: the same stat once the X session restarted" 
 ev_pass "after the X session restarted (Xorg $xpid -> $(first_xorg)): /dev/tty1 is still desktop:tty"
 ev_end
 
+log "mwm killed with a plain kill (SIGTERM): the session ends and a new one starts"
+ev_begin S2.3.6 "mwm exit ends the session and it restarts" T2
+x_term_before=$(first_xorg)
+since_term=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sleep 1
+ev_save pids-before "EV-PIDS: desktop-init, Xorg and mwm before mwm gets a SIGTERM" \
+    sh -c "ps -o pid,user,lstart,comm -p $initpid; podman exec desktop ps -o pid,user,lstart,comm -C Xorg,mwm" >/dev/null || true
+podman exec -u desktop desktop pkill -TERM -u desktop -x mwm || fail "no mwm to send SIGTERM to"
+ev_note "sent mwm SIGTERM, a plain kill's signal, as the session user (Xorg was pid $x_term_before)"
+term_restarted() { local p; p=$(first_xorg); [ -n "$p" ] && [ "$p" != "$x_term_before" ] && x_up; }
+ok=0
+for _ in $(seq 20); do term_restarted && { ok=1; break; }; sleep 1; done
+[ "$ok" = 1 ] || fail "a SIGTERM to mwm did not end the session within 20 s (mwm asking 'Quit Mwm?' instead?)"
+ev_save pids-after "EV-PIDS: the same after the session restarted: new Xorg and mwm, the same desktop-init" \
+    sh -c "ps -o pid,user,lstart,comm -p $initpid; podman exec desktop ps -o pid,user,lstart,comm -C Xorg,mwm" >/dev/null || true
+ev_pass "a SIGTERM to mwm ended the session: Xorg $x_term_before -> $(first_xorg), a new mwm, and the display answers"
+[ -d "/proc/$initpid" ] || fail "desktop-init (pid $initpid) did not survive the session's end"
+ev_pass "desktop-init carried on (pid $initpid)"
+term_log=$(podman logs --since "$since_term" desktop 2>/dev/null | tr -d '\r' || true)
+ev_text log "EV-LOG-DESKTOP: the desktop's log from just before the SIGTERM: the session's clean end and the new session" "$term_log"
+grep -q '^desktop-init: session exited (rc=0)' <<<"$term_log" || fail "desktop-init did not log the session's end"
+if grep -q '^postmortem:' <<<"$term_log"; then fail "a postmortem ran for mwm's clean exit"; fi
+ev_pass "desktop-init logged 'session exited (rc=0)' and ran no postmortem: a clean end"
+ev_end
+
 log "session-leader check: silent through the boot and a restart of each tree"
 ev_begin S2.3.4 "Session leader sanity check never fires in a normal boot" T2
 now_log=$(desktop_log)
@@ -1396,10 +1421,11 @@ sleep 1
 ev_save pids-before "EV-PIDS: every uid-61000 process on the host before the stop" \
     ps -o pid,ppid,sess,tty,lstart,comm -u 61000 >/dev/null || true
 stop_epoch=$(date +%s)
+stop_t0=$(date +%s.%N)
 # Which processes outlive the SIGTERM, and for how long: desktop-init gives
 # each tree 5 s before it KILLs what is left.
 ( for _ in $(seq 24); do
-      echo "-- $(date +%T.%N | cut -c1-12)"
+      echo "-- $(date +%s.%N | cut -c1-14) $(date +%T.%N | cut -c1-12)"
       ps -o pid,ppid,stat,comm -u 61000 --no-headers 2>/dev/null || true
       sleep 0.5
   done ) > "$tmp/samples" 2>&1 &
@@ -1418,6 +1444,16 @@ ev_text podman-wait "EV-STATE: what 'podman wait desktop', started before the st
 ev_pass "podman wait, started before the stop, reports exit code 0"
 wait "$sampler" 2>/dev/null || true
 ev_copy "$tmp/samples" during-stop "EV-PIDS: every uid-61000 process on the host, sampled every 0.5 s from just before the stop (what outlives the SIGTERM, and for how long)"
+# The last sample any process of the two trees appears in, in seconds after
+# the stop began.
+last=$(awk -v t0="$stop_t0" '
+    /^-- / { t = $2 - t0; next }
+    $4 ~ /^(Xorg|mwm|xterm|pipewire|wireplumber|pipewire-pulse|start-audio|startx|xinit)$/ { if (t > last) last = t }
+    END { printf "%.1f", last }' "$tmp/samples")
+ev_note "the last sample showing any process of the two trees came $last s after the stop began"
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 4.0 else 1)' "$last" \
+    || fail "a process of the trees was still there $last s into the stop: it waited for desktop-init's KILL at 5 s"
+ev_pass "every process of both trees was gone within $last s: none waited for desktop-init's KILL at 5 s"
 ev_save unit "EV-STATE: systemctl show of desktop.service after the stop" \
     systemctl show -p Result,ExecMainCode,ExecMainStatus,ActiveState desktop.service >/dev/null || true
 ev_save pids-after "EV-PIDS: every uid-61000 process on the host after the stop" \
