@@ -195,13 +195,15 @@ phase_deploy() {
     ls -l --full-time /etc/cdi > /tmp/ev-cdi-before-start.txt 2>&1 || true
     [ -L /etc/systemd/system/getty@tty1.service ] || fail "getty mask did not survive as a symlink"
     systemctl daemon-reload
+    deploy_applied
     systemd-sysusers
     systemd-tmpfiles --create || true
     # the sshd_config.d drop-in (root-owned authorized_keys path) is only
     # read at sshd start; this VM's sshd predates it
     systemctl reload sshd
 
-    log pd "start desktop.service; seat-prep must evict the boot getty"
+    log pd "desktop-seat-prep on its own must evict the boot getty (S5.3.1); then desktop.service"
+    seat_prep_dirty
     systemctl start desktop.service
     for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell desktop-selinux; do
         systemctl is-active --quiet "$u.service" || fail "$u.service not active"
@@ -1451,6 +1453,547 @@ monitors_set() { # two|shipped
     desktop_up
     x_up_wait() { session_up; }
     wait_for 40 2 "the new session's mwm" x_up_wait
+}
+
+# --- the deploy tree on the host (E5) -----------------------------------------
+# Every desktop restart below waits for the same thing: X answering, then the
+# session's mwm.
+desk_back() { desktop_up; wait_for 40 2 "the session's mwm" session_up; }
+desk_down() {
+    systemctl stop desktop.service
+    wait_for 30 1 "desktop.service to stop" sh -c '! systemctl is-active --quiet desktop.service'
+}
+ev_since() { date '+%Y-%m-%d %H:%M:%S'; }
+# The full SELinux context of a path (ls -Zd's first field).
+ctx_of() { ls -Zd "$1" 2>/dev/null | awk '{print $1}'; }
+
+# S5.1.1: deploy/README.md's "Apply" block, as written, installs the tree.
+# phase_deploy runs its first two commands as they stand there; the reboot
+# that ends the block is the deploy tail's (S5.1.3).
+deploy_applied() {
+    local block want st u
+    ev_begin S5.1.1 "The documented rsync is the whole installation" T3
+    block=$(awk '/^## Apply/ {a = 1; next} a && /^```sh/ {c = 1; next} c && /^```/ {exit} c' deploy/README.md)
+    ev_text apply-block "EV-CONFIG: deploy/README.md's \"Apply\" block as this run read it; phase-deploy ran its first two commands as written, and the reboot that ends it is the deploy tail's (S5.1.3)" "$block"
+    want=$(printf '%s\n' 'rsync -a --chown=root:root deploy/host/ /' 'systemctl daemon-reload' 'reboot')
+    [ "$(grep -v '^#' <<<"$block" | sed '/^[[:space:]]*$/d')" = "$want" ] \
+        || fail "deploy/README.md's Apply block is no longer rsync, daemon-reload and reboot; phase-deploy runs the first two as this check reads them"
+    ev_pass "the README's Apply block is rsync -a --chown=root:root deploy/host/ /, systemctl daemon-reload and reboot, and phase-deploy ran the first two as written"
+    ev_save symlinks "EV-STATE: find /etc/systemd/system -maxdepth 2 -type l -ls after the two commands" \
+        find /etc/systemd/system -maxdepth 2 -type l -ls >/dev/null || true
+    [ "$(readlink /etc/systemd/system/default.target)" = /usr/lib/systemd/system/multi-user.target ] \
+        || fail "default.target is not the tree's symlink to multi-user.target: $(ls -l /etc/systemd/system/default.target 2>&1)"
+    [ "$(readlink /etc/systemd/system/getty@tty1.service)" = /dev/null ] \
+        || fail "getty@tty1.service is not the tree's symlink to /dev/null: $(ls -l /etc/systemd/system/getty@tty1.service 2>&1)"
+    for u in desktop-client-cdi.service desktop-selinux.service desktop-session.service desktop-tools-cdi.path; do
+        [ "$(readlink "/etc/systemd/system/multi-user.target.wants/$u")" = "../$u" ] \
+            || fail "multi-user.target.wants/$u is not the tree's symlink to ../$u"
+    done
+    ev_pass "the two symlinks (default.target to multi-user.target, getty@tty1.service to /dev/null) and the four multi-user.target.wants links arrived as symlinks"
+    st=$(ev_save is-enabled "EV-STATE: systemctl is-enabled of the four units the tree enables, in this order: desktop-client-cdi.service, desktop-selinux.service, desktop-session.service, desktop-tools-cdi.path" \
+        systemctl is-enabled desktop-client-cdi.service desktop-selinux.service desktop-session.service desktop-tools-cdi.path) || true
+    [ "$(sort -u <<<"$st")" = enabled ] && [ "$(wc -l <<<"$st")" = 4 ] \
+        || fail "not all four units read enabled: $(echo $st)"
+    ev_pass "systemctl is-enabled reads enabled for desktop-client-cdi, desktop-selinux, desktop-session and desktop-tools-cdi.path"
+    ev_save units "EV-STATE: systemctl list-units --all 'desktop*' right after the two commands" \
+        systemctl list-units --all --no-pager 'desktop*' >/dev/null || true
+    ev_end
+}
+
+# S5.3.1: on the stock image the boot getty owns tty1. seat-prep, started on
+# its own, must stop it and say so, and restart logind because it changed
+# something. Starting the desktop instead would prove nothing: its
+# Conflicts= stops that getty in the same transaction.
+seat_prep_dirty() {
+    local sb lp0 lp1 t0 journal
+    ev_begin S5.3.1 "Dirty seat is walked back" T3
+    ev_save status-before "EV-STATE: systemctl status getty@tty1 display-manager before desktop-seat-prep runs: the stock image's getty owns tty1, and there is no display manager" \
+        systemctl --no-pager status getty@tty1.service display-manager.service >/dev/null || true
+    sb=$EV_LAST
+    lp0=$(systemctl show -p MainPID --value systemd-logind.service)
+    t0=$(ev_since)
+    sleep 1
+    systemctl start desktop-seat-prep.service || fail "desktop-seat-prep.service failed on the stock host"
+    wait_for 10 1 "seat-prep's journal lines" \
+        sh -c "journalctl --no-pager -u desktop-seat-prep.service --since '$t0' | grep -q 'seat-prep: seat converged'"
+    journal=$(ev_save journal "EV-LOG-JOURNAL: desktop-seat-prep's journal for this run, started on its own before the desktop" \
+        journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$t0") || true
+    ev_save logind-journal "EV-LOG-JOURNAL: systemd-logind's journal since seat-prep started: its restart" \
+        journalctl --no-pager -o short-iso -u systemd-logind.service --since "$t0" >/dev/null || true
+    lp1=$(systemctl show -p MainPID --value systemd-logind.service)
+    ev_save status-after "EV-STATE: systemctl status getty@tty1 display-manager after desktop-seat-prep ran on its own" \
+        systemctl --no-pager status getty@tty1.service display-manager.service >/dev/null || true
+    ev_diff status "EV-DIFF: getty@tty1 and display-manager before and after seat-prep ran on its own" "$sb" "$EV_LAST"
+    ev_save default "EV-STATE: systemctl get-default, then systemctl is-enabled getty@tty1" \
+        sh -c 'systemctl get-default; systemctl is-enabled getty@tty1.service' >/dev/null || true
+    ! systemctl is-active --quiet getty@tty1.service || fail "getty@tty1 still runs after desktop-seat-prep ran on its own"
+    ev_pass "desktop-seat-prep, started on its own before the desktop, stopped getty@tty1"
+    grep -q 'seat-prep: stopping running getty@tty1.service' <<<"$journal" \
+        || fail "seat-prep's journal does not say 'stopping running getty@tty1.service'"
+    ev_pass "its journal names what it did: stopping running getty@tty1.service, then seat converged"
+    [ -n "$lp1" ] && [ "$lp1" != 0 ] && [ "$lp1" != "$lp0" ] \
+        || fail "systemd-logind was not restarted (MainPID $lp0 -> $lp1)"
+    ev_pass "systemd-logind was restarted, because seat state changed: MainPID $lp0 -> $lp1"
+    [ "$(systemctl get-default)" = multi-user.target ] || fail "the default target is $(systemctl get-default)"
+    ev_pass "the default target is multi-user.target"
+    ev_end
+}
+
+# After phase_deploy, with the desktop up: labels, policy, the host-shell
+# key and its limits, the login session, the tty, the container preflight.
+deploy_checks() {
+    local f c rules pats spell out ak line ip t0 rc sp got lrc sid show w lead tty dlog hits block kv s
+    local -a o
+    # S5.6.2
+    ev_begin S5.6.2 "Three directories and the published binary are container_file_t" T3
+    ev_save getenforce "EV-STATE: getenforce" getenforce >/dev/null || true
+    ev_save labels "EV-STATE: ls -Zd of the three client directories, then ls -Z of what the desktop published into the toolkit directory" \
+        sh -c 'ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin; ls -Z /var/lib/desktop-container/bin' >/dev/null || true
+    for f in /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin /var/lib/desktop-container/bin/screenshot; do
+        c=$(ctx_of "$f")
+        [ "$c" = system_u:object_r:container_file_t:s0 ] || fail "$f is labelled '${c:-?}', want exactly system_u:object_r:container_file_t:s0"
+    done
+    ev_pass "the three directories and the published screenshot binary are labelled exactly system_u:object_r:container_file_t:s0: no categories"
+    ev_end
+
+    # S5.6.3
+    ev_begin S5.6.3 "The label is policy, including the /run equivalency workaround" T3
+    rules=$(ev_save fcontext "EV-STATE: semanage fcontext -l -C, the host's local file-context rules" semanage fcontext -l -C) \
+        || fail "semanage fcontext -l -C failed"
+    pats=$(awk 'NF >= 3 && $NF ~ /:container_file_t:/ {print $1}' <<<"$rules")
+    grep -qxF '/tmp/\.X11-unix(/.*)?' <<<"$pats" || fail "no local container_file_t rule for /tmp/.X11-unix"
+    grep -qxF '/var/lib/desktop-container/bin(/.*)?' <<<"$pats" || fail "no local container_file_t rule for /var/lib/desktop-container/bin"
+    if grep -qxF '/run/desktop-audio(/.*)?' <<<"$pats"; then spell=/run
+    elif grep -qxF '/var/run/desktop-audio(/.*)?' <<<"$pats"; then spell=/var/run
+    else fail "no local container_file_t rule for /run/desktop-audio, under /run or /var/run"; fi
+    ev_pass "semanage lists a local container_file_t rule for each of the three directories; /run/desktop-audio's is stored under $spell"
+    ev_note "the policy took /run/desktop-audio's rule spelled under $spell (desktop-selinux tries /run first, then /var/run)"
+    out=$(ev_save restorecon "EV-STATE: restorecon -Rv of the three directories: no output means nothing was relabelled" \
+        restorecon -Rv /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin) || fail "restorecon -Rv failed"
+    [ -z "$out" ] || fail "restorecon -Rv relabelled something: $(echo $out)"
+    ev_pass "restorecon -Rv of the three directories changes nothing: what is on disk is what the policy says"
+    ev_save labels-after "EV-STATE: ls -Zd of the three directories after restorecon" \
+        ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin >/dev/null || true
+    ev_end
+
+    # S5.7.1
+    ev_begin S5.7.1 "Fresh key every boot, root-only, restricted trust" T3
+    ev_save files "EV-STATE: ls -l /etc/desktop-container /etc/ssh/authorized_keys.d" \
+        ls -l /etc/desktop-container /etc/ssh/authorized_keys.d >/dev/null || true
+    ak=$(ev_save authorized-keys "EV-CONFIG: /etc/ssh/authorized_keys.d/desktop-shell, the trust desktop-host-shell-setup wrote" \
+        cat /etc/ssh/authorized_keys.d/desktop-shell) || fail "no authorized_keys entry for desktop-shell"
+    [ "$(stat -c '%a %U' /etc/desktop-container/host-shell-key)" = "400 root" ] || fail "host-shell-key is $(stat -c '%a %U' /etc/desktop-container/host-shell-key), want 400 root"
+    [ "$(stat -c '%a %U' /etc/desktop-container/host-shell-key.pub)" = "644 root" ] || fail "host-shell-key.pub is $(stat -c '%a %U' /etc/desktop-container/host-shell-key.pub), want 644 root"
+    [ "$(stat -c '%a %U' /etc/ssh/authorized_keys.d/desktop-shell)" = "644 root" ] || fail "the authorized_keys entry is $(stat -c '%a %U' /etc/ssh/authorized_keys.d/desktop-shell), want 644 root"
+    ev_pass "the private key is 0400 root; the public key and the authorized_keys entry are 0644 root"
+    [ "$(wc -l <<<"$ak")" = 1 ] || fail "the authorized_keys entry is $(wc -l <<<"$ak") lines, want one"
+    line=$ak
+    case "$line" in
+        'from="127.0.0.1,::1",no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 '*) ;;
+        *) fail "the authorized_keys entry does not carry the expected restrictions and an ed25519 key: $line" ;;
+    esac
+    ev_pass "the entry is one line: from=\"127.0.0.1,::1\", no-port-forwarding, no-agent-forwarding, no-X11-forwarding, then an ssh-ed25519 key"
+    [ "${line#* }" = "$(cat /etc/desktop-container/host-shell-key.pub)" ] || fail "the entry's key is not host-shell-key.pub's"
+    ev_pass "the entry's key is the one in host-shell-key.pub"
+    ssh-keygen -lf /etc/desktop-container/host-shell-key.pub | awk '{print $2}' > /var/tmp/ev-host-shell-fp
+    ev_save fingerprint "EV-STATE: ssh-keygen -lf host-shell-key.pub: this boot's key (the deploy tail's reboot compares it)" \
+        ssh-keygen -lf /etc/desktop-container/host-shell-key.pub >/dev/null || true
+    ev_end
+
+    # S5.7.3
+    ev_begin S5.7.3 "Restrictions are enforced" T3
+    ip=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | sed -n 1p)
+    [ -n "$ip" ] || fail "the VM has no non-loopback IPv4 address to try"
+    o=(-n -i /etc/desktop-container/host-shell-key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+    t0=$(ev_since)
+    sleep 1
+    rc=0
+    ev_save loopback "EV-STATE: ssh with the host-shell key to desktop-shell@127.0.0.1, running true: the control, allowed from loopback" \
+        ssh "${o[@]}" desktop-shell@127.0.0.1 true >/dev/null || rc=$?
+    [ "$rc" = 0 ] || fail "the key does not work even from loopback (exit $rc): nothing below would mean anything"
+    rc=0
+    ev_save non-loopback "EV-STATE: the same ssh to desktop-shell@$ip, this VM's own non-loopback address: refused by from=" \
+        ssh "${o[@]}" "desktop-shell@$ip" true >/dev/null || rc=$?
+    [ "$rc" != 0 ] || fail "the key was accepted from $ip"
+    ev_pass "the key is accepted from 127.0.0.1 and refused from $ip (ssh exit $rc)"
+    rc=0
+    ev_save remote-forward "EV-STATE: ssh -o ExitOnForwardFailure=yes -R 127.0.0.1:40022:127.0.0.1:22 desktop-shell@127.0.0.1 true: a remote forward, refused when it is set up" \
+        ssh "${o[@]}" -o ExitOnForwardFailure=yes -R 127.0.0.1:40022:127.0.0.1:22 desktop-shell@127.0.0.1 true >/dev/null || rc=$?
+    [ "$rc" != 0 ] || fail "a remote port forward was set up"
+    ev_pass "a remote port forward is refused when it is set up: ssh -R with ExitOnForwardFailure=yes exits $rc"
+    # A local forward is refused only when something uses it: sshd turns
+    # down the channel then, not the listening ssh's setup.
+    ssh "${o[@]}" -o ExitOnForwardFailure=yes -L 127.0.0.1:40023:127.0.0.1:22 desktop-shell@127.0.0.1 'sleep 6' \
+        > /tmp/ev-s573-local.log 2>&1 &
+    sp=$!
+    sleep 2
+    got=$(timeout 4 bash -c 'exec 3<>/dev/tcp/127.0.0.1/40023 && timeout 2 head -c 32 <&3' 2>&1 || true)
+    lrc=0
+    wait "$sp" || lrc=$?
+    ev_copy /tmp/ev-s573-local.log local-forward "EV-STATE: the stderr of ssh -o ExitOnForwardFailure=yes -L 127.0.0.1:40023:127.0.0.1:22 desktop-shell@127.0.0.1 'sleep 6', while a connection was made through the forward"
+    ev_text local-forward-use "EV-STATE: what a connection through the local forward read back (sshd's banner would mean the forward worked)" "${got:-(nothing)}"
+    grep -q 'administratively prohibited' /tmp/ev-s573-local.log || fail "the local forward was not refused when used: $(cat /tmp/ev-s573-local.log)"
+    ! grep -q '^SSH-' <<<"$got" || fail "a connection through the local forward reached sshd: $got"
+    ev_pass "a local forward is refused when used: the channel is administratively prohibited and the connection gets nothing"
+    ev_note "ssh -L with ExitOnForwardFailure=yes exited $lrc: the refusal comes when the forward is used, after setup, so ExitOnForwardFailure does not see it"
+    ev_save sshd-journal "EV-LOG-JOURNAL: sshd's journal since the first of these connections" \
+        journalctl --no-pager -o short-iso -u sshd.service --since "$t0" >/dev/null || true
+    ev_end
+
+    # S5.8.1
+    ev_begin S5.8.1 "A real logind session on seat0/tty1" T3
+    ev_save sessions "EV-STATE: loginctl list-sessions" loginctl list-sessions --no-pager >/dev/null || true
+    sid=""
+    for s in $(loginctl list-sessions --no-legend --no-pager | awk '{print $1}'); do
+        [ "$(loginctl show-session "$s" -p Name --value)" = desktop ] && { sid=$s; break; }
+    done
+    [ -n "$sid" ] || fail "no logind session for the desktop user"
+    show=$(ev_save show-session "EV-STATE: loginctl show-session $sid, the desktop user's session" loginctl show-session "$sid") || true
+    for kv in Name=desktop Seat=seat0 TTY=tty1 Class=user; do
+        grep -qx "$kv" <<<"$show" || fail "the desktop session's $kv is not so: $(grep "^${kv%%=*}=" <<<"$show")"
+    done
+    ev_pass "logind holds a user session for desktop on seat0, on tty1 (session $sid)"
+    ev_save findmnt "EV-STATE: findmnt /run/user/61000, and the unit that mounted it" \
+        sh -c 'findmnt /run/user/61000; systemctl --no-pager status user-runtime-dir@61000.service | head -5' >/dev/null || true
+    [ "$(findmnt -n -o FSTYPE /run/user/61000)" = tmpfs ] || fail "/run/user/61000 is not a tmpfs mount"
+    systemctl is-active --quiet user-runtime-dir@61000.service || fail "user-runtime-dir@61000.service, logind's mounter, is not active"
+    ev_pass "/run/user/61000 is a tmpfs mounted by logind's user-runtime-dir@61000.service"
+    w=$(ev_save who "EV-STATE: who: utmp's login records" who) || true
+    grep -Eq '^desktop +tty1 ' <<<"$w" || fail "utmp has no tty1 entry for desktop: $w"
+    ev_pass "utmp records desktop on tty1"
+    ev_end
+
+    # S5.8.3
+    ev_begin S5.8.3 "Does not steal the controlling tty" T3
+    lead=$(systemctl show -p MainPID --value desktop-session.service)
+    [ -n "$lead" ] && [ "$lead" != 0 ] || fail "desktop-session.service has no main process"
+    ev_save lead "EV-PIDS: desktop-session-lead, desktop-session.service's main process: pid, controlling tty, user, command" \
+        ps -o pid,tty,user,args -p "$lead" >/dev/null || true
+    tty=$(ps -o tty= -p "$lead" | tr -d ' ')
+    [ "$tty" = "?" ] || fail "desktop-session-lead has a controlling tty: $tty"
+    ev_pass "the host session's lead process has no controlling tty ($lead: ?)"
+    dlog=$(podman logs desktop 2>&1 | tr -d '\r')
+    hits=$(grep 'failed to set the controlling terminal' <<<"$dlog" || true)
+    ev_text grep "EV-LOG-DESKTOP: the desktop log's lines saying 'failed to set the controlling terminal'" "${hits:-(none)}"
+    [ -z "$hits" ] || fail "the desktop's log says it failed to set the controlling terminal"
+    ev_pass "the desktop's log never says it failed to set the controlling terminal"
+    ev_save x-tty "EV-PIDS: Xorg in the container: its controlling tty" \
+        podman exec desktop ps -o pid,tty,user,args -C Xorg >/dev/null || true
+    ev_end
+
+    # S5.11.1
+    ev_begin S5.11.1 "Green on a provisioned KMS host" T3
+    block=$(grep 'preflight:' <<<"$dlog" || true)
+    ev_text preflight "EV-LOG-DESKTOP: the container preflight's lines in the desktop's log" "${block:-(none)}"
+    [ -n "$block" ] || fail "the desktop's log has no preflight: lines"
+    ! grep -q 'preflight: FAIL:' <<<"$block" || fail "the container preflight reports: $(grep 'preflight: FAIL:' <<<"$block" | head -3)"
+    ev_pass "the container preflight ran ($(wc -l <<<"$block") lines) and reported no FAIL"
+    ev_end
+}
+
+# The destructive tail, last in the core shard: oneshots and the gate with
+# the desktop stopped, the .path unit, an image pin, the labeller on probe
+# directories, and the Conflicts= backstop. Each step leaves the desktop up.
+deploy_tail() {
+    local b c d f out rc holder t0 journal xpid running img pf spec
+    # S5.5.6
+    ev_begin S5.5.6 "Specs are host state, independent of the desktop and of kubernetes" T3
+    desk_down
+    ev_save cdi-before "EV-STATE: ls -l --full-time /etc/cdi with desktop.service stopped" ls -l --full-time /etc/cdi >/dev/null || true
+    b=$EV_LAST
+    mkdir -p /run/ev-s556
+    cp /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml /run/ev-s556/
+    rm -f /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml
+    ev_save cdi-removed "EV-STATE: ls -l --full-time /etc/cdi with the display and audio specs removed" ls -l --full-time /etc/cdi >/dev/null || true
+    systemctl restart desktop-client-cdi.service || fail "desktop-client-cdi.service failed with the desktop down"
+    ev_save cdi-after "EV-STATE: ls -l --full-time /etc/cdi after systemctl restart desktop-client-cdi, the desktop still stopped" \
+        ls -l --full-time /etc/cdi >/dev/null || true
+    ev_diff cdi "EV-DIFF: /etc/cdi before the removal and after desktop-client-cdi ran again: the two specs are back, rewritten" "$b" "$EV_LAST"
+    for f in desktop-display.yaml desktop-audio.yaml; do
+        [ -s "/etc/cdi/$f" ] || fail "desktop-client-cdi did not write $f with the desktop down"
+        cmp -s "/run/ev-s556/$f" "/etc/cdi/$f" || fail "$f came back different"
+    done
+    ev_save specs-diff "EV-DIFF: the two specs before the removal against the rewritten ones (no output: the same bytes)" \
+        sh -c 'diff -u /run/ev-s556/desktop-display.yaml /etc/cdi/desktop-display.yaml; diff -u /run/ev-s556/desktop-audio.yaml /etc/cdi/desktop-audio.yaml' >/dev/null || true
+    ! systemctl is-active --quiet desktop.service || fail "the desktop started"
+    ev_pass "with desktop.service stopped, desktop-client-cdi wrote the display and audio specs again, byte for byte the same"
+    ev_end
+
+    # S5.3.3 (the desktop is still down)
+    ev_begin S5.3.3 "The gate names a culprit and fails" T3
+    # The redirection is the point: the sleep holds card0 open, as a leftover
+    # compositor would.
+    # shellcheck disable=SC2217
+    (exec sleep 600 < /dev/dri/card0) >/dev/null 2>&1 &
+    holder=$!
+    sleep 1
+    ev_save holders "EV-PIDS: fuser -v /dev/dri/card0 /dev/tty1 with the desktop stopped and a sleep (pid $holder) holding card0" \
+        sh -c 'fuser -v /dev/dri/card0 /dev/tty1 2>&1; true' >/dev/null || true
+    t0=$(ev_since)
+    sleep 1
+    rc=0
+    systemctl restart desktop-seat-prep.service || rc=$?
+    [ "$rc" != 0 ] || { kill "$holder" 2>/dev/null || true; fail "desktop-seat-prep succeeded while pid $holder held /dev/dri/card0"; }
+    wait_for 10 1 "seat-prep's ERROR line in the journal" \
+        sh -c "journalctl --no-pager -u desktop-seat-prep.service --since '$t0' | grep -q 'ERROR: devices still held'"
+    journal=$(ev_save journal "EV-LOG-JOURNAL: desktop-seat-prep's journal for the run with card0 held: its ERROR line and fuser's table" \
+        journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$t0") || true
+    grep -Eq "ERROR: devices still held after convergence:.* /dev/dri/card0\(([0-9 ]* )?$holder( [0-9 ]*)?\)" <<<"$journal" \
+        || { kill "$holder" 2>/dev/null || true; fail "seat-prep's ERROR line does not name pid $holder on /dev/dri/card0"; }
+    ev_pass "systemctl restart desktop-seat-prep failed (exit $rc), its journal naming /dev/dri/card0 held by pid $holder, with fuser's table"
+    systemctl start desktop.service || { kill "$holder" 2>/dev/null || true; fail "desktop.service did not start with seat-prep failed"; }
+    desk_back
+    ev_save status "EV-STATE: systemctl status desktop-seat-prep desktop with seat-prep failed and the desktop up" \
+        systemctl --no-pager status desktop-seat-prep.service desktop.service >/dev/null || true
+    ev_pass "desktop.service still starts with seat-prep failed: the quadlet only Wants= it, and X came up"
+    running=$(ev_save running-view "EV-STATE: fuser -v /dev/dri/card* /dev/tty1 on the host with the desktop running: what seat-prep's gate can see of the container's own Xorg" \
+        sh -c 'fuser -v /dev/dri/card* /dev/tty1 2>&1; true') || true
+    xpid=$(pgrep -x Xorg | sed -n 1p || true)
+    if [ -n "$xpid" ] && grep -qw "$xpid" <<<"$running"; then
+        ev_note "the host's fuser lists the container's Xorg (pid $xpid) on the DRM or VT devices"
+    else
+        ev_note "the host's fuser does not list the container's Xorg (pid ${xpid:-?}): podman gives the container device nodes of its own, and fuser matches an open file by its node"
+    fi
+    desk_down
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    rc=0
+    systemctl restart desktop-seat-prep.service || rc=$?
+    [ "$rc" = 0 ] || fail "with the sleep gone and the desktop down, desktop-seat-prep still fails (exit $rc)"
+    ev_pass "with the sleep gone, desktop-seat-prep succeeds again"
+    systemctl start desktop.service || fail "desktop.service did not start again"
+    desk_back
+    ev_end
+
+    # S5.5.5
+    ev_begin S5.5.5 "The .path unit advertises once per boot and parks" T3
+    spec=/etc/cdi/desktop-tools.yaml
+    wait_for 30 1 "the tools spec, after the desktop's restart" test -s "$spec"
+    ev_save state-before "EV-STATE: desktop-tools-cdi.path and .service, and the tools spec" \
+        sh -c 'systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service; ls -l --full-time /etc/cdi/desktop-tools.yaml' >/dev/null || true
+    t0=$(ev_since)
+    rm -f "$spec"
+    sleep 5
+    ev_save state-removed "EV-STATE: the same 5 s after the spec was removed" \
+        sh -c 'systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service; ls -l --full-time /etc/cdi/desktop-tools.yaml' >/dev/null || true
+    [ ! -e "$spec" ] || fail "the tools spec came back within 5 s by itself"
+    [ "$(systemctl show -p ActiveState --value desktop-tools-cdi.service)" = active ] || fail "desktop-tools-cdi.service is not active (exited)"
+    ev_pass "removed, the spec stays gone for 5 s: desktop-tools-cdi.service is still active, so the .path unit does not fire again"
+    systemctl stop desktop-tools-cdi.service
+    wait_for 15 1 "the tools spec to come back" test -s "$spec"
+    ev_save state-after "EV-STATE: the same after systemctl stop desktop-tools-cdi.service" \
+        sh -c 'systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service; ls -l --full-time /etc/cdi/desktop-tools.yaml' >/dev/null || true
+    ! systemctl is-failed --quiet desktop-tools-cdi.path || fail "desktop-tools-cdi.path failed"
+    [ "$(systemctl show -p ActiveState --value desktop-tools-cdi.path)" = active ] || fail "desktop-tools-cdi.path is not active"
+    ev_pass "stopping desktop-tools-cdi.service let the .path unit fire again: the spec is back, and the .path unit is active, not failed"
+    ev_save journal "EV-LOG-JOURNAL: desktop-tools-cdi.path and .service since the spec was removed" \
+        journalctl --no-pager -o short-iso -u desktop-tools-cdi.path -u desktop-tools-cdi.service --since "$t0" >/dev/null || true
+    ev_end
+
+    # S5.2.6
+    ev_begin S5.2.6 "Image pin drop-in" T3
+    ev_save podman-version "EV-STATE: podman --version" podman --version >/dev/null || true
+    podman tag localhost/desktop-container:latest localhost/desktop-container:ev-pinned
+    mkdir -p /etc/containers/systemd/desktop.container.d
+    printf '[Container]\nImage=localhost/desktop-container:ev-pinned\n' > /etc/containers/systemd/desktop.container.d/50-image.conf
+    ev_copy /etc/containers/systemd/desktop.container.d/50-image.conf drop-in "EV-CONFIG: the drop-in: desktop.container.d/50-image.conf, pinning localhost/desktop-container:ev-pinned (a second name for the same image)"
+    systemctl daemon-reload
+    c=$(ev_save unit "EV-CONFIG: systemctl cat desktop.service with the drop-in in place: the unit quadlet generated" \
+        systemctl cat desktop.service) || fail "systemctl cat desktop.service failed"
+    grep -q 'localhost/desktop-container:ev-pinned' <<<"$c" || fail "the generated desktop.service does not carry the drop-in's image"
+    ev_pass "the generated desktop.service carries the drop-in's image"
+    systemctl restart desktop.service
+    desk_back
+    img=$(podman inspect desktop --format '{{.ImageName}}')
+    ev_text image "EV-STATE: podman inspect desktop --format '{{.ImageName}}' after the restart" "$img"
+    [ "$img" = localhost/desktop-container:ev-pinned ] || fail "the restarted desktop runs $img, not the pinned image"
+    ev_pass "restarted, the desktop runs the pinned image: $img"
+    pf=$(ev_save preflight "EV-STATE: desktop-preflight with the drop-in in place" desktop-preflight) || true
+    grep -qF 'host-preflight: PASS: quadlet drop-ins present in /etc/containers/systemd/desktop.container.d (podman merges them)' <<<"$pf" \
+        || fail "desktop-preflight does not report the drop-in as merged"
+    grep -qF 'host-preflight: PASS: image in podman storage: localhost/desktop-container:ev-pinned' <<<"$pf" \
+        || fail "desktop-preflight does not report the pinned image"
+    ev_pass "desktop-preflight reports the drop-in as merged and the pinned image in storage"
+    rm -f /etc/containers/systemd/desktop.container.d/50-image.conf
+    rmdir /etc/containers/systemd/desktop.container.d
+    systemctl daemon-reload
+    systemctl restart desktop.service
+    desk_back
+    img=$(podman inspect desktop --format '{{.ImageName}}')
+    [ "$img" = localhost/desktop-container:latest ] || fail "with the drop-in removed the desktop runs $img"
+    podman untag localhost/desktop-container:ev-pinned localhost/desktop-container:ev-pinned >/dev/null 2>&1 || true
+    ev_pass "with the drop-in removed, the desktop runs localhost/desktop-container:latest again"
+    ev_end
+
+    # S5.6.4: no semanage on PATH (and with it, no policy rule for a probe).
+    ev_begin S5.6.4 "chcon fallback without semanage" T3
+    d=/var/tmp/ev-s564
+    mkdir -p "$d"
+    ev_save before "EV-STATE: ls -Zd of the probe directory before" ls -Zd "$d" >/dev/null || true
+    rc=0
+    out=$(ev_save run "EV-STATE: PATH=/usr/bin:/bin desktop-selinux $d (no semanage, restorecon or selinuxenabled on PATH): its output and exit status" \
+        env PATH=/usr/bin:/bin /usr/local/libexec/desktop-selinux "$d") || rc=$?
+    [ "$rc" = 0 ] || fail "desktop-selinux without semanage exited $rc"
+    grep -qF 'note: policycoreutils-python-utils absent, so the labels cannot become policy' <<<"$out" || fail "desktop-selinux did not print the policy note"
+    grep -qF "labeled container_file_t: $d" <<<"$out" || fail "desktop-selinux did not report the probe labelled"
+    [ "$(ctx_of "$d" | cut -d: -f3)" = container_file_t ] || fail "the probe directory is $(ctx_of "$d")"
+    ev_save after "EV-STATE: ls -Zd of the probe directory after" ls -Zd "$d" >/dev/null || true
+    ! grep -qF "$d" <<<"$(semanage fcontext -l -C)" || fail "a policy rule for the probe directory appeared"
+    ev_pass "without semanage on PATH, desktop-selinux printed the policy note, labelled the probe directory container_file_t with chcon and exited 0, and added no policy rule"
+    ev_end
+
+    # S5.6.5: a filesystem that refuses relabeling (a context= mount).
+    ev_begin S5.6.5 "Verification fails the unit when a label does not land" T3
+    d=/var/tmp/ev-s565
+    mkdir -p "$d"
+    mount -t tmpfs -o size=1m,context=system_u:object_r:tmp_t:s0 tmpfs "$d"
+    mkdir -p "$d/dir"
+    ev_save mount "EV-STATE: findmnt of the probe filesystem: a tmpfs mounted with context=, whose files cannot be relabelled" findmnt "$d" >/dev/null || true
+    rc=0
+    ev_save chcon "EV-STATE: chcon -t container_file_t on it by hand: refused" chcon -t container_file_t "$d/dir" >/dev/null || rc=$?
+    [ "$rc" != 0 ] || { umount "$d"; fail "chcon relabelled a file on the context= mount; the probe proves nothing"; }
+    rc=0
+    out=$(ev_save run "EV-STATE: PATH=/usr/bin:/bin desktop-selinux $d/dir: its output and exit status" \
+        env PATH=/usr/bin:/bin /usr/local/libexec/desktop-selinux "$d/dir") || rc=$?
+    ev_save after "EV-STATE: ls -Zd of the probe directory after" ls -Zd "$d/dir" >/dev/null || true
+    umount "$d"
+    rmdir "$d"
+    [ "$rc" = 1 ] || fail "desktop-selinux exited $rc on a directory it could not label, want 1"
+    grep -qF 'FAILED to label for confined containers:' <<<"$out" || fail "desktop-selinux did not say FAILED to label"
+    grep -qF "$d/dir: system_u:object_r:tmp_t:s0" <<<"$out" || fail "desktop-selinux did not name the directory and its label"
+    ev_pass "on a directory it could not relabel, desktop-selinux said FAILED to label, named it with its tmp_t label, and exited 1"
+    ev_end
+
+    # S5.6.6
+    ev_begin S5.6.6 "Missing directories are reported, not invented" T3
+    d=/var/tmp/ev-s566
+    mkdir -p "$d"
+    rc=0
+    out=$(ev_save two-bogus "EV-STATE: desktop-selinux /nonexistent/ev-a /nonexistent/ev-b (PATH=/usr/bin:/bin): its output and exit status" \
+        env PATH=/usr/bin:/bin /usr/local/libexec/desktop-selinux /nonexistent/ev-a /nonexistent/ev-b) || rc=$?
+    [ "$rc" = 1 ] || fail "with both paths missing desktop-selinux exited $rc, want 1"
+    grep -qF 'WARNING: not created by tmpfiles.d, skipping: /nonexistent/ev-a /nonexistent/ev-b' <<<"$out" || fail "the warning does not name both paths"
+    grep -qF 'none of the client directories exist yet' <<<"$out" || fail "desktop-selinux did not say none exist"
+    ev_pass "two missing paths: both named in the warning, then 'none of the client directories exist yet', exit 1"
+    rc=0
+    out=$(ev_save one-bogus "EV-STATE: desktop-selinux /nonexistent/ev-a $d (PATH=/usr/bin:/bin): its output and exit status" \
+        env PATH=/usr/bin:/bin /usr/local/libexec/desktop-selinux /nonexistent/ev-a "$d") || rc=$?
+    [ "$rc" = 0 ] || fail "with one path missing desktop-selinux exited $rc, want 0"
+    grep -qF 'WARNING: not created by tmpfiles.d, skipping: /nonexistent/ev-a' <<<"$out" || fail "the warning does not name the missing path"
+    grep -qF "labeled container_file_t: $d" <<<"$out" || fail "the real directory was not reported labelled"
+    [ ! -e /nonexistent/ev-a ] || fail "desktop-selinux created the missing directory"
+    ev_pass "one missing path and one real: the missing one warned about and not created, the real one labelled, exit 0"
+    ev_end
+
+    # S5.2.5, then put everything back for the reboot.
+    ev_begin S5.2.5 "Conflicts= backstop" T3
+    c=$(ev_save conflicts "EV-CONFIG: systemctl show -p Conflicts desktop.service: the generated unit's conflicts" \
+        systemctl show -p Conflicts desktop.service) || true
+    grep -qw 'getty@tty1.service' <<<"$c" && grep -qw 'display-manager.service' <<<"$c" \
+        || fail "desktop.service does not conflict with both getty@tty1 and display-manager: $c"
+    systemctl is-active --quiet desktop.service || fail "the desktop is not running before the backstop test"
+    t0=$(ev_since)
+    systemctl unmask getty@tty1.service
+    systemctl start getty@tty1.service
+    wait_for 30 1 "desktop.service to stop once getty@tty1 started" sh -c '! systemctl is-active --quiet desktop.service'
+    ev_save status-getty "EV-STATE: systemctl status getty@tty1 desktop with getty@tty1 started on purpose: the desktop stopped" \
+        systemctl --no-pager status getty@tty1.service desktop.service >/dev/null || true
+    ev_pass "starting getty@tty1 stopped desktop.service"
+    systemctl stop getty@tty1.service
+    ln -sfn /dev/null /etc/systemd/system/getty@tty1.service
+    systemctl daemon-reload
+    [ "$(systemctl is-enabled getty@tty1.service 2>/dev/null || true)" = masked ] || fail "getty@tty1 is not masked again"
+    systemctl start desktop.service
+    desk_back
+    printf '[Unit]\nDescription=ev: a stand-in display manager (S5.2.5)\n[Service]\nExecStart=/usr/bin/sleep infinity\n' \
+        > /etc/systemd/system/display-manager.service
+    systemctl daemon-reload
+    systemctl start display-manager.service
+    wait_for 30 1 "desktop.service to stop once a display manager started" sh -c '! systemctl is-active --quiet desktop.service'
+    ev_save status-dm "EV-STATE: systemctl status display-manager desktop with a stand-in display manager started: the desktop stopped" \
+        systemctl --no-pager status display-manager.service desktop.service >/dev/null || true
+    ev_pass "starting a display-manager.service stopped desktop.service"
+    systemctl stop display-manager.service
+    rm -f /etc/systemd/system/display-manager.service
+    systemctl daemon-reload
+    systemctl start desktop.service
+    desk_back
+    ev_save journal "EV-LOG-JOURNAL: desktop, getty@tty1 and display-manager through the test" \
+        journalctl --no-pager -o short-iso -u desktop.service -u getty@tty1.service -u display-manager.service --since "$t0" >/dev/null || true
+    ev_pass "restored: getty@tty1 masked again, no display manager, the desktop running"
+    ev_end
+
+    cat /proc/sys/kernel/random/boot_id > /var/tmp/ev-boot-id-before
+}
+
+# After the host rebooted the VM with nobody touching it.
+deploy_reboot() {
+    local old now u boot_epoch mt j fp0 fp1 st n
+    ev_begin S5.1.3 "Reboot is sufficient, and the operator gets a desktop with no one touching the host" T3
+    old=$(cat /var/tmp/ev-boot-id-before 2>/dev/null || true)
+    now=$(cat /proc/sys/kernel/random/boot_id)
+    [ -n "$old" ] && [ "$now" != "$old" ] || fail "this is not a new boot (boot id $now)"
+    ev_note "boot id before the reboot $old, now $now"
+    wait_for 60 3 "desktop.service active after the reboot" systemctl is-active --quiet desktop.service
+    desk_back
+    for u in desktop-seat-prep desktop-cdi-refresh desktop-client-cdi desktop-host-shell desktop-selinux; do
+        st="$(systemctl show -p ActiveState --value "$u.service")/$(systemctl show -p Result --value "$u.service")"
+        [ "$st" = active/success ] || fail "$u.service is $st after the reboot"
+    done
+    ev_pass "after the reboot desktop.service is active, X answers, mwm runs, and the five boot oneshots are active and succeeded"
+    wait_for 60 2 "the tools spec, advertised this boot" test -s /etc/cdi/desktop-tools.yaml
+    boot_epoch=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))
+    mt=$(stat -c %Y /etc/cdi/desktop-tools.yaml)
+    [ "$mt" -ge "$boot_epoch" ] || fail "the tools spec was not rewritten this boot (mtime $mt, boot $boot_epoch)"
+    [ "$(systemctl show -p Result --value desktop-tools-cdi.service)" = success ] || fail "desktop-tools-cdi.service did not succeed this boot"
+    ev_pass "desktop-tools-cdi rewrote the tools spec this boot ($(date -u -d "@$mt" +%H:%M:%S) UTC, boot at $(date -u -d "@$boot_epoch" +%H:%M:%S))"
+    ev_save units "EV-STATE: systemctl status of the tree's units after the reboot" \
+        systemctl --no-pager status desktop.service desktop-session.service desktop-seat-prep.service desktop-cdi-refresh.service \
+            desktop-client-cdi.service desktop-host-shell.service desktop-selinux.service desktop-tools-cdi.path desktop-tools-cdi.service >/dev/null || true
+    ev_save failed "EV-STATE: systemctl --failed after the reboot" systemctl --failed --no-pager >/dev/null || true
+    ! grep -q 'desktop' <<<"$(systemctl --failed --no-legend --no-pager)" || fail "a desktop unit failed this boot"
+    ev_pass "no desktop unit failed this boot"
+    ev_save labels "EV-STATE: ls -Zd of the three client directories after the reboot" \
+        ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin >/dev/null || true
+    for u in /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin; do
+        [ "$(ctx_of "$u")" = system_u:object_r:container_file_t:s0 ] || fail "$u is $(ctx_of "$u") after the reboot"
+    done
+    ev_pass "the three client directories are container_file_t again after the reboot (/run/desktop-audio is new this boot)"
+    ev_save cdi "EV-STATE: ls -l --full-time /etc/cdi after the reboot" ls -l --full-time /etc/cdi >/dev/null || true
+    j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -b -u desktop-seat-prep: this boot's seat-prep, on a converged seat" \
+        journalctl -b --no-pager -o short-iso -u desktop-seat-prep.service) || true
+    ! grep -q 'seat-prep: ' <<<"$j" || fail "seat-prep changed something this boot: $(grep 'seat-prep: ' <<<"$j" | head -3)"
+    ev_pass "seat-prep logged nothing this boot: on a converged seat it changes nothing"
+    ev_save sessions "EV-STATE: loginctl list-sessions after the reboot" loginctl list-sessions --no-pager >/dev/null || true
+    ev_end
+
+    # S5.3.1's steady half: no change, so no logind restart either.
+    ev_begin S5.3.1 "Dirty seat is walked back" T3
+    ev_save logind-journal "EV-LOG-JOURNAL: journalctl -b -u systemd-logind: logind this boot, started once" \
+        journalctl -b --no-pager -o short-iso -u systemd-logind.service >/dev/null || true
+    n=$(journalctl -b --no-pager -o cat -u systemd-logind.service | grep -c '^Started ' || true)
+    [ "$n" = 1 ] || fail "systemd-logind started $n times this boot, want once"
+    ev_pass "on the steady-state boot seat-prep logged nothing, and logind started once, at boot: no restart"
+    ev_end
+
+    # S5.5.5's reboot half
+    ev_begin S5.5.5 "The .path unit advertises once per boot and parks" T3
+    ev_pass "after a reboot with the toolkit directory populated, the .path unit advertised again: the tools spec was rewritten this boot (S5.1.3)"
+    ev_save state "EV-STATE: desktop-tools-cdi.path and .service after the reboot" \
+        systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service >/dev/null || true
+    ev_end
+
+    # S5.7.1's every-boot half
+    ev_begin S5.7.1 "Fresh key every boot, root-only, restricted trust" T3
+    fp0=$(cat /var/tmp/ev-host-shell-fp 2>/dev/null || true)
+    fp1=$(ssh-keygen -lf /etc/desktop-container/host-shell-key.pub | awk '{print $2}')
+    ev_text fingerprints "EV-STATE: the host-shell key's fingerprint before and after the reboot" "before: ${fp0:-?}
+after:  $fp1"
+    [ -n "$fp0" ] && [ "$fp1" != "$fp0" ] || fail "the host-shell key is the same after the reboot"
+    [ "$(cut -d' ' -f2- /etc/ssh/authorized_keys.d/desktop-shell)" = "$(cat /etc/desktop-container/host-shell-key.pub)" ] \
+        || fail "after the reboot the authorized_keys entry does not carry the new key"
+    ev_pass "the reboot made a new key ($fp0 -> $fp1), and the authorized_keys entry carries it"
+    ev_end
 }
 
 phase2() {
@@ -4147,7 +4690,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-checks|deploy-tail|deploy-reboot|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -4181,6 +4724,9 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     layout-restore) layout_restore ;;
     autodetect) autodetect "${2:-}" "${3:-}" ;;
     monitors-set) monitors_set "${2:-}" ;;
+    deploy-checks) deploy_checks ;;
+    deploy-tail) deploy_tail ;;
+    deploy-reboot) deploy_reboot ;;
     deploy-proof) deploy_proof ;;
     hotplug-probe) hotplug_probe ;;
     snd-probe) snd_probe ;;

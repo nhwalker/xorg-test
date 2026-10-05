@@ -847,6 +847,11 @@ in_shard core && pd_ev=$GUEST_EV
 guest_ev "$pd_ev" phase-deploy \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
          2>&1 | tee "$ART/guest-deploy-fail.log" || true; fail "guest phase-deploy failed"; }
+if in_shard core; then
+    # E5 on the deployed host: labels and policy, the host-shell key and its
+    # limits, the login session and its tty, the container preflight.
+    guest_ev "$GUEST_EV" deploy-checks || fail "the deployed host is not what the deploy tree should make it (E5)"
+fi
 
 log "fixed monitor layout: declared across a connector QEMU never connects, then unplugged and restored"
 # vm-guest.sh's layout steps, one call each, so this side can look at the
@@ -1930,6 +1935,31 @@ else
     ev_pass "the capture source left with the card: $new_src is gone from pactl list short sources"
     ev_end
 fi
+
+
+# E5's destructive tail, then the README's own last step: a reboot, with
+# nobody touching the VM. Last in this shard because it stops and restarts
+# the desktop and its units.
+log "the deploy tree on the host: oneshots with the desktop down, the gate, the .path unit, an image pin, the labeller, the Conflicts= backstop (E5)"
+guest_ev "$GUEST_EV" deploy-tail || fail "the deploy tree's tail stories failed (E5)"
+log "reboot the VM, with nobody touching it afterwards (S5.1.3)"
+boot0=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)
+[ -n "$boot0" ] || fail "could not read the VM's boot id before the reboot"
+vm_ssh 'sudo systemctl reboot' >/dev/null 2>&1 || true
+sleep 15
+boot1=""
+for _ in $(seq 60); do
+    boot1=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)
+    [ -n "$boot1" ] && [ "$boot1" != "$boot0" ] && break
+    sleep 5
+done
+[ -n "$boot1" ] && [ "$boot1" != "$boot0" ] || fail "the VM did not come back from its reboot (boot id ${boot1:-none})"
+guest_ev "$GUEST_EV" deploy-reboot || fail "after the reboot the desktop and its units did not come back as they should (S5.1.3)"
+EV_SIDE=h-
+ev_begin S5.1.3 "Reboot is sufficient, and the operator gets a desktop with no one touching the host" T3
+ev_shot after-reboot "EV-SHOT: the display after the reboot, nobody having touched the VM: the desktop's session, its xterm in mwm's frame"
+ev_end
+EV_SIDE=
 
 fi # ---- end shard: core ----------------------------------------------------------
 
