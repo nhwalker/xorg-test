@@ -1937,6 +1937,173 @@ else
 fi
 
 
+# The session's tail: the device groups as the session sees them, mwm's own
+# exit, a desktop with no host session unit, a device tagged for another
+# seat, and the host's own Pulse and ALSA clients. Before the deploy tail:
+# each step restarts the desktop or the session and leaves it up.
+log "the session's tail: device groups, mwm's exit, no host session unit, a foreign seat tag, the host's audio clients"
+guest_ev "$GUEST_EV" session-groups || fail "S3.2.2: the container's device groups do not match the host's nodes"
+
+# S3.5.4: the deploy screendump's measure (assert_nonblank's, kept for
+# S3.5.1), against twice the render test's threshold.
+ev_begin S3.5.4 "Palette keeps the render test's margin" T3
+dd_line=$(awk -F'\t' '$1 == "desktop-deploy" {print; exit}' "$ART/.nonblank.tsv" 2>/dev/null || true)
+[ -n "$dd_line" ] || fail "S3.5.4: the deploy screendump was not measured"
+dd_file=$(cut -f2 <<<"$dd_line")
+dd_sd=$(cut -f3 <<<"$dd_line")
+[ -s "$dd_file" ] && ev_copy "$dd_file" desktop-deploy "EV-SHOT: the deploy screendump, the desktop as phase-deploy leaves it (mwm's root and the deploy-proof xterm): grayscale standard deviation $dd_sd"
+ev_text measurement "the measurement: convert -colorspace Gray -format %[fx:standard_deviation] of the deploy screendump" \
+    "desktop-deploy grayscale stddev $dd_sd; the render test's threshold 0.02, this story's floor twice it, 0.04"
+awk -v s="$dd_sd" 'BEGIN { exit !(s >= 0.04) }' \
+    || fail "S3.5.4: the deploy screendump's grayscale stddev is $dd_sd, under twice the render test's 0.02"
+ev_pass "the deploy screendump's grayscale stddev is $dd_sd, at least twice the render test's 0.02"
+ev_end
+
+# S2.3.6: mwm's exit, recorded from before the SIGTERM until the new session.
+EV_SIDE=h-
+ev_begin S2.3.6 "mwm exit ends the session and it restarts" T3
+ev_video_start mwm-exit
+ev_end
+EV_SIDE=
+guest_ev "$GUEST_EV" mwm-exit || fail "S2.3.6: mwm's exit did not end the session, or no new one started"
+EV_SIDE=h-
+ev_begin S2.3.6 "mwm exit ends the session and it restarts" T3
+ev_video_stop "EV-VIDEO: the display from before mwm's SIGTERM until the new session's desktop is back (index.txt and the guest's notes give the times)"
+ev_shot desktop-back "EV-SHOT: the new session's desktop"
+ev_end
+EV_SIDE=
+
+# S3.8.6: the USB keyboard tagged for seat1 and back; then it types again.
+guest_ev "$GUEST_EV" seat-tags attach || fail "S3.8.6: the seat1 tag did not take, or the preflight did not warn about it"
+guest_ev "$GUEST_EV" seat-tags fix || fail "S3.8.6: seat-prep did not undo the seat1 tag, or the preflight did not pass after it"
+EV_SIDE=h-
+ev_begin S3.8.6 "Foreign seat tags are detected and undone" T3
+res=$(vm_ssh 'sudo podman exec -u desktop -e DISPLAY=:0 desktop \
+    sh -c "xdpyinfo | awk \"/dimensions:/{print \\\$2; exit}\""')
+[ -n "$res" ] || fail "S3.8.6: could not read the display's size"
+kid=""
+for _ in $(seq 15); do
+    kid=$(gq xi-id QEMU QEMU USB Keyboard 2>/dev/null | head -1 || true)
+    [ -n "$kid" ] && break
+    sleep 1
+done
+ev_save xinput "EV-STATE: xinput list, the desktop back after seat-prep" gq desk xinput list >/dev/null || true
+[ -n "$kid" ] || fail "S3.8.6: X does not list the USB keyboard after seat-prep"
+gq xi-test-start "$kid" >/dev/null || fail "S3.8.6: could not start xinput test on id $kid"
+sleep 1
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
+sleep 2
+qlog=$(ev_name qmp-input txt)
+QMP_TRANSCRIPT="$EV_DIR/$qlog" QMP_KEY_DEVICE=vga0 QMP_KEY_HEAD=0 python3 qmp-type.py "$QMP" "$res" 550 395 seatok
+ev_attach "$qlog" "EV-QEMU: every QMP command sent: the pointer to the sink xterm's centre (550,395 on $res) and a click, then s e a t o k Return, every key event naming device vga0, head 0: the USB keyboard, kvmkbd"
+sleep 2
+ev_shot typed "EV-SHOT: the sink xterm (title inputtest) right after seatok was typed through the USB keyboard, back on seat0"
+xt=$(ev_save xinput-test "EV-STATE: xinput test on the USB keyboard's own X device (id $kid) while the keys were sent: a key press and a key release per key" \
+    gq xi-test-read) || true
+gq xi-test-stop >/dev/null 2>&1 || true
+ev_save sink-file "EV-LOG-CLIENT: what the sink xterm's shell read (/tmp/inputproof in the desktop container); must be exactly 'seatok'" \
+    vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null; echo' >/dev/null || true
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check seatok' \
+    || fail "S3.8.6: the sink xterm did not read 'seatok' typed through the USB keyboard after seat-prep"
+presses=$(grep -c '^key press' <<<"$xt" || true)
+[ "${presses:-0}" -ge 7 ] \
+    || fail "S3.8.6: xinput test on the USB keyboard (id $kid) saw ${presses:-0} key presses, want at least 7 (s e a t o k and Return)"
+ev_pass "back on seat0 the USB keyboard types again: the sink xterm read 'seatok', and xinput test on the keyboard's own device saw $presses key presses"
+ev_end
+EV_SIDE=
+
+# S2.2.2 and S5.8.4: the desktop with no host session unit, shot and heard.
+guest_ev "$GUEST_EV" standalone on || fail "S2.2.2/S5.8.4: the desktop did not run as specified without its host session unit"
+EV_SIDE=h-
+ev_begin S2.2.2 "Standalone fallback fabricates the runtime dir" T3
+ev_shot standalone "EV-SHOT: the desktop with no desktop-session unit: the session's xterm in mwm's frame"
+hz=$(freq_for pulse)
+ev_audio_start standalone "$hz"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio pulse' \
+    || { audio_capture_stop; fail "S2.2.2: a pulse client in the session could not play without the host session unit"; }
+ev_audio_stop "EV-AUDIO: the machine's output while a pulse client in the session played $hz Hz, the runtime dir desktop-init's own - listen for one beep" 1 0.05 "$hz" \
+    || fail "S2.2.2: the tone was not heard without the host session unit"
+ev_pass "a pulse client in the session played $hz Hz, heard at the machine's output"
+ev_end
+ev_begin S5.8.4 "The desktop runs with the unit disabled" T3
+ev_shot running "EV-SHOT: the desktop running without its host session unit"
+ev_end
+EV_SIDE=
+guest_ev "$GUEST_EV" standalone off || fail "S2.2.2: desktop-session did not come back as the tree ships it"
+
+# S4.2.1: an unconfigured host Pulse client reaches the export, and nothing
+# autospawns (the guest half asks libpulse to autospawn, with a control).
+guest_ev "$GUEST_EV" host-audio autospawn \
+    || fail "S4.2.1: the Pulse client drop-in's autospawn = no did not hold, or the control could not autospawn"
+EV_SIDE=h-
+ev_begin S4.2.1 "Host Pulse clients are routed to the container" T3
+ev_audio_start rocky-paplay 440
+ev_save probe "EV-STATE: as rocky with a clean environment on the VM host: the Pulse client drop-in, env | grep PULSE, paplay of a 440 Hz tone, pgrep -a pulseaudio, and the stub /usr/bin/pulseaudio's record of starts" \
+    vm_ssh 'sudo repo/ci/vm/vm-guest.sh host-audio pulse-play' >/dev/null || true
+probe=$(ev_payload "$EV_DIR/$EV_LAST")
+ev_audio_stop "EV-AUDIO: the machine's output while rocky's paplay, with no PULSE_SERVER, played 440 Hz - listen for one beep" 2 0.05 440 \
+    || fail "S4.2.1: rocky's 440 Hz tone was not heard"
+grep -q '^paplay exited 0$' <<<"$probe" || fail "S4.2.1: rocky's paplay did not exit 0: $(grep '^paplay exited' <<<"$probe")"
+awk '/^== env \| grep PULSE/ {f = 1; next} /^==/ {f = 0} f' <<<"$probe" | grep -qx '(none)' \
+    || fail "S4.2.1: rocky's environment carries PULSE_ variables"
+ev_pass "rocky's paplay, with no PULSE_ variable set, exited 0 and its 440 Hz tone was heard: the drop-in's default-server took it to the export"
+starts=$(awk '/^== the stub.s record of starts/ {f = 1; next} /^\(end of record\)$/ {f = 0} f' <<<"$probe")
+[ -z "$starts" ] || fail "S4.2.1: a pulseaudio daemon was started: $starts"
+awk '/^== pgrep -a pulseaudio/ {f = 1; next} /^==/ {f = 0} f' <<<"$probe" | grep -qx '(none)' \
+    || fail "S4.2.1: a pulseaudio process runs on the host"
+ev_pass "nothing was spawned: the stub /usr/bin/pulseaudio recorded no start, and no pulseaudio runs"
+ev_end
+EV_SIDE=
+
+# S4.2.2: ALSA's default through the deploy tree's drop-in alone.
+guest_ev "$GUEST_EV" host-audio alsa-setup \
+    || fail "S4.2.2: the ALSA probe's packages, or the drop-in's place in /etc/alsa/conf.d, are not as needed"
+EV_SIDE=h-
+ev_begin S4.2.2 "Host ALSA clients are routed through the pulse plugin" T3
+ev_audio_start rocky-aplay 1320
+ev_save probe "EV-STATE: as rocky with a clean environment, libpulse given no default server of its own (an empty client config): aplay of a 1320 Hz tone through ALSA's default, amixer info and amixer" \
+    vm_ssh 'sudo repo/ci/vm/vm-guest.sh host-audio alsa-play' >/dev/null || true
+probe=$(ev_payload "$EV_DIR/$EV_LAST")
+ev_audio_stop "EV-AUDIO: the machine's output while rocky's aplay played 1320 Hz through ALSA's default - listen for one beep" 2 0.05 1320 \
+    || fail "S4.2.2: rocky's 1320 Hz tone through ALSA was not heard"
+grep -q '^aplay exited 0$' <<<"$probe" || fail "S4.2.2: rocky's aplay did not exit 0: $(grep -m1 'error' <<<"$probe")"
+ev_pass "rocky's aplay through ALSA's default, libpulse given no server of its own, exited 0 and its 1320 Hz tone was heard: the drop-in took it to the export"
+grep -q "^Card default 'pulse'/'PulseAudio'" <<<"$probe" || fail "S4.2.2: amixer info does not name the pulse card"
+ev_pass "amixer lists the pulse control: $(grep -m1 '^Card default' <<<"$probe")"
+ev_end
+EV_SIDE=
+guest_ev "$GUEST_EV" host-audio alsa-control || fail "S4.2.2: with the drop-in hidden, aplay still played"
+
+# S4.2.3: a host-local /etc/asound.conf routing default to null wins.
+guest_ev "$GUEST_EV" host-audio null-on || fail "S4.2.3: could not write /etc/asound.conf"
+EV_SIDE=h-
+ev_begin S4.2.3 "A host-local asound.conf still wins" T3
+ev_audio_start null-default 1320
+ev_save probe "EV-STATE: as rocky, the same aplay -D default of a 1320 Hz tone, /etc/asound.conf routing default to null" \
+    vm_ssh 'sudo repo/ci/vm/vm-guest.sh host-audio null-play' >/dev/null || true
+probe=$(ev_payload "$EV_DIR/$EV_LAST")
+null_wav=$EV_WAV
+if ev_audio_stop "EV-AUDIO: the machine's output while rocky's aplay -D default played 1320 Hz into /etc/asound.conf's null - silence expected, so check-audio's failing verdict is the pass" 1 0.05 1320; then
+    fail "S4.2.3: the 1320 Hz tone was heard with /etc/asound.conf routing default to null"
+fi
+[ -e "$EV_DIR/$null_wav" ] || fail "S4.2.3: no capture was written, so its silence proves nothing"
+grep -q '^aplay exited 0$' <<<"$probe" || fail "S4.2.3: aplay -D default did not exit 0 into null: $(grep -m1 'error' <<<"$probe")"
+ev_pass "aplay -D default exited 0 and nothing was heard: the host's /etc/asound.conf won over the deploy tree's drop-in"
+ev_end
+EV_SIDE=
+guest_ev "$GUEST_EV" host-audio null-off || fail "S4.2.3: could not remove /etc/asound.conf"
+EV_SIDE=h-
+ev_begin S4.2.3 "A host-local asound.conf still wins" T3
+ev_audio_start removed 1320
+ev_save probe-removed "EV-STATE: the same aplay -D default, /etc/asound.conf removed" \
+    vm_ssh 'sudo repo/ci/vm/vm-guest.sh host-audio null-play' >/dev/null || true
+ev_audio_stop "EV-AUDIO: the same aplay with /etc/asound.conf removed - listen for one beep: the drop-in routes again" 2 0.05 1320 \
+    || fail "S4.2.3: with /etc/asound.conf removed, the tone was not heard"
+ev_pass "with /etc/asound.conf removed, the same aplay is heard again: the deploy tree's drop-in routes default to the export"
+ev_end
+EV_SIDE=
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh host-audio cleanup' || true
+
 # E5's destructive tail, then the README's own last step: a reboot, with
 # nobody touching the VM. Last in this shard because it stops and restarts
 # the desktop and its units.

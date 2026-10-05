@@ -121,10 +121,12 @@ Seat handover — the host must stop claiming the devices the container needs:
 2. `desktop-seat-prep.service` makes that baseline true again at every boot,
    whatever the host has drifted to: it deletes
    `/etc/udev/rules.d/72-seat-*.rules` (created by `loginctl attach`) and
-   re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems so all
-   devices fall back to default `seat0` tagging (custom multi-seat splits
-   would otherwise hide devices from the container's libinput, which reads
-   the host udev database's seat tags); disables and
+   re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems, then
+   for every device still tagged for a seat (a keyboard's LEDs copy their
+   parent's tag), so all devices fall back to default `seat0` tagging
+   (custom multi-seat splits would otherwise hide devices from the
+   container's libinput, which reads the host udev database's seat tags);
+   disables and
    stops whatever `display-manager.service` resolves to; re-asserts the
    default target and the getty mask; then verifies nothing still holds the
    VT or DRM master before `desktop.service` starts.
@@ -502,7 +504,7 @@ two extra sockets in `/run/desktop-audio` (bind-mounted from the host):
 | ALSA | (via pulse plugin) | an alsa conf drop-in routing `pcm.!default` to the pulse socket |
 
 - **Host**: the deploy tree ships `/etc/pulse/client.conf.d/…` and
-  `/etc/alsa/conf.d/60-desktop-container.conf`, so unmodified pulse and ALSA
+  `/etc/alsa/conf.d/99-zz-desktop-container.conf`, so unmodified pulse and ALSA
   apps just work (host needs `alsa-plugins-pulseaudio`, standard on EL).
 - **Inside this container**: apps use the default per-user sockets;
   ALSA apps go through `pipewire-alsa`.
@@ -514,8 +516,10 @@ podman run -v /run/desktop-audio:/run/desktop-audio \
 ```
 
 For ALSA-only apps in other containers, add the same two-stanza config the
-deploy tree drops at `/etc/alsa/conf.d/60-desktop-container.conf` (requires
-`alsa-plugins-pulseaudio` in that image).
+deploy tree drops at `/etc/alsa/conf.d/99-zz-desktop-container.conf` (requires
+`alsa-plugins-pulseaudio` in that image). Put it in `/etc/asound.conf`, or in
+an `/etc/alsa/conf.d` file that sorts after the package's own
+`99-pulseaudio-default.conf`: the last `pcm.!default` loaded wins.
 
 ### Audio has its own lifecycle
 
