@@ -669,6 +669,13 @@ class Ctx:
     def save_state(self, moment, text, what):
         return self.st.write(moment, text, what)
 
+    def save_cmd(self, moment, cmd, what, label=None):
+        """evidence.sh's ev_save: the command, then what it printed. Never an
+        empty file, so 'printed nothing' reads differently from 'never ran'."""
+        out = self.g.sh(f"{cmd}; true", label=label or cmd)
+        self.st.write(moment, f"$ {cmd}\n" + (out if out.strip() else "(no output)\n"), what)
+        return out
+
     def diff(self, moment, before, after, what):
         # Rule 1 (Requirements.md, evidence standard): before and after are
         # kept as files beside the diff, never the diff alone.
@@ -983,9 +990,9 @@ class Ctx:
         with contextlib.suppress(Exception):
             st.write("failure-ps", self.g.ps(), "every process when the story failed")
         with contextlib.suppress(Exception):
-            st.write("failure-desktop-log",
-                     self.g.sh("podman logs --tail 60 desktop 2>&1; true", label="podman logs desktop"),
-                     "the desktop container's log (EV-LOG-DESKTOP), last 60 lines")
+            self.save_cmd("failure-desktop-log", "podman logs --tail 60 desktop 2>&1",
+                          "the desktop container's log (EV-LOG-DESKTOP), last 60 lines",
+                          label="podman logs desktop")
 
 
 # US layout, which is what the session gets: nothing configures another.
@@ -1483,24 +1490,22 @@ def s11_2_1(ctx, st):
             ctx.click(info.ax + info.w // 2, info.ay + info.h // 2, button="middle")
             ctx.chord("ret")
 
-        for src in apps:
-            for dst in apps:
-                if src == dst:
-                    continue
-                tag = f"{src.replace(' ', '')}-to-{dst.replace(' ', '')}"
-                decoy = f"decoy{s}{len(st.checks)}"
-                ctx.click(*word_point(src), count=2)
-                ctx.shot(f"{s}-{tag}-selected", f"{sel}: '{words[src]}' selected by a double-click "
-                         f"in {owners[src]} xterm")
-                # The control: overwrite the cut buffer xterm also writes, so a
-                # word that arrives can only have come through the selection.
-                ctx.g.xprobe(f"xprop -root -f CUT_BUFFER0 8s -set CUT_BUFFER0 {decoy}",
-                             label=f"observer: CUT_BUFFER0 := {decoy} (control)")
-                paste_into(dst)
-                got = wait_until(lambda: words[src] in lines(dst), 5, 0.4)
-                ctx.shot(f"{s}-{tag}-pasted", f"{sel}: '{words[src]}' pasted into {owners[dst]} xterm")
-                st.check(got, f"{sel}: text selected in {owners[src]} xterm pastes into {owners[dst]}",
-                         f"{owners[dst]} sink ends {lines(dst)[-1:]}, the cut buffer held '{decoy}'")
+        pairs = [(src, dst) for src in apps for dst in apps if src != dst]
+        for n, (src, dst) in enumerate(pairs, 1):
+            tag = f"{src.replace(' ', '')}-to-{dst.replace(' ', '')}"
+            decoy = f"decoy{s}{n}"
+            ctx.click(*word_point(src), count=2)
+            ctx.shot(f"{s}-{tag}-selected", f"{sel}: '{words[src]}' selected by a double-click "
+                     f"in {owners[src]} xterm")
+            # The control: overwrite the cut buffer xterm also writes, so a
+            # word that arrives can only have come through the selection.
+            ctx.g.xprobe(f"xprop -root -f CUT_BUFFER0 8s -set CUT_BUFFER0 {decoy}",
+                         label=f"observer: CUT_BUFFER0 := {decoy} (control)")
+            paste_into(dst)
+            got = wait_until(lambda: words[src] in lines(dst), 5, 0.4)
+            ctx.shot(f"{s}-{tag}-pasted", f"{sel}: '{words[src]}' pasted into {owners[dst]} xterm")
+            st.check(got, f"{sel}: text selected in {owners[src]} xterm pastes into {owners[dst]}",
+                     f"{owners[dst]} sink ends {lines(dst)[-1:]}, the cut buffer held '{decoy}'")
 
         for who in apps:
             ctx.save_state(f"{s}-sink-{who.replace(' ', '')}", "\n".join(lines(who)) + "\n",
@@ -1591,10 +1596,11 @@ def menu_host_terminal(ctx, st, state):
              "whoami typed into it and its answer")
     st.check(who == "desktop-shell", "typing into Host Terminal runs commands on the host as desktop-shell",
              f"whoami wrote {who!r} on the host")
-    journal = ctx.g.sh(f"journalctl -u sshd --since @{state['epoch']} -o short-precise --no-pager "
-                       "| grep 'Accepted publickey for desktop-shell'; true", label="sshd's journal")
-    st.write("sshd-journal", journal, "EV-LOG-JOURNAL: sshd accepting the desktop-shell key for this "
-             "login")
+    journal = ctx.save_cmd("sshd-journal",
+                           f"journalctl -u sshd --since @{state['epoch']} -o short-precise --no-pager "
+                           "| grep 'Accepted publickey for desktop-shell'",
+                           "EV-LOG-JOURNAL: sshd accepting the desktop-shell key for this login",
+                           label="sshd's journal")
     st.check(journal.strip(), "sshd logged the publickey login behind the window")
     xorg_kept(ctx, st, state, "Host Terminal", before)
 
@@ -1721,9 +1727,9 @@ def menu_quit_session(ctx, st, state):
              "the new session shows its xterm at 100x30+60+60")
     x, y = ctx.free_point(xs)
     st.check(img.px(x, y) == ROOT_RGB, "and the #101216 root", f"sampled {img.px(x, y)} at ({x},{y})")
-    st.write("desktop-log", ctx.g.sh(f"podman logs --since {state['since']} desktop 2>&1 | tail -80; true",
-                                     label="podman logs desktop"),
-             "the desktop's log for this story (EV-LOG-DESKTOP): the session's exit and restart")
+    ctx.save_cmd("desktop-log", f"podman logs --since {state['since']} desktop 2>&1 | tail -80",
+                 "the desktop's log for this story (EV-LOG-DESKTOP): the session's exit and restart",
+                 label="podman logs desktop")
 
 
 # --- S11.3.1: sound under the operator's control ---------------------------------
@@ -2099,8 +2105,9 @@ def sound_persistence(ctx, st):
     container's home directory, where WirePlumber keeps them, is not meant
     to outlive the container)."""
     g = ctx.g
-    st.write("player-log", g.sh("podman logs op-player 2>&1; true", label="podman logs op-player"),
-             "the player's own output (EV-LOG-CLIENT): empty unless paplay complained")
+    ctx.save_cmd("player-log", "podman logs op-player 2>&1",
+                 "the player's own output (EV-LOG-CLIENT): '(no output)' unless paplay complained",
+                 label="podman logs op-player")
     g.client_stop("player")
     audio_snapshot(ctx, "persist-0-before", "volume, mute and default output as the operator left them")
     pw = ctx.pid_of("pipewire")

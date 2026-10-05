@@ -1678,14 +1678,16 @@ operator_setup() {
     wait_for 20 1 "the observer to read the window tree" \
         podman exec -e DISPLAY="$disp" op-observer xwininfo -root -tree
 
-    # The input tests' sink terminals idle in a `sleep 60` after their read,
-    # and one may still be up. The operator's first story looks at the
-    # desktop as the session leaves it, so they go first - as the session
-    # user, since container root holds no CAP_KILL (verify_audio_lifecycle).
-    log op "retire the input tests' sink terminals"
-    podman exec -u desktop desktop pkill -u desktop -f 'xterm -T inputtest' || true
-    wait_for 15 1 "the input tests' sink terminals to exit" \
-        sh -c '! podman exec desktop pgrep -u desktop -f "xterm -T inputtest" >/dev/null'
+    # The terminals earlier phases leave up: phase-deploy's deploy-proof
+    # xterm, which every shard runs first, and the input tests' sink
+    # terminals, which idle in a `sleep 60` after their read. The operator's
+    # first story looks at the desktop as the session leaves it, so they go
+    # first - as the session user, since container root holds no CAP_KILL
+    # (verify_audio_lifecycle). pgrep/pkill patterns are extended regexps.
+    log op "retire the terminals earlier phases left up"
+    podman exec -u desktop desktop pkill -u desktop -f 'xterm -T (deploy-proof|inputtest)' || true
+    wait_for 15 1 "the earlier phases' terminals to exit" \
+        sh -c '! podman exec desktop pgrep -u desktop -f "xterm -T (deploy-proof|inputtest)" >/dev/null'
 
     # One continuous 150 s stream for the sound story, long enough to outlast
     # every command typed under it. 441 frames hold exactly 11 cycles of

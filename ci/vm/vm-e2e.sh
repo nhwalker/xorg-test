@@ -360,9 +360,12 @@ vm_ssh_quick true || fail "VM never became reachable"
 VM_UP=1
 
 # The run's manifest (Requirements.md, report layout): what was tested, on
-# what, so evidence from different shards and runs can be compared.
+# what, so evidence from different shards and runs can be compared. Written
+# now and again once phase-deploy has installed podman, which the stock cloud
+# image lacks.
+write_manifest() {
 python3 - "$ART/run.json" "$SHARD" \
-    "$(vm_ssh_quick 'uname -r; cat /etc/rocky-release; getenforce; podman --version' 2>/dev/null | paste -sd'|')" <<'PY' || true
+    "$(vm_ssh_quick 'uname -r; cat /etc/rocky-release; getenforce; podman --version 2>/dev/null || echo "not installed yet"' 2>/dev/null | paste -sd'|')" <<'PY' || true
 import json, os, platform, subprocess, sys
 def out(*cmd):
     try:
@@ -384,6 +387,8 @@ json.dump({"shard": sys.argv[2], "source": os.environ.get("EV_SOURCE", ""),
            "guest": {"kernel": guest[0], "release": guest[1], "selinux": guest[2], "podman": guest[3]},
            "images": images}, open(sys.argv[1], "w"), indent=1)
 PY
+}
+write_manifest
 
 log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
@@ -413,6 +418,7 @@ in_shard core && pd_ev=$GUEST_EV
 guest_ev "$pd_ev" phase-deploy \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
          2>&1 | tee "$ART/guest-deploy-fail.log" || true; fail "guest phase-deploy failed"; }
+write_manifest
 screendump desktop-deploy
 assert_nonblank desktop-deploy
 
@@ -671,8 +677,11 @@ log "operator: the person at the display, through QEMU's own input devices (E11)
 # screendumps, video frames, state diffs, pid tables and audio capture.
 #
 # A failed story does not stop the others; the step fails once they have all
-# run. Placed before phase 2, which it hands a freshly restarted desktop: the
-# sound story ends with systemctl restart desktop.service.
+# run. In CI this shard boots its own VM, so the desktop it finds is the one
+# phase-deploy left (operator-setup retires phase-deploy's xterm). In a
+# single-VM run (shard "all") it comes after the core shard and before phase
+# 2, which it hands a freshly restarted desktop: the sound story ends with
+# systemctl restart desktop.service.
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh operator-setup' || fail "operator setup failed"
 op_rc=0
 python3 operator-e2e.py --qmp "$QMP" --ssh-port "$SSHPORT" --ssh-key id_ed25519 --art "$ART" \
