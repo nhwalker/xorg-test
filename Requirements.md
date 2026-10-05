@@ -367,8 +367,8 @@ the same directory also receives the diagnostics the harness already prints
 - Tier: T2 · Coverage: ❌.
 
 **S2.3.5 Postmortem runs on abnormal exit only**
-- Requirement: `session-postmortem` runs on nonzero exit, never on exit 0; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists.
-- Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL, and none after a clean end (Quit session, `rc=0`). "Never on exit 0" is `desktop-init`'s doing (it calls the script only for a nonzero exit), so only T2/T3 can prove it.
+- Requirement: `session-postmortem` runs after every abnormal end of the X session and never after a clean one; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists. Abnormal is a nonzero session exit, or an X server that did not shut down cleanly: xinit exits 0 whenever the server goes away, killed or crashed included, so `desktop-init` reads the server's log, which says `Server terminated successfully` only after a clean shutdown, and logs `the X server did not shut down cleanly` before the postmortem.
+- Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL (the session still exits `rc=0`; `desktop-init`'s `did not shut down cleanly` line comes first), and none after a clean end (Quit session, `rc=0`). Which ends get a postmortem is `desktop-init`'s doing, so only T2/T3 can prove it.
 - Evidence: T1 the script's stdout per case (EV-STATE); T2 EV-LOG-DESKTOP slice containing `postmortem:` lines.
 - Tier: T1/T2 · Coverage: ❌.
 
