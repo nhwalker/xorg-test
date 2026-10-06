@@ -911,7 +911,7 @@ vm_ssh 'mkdir -p repo && tar -xzf /tmp/repo.tgz -C repo' || fail "could not unpa
 pd_ev=""
 in_shard core && pd_ev=$GUEST_EV
 guest_ev "$pd_ev" phase-deploy \
-    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch -m avc -ts recent 2>/dev/null | tail -40' \
+    || { vm_ssh 'sudo journalctl -b --no-pager | tail -150; echo ---; sudo ausearch --input-logs -m avc -ts recent 2>/dev/null | tail -40' \
          2>&1 | tee "$ART/guest-deploy-fail.log" || true; fail "guest phase-deploy failed"; }
 if in_shard core; then
     # E5 on the deployed host: labels and policy, the host-shell key and its
@@ -989,7 +989,12 @@ if [ "$SHARD" = soundless ]; then
     SL10_T="A card that arrives after a soundless boot is openable"
     SL9_T="A client that started on a soundless host plays once a card arrives, without restarting"
     guest_ev "$GUEST_EV" soundless before || fail "S2.4.6: the soundless host is not as it should be, or the client did not start"
+    # F7.7's common set: the display across the event, from before the card
+    # is plugged in until after the client played.
     EV_SIDE=h-
+    ev_begin S7.7.9 "$SL9_T" T3
+    ev_video_start across-card
+    ev_end
     ev_begin S2.4.6 "$SL6_T" T3
     ev_copy "$ART/soundless-audio-group.txt" renumber "EV-STATE: the harness's groupmod -g 1063 audio on the host before the tree was applied, and getent group audio after it"
     ev_qemu sl-plug "EV-QEMU: device_add usb-audio,id=slsnd,audiodev=snd0,bus=xhci.0 (the first sound card this VM has) and QEMU's reply (empty: accepted)" \
@@ -1011,6 +1016,7 @@ if [ "$SHARD" = soundless ]; then
     ev_audio_stop "EV-AUDIO: the machine's output from before the stack's restart until after the client played: its 550 Hz tone, played by the client that started before the card existed" 3 0.02 550 \
         || fail "S7.7.9: the client's 550 Hz tone was not heard"
     ev_pass "the client's 550 Hz tone is heard through the card that arrived after it started"
+    ev_video_stop "EV-VIDEO: the display from before the card was plugged in until after the client played; index.txt gives each frame's UTC time"
     ev_end
     for st in "S2.4.6:770:the session user's tone through the realigned card" "S4.7.10:990:a tone through the card that arrived after the soundless boot"; do
         sid=${st%%:*} rest=${st#*:}

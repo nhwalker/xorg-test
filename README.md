@@ -338,9 +338,11 @@ them: the derived timings against `cvt(1)`, both driver paths, and the config
 rejections (`ci/monitor-layout-tests.sh`). The VM e2e proves the load-bearing claim
 itself. QEMU's virtio-vga is booted with `max_outputs=2`, and virtio-gpu
 reports connector status straight from whether QEMU has that scanout enabled —
-under `-display none` it never enables the second one, so the guest has a
-permanently **disconnected** `Virtual-2`: a monitor-shaped hole, with no DDC
-emulation involved. The e2e declares a two-monitor layout across both
+under `-display none` nothing enables the second one, so the guest has a
+**disconnected** `Virtual-2`: a monitor-shaped hole, with no DDC emulation
+involved. (A VNC server bound to that head is how the later monitor stories
+plug a monitor in, `HotpluggingTestHelp.md` §4.3.1; nothing talks to it
+during the layout test.) The e2e declares a two-monitor layout across both
 connectors and asserts that `xrandr` reports
 
 ```
