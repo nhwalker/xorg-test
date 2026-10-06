@@ -189,7 +189,7 @@ phase_deploy() {
         fail "getty@tty1 is not active - the seat is already clean, so seat-prep would prove nothing"
     fi
 
-    log pd "apply the deploy tree (verbatim README command)"
+    log pd "apply the deploy tree: deploy/README.md's Apply commands, typed (S5.1.1 checks them against the document), then the harness's own steps"
     rsync -a --chown=root:root deploy/host/ /
     # S7.2.5's "before": /etc/cdi as the tree leaves it, before the desktop's
     # first start. Kept now, attached to the story once the spec appears.
@@ -1540,6 +1540,7 @@ deploy_applied() {
     [ "$(grep -v '^#' <<<"$block" | sed '/^[[:space:]]*$/d')" = "$want" ] \
         || fail "deploy/README.md's Apply block is no longer rsync, daemon-reload and reboot; phase-deploy runs the first two as this check reads them"
     ev_pass "the README's Apply block is rsync -a --chown=root:root deploy/host/ /, systemctl daemon-reload and reboot, and phase-deploy ran the first two as written"
+    ev_note "harness-only, after the two commands and before the deploy tail's reboot (S5.1.3): systemd-sysusers, systemd-tmpfiles --create (its failures tolerated), systemctl reload sshd, S5.3.1's start of desktop-seat-prep.service on its own, then systemctl start desktop.service"
     ev_save symlinks "EV-STATE: find /etc/systemd/system -maxdepth 2 -type l -ls after the two commands" \
         find /etc/systemd/system -maxdepth 2 -type l -ls >/dev/null || true
     [ "$(readlink /etc/systemd/system/default.target)" = /usr/lib/systemd/system/multi-user.target ] \
@@ -1865,9 +1866,21 @@ deploy_tail() {
     ev_begin S5.2.6 "Image pin drop-in" T3
     ev_save podman-version "EV-STATE: podman --version" podman --version >/dev/null || true
     podman tag localhost/desktop-container:latest localhost/desktop-container:ev-pinned
+    # The drop-in as deploy/README.md "Overriding the image reference" gives
+    # it, read from the document; its one placeholder, the image reference,
+    # is this run's second name for the same image.
+    pin_blk=$(python3 ci/doc-blocks.py deploy/README.md "Overriding the image reference" 1 --lang ini) \
+        || fail "deploy/README.md has no ini block under \"Overriding the image reference\": $pin_blk"
+    ev_text pin-block "EV-PROCEDURE: deploy/README.md's \"Overriding the image reference\" block, as this run read it" "$pin_blk"
+    [ "$(sed -n '1s/^# *//p' <<<"$pin_blk")" = /etc/containers/systemd/desktop.container.d/50-image.conf ] \
+        || fail "the block no longer opens with the drop-in's path, 50-image.conf: $(sed -n 1p <<<"$pin_blk")"
+    pin_ph='registry.example.com/desktop-container@sha256:...'
+    grep -qxF "Image=$pin_ph" <<<"$pin_blk" || fail "the block's Image= line is no longer the placeholder $pin_ph"
     mkdir -p /etc/containers/systemd/desktop.container.d
-    printf '[Container]\nImage=localhost/desktop-container:ev-pinned\n' > /etc/containers/systemd/desktop.container.d/50-image.conf
-    ev_copy /etc/containers/systemd/desktop.container.d/50-image.conf drop-in "EV-CONFIG: the drop-in: desktop.container.d/50-image.conf, pinning localhost/desktop-container:ev-pinned (a second name for the same image)"
+    printf '%s\n' "${pin_blk/"Image=$pin_ph"/"Image=localhost/desktop-container:ev-pinned"}" \
+        > /etc/containers/systemd/desktop.container.d/50-image.conf
+    ev_note "the block's one placeholder, $pin_ph, is localhost/desktop-container:ev-pinned here, a second name for the same image"
+    ev_copy /etc/containers/systemd/desktop.container.d/50-image.conf drop-in "EV-CONFIG: the drop-in as written: the documented block, its placeholder localhost/desktop-container:ev-pinned"
     systemctl daemon-reload
     c=$(ev_save unit "EV-CONFIG: systemctl cat desktop.service with the drop-in in place: the unit quadlet generated" \
         systemctl cat desktop.service) || fail "systemctl cat desktop.service failed"
@@ -2679,11 +2692,14 @@ phase2() {
     # relying on it is both invisible and unverifiable from outside.
     # An unknown key here would stop crio starting, which k8s_crio_start
     # catches - a loud, immediate failure rather than a puzzling one later.
+    # The drop-in is README.md's, read from the document (S10.6.1 runs the
+    # same in the maintainer journey).
     mkdir -p /etc/crio/crio.conf.d
-    cat > /etc/crio/crio.conf.d/12-cdi.conf <<'EOF'
-[crio.runtime]
-cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
-EOF
+    crio_blk=$(python3 ci/doc-blocks.py README.md "Kubernetes (single-node k3s + CRI-O)" --lang toml) \
+        || fail "README.md has no CRI-O drop-in (a toml block under \"Kubernetes (single-node k3s + CRI-O)\"): $crio_blk"
+    [ "$(sed -n '1s/^# *//p' <<<"$crio_blk")" = /etc/crio/crio.conf.d/12-cdi.conf ] \
+        || fail "README.md's CRI-O block no longer opens with /etc/crio/crio.conf.d/12-cdi.conf: $(sed -n 1p <<<"$crio_blk")"
+    printf '%s\n' "$crio_blk" > /etc/crio/crio.conf.d/12-cdi.conf
     k8s_crio_start
     log p2 "crio configured to scan /etc/cdi for device specs"
 

@@ -248,6 +248,8 @@ jobs:
             "each counter read from the guest is an integer, or a failed read that fails or retries, before it is compared: never a stand-in number"
           rule S9.2.5 "Restore what you changed" \
             "each write under /etc in ci/'s shell and the workflows is one the guard's registry names: put back, or undone by the product, with a check of the restore after the write; or one that needs none (a scratch file, the shipped file itself, a container's own file, a VM discarded after the run)"
+          rule S9.2.6 "Documented procedures are run from the document" \
+            "every block, paragraph or entry the harness reads with ci/doc-blocks.py is in the document; no fenced block of README.md, deploy/README.md or deploy/HOST-REQUIRES.md is typed into ci/'s shell or Python or the workflows unless an ALLOW entry pins its digest and the lines typed; in a story that runs what a document gives, every recorded step is the document's or named harness-only, and each substitution is named a placeholder"
           rule S9.3.1 "Every story emits its named evidence on pass and on fail" \
             "every story the harness begins is one Requirements.md defines, and the evidence check fails each of five incomplete story directories and passes a complete one"
           exit "$f"

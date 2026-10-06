@@ -345,7 +345,7 @@ shopt -u nullglob
 ev_pass "the runner has no sound card: no /dev/snd/controlC*"
 ev_end
 
-log "apply the deploy tree (verbatim README command)"
+log "apply the deploy tree: README.md's first Install commands, typed for this runner (tmpfiles' failures on the runner's own entries tolerated)"
 rsync -a --chown=root:root deploy/host/ /
 [ -L /etc/systemd/system/getty@tty1.service ] || fail "getty mask did not survive as a symlink"
 [ "$(readlink /etc/systemd/system/default.target)" = /usr/lib/systemd/system/multi-user.target ] \

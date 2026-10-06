@@ -151,7 +151,7 @@ mt_packages() {
     # are the host clients whose tones the VM host listens for.
     probes="rsync pulseaudio-utils alsa-utils"
     # shellcheck disable=SC2086
-    ev_save dnf-probes "EV-PROCEDURE: this journey's own tools, installed after the documented line and not host requirements: rsync (the provisioning tool deploy/README.md uses), pulseaudio-utils (paplay) and alsa-utils (aplay)" \
+    ev_save dnf-probes "EV-PROCEDURE: harness-only: this journey's own tools, installed after the documented line and not host requirements: rsync (the provisioning tool deploy/README.md uses), pulseaudio-utils (paplay) and alsa-utils (aplay)" \
         dnf -y install $probes >/dev/null || fail "could not install the journey's own tools: $probes"
     ev_save rpm-probes "EV-STATE: rpm -qa | sort after the journey's own tools" sh -c 'rpm -qa | sort' >/dev/null || true
     ev_diff rpm-probes "EV-DIFF: what the journey's own tools added after the documented line" "$doc" "$EV_LAST"
@@ -720,6 +720,8 @@ mt_quiet() { # start <seconds>|state <moment>|ended|remove
 MT_MONCONF=/etc/desktop-container/monitors.conf
 MT_ALT=localhost/desktop-container:alt
 MT_PIN=/etc/containers/systemd/desktop.container.d/50-image.conf
+# The image reference deploy/README.md's pin block gives: its placeholder.
+MT_PIN_EXAMPLE='registry.example.com/desktop-container@sha256:...'
 MT_UPC=mt-upclient
 
 # A service command one of these journeys runs, with its time, in <story>.
@@ -960,24 +962,34 @@ second, $MT_ALT: $alt"
     ev_end
 }
 mt_route() { # pin|tag forward|back
-    local dg id
+    local dg id blk
     mt_begin S10.3.3
     case "$1:$2" in
         pin:forward)
             dg=$(mt_get img-alt | awk '{print $2}')
+            blk=$(python3 ci/doc-blocks.py deploy/README.md "Overriding the image reference" 1 --lang ini) \
+                || fail "deploy/README.md has no ini block under \"Overriding the image reference\": $blk"
+            ev_text pin-block "EV-PROCEDURE: deploy/README.md's \"Overriding the image reference\" block, as this run read it" "$blk"
+            [ "$(sed -n '1s/^# *//p' <<<"$blk")" = "$MT_PIN" ] \
+                || fail "the block no longer opens with the drop-in's path, $MT_PIN: $(sed -n 1p <<<"$blk")"
+            grep -qxF "Image=$MT_PIN_EXAMPLE" <<<"$blk" \
+                || fail "the block's Image= line is no longer the placeholder $MT_PIN_EXAMPLE"
             mkdir -p "$(dirname "$MT_PIN")"
-            printf '[Container]\nImage=localhost/desktop-container@%s\n' "$dg" > "$MT_PIN"
-            ev_copy "$MT_PIN" pin "EV-CONFIG: the documented digest pin (deploy/README.md \"Overriding the image reference\"), naming the second image by digest"
-            ev_save daemon-reload "EV-PROCEDURE: systemctl daemon-reload" systemctl daemon-reload >/dev/null || fail "daemon-reload failed" ;;
+            printf '%s\n' "${blk/"Image=$MT_PIN_EXAMPLE"/"Image=localhost/desktop-container@$dg"}" > "$MT_PIN"
+            ev_note "the block's one placeholder, $MT_PIN_EXAMPLE, is the second image by digest here: localhost/desktop-container@$dg"
+            ev_copy "$MT_PIN" pin "EV-CONFIG: $MT_PIN as written: the documented block, its placeholder the second image by digest"
+            ev_save daemon-reload "EV-PROCEDURE: harness-only: systemctl daemon-reload, which a new drop-in needs before it reaches the unit (the section gives no command for it)" \
+                systemctl daemon-reload >/dev/null || fail "daemon-reload failed" ;;
         pin:back)
             rm -f "$MT_PIN"
-            ev_save daemon-reload "EV-PROCEDURE: the pin removed, then systemctl daemon-reload" systemctl daemon-reload >/dev/null || fail "daemon-reload failed" ;;
+            ev_save daemon-reload "EV-PROCEDURE: harness-only: the pin removed, then systemctl daemon-reload (the section gives no way back)" \
+                systemctl daemon-reload >/dev/null || fail "daemon-reload failed" ;;
         tag:forward)
-            ev_save tag "EV-PROCEDURE: podman tag $MT_ALT localhost/desktop-container:latest: the unit's default name, moved to the second image" \
+            ev_save tag "EV-PROCEDURE: harness-only: podman tag $MT_ALT localhost/desktop-container:latest, S10.3.3's tag route: the unit's default name (deploy/README.md: \"The unit defaults to localhost/desktop-container:latest\") moved to the second image; the document gives no command for it" \
                 podman tag "$MT_ALT" localhost/desktop-container:latest >/dev/null || fail "podman tag failed" ;;
         tag:back)
             id=$(mt_get img-orig | awk '{print $1}')
-            ev_save tag "EV-PROCEDURE: podman tag <the first image's id> localhost/desktop-container:latest: moved back" \
+            ev_save tag "EV-PROCEDURE: harness-only: podman tag <the first image's id> localhost/desktop-container:latest: moved back" \
                 podman tag "$id" localhost/desktop-container:latest >/dev/null || fail "podman tag failed" ;;
         *) fail "no route $1 $2" ;;
     esac
@@ -1455,7 +1467,7 @@ mt_seat_diagnose() {
     line=$(mt_span "$MT_SEAT_LEAD" '^udevadm info ')
     ev_save check-written "EV-PROCEDURE: \`$line\`, as the entry writes it" sh -c "$line; true" >/dev/null || true
     while read -r e; do
-        out=$(ev_save "check-${e##*/}" "EV-PROCEDURE: \`${line/\/dev\/input\/event0/$e}\`: the entry's check against a staged node" \
+        out=$(ev_save "check-${e##*/}" "EV-PROCEDURE: \`${line/\/dev\/input\/event0/$e}\`: the entry's check, its example node /dev/input/event0 a placeholder for each staged node" \
             sh -c "${line/\/dev\/input\/event0/$e}; true") || true
         grep -qi 'ID_SEAT=seat1' <<<"$out" || bad="$bad $e"
     done < "$MT/seat-events"
@@ -1682,7 +1694,7 @@ mt_gid_hatch() {
         || fail "the escape hatch could not be applied"
     ev_save xwrapper-after "EV-CONFIG: /etc/X11/Xwrapper.config with the escape hatch" podman exec desktop cat /etc/X11/Xwrapper.config >/dev/null || true
     x=$(podman exec desktop pgrep -x Xorg || true)
-    ev_save kill-x "EV-PROCEDURE: Xorg (pid ${x:-none, the session is between attempts}) killed, so the next session starts under the escape hatch" \
+    ev_save kill-x "EV-PROCEDURE: harness-only: Xorg (pid ${x:-none, the session is between attempts}) killed, so the next session starts under the escape hatch (the entry does not say how the change takes effect)" \
         podman exec -u desktop desktop pkill -x Xorg >/dev/null || ev_note "no Xorg was running to kill"
     ev_end
 }

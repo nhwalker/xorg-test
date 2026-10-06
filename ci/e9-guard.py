@@ -25,6 +25,16 @@
           RESTORES registry names, for every write, how (restored, undone
           by the product, a scratch file, the shipped file, a discarded VM)
           and the check, which must come after the write;
+  S9.2.6  a documented procedure is run from the document: every
+          doc-blocks.py read whose arguments are literal (or the file's
+          constants) finds its block, paragraph or entry; no harness file
+          types two or more lines of one fenced block of README.md,
+          deploy/README.md or deploy/HOST-REQUIRES.md within 20 lines (the
+          one line of a one-command block with arguments) unless an ALLOW
+          entry pins the block's digest and the lines typed; in a story
+          that runs what a document gives, each EV-PROCEDURE step is the
+          document's or named harness-only, and each substitution it runs
+          or writes is named a placeholder;
   S9.3.1  every story the harness begins is one Requirements.md defines, and
           the evidence check (ci/evlib.py check) fails each kind of
           incomplete story directory.
@@ -41,9 +51,11 @@ any self-test misjudgement.
 import argparse
 import ast
 import glob
+import hashlib
 import importlib.util
 import os
 import re
+import shlex
 import sys
 import tempfile
 
@@ -84,6 +96,51 @@ ALLOW = [
      "S5.2.6: deploy/README.md's \"Overriding the image reference\" drop-in (50-image.conf); written, then removed"),
     ("S9.2.1", "ci/preflight-rows.py", r"^/etc/containers/systemd/desktop\.container$",
      "the preflight's rows are staged in a private mount namespace (unshare -m): a tmpfs over desktop.container.d, not the host's quadlet"),
+    # S9.2.6: the documented blocks the harness types for its own setup.
+    # Each entry pins the block's digest and the lines typed: a change to
+    # the block, or to what the harness types, stops it matching, and the
+    # retype is flagged again for someone to judge.
+    ("S9.2.6", "ci/smoke-deploy.sh",
+     "^" + re.escape('deploy/README.md "Apply" [f3d059bc37]: rsync -a --chown=root:root deploy/host/ / | '
+                     'systemctl daemon-reload') + "$",
+     "the smoke's deploy on the runner, for its own stories, which cannot reboot it; the block runs as written "
+     "in maint-guest.sh's mt_apply (S10.1.2)"),
+    ("S9.2.6", "ci/smoke-deploy.sh",
+     "^" + re.escape('README.md "Install" [ea8b2a10b4]: sudo rsync -a --chown=root:root deploy/host/ / | '
+                     'sudo systemctl daemon-reload | sudo systemd-sysusers | sudo systemd-tmpfiles --create') + "$",
+     "the same deploy: the block up to systemd-tmpfiles, whose failures on the runner's own entries it "
+     "tolerates; the smoke starts the desktop after its own stories. The block runs as written in "
+     "maint-guest.sh's mt_live readme (S10.1.4)"),
+    ("S9.2.6", "ci/smoke-deploy.sh",
+     "^" + re.escape('README.md "Fixed monitor layout (KVM video)" [425e0d716b]: DP-1 1920x1080@60 +0+0 primary | '
+                     'DP-2 1920x1080@60 +1920+0') + "$",
+     "S3.4.8's declared layout, which is README.md's example: the story checks that a host file reaches the "
+     "container and is acted on, so any valid layout serves; the example is not a procedure"),
+    ("S9.2.6", "ci/vm/vm-guest.sh",
+     "^" + re.escape('deploy/README.md "Apply" [f3d059bc37]: rsync -a --chown=root:root deploy/host/ / | '
+                     'systemctl daemon-reload') + "$",
+     "phase_deploy, the VM shards' deploy: S5.1.1 (deploy_applied) checks that the block still reads rsync, "
+     "daemon-reload and reboot, and names the steps phase_deploy adds harness-only; the reboot is the deploy "
+     "tail's (S5.1.3). The block runs as written in maint-guest.sh's mt_apply (S10.1.2)"),
+    ("S9.2.6", "ci/vm/vm-guest.sh",
+     "^" + re.escape('README.md "Install" [ea8b2a10b4]: sudo rsync -a --chown=root:root deploy/host/ / | '
+                     'sudo systemctl daemon-reload | sudo systemd-sysusers | sudo systemd-tmpfiles --create | '
+                     'sudo systemctl start desktop.service') + "$",
+     "the same deploy, which is this block with the harness's changes: tmpfiles' failures tolerated, sshd "
+     "reloaded rather than try-reload-or-restart, S5.3.1's seat-prep run before the start. The block runs as "
+     "written in maint-guest.sh's mt_live readme (S10.1.4)"),
+    ("S9.2.6", ".github/workflows/ci.yml",
+     "^" + re.escape('README.md "Base image vs application layer" [bfbac87260]: sudo podman build --network=none '
+                     '-t localhost/screenshot:latest -f Containerfile.screenshot . | sudo podman build '
+                     '--network=none -t localhost/desktop-container:latest -f Containerfile .') + "$",
+     "the images under test: the block's two application-layer builds, typed. The bases come from "
+     "ci/build-bases.sh's content-addressed cache, so the block's first two lines are replaced, not run. No "
+     "story runs the block from the document: this entry, pinned to its digest, is its drift check"),
+    ("S9.2.6", ".github/workflows/maintainer.yml",
+     "^" + re.escape('README.md "Base image vs application layer" [bfbac87260]: sudo podman build --network=none '
+                     '-t localhost/screenshot:latest -f Containerfile.screenshot . | sudo podman build '
+                     '--network=none -t localhost/desktop-container:latest -f Containerfile .') + "$",
+     "the same, for the maintainer journeys' images"),
     ("S9.3.1", "ci/hw/acceptance-tests.sh", r"S9\.9\.9",
      "a planted story id: the test's own fixture, in a scratch evidence root"),
 ]
@@ -1458,7 +1515,415 @@ def rule_s925(root, rep):
             f"{len(rep.violations('S9.2.5'))} violation(s)")
 
 
-RULES = {"S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.3.1": rule_s931}
+DOCS_WITH_PROCEDURES = ["deploy/HOST-REQUIRES.md", "deploy/README.md", "README.md"]
+COMMAND_LANGS = {"sh", "bash", "shell", "console"}
+# A placeholder in a document's line: "...", "<name>", an example.com host.
+PLACEHOLDER = re.compile(r"\.\.\.|<[^<>\s][^<>]*>|\bexample\.com\b")
+# Lines too generic to show a retype by themselves: a bare yaml key, an ini section.
+GENERIC = re.compile(r"^(?:[\w.-]+:|\[[\w.-]+\])$")
+RETYPE_WINDOW = 20
+# The harness's wrappers around a command it runs: sudo, and its own
+# functions that take arguments before the command (ev_save NAME "TEXT" ...).
+RUN_PREFIX = re.compile(r'^(?:(?:sudo|run|exec|command)\s+|ev_save\s+\S+\s+"(?:[^"\\]|\\.)*"\s+'
+                        r'|ev_check\s+"(?:[^"\\]|\\.)*"\s+|wait_for\s+\S+\s+\S+\s+"(?:[^"\\]|\\.)*"\s+)+')
+RUN_SUFFIX = re.compile(r"(?:\s+(?:\d?>>?\s*/dev/null|2>&1|\|\|.*|&&.*|;\s*\\?$))+$")
+DOC_READ = re.compile(r"doc-blocks\.py")
+# An EV-PROCEDURE step in a function that runs a documented block is the
+# document's own command or block, a step a document gives in prose (the
+# text names the document as its source), or the harness's own.
+STEP_FROM_DOC = re.compile(r"as written|as this run read it|as the entry writes it|verbatim|unmodified"
+                           r"|\$\{?(?:line|cmd)\b")
+_DOC = r"(?:deploy/)?(?:README|HOST-REQUIRES)\.md"
+STEP_NAMES_DOC = re.compile(rf"{_DOC}(?:'s\b|\s*:|\s+\\?\"|\s+(?:asks|says|gives|writes)\b)|\({_DOC}\b")
+# A run, or a write, of what a line holds: a step that uses a substitution.
+RUNS_OR_WRITES = re.compile(r"\b(?:sh|bash)\s+-c\b|\beval\s|\bev_save\s|(?<![<>&\d])>>?\s*\"?[$/\w](?!dev/null)")
+
+
+def norm(line):
+    return " ".join(line.split())
+
+
+def doc_blocks(root):
+    """Each fenced block of the documents: (doc, fence line, heading, lang,
+    lines, digest). A command block's lines are its commands as
+    ci/doc-blocks.py --commands reads them (continuation lines joined,
+    comments and blank lines dropped); any other block's are its lines,
+    blank and comment lines dropped. Whitespace is normalised. The digest
+    (of the lines) is what an ALLOW entry pins."""
+    out = []
+    for doc in DOCS_WITH_PROCEDURES:
+        p = os.path.join(root, doc)
+        if not os.path.exists(p):
+            continue
+        lines = read(p).split("\n")
+        heading, i = "", 0
+        while i < len(lines):
+            h = re.match(r"^#{1,6}\s+(.*?)\s*$", lines[i])
+            if h:
+                heading = h.group(1)
+            m = re.match(r"^\s*```([\w-]*)\s*$", lines[i])
+            if not m:
+                i += 1
+                continue
+            lang, j, body, cur = m.group(1), i + 1, [], ""
+            while j < len(lines) and not re.match(r"^\s*```\s*$", lines[j]):
+                t = lines[j].strip()
+                j += 1
+                if lang in COMMAND_LANGS:
+                    if t.endswith("\\"):
+                        cur += t[:-1] + " "
+                        continue
+                    t, cur = re.sub(r"\s+#.*$", "", cur + t).strip(), ""
+                    t = re.sub(r"^\$\s+", "", t)
+                if t and not t.startswith("#"):
+                    body.append(norm(t))
+            if body:
+                digest = hashlib.sha256("\n".join(body).encode()).hexdigest()[:10]
+                out.append((doc, i + 1, heading, lang, body, digest))
+            i = j + 1
+    return out
+
+
+def line_matcher(line, command):
+    """The harness lines that type this line of a document: the line itself
+    (sudo dropped from a command); a placeholder matches whatever stands in
+    its place, and a config line whose value has one matches any value for
+    its key."""
+    if command:
+        line = re.sub(r"^sudo\s+", "", line)
+    if not PLACEHOLDER.search(line):
+        return re.compile(re.escape(line))
+    key = re.match(r"^([\w.*/-]+\s*=\s*|[\w.*/-]+:\s+)", line) if not command else None
+    if key:
+        return re.compile(re.escape(key.group(1)) + r".*")
+    return re.compile(".+?".join(re.escape(p) for p in PLACEHOLDER.split(line)))
+
+
+def run_forms(line):
+    """A harness line as it could type a document's: as it stands, without
+    the harness's wrappers, without a trailing redirection or || / && tail,
+    without sudo."""
+    t = norm(line)
+    if not t or t.startswith("#"):
+        return []
+    forms = {t}
+    bare = RUN_PREFIX.sub("", t)
+    forms |= {bare, RUN_SUFFIX.sub("", bare), RUN_SUFFIX.sub("", t)}
+    forms |= {re.sub(r"^sudo\s+", "", f) for f in list(forms)}
+    return sorted(f for f in forms if f)
+
+
+def harness_lines(root, rel):
+    """(line number, forms) for each line of a harness file: its shell or
+    workflow lines, a printf or echo format's own lines, and each line of
+    a Python string."""
+    path = os.path.join(root, rel)
+    out = []
+    if rel.endswith(".py"):
+        try:
+            tree = ast.parse(read(path))
+        except SyntaxError:
+            return out
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for k, piece in enumerate(node.value.split("\n")):
+                    forms = run_forms(piece)
+                    if forms:
+                        out.append((node.lineno + k, forms))
+        return out
+    for n, l in enumerate(read(path).split("\n"), 1):
+        forms = run_forms(l)
+        if "\\n" in l:
+            for piece in l.split("\\n"):
+                piece = re.sub(r"""^.*?\b(?:printf|echo(?:\s+-e)?)\s+['"]""", "", piece)
+                forms += run_forms(piece.rstrip("'\""))
+        if forms:
+            out.append((n, forms))
+    return out
+
+
+def retypes(root, rel, blocks):
+    """(first line, block, the block's lines typed) for each block of which
+    the file types two or more lines within RETYPE_WINDOW lines, at least
+    one of them not generic; or the one line of a one-command block whose
+    command takes arguments. A one-line block of any other kind is not a
+    procedure."""
+    lines = harness_lines(root, rel)
+    out = []
+    for blk in blocks:
+        doc, at, heading, lang, body, digest = blk
+        command = lang in COMMAND_LANGS
+        if len(body) == 1 and not (command and len(re.sub(r"^sudo\s+", "", body[0]).split()) >= 2):
+            continue
+        matchers = [(b, line_matcher(b, command)) for b in body]
+        hits = [(n, b) for n, forms in lines for b, m in matchers if any(m.fullmatch(f) for f in forms)]
+        need = min(2, len(body))
+        for a, _ in hits:
+            near = {b for n, b in hits if a <= n <= a + RETYPE_WINDOW}
+            if len(near) >= need and any(not GENERIC.match(b) for b in near):
+                out.append((a, blk, [b for b in body if b in near]))
+                break
+    return out
+
+
+def shell_functions(text):
+    """(name, first line, lines) for each top-level function: from
+    `name() {` to the next line that is `}`."""
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*\(\)\s*\{", lines[i])
+        if not m:
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and not re.match(r"^\}\s*(#.*)?$", lines[j]):
+            j += 1
+        out.append((m.group(1), i + 1, lines[i:j + 1]))
+        i = j + 1
+    return out
+
+
+STORY_BEGIN = re.compile(r"\b(?:ev_begin|mt_begin|story_begin)\s")
+
+
+def story_segments(first, body):
+    """A function's lines cut where each story begins: (first line, lines).
+    A story that reads a document is judged on its own lines, not on the
+    rest of a long function's."""
+    cuts = [0] + [k for k, l in enumerate(body) if k and STORY_BEGIN.search(l)]
+    return [(first + a, body[a:b]) for a, b in zip(cuts, cuts[1:] + [len(body)])]
+
+
+def doc_readers(funcs):
+    """The functions that read a document: those that run doc-blocks.py,
+    and those that take one's output ($(f ...))."""
+    direct = {n for n, _, b in funcs if any(DOC_READ.search(l) for l in b)}
+    via = {n for n, _, b in funcs if any(re.search(rf"\$\(\s*{re.escape(r)}\b", l) for l in b for r in direct)}
+    return direct | via, direct
+
+
+def doc_vars(body, direct):
+    """A reading function's variables that hold what it read: assigned from
+    doc-blocks.py, from a reader's output, or from another such variable;
+    read from one (read, mapfile, a for loop over one)."""
+    held = set()
+    src_re = lambda: re.compile("|".join([r"doc-blocks\.py"] + [rf"\$\(\s*{re.escape(r)}\b" for r in direct]
+                                         + [rf"\$\{{?{v}\b" for v in held]))
+    changed = True
+    while changed:
+        changed = False
+        src = src_re()
+        for k, l in enumerate(body):
+            if not src.search(l):
+                continue
+            names = re.findall(r"(?:^|[\s;(])(?:local\s+)?([A-Za-z_]\w*)=", l)
+            names += re.findall(r"\bmapfile\s+(?:-\S+\s+)*([A-Za-z_]\w*)", l)
+            names += re.findall(r"\bfor\s+([A-Za-z_]\w*)\s+in\b", l)
+            m = re.search(r"\bread\s+((?:-\S+\s+)*)([A-Za-z_][\w ]*?)\s*(?:<<<|;|$)", l)
+            if m:
+                names += m.group(2).split()
+            if re.search(r"^\s*done\s*<", l):        # a while-read loop fed from a document
+                for b in reversed(body[:k]):
+                    w = re.search(r"\bwhile\b.*?\bread\s+(?:-\S+\s+)*([A-Za-z_][\w ]*?)\s*(?:;|$)", b)
+                    if w:
+                        names += w.group(1).split()
+                        break
+            for v in names:
+                if v not in held and v not in ("IFS",):
+                    held.add(v)
+                    changed = True
+    return held
+
+
+def doc_calls(root, rel, text, funcs):
+    """(line, doc, heading, options) for each doc-blocks.py call in a shell
+    file whose arguments are literal, the file's own constants, or a
+    function's positional parameters given that way at each of its call
+    sites in the file; (line, None, why, None) for one that is not."""
+    consts = {}
+    for m in re.finditer(r"^([A-Z_][A-Z0-9_]*)=(\"[^\"$`]*\"|'[^']*')\s*(?:#.*)?$", text, re.M):
+        consts[m.group(1)] = shlex.split(m.group(2))[0] if len(m.group(2)) > 2 else ""
+    lines = text.split("\n")
+    owner = {}
+    for name, first, body in funcs:
+        for k in range(len(body)):
+            owner[first + k] = name
+
+    def args_of(s, params):
+        """The words of a command's arguments, cut at the first operator
+        outside quotes, variables expanded where known."""
+        q, cut = None, len(s)
+        for i, c in enumerate(s):
+            if q:
+                if c == q:
+                    q = None
+            elif c in "'\"":
+                q = c
+            elif c in ")|;&<>":
+                cut = i
+                break
+        redirect = cut < len(s) and s[cut] in "<>"
+        s = s[:cut].rstrip()
+        if redirect:
+            s = re.sub(r"\s\d+$", "", s)            # the fd of a redirection (2>&1), not a block number
+        s = re.sub(r"\$\{?REPO\}?/", "", s)
+        unknown = []
+
+        def var(m):
+            name = m.group(1) or m.group(2)
+            if name.isdigit():
+                v = params.get(int(name))
+            else:
+                v = consts.get(name)
+            if v is None:
+                unknown.append(name)
+                return ""
+            return v.replace("\\", "\\\\").replace('"', '\\"')
+        s = re.sub(r"\$\{?(\d+|[A-Za-z_]\w*)(?::\?[^}]*)?\}?|\$\{([A-Za-z_]\w*)\}", var, s)
+        try:
+            return shlex.split(s), unknown
+        except ValueError as e:
+            return None, [str(e)]
+
+    def call_sites(name):
+        """The positional parameters at each call of a function in the file
+        (None for a call whose arguments are not readable)."""
+        sites = []
+        for n, l in enumerate(lines, 1):
+            if l.lstrip().startswith("#") or owner.get(n) == name:
+                continue
+            m = re.search(rf"(?:^|[\s;&|(]){re.escape(name)}\s+(.*)$", l)
+            if m:
+                words, unknown = args_of(m.group(1), {})
+                sites.append({k + 1: w for k, w in enumerate(words)} if words is not None and not unknown else None)
+        return sites
+
+    out = []
+    for n, l in enumerate(lines, 1):
+        m = re.search(r"doc-blocks\.py\"?\s+(.*)$", l)
+        if not m or l.lstrip().startswith("#"):
+            continue
+        rest = m.group(1)
+        param_sets = [{}]
+        if re.search(r"\$\{?\d", rest):
+            sites = call_sites(owner[n]) if n in owner else []
+            if not sites or None in sites:
+                out.append((n, None, f"a positional parameter, and {owner.get(n, 'the top level')} is called "
+                                     f"with arguments this guard cannot read", None))
+                continue
+            param_sets = sites
+        for params in param_sets:
+            words, unknown = args_of(rest, params)
+            if words is None or unknown or len(words) < 2:
+                out.append((n, None, f"arguments this guard cannot read ({', '.join(unknown) or 'too few'})", None))
+                continue
+            path = re.sub(r"^(?:\.\./|\./)+", "", words[0])
+            doc = next((d for d in DOCS_WITH_PROCEDURES if path == d or path.endswith("/" + d)), None)
+            if doc is None:
+                out.append((n, None, f"a file that is not one of the documents: {words[0]}", None))
+                continue
+            out.append((n, doc, words[1], words[2:]))
+    return out
+
+
+def check_doc_call(mod, root, doc, heading, opts):
+    """Whether doc-blocks.py finds the block, paragraph or entry: None, or
+    what it says when it does not."""
+    path = os.path.join(root, doc)
+    try:
+        if "--para" in opts:
+            mod.para(path, heading, opts[opts.index("--para") + 1])
+        elif "--entry" in opts:
+            mod.entry(path, heading, opts[opts.index("--entry") + 1])
+        else:
+            num = int(opts[0]) if opts and opts[0].isdigit() else 1
+            mod.block(path, heading, num, opts[opts.index("--lang") + 1] if "--lang" in opts else None)
+    except SystemExit as e:
+        return str(e)
+    except (IndexError, ValueError) as e:
+        return f"the call's options do not parse: {e}"
+    return None
+
+
+def rule_s926(root, rep):
+    """S9.2.6: a documented procedure is run from the document: every read
+    finds its block, nothing is retyped, placeholders are the only
+    substitutions and each is named, a harness step among the document's
+    is named harness-only."""
+    blocks = doc_blocks(root)
+    spec = importlib.util.spec_from_file_location("doc_blocks", os.path.join(root, "ci", "doc-blocks.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    files = shell_files(root) + [os.path.relpath(p, root) for p in
+                                 sorted(glob.glob(os.path.join(root, ".github", "workflows", "*.yml")))
+                                 + sorted(glob.glob(os.path.join(root, "ci", "**", "*.py"), recursive=True))]
+    found = reads = unread = steps = subs = 0
+    for rel in files:
+        if rel in ("ci/e9-guard.py", "ci/doc-blocks.py"):
+            continue
+        for a, (doc, at, heading, lang, body, digest), typed in retypes(root, rel, blocks):
+            found += 1
+            rep.flag("S9.2.6", rel, a, f'{doc} "{heading}" [{digest}]: {" | ".join(typed)}',
+                     f'types {len(typed)} of the {len(body)} line(s) of {doc}\'s {lang or "unlabelled"} block under '
+                     f'"{heading}" (line {at}, digest {digest}): {" | ".join(typed)[:160]}',
+                     "run the block from the document (ci/doc-blocks.py), its placeholders the only "
+                     "substitutions; or, where the harness types it for its own setup, say why in an "
+                     "ALLOW entry that pins this digest and these lines")
+    for rel in shell_files(root):
+        text = read(os.path.join(root, rel))
+        funcs = shell_functions(text)
+        for n, doc, heading, opts in doc_calls(root, rel, text, funcs):
+            if doc is None:
+                unread += 1
+                rep.ok("S9.2.6", rel, n, f"a doc-blocks.py read not checked: {heading}")
+                continue
+            reads += 1
+            why = check_doc_call(mod, root, doc, heading, opts)
+            if why:
+                rep.flag("S9.2.6", rel, n, f"{doc}:{heading}",
+                         f"reads {doc} under \"{heading}\" ({' '.join(opts)}), which is not there: {why}",
+                         "read what the document has now, or put back what it lost")
+        readers, direct = doc_readers(funcs)
+        reads_doc = re.compile("|".join([r"doc-blocks\.py"] + [rf"\$\(\s*{re.escape(r)}\b" for r in direct]))
+        for name, first, body in funcs:
+            if name not in readers:
+                continue
+            held = doc_vars(body, direct)
+            for start, seg in story_segments(first, body):
+                if not any(reads_doc.search(l) for l in seg):
+                    continue
+                last_sub = -9
+                for k, l in enumerate(seg):
+                    for d in re.findall(r'EV-PROCEDURE: ((?:[^"\\]|\\.)*)', l):
+                        steps += 1
+                        if not (STEP_FROM_DOC.search(d) or STEP_NAMES_DOC.search(d) or "harness-only" in d):
+                            rep.flag("S9.2.6", rel, start + k, d,
+                                     f"{name}, in a story that runs what a document gives, records a step that "
+                                     f"neither is the document's (as written, or naming its document as the source) "
+                                     f"nor is named harness-only: {d[:100]}",
+                                     "say where the step comes from in its EV-PROCEDURE text: the document's "
+                                     "(README.md's ...), or harness-only")
+                    sub = [v for v in held if re.search(rf"\$\{{{v}//?", l)
+                           or re.search(rf"\bsed\b[^|;]*\bs([|/#,]).*<<<\s*\"?\$\{{?{v}\b", l)]
+                    if sub and RUNS_OR_WRITES.search(l) and k - last_sub > 2:
+                        subs += 1
+                        last_sub = k
+                        near = " ".join(seg[max(0, k - 3):k + 4])
+                        if "placeholder" not in near:
+                            rep.flag("S9.2.6", rel, start + k, l.strip(),
+                                     f"{name} runs or writes a substitution into what it read from a document "
+                                     f"(${sub[0]}), and no text within three lines names it a placeholder: "
+                                     f"{l.strip()[:100]}",
+                                     "substitute only the document's placeholders, and name each in the step's "
+                                     "EV-PROCEDURE or ev_note text (\"placeholder\")")
+    return (f"S9.2.6: {len(blocks)} fenced block(s) in {', '.join(DOCS_WITH_PROCEDURES)}; {reads} doc-blocks.py "
+            f"read(s) checked against them ({unread} not readable statically); {found} block(s) typed into the "
+            f"harness; {steps} step(s) recorded where a document is run; {subs} substitution(s) run or written "
+            f"there; {len(rep.violations('S9.2.6'))} violation(s)")
+
+
+RULES = {"S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
 
 # --- the self-test --------------------------------------------------------------------
 
@@ -1527,6 +1992,23 @@ PLANTS = {
         ("ci/r6.sh", "#!/bin/bash\nset -e\n[ ! -e /etc/plant6.conf ] || fail \"the plant6 is still there\"\n"
                      "echo 'x=1' > /etc/plant6.conf\nrm -f /etc/plant6.conf\n", True),
     ],
+    "S9.2.6": [
+        ("ci/d1.sh", "#!/bin/bash\nset -e\nrsync -a --chown=root:root deploy/host/ /\nsystemctl daemon-reload\n", True),
+        ("ci/d2.sh", "#!/bin/bash\nset -e\nsystemctl daemon-reload\nsystemctl status desktop.service\n", False),
+        ("ci/d3.sh", "#!/bin/bash\nset -e\nwhile IFS=$'\\t' read -r cmd _; do sh -c \"$cmd\"; done "
+                     "< <(python3 ci/doc-blocks.py README.md Install 1 --commands)\n", False),
+        ("ci/d4.sh", "#!/bin/bash\nset -e\nprintf '[Container]\\nImage=localhost/x@%s\\n' \"$dg\" > \"$pin\"\n", True),
+        ("ci/d5.sh", "#!/bin/bash\nset -e\nst() {\n    raw=$(python3 ci/doc-blocks.py README.md Install)\n"
+                     "    ev_save stop \"EV-PROCEDURE: systemctl stop desktop.service\" systemctl stop desktop.service\n}\n", True),
+        ("ci/d6.sh", "#!/bin/bash\nset -e\nst() {\n    blk=$(python3 ci/doc-blocks.py README.md Overriding 1 --lang ini)\n"
+                     "    sed 's|registry.example.com|localhost|' <<<\"$blk\" > \"$pin\"\n}\n", True),
+        ("ci/d7.sh", "#!/bin/bash\nset -e\nst() {\n    blk=$(python3 ci/doc-blocks.py README.md Overriding 1 --lang ini)\n"
+                     "    sed 's|registry.example.com|localhost|' <<<\"$blk\" > \"$pin\"\n"
+                     "    ev_note \"the block's one placeholder, registry.example.com, is localhost here\"\n"
+                     "    ev_save stop \"EV-PROCEDURE: harness-only: systemctl stop desktop.service\" systemctl stop desktop.service\n}\n", False),
+        ("ci/d9.sh", "#!/bin/bash\nset -e\nraw=$(python3 ci/doc-blocks.py README.md \"No such heading\" 1 --commands)\n", True),
+        ("ci/vm/d8.py", "g.sh('sudo rsync -a --chown=root:root deploy/host/ /\\nsudo systemctl daemon-reload')\n", True),
+    ],
     "S9.2.2": [
         ("ci/vm/x-only-pod.yaml", "apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - name: c\n      image: i\n      resources:\n"
                                   "        limits:\n          desktop.local/display: 1\n          desktop.local/tools: 1\n", True),
@@ -1542,6 +2024,27 @@ PLANT_ENTRIES = [
     ("ci/r5.sh", r"/etc/plant\.conf", "restored", r"the plant is still there", "S0.0.1", "a planted write, restored and checked"),
     ("ci/r6.sh", r"/etc/plant6\.conf", "restored", r"the plant6 is still there", "S0.0.2", "a planted write, checked before it was made"),
 ]
+
+# The self-test tree's README.md: a command block and a config block with a
+# placeholder, for S9.2.6's plants.
+PLANT_README = """# A project
+
+## Install
+
+```sh
+# as root
+sudo rsync -a --chown=root:root deploy/host/ /
+sudo systemctl daemon-reload
+```
+
+## Overriding the image
+
+```ini
+# /etc/containers/systemd/desktop.container.d/50-image.conf
+[Container]
+Image=registry.example.com/desktop-container@sha256:...
+```
+"""
 
 
 def self_test(root, rules):
@@ -1559,7 +2062,9 @@ def self_test(root, rules):
                 # CDI generators for S9.2.1
                 with open(os.path.join(d, "Requirements.md"), "w") as f:
                     f.write("**S9.1.5 A story**\n**S9.3.1 Another**\n")
-                for support in ["ci/evlib.py"] + CDI_GENERATORS:
+                with open(os.path.join(d, "README.md"), "w") as f:
+                    f.write(PLANT_README)
+                for support in ["ci/evlib.py", "ci/doc-blocks.py"] + CDI_GENERATORS:
                     os.makedirs(os.path.dirname(os.path.join(d, support)), exist_ok=True)
                     with open(os.path.join(root, support)) as src, open(os.path.join(d, support), "w") as dst:
                         dst.write(src.read())
