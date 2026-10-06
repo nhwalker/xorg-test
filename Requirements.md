@@ -371,7 +371,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `session-postmortem` runs after every abnormal end of the X session and never after a clean one; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists. Abnormal is a nonzero session exit, or an X server that did not shut down cleanly: xinit exits 0 whenever the server goes away, killed or crashed included, so `desktop-init` reads the server's log, which says `Server terminated successfully` only after a clean shutdown, and logs `the X server did not shut down cleanly` before the postmortem.
 - Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL (the session still exits `rc=0`; `desktop-init`'s `did not shut down cleanly` line comes first), and none after a clean end (Quit session, `rc=0`). Which ends get a postmortem is `desktop-init`'s doing, so only T2/T3 can prove it.
 - Evidence: T1 the script's stdout per case (EV-STATE); T2 EV-LOG-DESKTOP slice containing `postmortem:` lines.
-- Tier: T1/T2 · Coverage: ✅ the T1 half: `script-unit` runs the postmortem on fabricated Xorg logs, one per known signature (each gets the log's tail and its `LIKELY CAUSE`), one with no known signature (the tail, no verdict), none at all (its own line), and with `SERVICE_RESULT=success` (silent), under `artifacts/S2.3.5/` (artifact `evidence-static`). The T2/T3 half, at T3: `guest:verify_audio_lifecycle` kills Xorg with SIGKILL and saves the desktop's log from just before: `the X server did not shut down cleanly`, the postmortem with the killed server's log tail, then `session exited (rc=0)`, in that order, under `artifacts/S2.3.5/` (artifact `evidence-vm-core`); `operator-e2e:menu_quit_session` checks that Quit session logs `session exited (rc=0)` and no `postmortem:` line, its desktop log under `artifacts/S11.1.1/` (artifact `evidence-vm-operator`).
+- Tier: T1/T2 · Coverage: ✅ the T1 half: `script-unit` runs the postmortem on fabricated Xorg logs, one per known signature (each gets the log's tail and its `LIKELY CAUSE`), one with no known signature (the tail, no verdict), none at all (its own line), and with `SERVICE_RESULT=success` (silent), under `artifacts/S2.3.5/` (artifact `evidence-static`). The T2/T3 half, at T3: `guest:verify_postmortem` kills Xorg with SIGKILL and saves the desktop's log from just before: `the X server did not shut down cleanly`, the postmortem with the killed server's log tail, then `session exited (rc=0)`, in that order, under `artifacts/S2.3.5/` (artifact `evidence-vm-core`); `operator-e2e:menu_quit_session` checks that Quit session logs `session exited (rc=0)` and no `postmortem:` line, its desktop log under `artifacts/S11.1.1/` (artifact `evidence-vm-operator`).
 
 **S2.3.6 mwm exit ends the session and it restarts**
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
@@ -551,7 +551,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: no file, or comments/globals only → no `30-monitors.conf`, stale one removed, no-op logged.
 - Acceptance: as stated.
 - Evidence: `ls /etc/X11/xorg.conf.d/` (EV-STATE); EV-LOG-DESKTOP no-op line; T3 `xrandr` showing autodetected geometry.
-- Tier: T0/T2/T3 · Coverage: ✅ `layout-tests` (no file, comments only, globals only: each removes a stale config and logs the no-op; `ls` of `xorg.conf.d` and the log per case) under `artifacts/S3.4.1/` (artifact `evidence-static`); `smoke` (the shipped comments-only file, the generator's no-op line, `ls` in the container) under `artifacts/S3.4.1/` (artifact `evidence-smoke`); and `guest:verify_fixed_layout`, once the declared layout is withdrawn: the restored comments-only file, `ls -l /etc/X11/xorg.conf.d` with no `30-monitors.conf`, the generator's no-op line, and `xrandr` with Virtual-2 disconnected and the screen autodetected, under `artifacts/S3.4.1/` (artifact `evidence-vm-core`).
+- Tier: T0/T2/T3 · Coverage: ✅ `layout-tests` (no file, comments only, globals only: each removes a stale config and logs the no-op; `ls` of `xorg.conf.d` and the log per case) under `artifacts/S3.4.1/` (artifact `evidence-static`); `smoke` (the shipped comments-only file, the generator's no-op line, `ls` in the container) under `artifacts/S3.4.1/` (artifact `evidence-smoke`); and `guest:layout_restore`, once the declared layout is withdrawn: the restored comments-only file, `ls -l /etc/X11/xorg.conf.d` with no `30-monitors.conf`, the generator's no-op line, and `xrandr` with Virtual-2 disconnected and the screen autodetected, under `artifacts/S3.4.1/` (artifact `evidence-vm-core`).
 
 **S3.4.2 modesetting emission**
 - Requirement: per-output `Monitor` sections with the documented options, a `Screen` on `gpu0` with pinned `Virtual`, no `MetaModes`.
@@ -597,15 +597,15 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.4.9 A declared output comes up on a disconnected connector**
 - Requirement: with `Virtual-1`/`Virtual-2` declared, X starts at 2048x768; `xrandr` shows `Virtual-2 disconnected 1024x768+1024+0`; `Virtual-1` is primary.
-- Acceptance: `guest:verify_fixed_layout`.
+- Acceptance: `guest:layout_declare`, and a screendump of each head showing what X drew there.
 - Evidence: `xrandr --query` (EV-STATE); an EV-SHOT of each head (`screendump` takes a device id and head: head 0 shows `Virtual-1`'s half, head 1 `Virtual-2`'s once X drives it; the e2e must give the virtio-vga an `id=`); EV-CONFIG.
-- Tier: T3 · Coverage: ❌ evidence not saved (no `xrandr`, shot or config is kept, and the deploy screendump is taken after the layout is withdrawn); asserted by `guest:verify_fixed_layout`.
+- Tier: T3 · Coverage: ✅ `guest:layout_declare` declares `Virtual-1` primary at +0+0 and `Virtual-2` at +1024+0, both 1024x768@60, and restarts the desktop: the generated `30-monitors.conf` forces both outputs enabled with a derived `1024x768_60.00` Modeline and pins a 2048x768 framebuffer, and X comes up at 2048x768 with `Virtual-1` connected and primary at 1024x768+0+0 and `Virtual-2` `disconnected` yet scanning out at 1024x768+1024+0. `e2e` then screendumps each head of the virtio-vga (`id=vga0`) and requires each to be 1024x768 and drawn (grayscale standard deviation above 0.02): head 0 shows the session's xterm, head 1 an xterm X drew at +1200+200. The declared file, the generated one, sysfs's connector states, `xrandr` and both shots, under `artifacts/S3.4.9/` (artifact `evidence-vm-core`).
 
 **S3.4.10 A live disconnect does not move the geometry**
 - Requirement: forcing `Virtual-1` off leaves the screen at 2048x768 and both outputs in place; the user's windows do not move.
-- Acceptance: `guest:verify_fixed_layout`.
-- Evidence: `xrandr` before/after (EV-DIFF: only the connection state differs); `xwininfo -root -tree` before/after (EV-DIFF empty); EV-VIDEO across the force; EV-LOG-XORG connector lines.
-- Tier: T3 · Coverage: ❌ window positions are not asserted and no evidence is saved; `guest:verify_fixed_layout` asserts the screen size and `Virtual-1`'s geometry across the forced disconnect.
+- Acceptance: `guest:layout_unplug`.
+- Evidence: `xrandr --verbose` before/after (EV-DIFF: the connection state changes, and with it the EDID, the physical size and the probed modes; the mode in use and every position do not); `xwininfo -root -tree` before/after (EV-DIFF empty); EV-VIDEO across the force; EV-LOG-XORG across the force.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug` forces `Virtual-1` off through sysfs (`status` set to `off`) under the running server, then queries RandR: the screen stays 2048x768, `Virtual-1` stays at 1024x768+0+0 (now `disconnected`) and `Virtual-2` at 1024x768+1024+0, and no client window moved or resized (each one's id, size and position compared between `xwininfo -root -tree` before and after; the whole tree's diff is empty). Sysfs, `xrandr --verbose` and the tree before and after, both diffs, the Xorg log since just before the force, and `e2e`'s 2 fps video of head 0 across the force and the re-plug, under `artifacts/S3.4.10/` (artifact `evidence-vm-core`).
 
 **S3.4.11 Preflight warns about unknown output names**
 - Requirement: an output name with no matching DRM connector yields the WARN line; known names yield the PASS line.
@@ -617,7 +617,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: one line per enabled output; refuses non-root; fails cleanly when the desktop is down; its output through the generator reproduces the geometry.
 - Acceptance: T3 with the two-output layout live: the two expected lines; T1 canned `xrandr` text; T3 desktop stopped → exit 1 with the hint.
 - Evidence: the tool's stdout (EV-STATE); the generator's output from it (EV-CONFIG); `xrandr` after applying it (EV-DIFF vs the original).
-- Tier: T1/T3 · Coverage: ✅ the T1 half: `script-unit` runs `desktop-monitors-capture` on canned `xrandr` text (`DESKTOP_XRANDR_CMD`): a non-root caller is refused (exit 2); the capture prints one line per enabled output, the rotated output's panel size restored with `rotate=left`; a failing query exits 1 with the hint; and the block, through the generator, gives back xrandr's framebuffer and positions; under `artifacts/S3.4.12/` (artifact `evidence-static`). The T3 half: `guest:verify_fixed_layout` captures the live two-output layout (Virtual-1 primary at +0+0, Virtual-2 at +1024+0), applies the block, and saves the generated `30-monitors.conf` and `xrandr` before and after with their diff (the same 2048x768 geometry); with desktop.service stopped the capture exits 1 with the hint; under `artifacts/S3.4.12/` (artifact `evidence-vm-core`). The refresh does not round-trip exactly (declared 60, read back as 59.92, re-derived as 59.68 Hz); the requirement asks for the geometry.
+- Tier: T1/T3 · Coverage: ✅ the T1 half: `script-unit` runs `desktop-monitors-capture` on canned `xrandr` text (`DESKTOP_XRANDR_CMD`): a non-root caller is refused (exit 2); the capture prints one line per enabled output, the rotated output's panel size restored with `rotate=left`; a failing query exits 1 with the hint; and the block, through the generator, gives back xrandr's framebuffer and positions; under `artifacts/S3.4.12/` (artifact `evidence-static`). The T3 half: `guest:layout_roundtrip` captures the live two-output layout (Virtual-1 primary at +0+0, Virtual-2 at +1024+0), applies the block, and saves the generated `30-monitors.conf` and `xrandr` before and after with their diff (the same 2048x768 geometry); in `guest:layout_restore`, with desktop.service stopped, the capture exits 1 with the hint; under `artifacts/S3.4.12/` (artifact `evidence-vm-core`). The refresh does not round-trip exactly (declared 60, read back as 59.92, re-derived as 59.68 Hz); the requirement asks for the geometry.
 
 ### F3.5 Rendering and theme
 
@@ -733,25 +733,25 @@ slice, EV-TIMELINE.
 - Requirement: a keyboard added while the desktop runs appears as a new `/dev/input/event*` inside the container.
 - Acceptance: the container node count rises after `device_add` (USB `usb-kbd` on xHCI, and PCI `virtio-keyboard-pci`).
 - Evidence: common set; the counter line from `xorg-input-count.txt`.
-- Tier: T3 · Coverage: ❌ evidence not saved (only the counter lines in `xorg-input-count.txt`); asserted by `e2e` "input hotplug" (PCI keyboard) and "KVM switch simulation" (USB re-add).
+- Tier: T3 · Coverage: ✅ `e2e` "input hotplug" (PCI `virtio-keyboard-pci`) and "KVM switch simulation" (the USB keyboard re-added) each save F3.9's common set before and after the `device_add` (QEMU's `info usb` and its reply to the command, `ls -l /dev/input` on the host and in the container, `/proc/bus/input/devices`, `xinput list`, each pair diffed) and the Xorg log's lines since; the host's and the container's event-node counts rise, the USB re-add's back to at least the count before the switch; the counter lines are saved, under `artifacts/S3.9.1/` (artifact `evidence-vm-core`).
 
 **S3.9.2 Keyboard plug-in is adopted by Xorg**
 - Requirement: Xorg/libinput opens the new device and lists it.
 - Acceptance: `xinput list` gains an entry named for the QEMU device, or the Xorg log gains `Adding input device` **and** `XINPUT: Adding extended input device` for it.
 - Evidence: common set with the `xinput list` diff and the two log lines quoted.
-- Tier: T3 · Coverage: ❌ not asserted: `e2e` "input hotplug" only records the `Adding input device` count. The `kvmok` check in "KVM switch simulation" can only pass if Xorg adopted the re-added USB keyboard, but no `xinput list` entry or log line is checked or saved.
+- Tier: T3 · Coverage: ✅ `e2e` "input hotplug": the device the kernel gained (`QEMU Virtio Keyboard`, from the `/proc/bus/input/devices` diff) gains an entry in `xinput list`, and Xorg's two adding lines for it are quoted from the log's slice; the xinput pair and its diff under `artifacts/S3.9.2/`, the rest of the common set under `artifacts/S3.9.1/` (artifact `evidence-vm-core`).
 
 **S3.9.3 Keyboard plug-out removes the node from the container**
 - Requirement: after `device_del`, the node is gone inside the container.
 - Acceptance: the container node count drops to the pre-add value.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌ evidence not saved; `e2e` "KVM switch simulation" asserts only that the container count drops (a failed probe reads 0 and passes), not that it returns to the pre-add value.
+- Tier: T3 · Coverage: ✅ `e2e` "KVM switch simulation": after `device_del kvmkbd` the USB keyboard's own event node(s), read from `/proc/bus/input/devices` before, are gone from the container's `/dev/input`, and its count is the one before less those nodes; the common set before and after, diffed, and the Xorg log since, under `artifacts/S3.9.3/` (artifact `evidence-vm-core`).
 
 **S3.9.4 Keyboard plug-out is seen by Xorg**
 - Requirement: the device leaves `xinput list`; the log records `removing device`.
 - Acceptance: as stated, polled.
 - Evidence: common set with the `removing device` line quoted.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "KVM switch simulation": `QEMU QEMU USB Keyboard` leaves `xinput list` (polled), and the Xorg log since the removal has `config/udev: removing device QEMU QEMU USB Keyboard`, quoted; the xinput pair, its diff and the log slice under `artifacts/S3.9.4/`, the rest of the common set under `artifacts/S3.9.3/` (artifact `evidence-vm-core`).
 
 **S3.9.5 A hot-added keyboard delivers keystrokes**
 - Requirement: keys sent through the re-added device itself reach the focused application, and the operator sees them.
@@ -763,7 +763,7 @@ slice, EV-TIMELINE.
 - Requirement: a remove/re-add cycle does not wedge the X session or its input stack.
 - Acceptance: click + type after the cycle lands in the sink xterm.
 - Evidence: EV-SHOT; EV-PIDS (Xorg pid unchanged across the cycle); EV-VIDEO of the cycle.
-- Tier: T3 · Coverage: ❌ evidence not saved (no screendump, pid table or video of the cycle); asserted by `e2e` "KVM switch simulation" (`kvmok`).
+- Tier: T3 · Coverage: ✅ `e2e` "KVM switch simulation": after the remove/re-add cycle the sink xterm reads `kvmok` typed through QEMU, and Xorg keeps its pid; the cycle on video (2 fps frames with their times, and a gif), the screendump after the typing, the QMP transcript, the sink file and Xorg's and mwm's pid tables before and after, under `artifacts/S3.9.6/` (artifact `evidence-vm-core`).
 
 **S3.9.7 Pointer plug-in reaches the container**
 - Requirement: a mouse or tablet added while the desktop runs appears as a new `event*` node inside the container.
@@ -821,19 +821,19 @@ event, EV-TIMELINE.
 - Requirement: forcing a declared connector down under the running server changes neither the screen size nor any output's or window's position.
 - Acceptance: S3.4.10.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_fixed_layout` asserts the screen size and `Virtual-1`'s position after the force, but not `Virtual-2`'s position or the windows.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`, on S3.4.10's force: the screen size (2048x768), every output's position (`Virtual-1` at +0+0, `Virtual-2` at +1024+0) and every client window's id, size and position held, asserted in S3.4.10 on the same snapshots; F3.10's common set before and after the force (sysfs, `xrandr --verbose`, `xwininfo -root -tree`), the tree's diff (empty) and the Xorg log since just before the force, under `artifacts/S3.10.1/`; the video and the `xrandr` diff under `artifacts/S3.4.10/` (artifact `evidence-vm-core`).
 
 **S3.10.2 Monitor plug-out is reported by RandR**
 - Requirement: after the connector goes down, `xrandr` reports it `disconnected` while it stays enabled.
 - Acceptance: `xr_is Virtual-1 disconnected 1024x768+0+0`.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted by `guest:verify_fixed_layout`.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`: after S3.4.10's force sysfs reads `Virtual-1` `disconnected`, and `xrandr` reports `Virtual-1 disconnected primary 1024x768+0+0`, still enabled; the snapshots before and after the force under `artifacts/S3.10.2/`, their diffs under `artifacts/S3.4.10/` (artifact `evidence-vm-core`).
 
 **S3.10.3 Monitor re-plug after plug-out restores connected status without moving anything**
 - Requirement: `detect` under the running server returns `xrandr` to `connected` with the same geometry and windows.
 - Acceptance: poll `xrandr` for `Virtual-1 connected 1024x768+0+0`; dims `2048x768`; window tree unchanged.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_fixed_layout` waits only for sysfs to read `connected`, then restarts the desktop before any `xrandr` check.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug` sets `Virtual-1`'s `status` back to `detect`, waits for sysfs to read `connected`, then polls `xrandr` until it reads `Virtual-1 connected primary 1024x768+0+0`; the screen is still 2048x768, `Virtual-2` still at 1024x768+1024+0, and no client window moved or resized across the unplug and re-plug. Sysfs, `xrandr --verbose` and the tree before the force and after the re-plug, their diffs (the tree's empty) and the Xorg log since just before the re-plug, under `artifacts/S3.10.3/` (artifact `evidence-vm-core`).
 
 **S3.10.4 Monitor plug-in on an empty connector, layout declared**
 - Requirement: forcing `Virtual-2` to `on` under a layout that declares it changes nothing except `xrandr` now saying `connected`.
@@ -951,9 +951,9 @@ event, EV-TIMELINE.
 
 **S4.5.2 Audio recovers from its own crash without disturbing X**
 - Requirement: new PipeWire pid, export reachable, mwm still running.
-- Acceptance: `guest:verify_audio_lifecycle`, with the Xorg and mwm pids compared before and after; `smoke` "RECOVERY" for the new PipeWire pid only, until it probes the socket with `pactl info` (`-S` alone passes on a stale socket).
+- Acceptance: `guest:verify_audio_lifecycle` and `smoke` "RECOVERY": a new PipeWire pid, `pactl info` answering over the export (a socket file alone passes when it is stale), and the Xorg and mwm pids unchanged.
 - Evidence: EV-PIDS before/after (pipewire changed, Xorg/mwm unchanged); EV-LOG-DESKTOP; EV-AUDIO after.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; asserted by `guest:verify_audio_lifecycle`, except that it checks X only by `pgrep mwm` (a restarted session passes), and `smoke` "RECOVERY" checks only that the pulse socket exists (a stale one passes).
+- Tier: T2/T3 · Coverage: ✅ the T2 half: `smoke` "RECOVERY" kills pipewire as the desktop user and requires a new pipewire pid, the pulse socket back in `/run/desktop-audio`, `pactl info` answering over it as the session user, and Xorg's and mwm's pids unchanged; the process tables before and after, `pactl info` and the desktop's log since the kill, under `artifacts/S4.5.2/` (artifact `evidence-smoke`). The T3 half: `guest:verify_audio_lifecycle` does the same in the VM, with `pactl info` from the host over the export, and `e2e` then captures a pulse client's 440 Hz tone at the machine's output through the recovered stack (the WAV, check-audio's verdict and its level plot), under `artifacts/S4.5.2/` (artifact `evidence-vm-core`).
 
 ### F4.6 Capture direction
 
@@ -981,13 +981,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: a card added while the desktop runs produces a new `/dev/snd/controlC*` inside the container.
 - Acceptance: the container node count rises after `device_add usb-audio,…,bus=xhci.0`.
 - Evidence: common set; counter line.
-- Tier: T3 · Coverage: ❌ evidence not saved (only the counter line in `xorg-input-count.txt`); asserted by `e2e` "audio hotplug".
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug": `device_add usb-audio` raises the host's and the container's `controlC*` counts; F4.7's common set before and after (QEMU's `info usb` and its reply, `ls -l /dev/snd` on the host and in the container, `wpctl status`, `pw-cli ls Device`, `pactl list short` sinks, sources and sink-inputs, `pactl get-default-sink`, the three daemons' pids), each pair diffed, the desktop's log since, and the counter line, under `artifacts/S4.7.1/` (artifact `evidence-vm-core`).
 
 **S4.7.2 Sound card plug-in reaches WirePlumber**
 - Requirement: WirePlumber gains an `alsa_card.*` Device object for it.
 - Acceptance: the `pw-cli ls Device` count rises.
 - Evidence: common set with the new Device object's block quoted.
-- Tier: T3 · Coverage: ❌ evidence not saved (no `pw-cli ls Device` before/after); asserted by `e2e` "audio hotplug".
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug": the `pw-cli ls Device` count of `alsa_card` devices rises, and the new Device object is quoted whole from the listing after; the before/after pair and its diff under `artifacts/S4.7.2/`, the rest of the common set under `artifacts/S4.7.1/` (artifact `evidence-vm-core`).
 
 **S4.7.3 A hot-added card plays, and it is the new card that is heard**
 - Requirement: audio routed to the hot-added card's sink is rendered by that device.
@@ -999,19 +999,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: after `device_del`, the `controlC*` node is gone inside the container.
 - Acceptance: the container node count returns to baseline.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌ evidence not saved; `e2e` "audio hotplug" asserts only that the container count drops below the plugged-in count (a failed probe reads 0 and passes), not that it returns to baseline.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug": after `device_del hotsnd` the container's `controlC*` count is back to its baseline, not just lower; the common set with the card plugged in and after, each pair diffed, and the counter line, under `artifacts/S4.7.4/`; the desktop's log across the cycle under `artifacts/S4.7.6/` (artifact `evidence-vm-core`).
 
 **S4.7.5 Sound card plug-out removes the WirePlumber device and a default sink is re-selected**
 - Requirement: WirePlumber drops the Device object and re-selects a default sink.
 - Acceptance: the Device count returns to baseline (polled); `pactl get-default-sink` names a surviving sink.
 - Evidence: common set; `pactl get-default-sink` before/after.
-- Tier: T3 · Coverage: ❌ evidence not saved; `e2e` "audio hotplug" asserts the Device count falls to at most the baseline but never checks the default sink, which `operator-e2e:s11_3_1` records around its own card removal without asserting it.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug": WirePlumber's `alsa_card` Device count is back to its baseline after the unplug, and `pactl get-default-sink` names one of the sinks left (the built-in card's; with the card plugged in WirePlumber had moved the default to it); the `pw-cli ls Device` pair and diff, the default sink before, plugged in and after, and the sinks after, under `artifacts/S4.7.5/`, the rest of the common set under `artifacts/S4.7.4/` (artifact `evidence-vm-core`).
 
 **S4.7.6 The built-in card plays after a cycle**
 - Requirement: a plug/unplug cycle does not wedge the audio stack; the operator hears the speakers again.
 - Acceptance: a pulse tone is captured at 440 Hz afterwards.
 - Evidence: EV-AUDIO; EV-PIDS (the three daemons unchanged across the cycle).
-- Tier: T3 · Coverage: ❌ evidence not saved (no pid table for the three audio daemons); asserted by `e2e` "audio hotplug" (the closing 440 Hz capture, `audio-after-hotplug.wav`).
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug": after the plug/unplug cycle a pulse client's 440 Hz tone is captured at the machine's output (the WAV, check-audio's verdict and its level plot), and pipewire, wireplumber and pipewire-pulse keep their pids (the tables before and after, their diff empty); the desktop's log across the cycle, under `artifacts/S4.7.6/` (artifact `evidence-vm-core`).
 
 **S4.7.7 A stream playing on the card that is unplugged fails cleanly**
 - Requirement: a client streaming to the hot-added card when it is removed is either moved to the remaining sink or gets a clean error; the three daemons keep their pids.
@@ -1280,7 +1280,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: ordinary users' home-dir keys still work.
 - Acceptance: every `vm_ssh` as `rocky` after the drop-in is active.
 - Evidence: one `vm_ssh` transcript after `sshd` reload (EV-STATE); the drop-in (EV-CONFIG).
-- Tier: T3 · Coverage: ❌ evidence not saved; asserted only implicitly, in that every `vm_ssh` as `rocky` after `guest:phase_deploy` reloads sshd with the drop-in would fail if home-dir keys broke.
+- Tier: T3 · Coverage: ✅ `e2e` "sshd": the deploy tree's drop-in is in `/etc/ssh/sshd_config.d/`; `sshd -T` gives `authorizedkeysfile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u`, the stock home-dir path first; a fresh ssh login lands as `rocky`, and sshd's journal has an accepted publickey login for rocky after sshd's first reload this boot; the drop-in, `sshd -T`'s line, and the login transcript with rocky's key file and both journal lines, under `artifacts/S5.7.6/` (artifact `evidence-vm-core`).
 
 **S5.7.7 Container side degrades gracefully without key material**
 - Requirement: no key → hint logged, exit 0; empty `shell-user` → warning, exit 0; both present → `~/.ssh/config` and a 0400 key copy; preflight WARNs `no host shell material`.
@@ -1621,7 +1621,7 @@ EV-LOG-CLIENT (the player's output), EV-AUDIO with spectrogram, EV-TIMELINE.
 - Requirement: a pod records the sink monitor and the recording carries the tone.
 - Acceptance: `guest:verify_record`.
 - Evidence: EV-AUDIO-REC; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence not saved: the recording stays in the VM; asserted by `guest:verify_record`.
+- Tier: T3 · Coverage: ✅ `e2e` "cdi: a client can RECORD": `guest:verify_record` has the cdi-verify pod record the default sink's monitor with `parec` while a 660 Hz tone plays (S4.6.1), and the recording, copied out of the VM, carries 660 Hz by `check-audio.py`; the pod's container (`restartCount`, id, start time) and its main process's host pid before and after, their diff empty (the same container, `restartCount` 0); the recording with its verdict and level plot, under `artifacts/S7.6.2/` (artifact `evidence-vm-k8s`).
 
 **S7.6.3 A client's playback continues through an X session restart, uninterrupted**
 - Requirement: an application container playing a 20 s tone when Xorg is killed keeps playing with no gap, `restartCount` 0, same app pid.
@@ -1777,7 +1777,7 @@ not evidence.
 **S8.2.2 Physical KVM: video, modesetting and NVIDIA**
 - Requirement: with a declared layout, `xrandr` geometry and window positions are unchanged across a switch cycle; the panel shows the picture after link retraining.
 - Evidence: EV-PHONEVIDEO with the monitor in frame through the whole cycle; `xrandr --query` and `xwininfo -root -tree` before/after (EV-DIFF empty); `cat /sys/class/drm/card*-*/status` during the away period; EV-LOG-XORG connector lines.
-- Tier: T4 · Coverage: 🔧 `guest:verify_fixed_layout` forces a connector off under a running X and asserts the declared geometry holds; guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `guest:layout_unplug` forces a connector off under a running X and asserts the declared geometry holds; guided hardware script, not yet written.
 
 **S8.2.3 Real EDID and `desktop-monitors-capture`**
 - Requirement: the capture tool prints the real output names and rates; pasting them yields the same arrangement after restart.
@@ -1953,7 +1953,7 @@ not, supposed to happen.
 - Requirement: starting from an autodetected desktop, the maintainer runs `desktop-monitors-capture`, pastes its output into `/etc/desktop-container/monitors.conf` and runs `systemctl restart desktop.service`, as `deploy/README.md` "Fixed monitor layout" says; the desktop returns with the same arrangement, now pinned.
 - Acceptance: the tool's stdout written to the file unmodified; after the restart, `30-monitors.conf` exists in the container and names the captured outputs; per output, the `xrandr --query` geometry equals the captured one (mode names may change to the `cvt(1)` names, as `monitors.conf`'s comments say); preflight prints its fixed-layout PASS line; S3.4.10's live disconnect then holds the geometry.
 - Evidence: common set; the captured block and the generated file (EV-CONFIG); `xrandr --query --verbose` before and after (EV-DIFF, with the expected mode-name changes listed in the index); EV-LOG-DESKTOP `xorg-monitor-conf:` and `preflight:` lines.
-- Tier: T3 · Coverage: ❌. `guest:verify_fixed_layout` starts from the autodetected desktop but writes its layout by hand; `desktop-monitors-capture` is never run (S3.4.12), so nothing checks that its output, pasted unmodified, reproduces the arrangement.
+- Tier: T3 · Coverage: ❌. `guest:layout_declare` starts from the autodetected desktop but writes its layout by hand; `guest:layout_roundtrip` (S3.4.12) runs `desktop-monitors-capture` on that declared layout, writes the block's output lines (its comments dropped) to `monitors.conf` and restarts the desktop, and S3.4.10's disconnect then holds. Nothing captures an autodetected arrangement, pastes the output unmodified, or reads preflight's fixed-layout line.
 
 **S10.3.2 A layout the maintainer gets wrong costs no desktop, and the documented checks say what was wrong**
 - Requirement: whatever the maintainer writes in `monitors.conf`, the desktop comes up after the restart, and `podman logs desktop | grep xorg-monitor-conf` or `podman logs desktop | grep preflight:` (both in `deploy/README.md` "Verify") names the problem; every keyword the documentation offers is one the generator accepts.
@@ -1997,7 +1997,7 @@ not, supposed to happen.
 - Requirement: `systemctl restart desktop.service`, the step several documented procedures end in, gives the operator the desktop back (root colour, initial xterm, mwm frames), with typing and sound working, within a stated budget; nothing in between offers a login prompt on the screen. Proposed budget: 60 s from the command; confirm it against measured runs before it gates anything.
 - Acceptance: EV-VIDEO from the command to the first frame showing the desktop, with the elapsed time in the index; typed text lands (S3.8.1); a pulse tone is heard; every desktop pid changed (a restart that was supposed to happen) and the host session moved with it (S5.8.2).
 - Evidence: common set; the time to desktop; EV-AUDIO.
-- Tier: T3 · Coverage: ❌ evidence not saved, and nothing checks what the operator gets back or how long it takes: `smoke` asserts the container and host session return (S5.8.2), `guest:verify_fixed_layout` waits for X to answer after its two restarts, and `operator-e2e:s11_3_1` waits for the ready marker and mwm after its own restart.
+- Tier: T3 · Coverage: ❌ evidence not saved, and nothing checks what the operator gets back or how long it takes: `smoke` asserts the container and host session return (S5.8.2), `guest:layout_declare`, `guest:layout_roundtrip` and `guest:layout_restore` each wait for X to answer after their restart, and `operator-e2e:s11_3_1` waits for the ready marker and mwm after its own restart.
 
 **S10.4.2 A maintenance stop leaves the seat free and the host quiet; a start restores everything**
 - Requirement: `systemctl stop desktop.service` stops the desktop and its host login session, leaves no `desktop` process on the host, frees `/dev/dri/card*` and `/dev/tty1`, puts no getty on any VT, and nothing restarts the desktop until the maintainer starts it; `desktop-preflight` describes that state accurately; `systemctl start desktop.service` brings back S10.4.1's outcome.
@@ -2300,14 +2300,14 @@ moves to ✅ only when a CI run has saved its evidence, which the
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 12 | 0 | 2 | 0 |
 | E2 Boot & supervision | 25 | 17 | 1 | 7 | 0 |
-| E3 Display & session | 62 | 27 | 1 | 31 | 3 |
-| E4 Audio | 23 | 5 | 0 | 17 | 1 |
-| E5 Deploy tree | 50 | 24 | 1 | 24 | 1 |
+| E3 Display & session | 62 | 37 | 1 | 21 | 3 |
+| E4 Audio | 23 | 11 | 0 | 11 | 1 |
+| E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
 | E6 Privileges | 9 | 3 | 0 | 6 | 0 |
-| E7 Client contract & journeys | 40 | 10 | 1 | 29 | 0 |
+| E7 Client contract & journeys | 40 | 11 | 1 | 28 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **103** | **4** | **138** | **6** |
+| **Total** | **251** | **121** | **4** | **120** | **6** |
 
 Regenerate after editing with:
 
