@@ -156,6 +156,7 @@ mt_provision() { # took|skipped: S10.1.3's restorecon line
     ev_shot stock "EV-SHOT: the stock host's screen before the tree: the image's own login prompt on tty1"
     EV_VID_FPS=1 ev_video_start first-boot
     vid="$EV_DIR/$EV_VID"
+    ev_mark "deploy/README.md's Apply block runs, its reboot last"
     mt_close
     lines=$(wc -l < "$VM_SERIAL")
     b0=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | tail -n1)
@@ -314,6 +315,7 @@ mt_watch() { # <story> <moment> <guest step...>
     ev_shot "before-$moment" "EV-SHOT: the screen right before '$*' ($moment)"
     ev_video_start "$moment"
     vid="$EV_DIR/$EV_VID"
+    ev_mark "'$*' runs ($moment)"
     mt_close
     t0=$(date +%s.%N)
     if ! mg "$@"; then
@@ -466,6 +468,7 @@ mt_hostterm() {
     ev_shot before-switch "EV-SHOT: the screen before the switch"
     EV_VID_FPS=1 ev_video_start switch-reboot
     vid="$EV_DIR/$EV_VID"
+    ev_mark "Host Terminal's off-switch is applied, then the host reboots"
     mt_close
     lines=$(wc -l < "$VM_SERIAL")
     # The step ends in the reboot: exit 1 is the step failing before it.
@@ -570,6 +573,7 @@ mt_rebuild() {
                 vid="$EV_DIR/$EV_VID"
                 t0=$(date +%s.%N)
                 MT_LF_RESTARTED=1
+                ev_mark "\`$line\` runs"
                 ev_save "rebuild-$n" "EV-PROCEDURE: \`$line\`, as written, by rocky in its checkout: its output and exit status" \
                     vm_ssh "cd repo && $line" >/dev/null || rc=$?
                 # Whichever image comes back, the old root colour or the
@@ -663,6 +667,7 @@ mt_fault_drm() {
     ev_shot before "EV-SHOT: the screen before the fault"
     EV_VID_FPS=1 ev_video_start drm
     vid="$EV_DIR/$EV_VID"
+    ev_mark "the fault is staged: a root process opens /dev/dri/card0, then the desktop is started"
     mt_close
     if ! mg drm-stage; then
         mt_open S10.5.1
@@ -673,6 +678,9 @@ mt_fault_drm() {
     mt_no_desktop S10.5.1 symptom 30
     mg drm-diagnose || mt_failed S10.5.1 "the documented first stops and checks could not run"
     n0=$(wc -l < "$vid/index.txt" 2>/dev/null || echo 0)
+    mt_open S10.5.1
+    ev_mark "the documented remedy: the holder is killed"
+    mt_close
     t0=$(date +%s.%N)
     mg drm-remedy || { mt_failed S10.5.1 "the holder could not be killed"; return 1; }
     if mt_wait_screen "$vid" 60 "$n0"; then
@@ -735,6 +743,7 @@ mt_fault_gid() {
     mt_open S10.5.4
     EV_VID_FPS=1 ev_video_start path-b
     vid="$EV_DIR/$EV_VID"
+    ev_mark "the entry's escape hatch is applied"
     mt_close
     t0=$(date +%s.%N)
     mg gid-hatch || mt_failed S10.5.4 "the escape hatch could not be applied"
@@ -778,6 +787,7 @@ mt_back() { # <story> <guest step> <moment before> <moment after> <tag> <word>
     ev_shot "before-$2" "EV-SHOT: the screen right before systemctl $2 desktop.service"
     ev_video_start "$2"
     vid="$EV_DIR/$EV_VID"
+    ev_mark "systemctl $2 desktop.service"
     mt_close
     t0=$(date +%s.%N)
     if ! mg "$2"; then
@@ -888,6 +898,7 @@ mt_live_host() { # readme|deploy <word> <hz>
     ev_shot "stock-$1" "EV-SHOT: the stock host's screen before the $1 path: the image's own login prompt on tty1"
     EV_VID_FPS=1 ev_video_start "live-$1"
     vid="$EV_DIR/$EV_VID"
+    ev_mark "the $1 path's first command runs"
     mt_close
     t0=$(date +%s.%N)
     mg live "$1" || mt_failed S10.1.4 "the $1 path's step did not run through"
@@ -944,6 +955,7 @@ maint_gdm() {
     ev_shot greeter "EV-SHOT: the graphical host's screen before the tree: gdm's greeter"
     EV_VID_FPS=1 ev_video_start greeter-to-desktop
     vid="$EV_DIR/$EV_VID"
+    ev_mark "the live sequence runs on the greeter's host (gdm-live)"
     mt_close
     t0=$(date +%s.%N)
     mg gdm-live || mt_failed S10.1.5 "the live sequence's step did not run through"
@@ -956,6 +968,9 @@ maint_gdm() {
         held)
             b0=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | tail -n1)
             skip=$(wc -l < "$vid/index.txt")
+            mt_open S10.1.5
+            ev_mark "the second outcome's reboot"
+            mt_close
             mg_reboot gdm-reboot && rc=0 || rc=$?
             [ "$rc" != 1 ] || { ev_pull; fail "S10.1.5: the reboot could not be started"; }
             if ! mt_wait_screen "$vid" 300 "$skip"; then
@@ -1037,6 +1052,7 @@ mt_unprovisioned() {
     mt_open S10.6.2
     EV_VID_FPS=1 ev_video_start start
     vid="$EV_DIR/$EV_VID"
+    ev_mark "systemctl start desktop.service, the client pod Pending"
     mt_close
     t0=$(date +%s.%N)
     mg unprov-start || mt_failed S10.6.2 "after the desktop's start, the same pod did not schedule, run and capture"
@@ -1069,6 +1085,7 @@ maint_k8s() {
     mt_open S10.6.1
     ev_shot before-apply "EV-SHOT: the screen before README.md's apply line: the desktop, nothing of the demo pod's"
     ev_video_start apply
+    ev_mark "README.md's apply line runs"
     mt_close
     if mg k8s-apply; then
         mt_open S10.6.1

@@ -779,13 +779,20 @@ class Ctx:
         procs = [p for p in table.get(comm, []) if p["user"] == "desktop"]
         return procs[0]["pid"] if len(procs) == 1 else None
 
+    def mark(self, label):
+        """The event the recording running now names the frame of (S9.3.5)."""
+        self.st.mark(label)
+
     @contextlib.contextmanager
     def video(self, moment, what, fps=2.0):
         """EV-VIDEO: screendumps at fps for the duration of the block. QEMU
         writes each frame as a PPM, its raw pixels, and the frames become
         PNGs after the block: QEMU compresses a PNG screendump in its main
         loop, where its sound cards run, and an emulated HDA codec drops
-        audio when that loop falls behind (qmp-tool.py's video says more)."""
+        audio when that loop falls behind (qmp-tool.py's video says more).
+        The gif's line in the index names its event frames (Requirements.md
+        S9.3.5): the frame at or after each mark (Ctx.mark) made inside the
+        block, and the frames where the screen first and last changes."""
         name = self.st.name(moment, "")
         frames = self.st.path(name)
         os.makedirs(frames, exist_ok=True)
@@ -815,17 +822,20 @@ class Ctx:
             time.sleep(0.6)
             stop.set()
             t.join(30)
-            for f in sorted(os.listdir(frames)):
-                if f.endswith(".ppm"):
-                    ppm = os.path.join(frames, f)
-                    subprocess.run(["convert", ppm, ppm[:-4] + ".png"], check=False, timeout=60)
-                    os.unlink(ppm)
+            ppms = sorted(os.path.join(frames, f) for f in os.listdir(frames) if f.endswith(".ppm"))
+            evlib.write_changes(frames, ppms)
+            for ppm in ppms:
+                subprocess.run(["convert", ppm, ppm[:-4] + ".png"], check=False, timeout=60)
+                os.unlink(ppm)
             self.run.log("video", f"stop {name} ({len(index)} frames)")
             with open(os.path.join(frames, "index.txt"), "w") as f:
                 f.write("\n".join(index) + "\n")
+            # The marks are this side's: the host's clock, as the frames are.
+            events = evlib.video_events(frames, host=[self.st.path(self.st.side + "timeline.log")])
             self.st.attach(name + "/", f"EV-VIDEO raw frames at {fps:g} fps; index.txt has each "
                            "frame's timestamp, to read against timeline.log, and how long QEMU took "
-                           "to write it")
+                           "to write it; changes.txt the share of each frame's rows that differ from "
+                           "the frame before; events.txt the event frames")
             gif = name + ".gif"
             pngs = sorted(p for p in os.listdir(frames) if p.endswith(".png"))
             if pngs:
@@ -833,7 +843,7 @@ class Ctx:
                                     *[os.path.join(frames, x) for x in pngs], "-resize", "50%",
                                     self.st.path(gif)], capture_output=True, timeout=300)
                 if p.returncode == 0:
-                    self.st.attach(gif, what)
+                    self.st.attach(gif, f"{what}; {events}")
 
     # -- doing: QEMU's tablet and keyboard only --
     def move(self, x, y, device=None):
@@ -1425,11 +1435,13 @@ def kbd_readd(ctx, bound):
     """The USB keyboard out and back: bound to the display (keys that name
     vga0 then come through it alone), or unbound, as QEMU boots it."""
     n = len(xi_ids(ctx, USB_KBD))
+    ctx.mark("device_del kvmkbd: the USB keyboard leaves")
     ctx.m.device_del("kvmkbd")
     wait_until(lambda: len(xi_ids(ctx, USB_KBD)) < n, 20, 0.5)
     props = {"driver": "usb-kbd", "id": "kvmkbd", "bus": "xhci.0"}
     if bound:
         props["display"] = "vga0"
+    ctx.mark("device_add kvmkbd: the USB keyboard comes back")
     ctx.m.device_add(**props)
     return wait_xi(ctx, USB_KBD, n)
 
@@ -1458,6 +1470,7 @@ def s3_9_11(ctx, st):
         with ctx.video("tablet", "EV-VIDEO: the pointer, driven through the hot-added tablet alone, crossing "
                        "the screen from its far corner to the sink xterm and clicking it: its frame turns the "
                        "focused colour"):
+            ctx.mark("the pointer, through the hot-added tablet alone, crosses the screen to the sink xterm and clicks it")
             ctx.move(ctx.width - 20, ctx.height - 20, device="vga0")
             time.sleep(0.3)
             ctx.glide(ctx.width - 20, ctx.height - 20, sx, sy, steps=24, dt=0.08, device="vga0")
@@ -1513,6 +1526,7 @@ def s3_9_11(ctx, st):
         xi_test_start(ctx, mid, "mouse")
         with ctx.video("mouse", "EV-VIDEO: the pointer moved by the hot-added USB mouse's relative motion "
                        "inside the session's xterm, then its click there"):
+            ctx.mark("the hot-added mouse moves the pointer, then clicks")
             for _ in range(12):
                 m.rel(-5, 4)
                 time.sleep(0.05)
@@ -1616,6 +1630,7 @@ def kvm_cycle(ctx, st, prefix="", on_away=None, on_back=None):
     returns (away, back, base)."""
     m = ctx.m
     base = (*node_counts(ctx), *snd_counts(ctx), len(xi_ids(ctx, USB_KBD)), len(xi_ids(ctx, USB_TABLET)))
+    ctx.mark("device_del kvmkbd, kvmtab and kvmsnd back to back: the KVM switches away")
     m.device_del("kvmkbd")
     m.device_del("kvmtab")
     m.device_del("kvmsnd")
@@ -1626,6 +1641,7 @@ def kvm_cycle(ctx, st, prefix="", on_away=None, on_back=None):
     away_c = (*node_counts(ctx), *snd_counts(ctx), len(xi_ids(ctx, USB_KBD)), len(xi_ids(ctx, USB_TABLET)))
     st.write(f"{prefix}away", input_state(ctx) + audio_devices(ctx),
              "the whole state with the three devices away: F3.9's and F4.7's common sets")
+    ctx.mark("device_add the keyboard, tablet and sound card: the KVM switches back")
     m.device_add(driver="usb-kbd", id="kvmkbd", bus="xhci.0")
     m.device_add(driver="usb-tablet", id="kvmtab", bus="xhci.0", display="vga0")
     m.device_add(driver="usb-audio", id="kvmsnd", audiodev="snd0", bus="xhci.0")
@@ -1951,6 +1967,7 @@ def s7_7_2(ctx, st):
     try:
         with ctx.video("tablet", "EV-VIDEO: a tablet plugged in after the client started, then clicking the "
                        "client's window through it: its frame turns the focused colour"):
+            ctx.mark("device_add usb-tablet: the tablet is plugged in")
             m.device_add(driver="usb-tablet", id="op772tab", bus="xhci.0", display="vga0")
             tid = wait_until(lambda: (xi_ids(ctx, USB_TABLET) or [None])[-1], 20, 0.5)
             a = xs.parts(cli)["swatch"]
@@ -1969,6 +1986,7 @@ def s7_7_2(ctx, st):
             st.check(tid and img.px(*a) == UNFOCUSED, "with the tablet plugged in and the session's xterm "
                      "clicked, the client's frame is the inactive colour", f"X id {tid}, frame {img.px(*a)}")
             xi_test_start(ctx, tid, "s772")
+            ctx.mark("the client's window clicked through the hot-added tablet")
             ctx.click(*centre(cli), device="vga0")
             xit = xi_test_stop(ctx, tid, "s772")
             img = ctx.shot("after-click", "EV-SHOT: the client's window clicked through the hot-added tablet: its "
@@ -2112,6 +2130,7 @@ def arrange(ctx, st, who, wid):
     gx, gy = visible_point(ctx, xs, win, f"{who}'s title bar")
     with ctx.video(f"{tag}-move", f"the {who} following the title-bar drag (mwm draws an outline "
                    "while the button is held)"):
+        ctx.mark(f"the {who}'s title bar dragged by ({dx:+d},{dy:+d})")
         ctx.drag(gx, gy, gx + dx, gy + dy)
     after = ctx.one(wid)
     ctx.shot(f"{tag}-after-move", f"the {who} moved by ({dx:+d},{dy:+d})")
@@ -2140,6 +2159,7 @@ def arrange(ctx, st, who, wid):
     st.check(ex < ctx.width - 4 and ey < ctx.height - 4, f"{who}: there is room on the screen to "
              "widen it by 10 columns and 4 rows", f"the corner would go to ({ex},{ey})")
     with ctx.video(f"{tag}-resize", f"the {who} following a drag of its bottom-right corner"):
+        ctx.mark(f"the {who}'s bottom-right corner dragged")
         ctx.drag(cx, cy, ex, ey)
     after = ctx.one(wid)
     ctx.shot(f"{tag}-after-resize", f"the {who} resized by its corner")
@@ -2688,6 +2708,7 @@ def menu_pack_icons(ctx, st, state):
         tx = int(ctx.width * (0.55 if i == 0 else 0.35))
         ty = int(ctx.height * (0.3 if i == 0 else 0.5))
         with ctx.video(f"icon-drag-{i + 1}", "an icon dragged away from mwm's icon row"):
+            ctx.mark("an icon dragged off mwm's icon row")
             ctx.drag(icon.ax + icon.w // 2, icon.ay + icon.h // 2, tx, ty)
     scattered = {tid: (ctx.one(icon).ax, ctx.one(icon).ay) for tid, icon in slots.items()}
     ctx.shot("icons-scattered", "the two icons dragged apart, away from the icon row")
@@ -2723,8 +2744,10 @@ def menu_restart_mwm(ctx, st, state):
     clients = [c.id for c in before.walk() if c.instance == "xterm"]
     states = {w: ctx.one(w).wm_state for w in clients}
     with ctx.video("restart-mwm", "Restart mwm: the frames go and come back; the windows stay"):
+        ctx.mark("Restart mwm chosen from the root menu")
         ctx.root_menu("Restart mwm", "restart-mwm")
         ctx.confirm(before, "restart-mwm")
+        ctx.mark("Restart mwm confirmed in its dialog")
         renewed = wait_until(lambda: (lambda s: s if s and s != socks else None)(mwm_sockets()), 20, 0.5)
         time.sleep(2)
     after = ctx.xstate(check=False)
@@ -2759,8 +2782,10 @@ def menu_quit_session(ctx, st, state):
 
     with ctx.video("quit-session", "Quit session: the X session ends, and 3 s later a new one starts "
                    "with its xterm at 100x30+60+60"):
+        ctx.mark("Quit session chosen from the root menu")
         ctx.root_menu("Quit session", "quit-session")
         ctx.confirm(before, "quit-session")
+        ctx.mark("Quit session confirmed in its dialog")
         came_back = wait_until(back, 60, 1)
         time.sleep(1)
     table = ctx.pids("pids-after-quit")
@@ -3063,6 +3088,7 @@ def sound_controls(ctx, st, held):
         usb_b = st.last
         with ctx.video("plug", "the display while the USB card is plugged in (QMP device_add): nothing on "
                        "it changes, and nothing restarts"):
+            ctx.mark("device_add usb-audio: the USB card is plugged in")
             m.device_add(driver="usb-audio", id="opsnd", audiodev="snd0", bus="xhci.0")
             held["card"] = ""
             mark(M_PLUG)
@@ -3645,8 +3671,10 @@ def m_restart_mwm(ctx, st, arg):
     before = ctx.xstate()
     with ctx.video(f"restart-mwm-{arg}", "Restart mwm chosen from the root menu: the frames go and "
                    "come back; the windows stay"):
+        ctx.mark("Restart mwm chosen from the root menu")
         ctx.root_menu("Restart mwm", f"restart-mwm-{arg}")
         ctx.confirm(before, f"restart-mwm-{arg}")
+        ctx.mark("Restart mwm confirmed in its dialog")
         renewed = wait_until(lambda: (lambda s: s if s and s != socks else None)(mwm_sockets()), 20, 0.5)
         time.sleep(2)
     table = ctx.pids(f"pids-after-restart-mwm-{arg}")

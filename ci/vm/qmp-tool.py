@@ -20,7 +20,9 @@
       command wait.
 
       QEMU writes each frame as a PPM, its raw pixels, and the frames become
-      PNGs once the recording stops. QEMU compresses a PNG screendump in its
+      PNGs once the recording stops. Before they do, DIR/changes.txt gets
+      the share of each frame's rows that differ from the frame before it
+      (ci/evlib.py's frame_changes), for the event frames (S9.3.5). QEMU compresses a PNG screendump in its
       main loop, the loop its emulated sound card and audio backend run in,
       and the sound card drops 8 KiB of audio (46 ms) when that loop falls
       behind: in run 37338352192 a PNG frame every half second cost S7.6.3's
@@ -37,6 +39,9 @@ import socket
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import evlib  # noqa: E402  (ci/evlib.py: each frame's change, for the event frames)
 
 
 def stamp():
@@ -111,12 +116,13 @@ def video(sock, out_dir, fps):
                 rc = 1
                 break
             time.sleep(max(0.0, 1.0 / fps - (time.monotonic() - t0)))
-    # The PNGs, now that QEMU is no longer waiting on them.
-    for f in sorted(os.listdir(out_dir)):
-        if f.endswith(".ppm"):
-            ppm = os.path.join(out_dir, f)
-            subprocess.run(["convert", ppm, ppm[:-4] + ".png"], check=False, timeout=60)
-            os.unlink(ppm)
+    # Each frame's change from the one before, from the raw pixels; then the
+    # PNGs, now that QEMU is no longer waiting on them.
+    ppms = sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(".ppm"))
+    evlib.write_changes(out_dir, ppms)
+    for ppm in ppms:
+        subprocess.run(["convert", ppm, ppm[:-4] + ".png"], check=False, timeout=60)
+        os.unlink(ppm)
     return rc
 
 
