@@ -268,6 +268,10 @@ jobs:
             "every diff the harness writes (ev_diff, ev_diff_paths, Ctx.diff and the like) says which lines are expected to differ, and the gate's pair check fails each of four planted story directories (a pair with no diff, a diff that states no expectation, one expected to differ in nothing that differs, one that names neither file) and passes a pair diffed with its expectation"
           rule S9.3.3 "\"No restart\" is measured" \
             "every check in the harness that can pass saying a container or process lived through an event is in a story that diffs two states, and the gate's survival check fails each of two planted claims left unmeasured (nothing kept; only a pid kept for a container) and passes five (a container's id and restart count, a process's pid, a pair a diff compares, a check that something did not survive, a failing check)"
+          rule S9.3.4 "Audio evidence is audible and visible" \
+            "every recording the harness names is judged and pictured where it is named (check-audio.py --report --plot, or the helpers that run it), and the gate's audio check fails each of five planted recordings (no plot, no verdict, a plot and verdict that do not name it, a name that says nothing of what to hear, a pulse tone at pipewire's pitch) and passes a tone and a voice sample with theirs"
+          rule S9.3.6 "The timeline is the spine" \
+            "ci/evidence.sh wraps podman and kubectl so each call is a line of the timeline, ev_log stamps each line and keeps it to one, every ssh, scp, socat or nc in the shell is logged first or kept by ev_save, the Python's ssh and QMP go through the classes that log them, nothing else writes a timeline, and the gate's timeline check fails a line with no timestamp and a file in the index with no line in the timeline and passes a story written through StoryWriter"
           ev_failures
           exit "$f"
       - name: helm lint + template assertions (and S7.3.3's static half)

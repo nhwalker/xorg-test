@@ -81,7 +81,20 @@
   S9.3.3  a claim that a container or process lived through an event is made
           where its story diffs a before/after pair, and the gate's survival
           check fails a claim with no before/after measure of the kind it
-          needs (a container's id and restart count, a process's pid).
+          needs (a container's id and restart count, a process's pid);
+  S9.3.4  each recording the harness names (ev_name ... wav, a Story's
+          name(..., "wav")) is judged and pictured where it is named
+          (check-audio.py --report --plot, or the helpers that run it), and
+          the gate's audio check fails a recording with no plot, no verdict,
+          a plot and verdict that do not name it, a name that says nothing
+          of what to hear, or a source's tone at another source's pitch;
+  S9.3.6  ci/evidence.sh wraps podman and kubectl so each call is a line of
+          the timeline, ev_log stamps each line and keeps it to one, every
+          ssh, scp, socat or nc in the shell is logged first or kept by
+          ev_save, the Python sends its ssh and QMP through the classes
+          that log them, nothing writes a timeline but those writers, and
+          the gate's timeline check fails a line with no timestamp and a
+          file in the index with no line in the timeline.
 
   ci/e9-guard.py [--rule S9.1.5,...] [--self-test]
 
@@ -109,6 +122,21 @@ import tempfile
 # Exceptions, keyed on content, never on line numbers. Each must excuse a
 # finding in the tree (the self-test checks), so none outlives its reason.
 ALLOW = [
+    ("S9.3.6", "ci/vm/operator-e2e.py", r'cmd\("screendump", \{"filename": ppm, "format": "ppm"\}, log=False\)',
+     "EV-VIDEO's frames, two a second: the video's index.txt gives each frame's time, and its start and stop are "
+     "lines of the timeline"),
+    ("S9.3.6", "ci/vm/operator-e2e.py", r'^\["ssh", "-q", "-p"',
+     "the Guest class's own ssh, which Guest.sh runs after logging the command"),
+    ("S9.3.6", "ci/evlib.py", r'open\(os\.path\.join\(self\.root, "timeline\.log"\), "a"\)',
+     "StoryWriter.log, the writer: it stamps each line and keeps it to one"),
+    ("S9.3.6", "ci/evlib.py", r'open\(self\._p\(self\.side \+ "timeline\.log"\), "a"\)',
+     "StoryWriter.log, the writer: the story's own copy of the line"),
+    ("S9.3.6", "ci/vm/operator-e2e.py", r'open\(os\.path\.join\(art, "timeline\.log"\), "a", buffering=1\)',
+     "Run.log, the operator phase's writer: it stamps each line and keeps it to one"),
+    ("S9.3.6", "ci/vm/operator-e2e.py", r'open\(os\.path\.join\(d, "timeline\.log"\), "w", buffering=1\)',
+     "the story's copy of Run.log's lines (Story.log_line)"),
+    ("S9.3.6", "ci/vm/operator-e2e.py", r'open\(os\.path\.join\(d, "h-timeline\.log"\), "a", buffering=1\)',
+     "the h-side story's copy of Run.log's lines (HostStory)"),
     ("S9.1.4", "ci/smoke-deploy.sh", r"^cursor=\$\(journalctl -q -n 1 -o cat --show-cursor",
      "the journal's position (its cursor), read once to bound the slice read after the unit's second run: "
      "state, not a log line, which S9.1.4 lets be read directly"),
@@ -2992,6 +3020,24 @@ def evlib_module(root):
 LEADS = {"{", "(", "!", "if", "then", "do", "else", "elif", "while", "until", "time"}
 
 
+def past_leads(words):
+    """A simple command's words from its verb on: past the reserved words
+    that open a compound command, a definition (name() { or function name {),
+    sudo, env and VAR=value. A call in a body on a definition's line is a
+    call."""
+    k = 0
+    while k < len(words):
+        if words[k] in LEADS or words[k] in PREFIXES or re.match(r"^[A-Za-z_]\w*=", words[k]):
+            k += 1
+        elif k + 1 < len(words) and words[k + 1] == "()":
+            k += 2                                         # name (): a definition, its body after
+        elif words[k] == "function" and k + 1 < len(words):
+            k += 2
+        else:
+            break
+    return words[k:]
+
+
 def shell_calls(cg, rel, start, text, names):
     """(line, name, args) of each call of a shell function in names, its
     continuation lines joined. A definition (name() { or function name {) is
@@ -3000,18 +3046,9 @@ def shell_calls(cg, rel, start, text, names):
         if toks is None:
             continue
         for words in simple_commands(cg, toks):
-            k = 0
-            while k < len(words):
-                if words[k] in LEADS or words[k] in PREFIXES or re.match(r"^[A-Za-z_]\w*=", words[k]):
-                    k += 1
-                elif k + 1 < len(words) and words[k + 1] == "()":
-                    k += 2                                 # name (): a definition, its body after
-                elif words[k] == "function" and k + 1 < len(words):
-                    k += 2
-                else:
-                    break
-            if k < len(words) and words[k] in names:
-                yield start + line - 1, words[k], words[k + 1:]
+            words = past_leads(words)
+            if words and words[0] in names:
+                yield start + line - 1, words[0], words[1:]
 
 
 def py_files(root):
@@ -3221,7 +3258,182 @@ def rule_s933(root, rep):
             f"{len(rep.violations('S9.3.3'))} violation(s)")
 
 
-RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931, "S9.3.2": rule_s932, "S9.3.3": rule_s933}
+# --- S9.3.4 and S9.3.6: recordings judged and pictured; the timeline whole -----------
+
+WAV_NAME_SH = re.compile(r"\bev_name\s+\S+\s+wav\b")
+AUDIO_JUDGED_SH = re.compile(r"\b(?:ev_audio_stop|ev_audio_check|ev_audio_silence|mt_heard)\b|check-audio\.py\b.*--plot")
+WAV_NAME_PY = re.compile(r"\.name\([^)]*[\"']wav[\"']\s*\)")
+AUDIO_JUDGED_PY = re.compile(r"[\"']--plot[\"']|\blevel_plot\(|\banalyse_capture\(")
+
+
+def scope_of(spans, line, nlines):
+    """(first, last, name) of the function holding `line`; at a script's top
+    level, the 40 lines from it."""
+    for a, b, name in spans:
+        if a <= line <= b:
+            return a, b, name
+    return line, min(nlines, line + 40), None
+
+
+def py_functions(tree):
+    """A module's functions and its classes' methods."""
+    out = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    return out + [m for c in tree.body if isinstance(c, ast.ClassDef) for m in c.body if isinstance(m, ast.FunctionDef)]
+
+
+def rule_s934(root, rep):
+    """S9.3.4: each recording the harness names is judged and pictured where
+    it is named, and the gate's audio check holds a story's recordings."""
+    named = 0
+    for rel in shell_files(root):
+        if rel.endswith("evidence.sh"):
+            continue
+        text = read(os.path.join(root, rel))
+        lines = text.split("\n")
+        spans = [(first, first + len(body) - 1, name) for name, first, body in shell_functions(text)]
+        for i, l in enumerate(lines, 1):
+            if not WAV_NAME_SH.search(code_of(l)):
+                continue
+            named += 1
+            _, last, name = scope_of(spans, i, len(lines))
+            where = f"in {name}" if name else "at the top level"
+            if name == "ev_audio_start":
+                rep.ok("S9.3.4", rel, i, "ev_audio_start names the WAV that ev_audio_stop judges and pictures")
+            elif any(AUDIO_JUDGED_SH.search(code_of(s)) for s in lines[i - 1:last]):
+                rep.ok("S9.3.4", rel, i, f"{where}: the recording named here is judged and pictured after it")
+            else:
+                rep.flag("S9.3.4", rel, i, l.strip()[:120],
+                         f"{where}: a recording named here is not judged and pictured after it",
+                         "run check-audio.py with --report and --plot on it (ev_audio_check, ev_audio_silence, "
+                         "mt_heard) and index both, naming the WAV")
+    for rel in py_files(root):
+        text = read(os.path.join(root, rel))
+        try:
+            tree = ast.parse(text, rel)
+        except SyntaxError:
+            continue
+        for f in py_functions(tree):
+            src = ast.get_source_segment(text, f) or ""
+            for m in WAV_NAME_PY.finditer(src):
+                named += 1
+                line = f.lineno + src[:m.start()].count("\n")
+                if AUDIO_JUDGED_PY.search(src):
+                    rep.ok("S9.3.4", rel, line, f"{f.name}: the recording named here is judged and pictured in it")
+                else:
+                    rep.flag("S9.3.4", rel, line, f"{f.name}: {m.group(0)}",
+                             f"{f.name} names a recording it does not judge and picture",
+                             "run check-audio.py with --report and --plot on it (as tone_to does), or level_plot, "
+                             "and attach both, naming the WAV")
+    evlib = evlib_module(root)
+    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as d:
+        def rec(st, moment, plot=True, verdict=True, names=True):
+            st.write(moment, "RIFF\n", "EV-AUDIO: a tone at the machine's output", ext="wav")
+            w = st.last
+            if plot:
+                st.write(f"{moment}-level", "PNG\n", f"the level across {w if names else 'the capture'}", ext="png")
+            if verdict:
+                st.write(f"{moment}-verdict", "PASS\n", f"check-audio.py's verdict on {w if names else 'the capture'}")
+        cases = [
+            ("a tone with its plot and verdict, each naming it", lambda st: rec(st, "tone-440hz"), False),
+            ("a voice sample with its plot and verdict", lambda st: rec(st, "pw-play-voice"), False),
+            ("a recording with no plot", lambda st: rec(st, "tone-440hz", plot=False), True),
+            ("a recording with no verdict", lambda st: rec(st, "tone-440hz", verdict=False), True),
+            ("a plot and verdict that do not name the recording", lambda st: rec(st, "tone-440hz", names=False), True),
+            ("a name that says nothing of what to hear", lambda st: rec(st, "tone"), True),
+            ("a pulse tone at pipewire's pitch", lambda st: rec(st, "pulse-880hz"), True),
+        ]
+        judge_planted(rep, "S9.3.4", planted_dirs(evlib, d, cases), "the gate's audio check")
+    return (f"S9.3.4: {named} recording(s) named in the harness, {len(cases)} planted story directories judged; "
+            f"{len(rep.violations('S9.3.4'))} violation(s)")
+
+
+TRANSPORTS = ("ssh", "scp", "socat", "nc")
+TIMELINE_WRITE_SH = re.compile(r">>?\s*\"?[^\s;|&]*timeline\.log")
+
+
+def rule_s936(root, rep):
+    """S9.3.6: the harness's actions reach the timeline, each line stamped."""
+    actions = 0
+    ev = read(os.path.join(root, "ci", "evidence.sh"))
+    for name in ("podman", "kubectl"):
+        if re.search(rf"^{name}\(\)\s*\{{\s*ev_log\s+{name}\s+\"\$\*\";\s*command\s+{name}\s+\"\$@\";\s*\}}", ev, re.M):
+            rep.ok("S9.3.6", "ci/evidence.sh", 0, f"{name} is wrapped: each call is a line of the timeline before it runs")
+        else:
+            rep.flag("S9.3.6", "ci/evidence.sh", 0, f"{name}()", f"ci/evidence.sh does not wrap {name}",
+                     f"define {name}() {{ ev_log {name} \"$*\"; command {name} \"$@\"; }}")
+    if re.search(r"^ev_log\(\)[^\n]*\n(?:[^\n]*\n){0,3}?[^\n]*\$\(_ev_ts\)[^\n]*\$\(_ev_one ", ev, re.M):
+        rep.ok("S9.3.6", "ci/evidence.sh", 0, "ev_log writes each entry as one line that starts with its timestamp")
+    else:
+        rep.flag("S9.3.6", "ci/evidence.sh", 0, "ev_log()", "ev_log does not stamp each entry and keep it to one line",
+                 "build the line from $(_ev_ts) and $(_ev_one ...)")
+    cg = client_guard()
+    for rel, start, text in shell_units(root):
+        lines = text.split("\n")
+        for line, src, toks in cg.logical_commands(rel, source=text):
+            if toks is None:
+                continue
+            for words in simple_commands(cg, toks):
+                words = past_leads(words)
+                verb, _ = command_word(words) if words else ("", [])
+                if verb not in TRANSPORTS:
+                    continue
+                actions += 1
+                if "ev_save" in words[:3]:
+                    rep.ok("S9.3.6", rel, start + line - 1, f"{verb}, kept by ev_save: its file is a line of the timeline")
+                elif any("ev_log" in code_of(l) for l in lines[max(0, line - 4):line]):
+                    rep.ok("S9.3.6", rel, start + line - 1, f"{verb}, logged by the ev_log before it")
+                else:
+                    rep.flag("S9.3.6", rel, start + line - 1, " ".join(words)[:120],
+                             f"a {verb} the timeline does not record",
+                             f"log it first (ev_log {verb} \"...\"), or keep it with ev_save")
+        if not rel.endswith("evidence.sh"):
+            for i, l in enumerate(lines, 1):
+                if TIMELINE_WRITE_SH.search(code_of(l)):
+                    rep.flag("S9.3.6", rel, start + i - 1, l.strip()[:120], "a write to a timeline outside ev_log",
+                             "write through ev_log, which stamps the line and keeps it to one")
+    for rel in py_files(root):
+        text = read(os.path.join(root, rel))
+        try:
+            tree = ast.parse(text, rel)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "cmd" \
+                    and any(k.arg == "log" and isinstance(k.value, ast.Constant) and k.value.value is False
+                            for k in node.keywords):
+                rep.flag("S9.3.6", rel, node.lineno, ast.get_source_segment(text, node)[:120] or "cmd(log=False)",
+                         "a QMP command kept out of the timeline", "let Qmp.cmd log it")
+            elif isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant) \
+                    and node.elts[0].value in TRANSPORTS:
+                rep.flag("S9.3.6", rel, node.lineno, ast.get_source_segment(text, node)[:120] or "ssh",
+                         f"a {node.elts[0].value} command line outside the Guest class, which logs each command it runs",
+                         "run it through Guest.sh, which logs it")
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open" \
+                    and "timeline.log" in (ast.get_source_segment(text, node) or ""):
+                rep.flag("S9.3.6", rel, node.lineno, ast.get_source_segment(text, node)[:120],
+                         "a timeline opened outside evlib's StoryWriter", "write through StoryWriter.log, which "
+                         "stamps the line and keeps it to one")
+    evlib = evlib_module(root)
+    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as d:
+        def raw_line(st):
+            with open(st._p(st.side + "timeline.log"), "a") as f:
+                f.write("a second line of a check's text, with no timestamp\n")
+
+        def unlogged_file(st):
+            with open(st._p("01-kept.txt"), "w") as f:
+                f.write("kept\n")
+            st._append("files.tsv", evlib.stamp(), "01-kept.txt", "EV-STATE: a file indexed and not logged")
+        cases = [
+            ("a story written through StoryWriter", lambda st: st.write("state", "x\n", "EV-STATE: x"), False),
+            ("a timeline line with no timestamp", raw_line, True),
+            ("a file in the index with no line in the timeline", unlogged_file, True),
+        ]
+        judge_planted(rep, "S9.3.6", planted_dirs(evlib, d, cases), "the gate's timeline check")
+    return (f"S9.3.6: podman and kubectl wrapped; {actions} ssh, scp, socat or nc command(s) in the harness; "
+            f"{len(cases)} planted story directories judged; {len(rep.violations('S9.3.6'))} violation(s)")
+
+
+RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931, "S9.3.2": rule_s932, "S9.3.3": rule_s933, "S9.3.4": rule_s934, "S9.3.6": rule_s936}
 
 # --- the self-test --------------------------------------------------------------------
 
@@ -3284,6 +3496,24 @@ PLANTS = {
         ('ci/v1.sh', '#!/bin/bash\nset -euo pipefail\nev_begin S9.1.5 "a story" T3\nev_pass "the pod is the same container, restartCount 0"\nev_end\n', True),
         ('ci/v2.sh', '#!/bin/bash\nset -euo pipefail\nev_begin S9.1.5 "a story" T3\nev_save pod-before "EV-PIDS: before" gq pod-state p\nb=$EV_LAST\nev_save pod-after "EV-PIDS: after" gq pod-state p\nev_diff pod "EV-DIFF: the pod" "$b" "$EV_LAST" "nothing: the same container"\nev_pass "the pod is the same container, restartCount 0"\nev_end\n', False),
         ('ci/vm/v3.py', 'def s(ctx, st):\n    st.check(True, "Xorg kept its pid")\n', True),
+    ],
+    "S9.3.4": [
+        ('ci/a1.sh', '#!/bin/bash\nrec() {\n    local wav\n    wav=$(ev_name tone wav)\n    mon_cmd "wavcapture $EV_DIR/$wav snd0 44100 16 2"\n'
+                     '    ev_attach "$wav" "EV-AUDIO: a tone"\n}\n', True),
+        ('ci/a2.sh', '#!/bin/bash\nrec() {\n    local wav\n    wav=$(ev_name tone-440hz wav)\n    mon_cmd "wavcapture $EV_DIR/$wav snd0 44100 16 2"\n'
+                     '    ev_attach "$wav" "EV-AUDIO: a tone"\n    ev_audio_check tone "$wav" 1 0.05 440\n}\n', False),
+        ('ci/vm/a3.py', 'def rec(st):\n    n = st.name("tone-440hz", "wav")\n    st.attach(n, "EV-AUDIO: a tone")\n', True),
+        ('ci/vm/a4.py', 'import subprocess\n\n\ndef rec(st):\n    n = st.name("tone-440hz", "wav")\n    st.attach(n, "EV-AUDIO: a tone")\n'
+                        '    subprocess.run(["python3", "check-audio.py", "--report", "r.txt", "--plot", "p.png", n, "1", "0.05", "440"])\n',
+         False),
+    ],
+    "S9.3.6": [
+        ('ci/t1.sh', '#!/bin/bash\nprobe() { ssh -p 22 rocky@127.0.0.1 true; }\n', True),
+        ('ci/t2.sh', '#!/bin/bash\nprobe() {\n    ev_log ssh "true"\n    ssh -p 22 rocky@127.0.0.1 true\n}\n', False),
+        ('ci/t3.sh', '#!/bin/bash\necho "a line" >> "$EV_DIR/timeline.log"\n', True),
+        ('ci/vm/t4.py', 'def shot(m):\n    m.qmp.cmd("screendump", {"filename": "f.ppm"}, log=False)\n', True),
+        ('ci/vm/t5.py', 'import os\n\n\ndef note(d):\n    with open(os.path.join(d, "timeline.log"), "a") as f:\n        f.write("x\\n")\n', True),
+        ('ci/vm/t6.py', 'def run(g):\n    return g.sh("true", label="a probe")\n', False),
     ],
     "S9.3.1": [
         ("ci/s1.sh", "ev_begin S99.1.1 \"no such story\" T0\n", True),
