@@ -2718,9 +2718,9 @@ EOF
     log p2 "client pod schedules and opens xterm on the desktop"
     # The example pod declares only the resource request - no volumes, no
     # env - so it running an X client at all means the plugin named the CDI
-    # device and CRI-O applied the spec.
-    sed 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
-        examples/x11-client-pod.yaml | k3s kubectl apply -f -
+    # device and CRI-O applied the spec. It is applied as it stands: its image
+    # is the desktop's own, localhost/desktop-container:latest.
+    k3s kubectl apply -f examples/x11-client-pod.yaml
     wait_for 30 4 "client pod running" \
         sh -c "k3s kubectl get pod x11-client-demo -o jsonpath='{.status.phase}' | grep -q Running"
     sleep 5
@@ -2731,7 +2731,7 @@ EOF
     # proving nothing. Read the type the kernel actually gave it.
     log p2 "the client pod runs confined, and reached the display anyway"
     ev_begin S7.3.3 "Pods are confined and declare no securityContext" T3
-    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, which phase2 applies with only its image pointed at the locally loaded one: a resource request and nothing else - no securityContext, volumes, env or CDI annotation"
+    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, which phase2 applies as it stands: its image (the desktop's own, localhost/desktop-container:latest) and a resource request, nothing else - no securityContext, volumes, env or CDI annotation"
     ev_save demo-spec "EV-STATE: the demo pod as the API server holds it: the pod's securityContext ({} is the API server's empty default), the container's (empty), the volumes (the service-account token's, which the API server adds) and the container's env (empty)" \
         k3s kubectl get pod x11-client-demo -o jsonpath='pod securityContext: {.spec.securityContext}{"\n"}container securityContext: {.spec.containers[0].securityContext}{"\n"}volumes: {.spec.volumes[*].name}{"\n"}container env: {.spec.containers[0].env}{"\n"}' >/dev/null || true
     pctx=$(k3s kubectl exec x11-client-demo -- sh -c 'tr -d "\000" < /proc/self/attr/current' 2>/dev/null || true)
@@ -4746,11 +4746,10 @@ operator_teardown() {
 
 apply_client() { # $1: pod name; $2: xterm geometry (default: the example's)
     # Reuse the example client (a long-running xterm), renamed, titled after
-    # the pod, placed where asked and pointed at the locally-imported image.
+    # the pod and placed where asked.
     sed -e "s/name: x11-client-demo/name: $1/" \
         -e "s/\"CDI demo\"/\"$1\"/" \
         -e "s/80x24+200+200/${2:-80x24+200+200}/" \
-        -e 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
         examples/x11-client-pod.yaml | k3s kubectl apply -f -
 }
 
