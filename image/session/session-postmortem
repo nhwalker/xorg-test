@@ -15,7 +15,11 @@ set -u
 
 echo "postmortem: X session ended abnormally (result=${SERVICE_RESULT:-?}, code=${EXIT_CODE:-?}, status=${EXIT_STATUS:-?})"
 
-xlog=$(ls -t /home/desktop/.local/share/xorg/Xorg.*.log /var/log/Xorg.*.log 2>/dev/null | head -n 1)
+# POSTMORTEM_XLOG_GLOB: where to look for Xorg logs, newest first. Unset in
+# production (the rootless log dir, then the system one); tests point it at
+# fabricated logs.
+# shellcheck disable=SC2086 # the globs are meant to expand
+xlog=$(ls -t ${POSTMORTEM_XLOG_GLOB:-/home/desktop/.local/share/xorg/Xorg.*.log /var/log/Xorg.*.log} 2>/dev/null | head -n 1)
 if [ -z "$xlog" ]; then
     echo "postmortem: no Xorg log file found; startx/xauth failed before the X server produced a log"
     exit 0
