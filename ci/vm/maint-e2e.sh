@@ -86,8 +86,9 @@ mt_screen_check() { # <moment> <what>
 # S3.8.1's probe: a sink xterm, a click into it and a word typed, all through
 # QEMU's own devices.
 mt_typing() { # <story> <word> [absent]: typed text lands; "absent", that it does not (a fault's symptom)
-    local res qlog
-    res=$(gq desk xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}')
+    local res qlog xd
+    xd=$(gq desk xdpyinfo 2>/dev/null) || xd=""
+    res=$(awk '/dimensions:/ {print $2; exit}' <<<"$xd")
     [ -n "$res" ] || return 1
     vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start' || return 1
     sleep 2
@@ -582,7 +583,7 @@ mt_rebuild() {
                 VM_SSH_TIMEOUT=1200 ev_save "rebuild-$n" "EV-PROCEDURE: \`$line\`, as written, by rocky in its checkout: its output and exit status" \
                     vm_ssh "cd repo && $line" >/dev/null || rc=$?
                 if [ "$rc" != 0 ]; then
-                    ev_fail "\`$line\` exited $rc, so the block stops there: $(tail -n 3 "$EV_DIR/$EV_LAST" | head -n 2 | tr '\n' ' ')"
+                    ev_fail "\`$line\` exited $rc, so the block stops there: $(tail -n 3 "$EV_DIR/$EV_LAST" | sed -n '1,2p' | tr '\n' ' ')"
                     break
                 fi
                 ev_pass "\`$line\` exited 0"
@@ -977,8 +978,9 @@ maint_gdm() {
 # and a line typed, through QEMU's own devices, which its shell runs in the pod
 # (S7.5.2's check, here after README.md's steps as written).
 mt_k8s_type() {
-    local res rect d_wid d_w d_h d_x d_y qlog got=""
-    res=$(gq desk xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}')
+    local res rect d_wid d_w d_h d_x d_y qlog got="" xd
+    xd=$(gq desk xdpyinfo 2>/dev/null) || xd=""
+    res=$(awk '/dimensions:/ {print $2; exit}' <<<"$xd")
     mt_open S10.6.1
     [ -n "$res" ] || { ev_fail "could not read the display's size for the input"; mt_close; return 1; }
     ev_save windows "EV-STATE: the demo pod's main process (its xterm), the X client it holds and its windows, read just before the click" \

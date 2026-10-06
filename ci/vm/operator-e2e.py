@@ -360,12 +360,13 @@ class Guest:
         return p.stdout
 
     def xprobe(self, script, *args, label=None, check=True):
-        # DISPLAY passed explicitly: CDI's env edits reach the observer's own
-        # process but not `podman exec` sessions. operator-setup checks that
-        # CDI gave the observer this value (vm-guest.sh).
-        return self.sh(shlex.join(["podman", "exec", "-e", "DISPLAY=:0", OBSERVER,
-                                   "sh", "-c", script, "sh", *args]),
-                       label=label or f"observer: {script.strip()}", check=check)
+        # CDI's env edits reach the observer's own process (its pid 1) but not
+        # a `podman exec` session, so the session takes DISPLAY from pid 1:
+        # Requirements.md S9.2.1 allows that, and no -e with a value of ours.
+        label = label or f"observer: {script.strip()}"
+        script = "export \"$(tr '\\0' '\\n' </proc/1/environ | grep '^DISPLAY=')\"; " + script
+        return self.sh(shlex.join(["podman", "exec", OBSERVER, "sh", "-c", script, "sh", *args]),
+                       label=label, check=check)
 
     def desk(self, argv, user="desktop", detach=False, check=True, timeout=60):
         return self.sh(shlex.join(
@@ -966,7 +967,10 @@ class Ctx:
     def pid_of(self, comm):
         """The session user's process named comm, quietly (for polling)."""
         out = self.g.sh(f"pgrep -u desktop -x {comm}; true", label=f"pgrep -u desktop -x {comm}").split()
-        return int(out[0]) if len(out) == 1 else None
+        try:
+            return int(out[0]) if len(out) == 1 else None
+        except ValueError:
+            return None
 
     def post_root_menu(self, xs):
         """Press button 1 on bare root and hold it: mwm posts the root menu
@@ -1343,12 +1347,25 @@ def xi_ids(ctx, name):
     return [i for n, i in xi_slaves(ctx) if n == name]
 
 
+def guest_count(ctx, cmd, label, tries=3):
+    """An integer the guest prints. A failed read is retried, then fails the
+    story by name: it never stands in as a number, which could satisfy a
+    check that a count dropped (Requirements.md S9.2.4)."""
+    last = None
+    for _ in range(tries):
+        try:
+            return int(ctx.g.sh(cmd, label=label).strip())
+        except (RuntimeError, ValueError) as e:
+            last = e
+            time.sleep(0.5)
+    raise RuntimeError(f"could not read {label} after {tries} tries: {last}")
+
+
 def node_counts(ctx):
     """Event nodes on the VM host and in the desktop container."""
-    h = ctx.g.sh("ls /dev/input/event* | wc -l", label="count /dev/input/event* (host)").strip()
-    c = ctx.g.sh("podman exec desktop sh -c 'ls /dev/input/event* | wc -l'",
-                 label="count /dev/input/event* (container)").strip()
-    return int(h), int(c)
+    return (guest_count(ctx, "ls /dev/input/event* | wc -l", "count /dev/input/event* (host)"),
+            guest_count(ctx, "podman exec desktop sh -c 'ls /dev/input/event* | wc -l'",
+                        "count /dev/input/event* (container)"))
 
 
 def xi_test_start(ctx, xid, tag):
@@ -1540,11 +1557,11 @@ def s3_9_12(ctx, st):
 
 def snd_counts(ctx):
     """Sound nodes on the host and in the container, and PipeWire's devices."""
-    h = ctx.g.sh("ls /dev/snd | wc -l", label="count /dev/snd (host)").strip()
-    c = ctx.g.sh("podman exec desktop sh -c 'ls /dev/snd | wc -l'", label="count /dev/snd (container)").strip()
+    h = guest_count(ctx, "ls /dev/snd | wc -l", "count /dev/snd (host)")
+    c = guest_count(ctx, "podman exec desktop sh -c 'ls /dev/snd | wc -l'", "count /dev/snd (container)")
     d = len(re.findall(r"^\s*id \d+, type PipeWire:Interface:Device", ctx.g.desk(["pw-cli", "ls", "Device"],
                                                                                   check=False), re.M))
-    return int(h), int(c), d
+    return h, c, d
 
 
 def kvm_plug(ctx):

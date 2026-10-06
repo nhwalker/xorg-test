@@ -169,24 +169,32 @@ ev_shot_head() { # <moment> <head> <what>
     ev_attach "$name" "$3"
     convert "$EV_DIR/$name" -colorspace Gray -format '%wx%h %[fx:standard_deviation]' info: 2>/dev/null
 }
-# hotplug_probe echoes "<container input nodes> <Xorg input adds>", always as
-# two integers. Defaults to "0 0" rather than letting an ssh hiccup produce an
-# empty string that the arithmetic comparisons below would choke on.
-hotplug_probe() {
-    local out nodes adds
-    out=$(vm_ssh_quick 'sudo repo/ci/vm/vm-guest.sh hotplug-probe' 2>/dev/null || true)
-    read -r nodes adds <<<"$out"
-    echo "${nodes:-0} ${adds:-0}"
+# A counter read over ssh is an integer or a failed read (status 1), never a
+# stand-in: a 0 for a failed read would satisfy a check that a count dropped
+# (Requirements.md S9.2.4). A poll retries a failed read and keeps the last
+# value read; a one-shot read fails its story with a message.
+is_int() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+host_count() { # <command on the VM host that prints one integer>
+    local n
+    n=$(vm_ssh_quick "$1" 2>/dev/null) || return 1
+    is_int "$n" || return 1
+    echo "$n"
 }
-# snd_probe echoes "<container ALSA control nodes> <WirePlumber alsa devices>",
-# always as two integers, for the same reason and with the same defaulting as
-# hotplug_probe above.
-snd_probe() {
-    local out nodes devs
-    out=$(vm_ssh_quick 'sudo repo/ci/vm/vm-guest.sh snd-probe' 2>/dev/null || true)
-    read -r nodes devs <<<"$out"
-    echo "${nodes:-0} ${devs:-0}"
+# read_pair <probe> <name> <name>: one of vm-guest.sh's two-integer probes into
+# the two variables, or status 1 with both left as they were.
+read_pair() {
+    local out a b
+    out=$(vm_ssh_quick "sudo repo/ci/vm/vm-guest.sh $1" 2>/dev/null) || return 1
+    read -r a b <<<"$out"
+    is_int "$a" && is_int "$b" || return 1
+    printf -v "$2" '%s' "$a"
+    printf -v "$3" '%s' "$b"
 }
+# hotplug-probe: "<container input nodes> <Xorg input adds>"; snd-probe:
+# "<container ALSA control nodes> <WirePlumber alsa devices>".
+# The Xorg log's length, the line a story's slice of the log starts after. A
+# failed read is not 0: a slice from the top would hold earlier stories' lines.
+xorg_len() { host_count 'sudo repo/ci/vm/vm-guest.sh xorg-log-lines'; }
 # --- hotplug evidence (Requirements.md F3.9 and F4.7 common sets) ---------------
 # One of vm-guest.sh's read-only probes (desk, ctr-pids, xorg-log-lines,
 # xorg-log-since), so the commands here need no quoting through ssh.
@@ -351,10 +359,14 @@ xi_count() { xi_names < "$1" | grep -cxF -- "$2" || true; }
 # Poll until xinput lists fewer than <count> entries for the name (10 s at
 # most): the judgement is the story's, on the picture taken after.
 xi_wait_gone() { # <name> <count before>
-    local n
+    local n out
     for _ in $(seq 10); do
-        n=$(gq desk xinput list 2>/dev/null | xi_names | grep -cxF -- "$1" || true)
-        [ "${n:-0}" -lt "$2" ] && return 0
+        # A failed read is not a count of 0, which would end the wait while
+        # the name is still listed (Requirements.md S9.2.4): it is read again.
+        if out=$(gq desk xinput list 2>/dev/null); then
+            n=$(xi_names <<<"$out" | grep -cxF -- "$1" || true)
+            [ "$n" -lt "$2" ] && return 0
+        fi
         sleep 1
     done
 }
@@ -408,7 +420,7 @@ xi_judge_removed() { # <story> <xinput before> <xinput after> <xorg log> <name>.
         ev_pass "'$name' left xinput list: $nb -> $na entries"
         grep -qF "removing device $name" "$EV_DIR/$xl" \
             || fail "the Xorg log has no 'removing device $name' since the removal"
-        ev_pass "the Xorg log records the removal: $(grep -F "removing device $name" "$EV_DIR/$xl" | head -1 | sed 's/^ *//')"
+        ev_pass "the Xorg log records the removal: $(grep -F -m1 "removing device $name" "$EV_DIR/$xl" | sed 's/^ *//')"
     done
 }
 # The role of each entry with that name in a saved xinput list: pointer or
@@ -1319,9 +1331,9 @@ log "input hotplug: add a virtio keyboard while X runs"
 ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
 input_set before-pci "before device_add virtio-keyboard-pci"
 input_keep
-xl0=$(gq xorg-log-lines 2>/dev/null || echo 0)
-before_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-read -r before_nodes before_adds <<<"$(hotplug_probe)"
+xl0=$(xorg_len) || fail "could not read the Xorg log's length before device_add virtio-keyboard-pci"
+before_host=$(host_count 'ls /dev/input/event* | wc -l') || fail "could not count the VM host's input event nodes"
+read_pair hotplug-probe before_nodes before_adds || fail "could not read the container's input counts (hotplug-probe)"
 log "  before: host=$before_host container-nodes=$before_nodes xorg-adds=$before_adds"
 
 ev_qemu device-add-pci "EV-QEMU: device_add virtio-keyboard-pci,id=hotkbd and QEMU's reply (empty: accepted)" \
@@ -1330,9 +1342,10 @@ ev_qemu device-add-pci "EV-QEMU: device_add virtio-keyboard-pci,id=hotkbd and QE
 
 after_host=$before_host after_nodes=$before_nodes after_adds=$before_adds
 for _ in $(seq 20); do
-    after_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-    read -r after_nodes after_adds <<<"$(hotplug_probe)"
-    [ "$after_host" -gt "$before_host" ] && [ "$after_nodes" -gt "$before_nodes" ] && break
+    if hc=$(host_count 'ls /dev/input/event* | wc -l') && read_pair hotplug-probe after_nodes after_adds; then
+        after_host=$hc
+        [ "$after_host" -gt "$before_host" ] && [ "$after_nodes" -gt "$before_nodes" ] && break
+    fi
     sleep 1
 done
 log "  after:  host=$after_host container-nodes=$after_nodes xorg-adds=$after_adds"
@@ -1387,9 +1400,9 @@ ev_video_start kvm-cycle
 ev_begin S3.9.3 "Keyboard plug-out removes the node from the container" T3
 input_set base "before device_del kvmkbd"
 input_keep
-xl1=$(gq xorg-log-lines 2>/dev/null || echo 0)
-kvm_base_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-read -r kvm_base_nodes _ <<<"$(hotplug_probe)"
+xl1=$(xorg_len) || fail "could not read the Xorg log's length before device_del kvmkbd"
+kvm_base_host=$(host_count 'ls /dev/input/event* | wc -l') || fail "could not count the VM host's input event nodes"
+read_pair hotplug-probe kvm_base_nodes _ || fail "could not read the container's input counts (hotplug-probe)"
 log "  base:    host=$kvm_base_host container-nodes=$kvm_base_nodes"
 # The keyboard's own nodes, from the kernel's table: the event handlers of
 # the device named for QEMU's USB keyboard.
@@ -1401,9 +1414,10 @@ ev_qemu device-del "EV-QEMU: device_del kvmkbd (the KVM switches away) and QEMU'
     "device_del kvmkbd" >/dev/null || fail "QEMU refused device_del kvmkbd"
 kvm_off_host=$kvm_base_host kvm_off_nodes=$kvm_base_nodes
 for _ in $(seq 20); do
-    kvm_off_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-    read -r kvm_off_nodes _ <<<"$(hotplug_probe)"
-    [ "$kvm_off_host" -lt "$kvm_base_host" ] && [ "$kvm_off_nodes" -lt "$kvm_base_nodes" ] && break
+    if hc=$(host_count 'ls /dev/input/event* | wc -l') && read_pair hotplug-probe kvm_off_nodes _; then
+        kvm_off_host=$hc
+        [ "$kvm_off_host" -lt "$kvm_base_host" ] && [ "$kvm_off_nodes" -lt "$kvm_base_nodes" ] && break
+    fi
     sleep 1
 done
 log "  switched away: host=$kvm_off_host container-nodes=$kvm_off_nodes"
@@ -1439,14 +1453,15 @@ ev_end
 # guest, so the id is free by the time the removal shows up in /dev.
 ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
 input_import S3.9.3 switched-away "after device_del kvmkbd (the KVM switched away)"
-xl2=$(gq xorg-log-lines 2>/dev/null || echo 0)
+xl2=$(xorg_len) || fail "could not read the Xorg log's length before the KVM switches back"
 ev_qemu device-add-usb "EV-QEMU: device_add usb-kbd,id=kvmkbd,bus=xhci.0 (the KVM switches back) and QEMU's reply (empty: accepted)" \
     "device_add usb-kbd,id=kvmkbd,bus=xhci.0" >/dev/null || fail "QEMU refused to re-add the USB keyboard"
 kvm_on_host=$kvm_off_host kvm_on_nodes=$kvm_off_nodes
 for _ in $(seq 20); do
-    kvm_on_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-    read -r kvm_on_nodes _ <<<"$(hotplug_probe)"
-    [ "$kvm_on_host" -ge "$kvm_base_host" ] && [ "$kvm_on_nodes" -ge "$kvm_base_nodes" ] && break
+    if hc=$(host_count 'ls /dev/input/event* | wc -l') && read_pair hotplug-probe kvm_on_nodes _; then
+        kvm_on_host=$hc
+        [ "$kvm_on_host" -ge "$kvm_base_host" ] && [ "$kvm_on_nodes" -ge "$kvm_base_nodes" ] && break
+    fi
     sleep 1
 done
 log "  switched back: host=$kvm_on_host container-nodes=$kvm_on_nodes"
@@ -1518,7 +1533,7 @@ ev_qemu device-add-bound "EV-QEMU: device_add usb-kbd,id=kvmkbd,bus=xhci.0,displ
     "device_add usb-kbd,id=kvmkbd,bus=xhci.0,display=vga0" >/dev/null || fail "QEMU refused to add the keyboard bound to vga0"
 kid=""
 for _ in $(seq 15); do
-    kid=$(gq xi-id QEMU QEMU USB Keyboard 2>/dev/null | head -1 || true)
+    kid=$(first_of gq xi-id QEMU QEMU USB Keyboard)
     [ -n "$kid" ] && break
     sleep 1
 done
@@ -1563,18 +1578,19 @@ PTRS=("QEMU QEMU USB Mouse" "QEMU QEMU USB Tablet")
 ev_begin S3.9.7 "Pointer plug-in reaches the container" T3
 input_set base-ptr "before device_add usb-mouse and usb-tablet"
 input_keep
-xlp=$(gq xorg-log-lines 2>/dev/null || echo 0)
-ptr_base_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-read -r ptr_base_nodes _ <<<"$(hotplug_probe)"
+xlp=$(xorg_len) || fail "could not read the Xorg log's length before device_add usb-mouse and usb-tablet"
+ptr_base_host=$(host_count 'ls /dev/input/event* | wc -l') || fail "could not count the VM host's input event nodes"
+read_pair hotplug-probe ptr_base_nodes _ || fail "could not read the container's input counts (hotplug-probe)"
 ev_qemu device-add-mouse "EV-QEMU: device_add usb-mouse,id=hotmouse,bus=xhci.0 (relative) and QEMU's reply (empty: accepted)" \
     "device_add usb-mouse,id=hotmouse,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-mouse"
 ev_qemu device-add-tablet "EV-QEMU: device_add usb-tablet,id=hottablet,bus=xhci.0 (absolute) and QEMU's reply (empty: accepted)" \
     "device_add usb-tablet,id=hottablet,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-tablet"
 ptr_on_host=$ptr_base_host ptr_on_nodes=$ptr_base_nodes
 for _ in $(seq 20); do
-    ptr_on_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-    read -r ptr_on_nodes _ <<<"$(hotplug_probe)"
-    [ "$ptr_on_host" -ge $((ptr_base_host + 2)) ] && [ "$ptr_on_nodes" -ge $((ptr_base_nodes + 2)) ] && break
+    if hc=$(host_count 'ls /dev/input/event* | wc -l') && read_pair hotplug-probe ptr_on_nodes _; then
+        ptr_on_host=$hc
+        [ "$ptr_on_host" -ge $((ptr_base_host + 2)) ] && [ "$ptr_on_nodes" -ge $((ptr_base_nodes + 2)) ] && break
+    fi
     sleep 1
 done
 # Xorg's side (S3.9.8) is polled too: xinput may lag the nodes.
@@ -1616,7 +1632,7 @@ ev_end
 
 ev_begin S3.9.9 "Pointer plug-out removes the node from the container" T3
 input_import S3.9.7 plugged "with the USB mouse and tablet plugged in"
-xlq=$(gq xorg-log-lines 2>/dev/null || echo 0)
+xlq=$(xorg_len) || fail "could not read the Xorg log's length before the mouse and tablet are removed"
 ptr_nodes=""
 for name in "${PTRS[@]}"; do ptr_nodes="$ptr_nodes $(dev_events "$EV_DIR/$B_DEV" "$name")"; done
 ptr_nodes=$(echo $ptr_nodes)
@@ -1630,9 +1646,10 @@ ev_qemu device-del-tablet "EV-QEMU: device_del hottablet and QEMU's reply (empty
     "device_del hottablet" >/dev/null || fail "QEMU refused device_del hottablet"
 ptr_off_host=$ptr_on_host ptr_off_nodes=$ptr_on_nodes
 for _ in $(seq 20); do
-    ptr_off_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
-    read -r ptr_off_nodes _ <<<"$(hotplug_probe)"
-    [ "$ptr_off_host" -le "$ptr_base_host" ] && [ "$ptr_off_nodes" -le "$ptr_base_nodes" ] && break
+    if hc=$(host_count 'ls /dev/input/event* | wc -l') && read_pair hotplug-probe ptr_off_nodes _; then
+        ptr_off_host=$hc
+        [ "$ptr_off_host" -le "$ptr_base_host" ] && [ "$ptr_off_nodes" -le "$ptr_base_nodes" ] && break
+    fi
     sleep 1
 done
 xi_wait_gone "${PTRS[0]}" "$mouse_n"
@@ -1687,8 +1704,8 @@ ev_begin S4.7.1 "Sound card plug-in reaches the container" T3
 snd_set base "before device_add usb-audio"
 snd_keep
 SND_BASE_PIDS=$SN_PIDS SND_BASE_PW=$SN_PW SND_BASE_DEF=$SN_DEF
-read -r snd_base_nodes snd_base_devs <<<"$(snd_probe)"
-snd_base_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
+read_pair snd-probe snd_base_nodes snd_base_devs || fail "could not read the container's sound counts (snd-probe)"
+snd_base_host=$(host_count 'ls /dev/snd/controlC* 2>/dev/null | wc -l') || fail "could not count the VM host's controlC nodes"
 audio_pids_base=$(audio_pids)
 log "  base:      host=$snd_base_host container-nodes=$snd_base_nodes wireplumber-devices=$snd_base_devs"
 
@@ -1696,10 +1713,11 @@ ev_qemu device-add "EV-QEMU: device_add usb-audio,id=hotsnd,audiodev=snd0,bus=xh
     "device_add usb-audio,id=hotsnd,audiodev=snd0,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-audio"
 snd_on_host=$snd_base_host snd_on_nodes=$snd_base_nodes snd_on_devs=$snd_base_devs
 for _ in $(seq 30); do
-    snd_on_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
-    read -r snd_on_nodes snd_on_devs <<<"$(snd_probe)"
-    [ "$snd_on_host" -gt "$snd_base_host" ] && [ "$snd_on_nodes" -gt "$snd_base_nodes" ] \
-        && [ "$snd_on_devs" -gt "$snd_base_devs" ] && break
+    if hc=$(host_count 'ls /dev/snd/controlC* 2>/dev/null | wc -l') && read_pair snd-probe snd_on_nodes snd_on_devs; then
+        snd_on_host=$hc
+        [ "$snd_on_host" -gt "$snd_base_host" ] && [ "$snd_on_nodes" -gt "$snd_base_nodes" ] \
+            && [ "$snd_on_devs" -gt "$snd_base_devs" ] && break
+    fi
     sleep 1
 done
 log "  plugged in: host=$snd_on_host container-nodes=$snd_on_nodes wireplumber-devices=$snd_on_devs"
@@ -1739,13 +1757,14 @@ ev_qemu device-del "EV-QEMU: device_del hotsnd and QEMU's reply (empty: accepted
     "device_del hotsnd" >/dev/null || fail "QEMU refused device_del hotsnd"
 snd_off_host=$snd_on_host snd_off_nodes=$snd_on_nodes snd_off_devs=$snd_on_devs
 for _ in $(seq 30); do
-    snd_off_host=$(vm_ssh_quick 'ls /dev/snd/controlC* 2>/dev/null | wc -l')
-    read -r snd_off_nodes snd_off_devs <<<"$(snd_probe)"
     # Wait for the WirePlumber count to settle back too, not just the nodes:
     # the tone check below needs a default sink, and WirePlumber has to pick
     # one again after the card it may have switched to disappeared.
-    [ "$snd_off_host" -lt "$snd_on_host" ] && [ "$snd_off_nodes" -lt "$snd_on_nodes" ] \
-        && [ "$snd_off_devs" -le "$snd_base_devs" ] && break
+    if hc=$(host_count 'ls /dev/snd/controlC* 2>/dev/null | wc -l') && read_pair snd-probe snd_off_nodes snd_off_devs; then
+        snd_off_host=$hc
+        [ "$snd_off_host" -lt "$snd_on_host" ] && [ "$snd_off_nodes" -lt "$snd_on_nodes" ] \
+            && [ "$snd_off_devs" -le "$snd_base_devs" ] && break
+    fi
     sleep 1
 done
 log "  unplugged: host=$snd_off_host container-nodes=$snd_off_nodes wireplumber-devices=$snd_off_devs"
@@ -1780,11 +1799,11 @@ ev_copy "$ART/S4.7.4/$SND_OFF_SINKS" sinks-unplugged "EV-STATE: pactl list short
 [ "$snd_off_devs" = "$snd_base_devs" ] \
     || fail "WirePlumber lists $snd_off_devs alsa devices after the unplug, want the $snd_base_devs from before the plug-in"
 ev_pass "WirePlumber's alsa_card Device count is back to its baseline: $snd_base_devs -> $snd_on_devs -> $snd_off_devs"
-def_off=$(ev_payload "$ART/S4.7.4/$SND_OFF_DEF" | head -1)
+def_off=$(first_of ev_payload "$ART/S4.7.4/$SND_OFF_DEF")
 sinks_off=$(ev_payload "$ART/S4.7.4/$SND_OFF_SINKS" | awk '{print $2}')
 [ -n "$def_off" ] && grep -qxF -- "$def_off" <<<"$sinks_off" \
     || fail "after the unplug the default sink is '$def_off', which is not one of the sinks left: $(echo $sinks_off)"
-ev_pass "a default sink is re-selected among the sinks left: $def_off (with the card plugged in it was $(ev_payload "$ART/S4.7.1/$SND_ON_DEF" | head -1))"
+ev_pass "a default sink is re-selected among the sinks left: $def_off (with the card plugged in it was $(first_of ev_payload "$ART/S4.7.1/$SND_ON_DEF"))"
 ev_end
 
 # Health after the cycle, the audio counterpart of the input-sink check: the
@@ -1827,21 +1846,21 @@ log "audio hotplug, again: the new card is the one heard, and a stream on it whe
 ev_begin S4.7.3 "A hot-added card plays, and it is the new card that is heard" T3
 snd_set base "before the card is plugged in again"
 snd_keep
-read -r s2_base_nodes s2_base_devs <<<"$(snd_probe)"
-builtin_sink=$(ev_payload "$EV_DIR/$SN_DEF" | head -1)
+read_pair snd-probe s2_base_nodes s2_base_devs || fail "could not read the container's sound counts (snd-probe)"
+builtin_sink=$(first_of ev_payload "$EV_DIR/$SN_DEF")
 ev_qemu device-add "EV-QEMU: device_add usb-audio,id=hotsnd2,audiodev=snd0,bus=xhci.0 and QEMU's reply (empty: accepted)" \
     "device_add usb-audio,id=hotsnd2,audiodev=snd0,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-audio"
 s2_on_nodes=$s2_base_nodes s2_on_devs=$s2_base_devs
 for _ in $(seq 30); do
-    read -r s2_on_nodes s2_on_devs <<<"$(snd_probe)"
-    [ "$s2_on_nodes" -gt "$s2_base_nodes" ] && [ "$s2_on_devs" -gt "$s2_base_devs" ] && break
+    read_pair snd-probe s2_on_nodes s2_on_devs \
+        && [ "$s2_on_nodes" -gt "$s2_base_nodes" ] && [ "$s2_on_devs" -gt "$s2_base_devs" ] && break
     sleep 1
 done
 # The new card's sink shows in pactl a moment after its Device.
 usb_sink=""
 for _ in $(seq 15); do
-    usb_sink=$(comm -13 <(ev_payload "$EV_DIR/$SB_SINKS" | awk '{print $2}' | sort) \
-                        <(gq desk pactl list short sinks 2>/dev/null | awk '{print $2}' | sort) | head -1)
+    usb_sink=$(first_of comm -13 <(ev_payload "$EV_DIR/$SB_SINKS" | awk '{print $2}' | sort) \
+                                 <(gq desk pactl list short sinks 2>/dev/null | awk '{print $2}' | sort))
     [ -n "$usb_sink" ] && break
     sleep 1
 done
@@ -1909,8 +1928,8 @@ for _ in $(seq 10); do
     fi
     sk=$(gq desk pactl list short sinks 2>/dev/null || true)
     if ! awk -v n="$usb_sink" '$2 == n {f = 1} END {exit !f}' <<<"$sk"; then
-        moved=$(gq desk pactl list short sink-inputs 2>/dev/null \
-            | awk 'NR == FNR {name[$1] = $2; next} NF > 2 && ($2 in name) {print name[$2]; exit}' <(printf '%s\n' "$sk") - || true)
+        si=$(gq desk pactl list short sink-inputs 2>/dev/null || true)
+        moved=$(awk 'NR == FNR {name[$1] = $2; next} NF > 2 && ($2 in name) {print name[$2]; exit}' <(printf '%s\n' "$sk") - <<<"$si")
         if [ -n "$moved" ]; then
             outcome="kept playing, its stream moved to $moved $(( $(date +%s) - t_del )) s after the removal"
             break
@@ -1949,8 +1968,8 @@ log "audio hotplug: five plug/unplug cycles leave no phantom devices"
 ev_begin S4.7.11 "Repeated audio cycles leave no phantom devices" T3
 snd_set base "before the first of five plug/unplug cycles"
 snd_keep
-read -r cyc_n0 cyc_d0 <<<"$(snd_probe)"
-cyc_h0=$(vm_ssh_quick 'ls /dev/snd | wc -l' 2>/dev/null || echo 0)
+read_pair snd-probe cyc_n0 cyc_d0 || fail "could not read the container's sound counts (snd-probe)"
+cyc_h0=$(host_count 'ls /dev/snd | wc -l') || fail "could not count the VM host's /dev/snd nodes"
 cyc_rows=$(printf '%-6s %-9s %-15s %-20s %s' cycle state host-snd-nodes container-controlC wireplumber-alsa-cards)
 cyc_row() { cyc_rows+=$'\n'$(printf '%-6s %-9s %-15s %-20s %s' "$@"); }
 cyc_row 0 baseline "$cyc_h0" "$cyc_n0" "$cyc_d0"
@@ -1960,18 +1979,18 @@ for i in 1 2 3 4 5; do
         || fail "QEMU refused device_add usb-audio in cycle $i"
     n=0 d=0
     for _ in $(seq 30); do
-        read -r n d <<<"$(snd_probe)"
-        [ "$n" -gt "$cyc_n0" ] && [ "$d" -gt "$cyc_d0" ] && break
+        read_pair snd-probe n d && [ "$n" -gt "$cyc_n0" ] && [ "$d" -gt "$cyc_d0" ] && break
         sleep 1
     done
-    hn=$(vm_ssh_quick 'ls /dev/snd | wc -l' 2>/dev/null || echo 0)
+    hn=$(host_count 'ls /dev/snd | wc -l') || hn="(not read)"
     cyc_row "$i" plugged "$hn" "$n" "$d"
     { [ "$n" -gt "$cyc_n0" ] && [ "$d" -gt "$cyc_d0" ]; } || cyc_in=no
     python3 qmp-tool.py hmp "$QMP" "device_del cyc$i" >/dev/null || fail "QEMU refused device_del cyc$i"
     for _ in $(seq 30); do
-        read -r n d <<<"$(snd_probe)"
-        hn=$(vm_ssh_quick 'ls /dev/snd | wc -l' 2>/dev/null || echo 0)
-        [ "$n" = "$cyc_n0" ] && [ "$d" = "$cyc_d0" ] && [ "$hn" = "$cyc_h0" ] && break
+        if read_pair snd-probe n d && hc=$(host_count 'ls /dev/snd | wc -l'); then
+            hn=$hc
+            [ "$n" = "$cyc_n0" ] && [ "$d" = "$cyc_d0" ] && [ "$hn" = "$cyc_h0" ] && break
+        fi
         sleep 1
     done
     cyc_row "$i" removed "$hn" "$n" "$d"
@@ -2014,7 +2033,8 @@ else
     new_src=""
     for _ in $(seq 30); do
         new_src=$(comm -13 <(ev_payload "$EV_DIR/$SB_SOURCES" | awk '{print $2}' | sort) \
-                           <(gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | sort) | grep '^alsa_input\.' | head -1 || true)
+                           <(gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | sort))
+        new_src=$(grep -m1 '^alsa_input\.' <<<"$new_src" || true)
         [ -n "$new_src" ] && break
         sleep 1
     done
@@ -2048,7 +2068,8 @@ else
         "device_del hotcap" >/dev/null || fail "QEMU refused device_del hotcap"
     gone=no
     for _ in $(seq 30); do
-        gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qxF -- "$new_src" || { gone=yes; break; }
+        srcs=$(gq desk pactl list short sources 2>/dev/null) || { sleep 1; continue; }
+        awk -v s="$new_src" '$2 == s {f = 1} END {exit !f}' <<<"$srcs" || { gone=yes; break; }
         sleep 1
     done
     snd_set off "after device_del hotcap"
@@ -2105,7 +2126,7 @@ res=$(vm_ssh 'sudo podman exec -u desktop -e DISPLAY=:0 desktop \
 [ -n "$res" ] || fail "S3.8.6: could not read the display's size"
 kid=""
 for _ in $(seq 15); do
-    kid=$(gq xi-id QEMU QEMU USB Keyboard 2>/dev/null | head -1 || true)
+    kid=$(first_of gq xi-id QEMU QEMU USB Keyboard)
     [ -n "$kid" ] && break
     sleep 1
 done
@@ -2166,12 +2187,12 @@ probe=$(ev_payload "$EV_DIR/$EV_LAST")
 ev_audio_stop "EV-AUDIO: the machine's output while rocky's paplay, with no PULSE_SERVER, played 440 Hz - listen for one beep" 2 0.05 440 \
     || fail "S4.2.1: rocky's 440 Hz tone was not heard"
 grep -q '^paplay exited 0$' <<<"$probe" || fail "S4.2.1: rocky's paplay did not exit 0: $(grep '^paplay exited' <<<"$probe")"
-awk '/^== env \| grep PULSE/ {f = 1; next} /^==/ {f = 0} f' <<<"$probe" | grep -qx '(none)' \
+awk '/^== env \| grep PULSE/ {f = 1; next} /^==/ {f = 0} f && $0 == "(none)" {n = 1} END {exit !n}' <<<"$probe" \
     || fail "S4.2.1: rocky's environment carries PULSE_ variables"
 ev_pass "rocky's paplay, with no PULSE_ variable set, exited 0 and its 440 Hz tone was heard: the drop-in's default-server took it to the export"
 starts=$(awk '/^== the stub.s record of starts/ {f = 1; next} /^\(end of record\)$/ {f = 0} f' <<<"$probe")
 [ -z "$starts" ] || fail "S4.2.1: a pulseaudio daemon was started: $starts"
-awk '/^== pgrep -a pulseaudio/ {f = 1; next} /^==/ {f = 0} f' <<<"$probe" | grep -qx '(none)' \
+awk '/^== pgrep -a pulseaudio/ {f = 1; next} /^==/ {f = 0} f && $0 == "(none)" {n = 1} END {exit !n}' <<<"$probe" \
     || fail "S4.2.1: a pulseaudio process runs on the host"
 ev_pass "nothing was spawned: the stub /usr/bin/pulseaudio recorded no start, and no pulseaudio runs"
 ev_end
@@ -3038,7 +3059,7 @@ R_POD_A=$EV_LAST
 ev_diff pod "EV-DIFF: the journey pod across the restart (no differences: the same container)" "$R_POD_B" "$R_POD_A"
 grep -q 'published screenshot' <<<"$dlog" || fail "the restarted desktop did not log 'published screenshot'"
 ! grep -qE 'Text file busy|ETXTBSY|publish-tools failed' <<<"$dlog" \
-    || fail "the republish hit an error: $(grep -E 'Text file busy|ETXTBSY|publish-tools failed' <<<"$dlog" | head -2)"
+    || fail "the republish hit an error: $(grep -m2 -E 'Text file busy|ETXTBSY|publish-tools failed' <<<"$dlog")"
 ev_pass "the restarted desktop logged 'published screenshot', with no Text file busy and no failed publish"
 ino_old=$(awk '/^file-inode/ {print $2}' <<<"$held_b"); exe_b=$(awk '/^exe-inode/ {print $2}' <<<"$held_b")
 ino_new=$(awk '/^file-inode/ {print $2}' <<<"$held_a"); exe_a=$(awk '/^exe-inode/ {print $2}' <<<"$held_a")
@@ -3205,7 +3226,7 @@ U_D_B=$EV_LAST
 u_dmn_b=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
 snd_set base "before the USB sound card arrives"
 snd_keep
-u_builtin=$(ev_payload "$EV_DIR/$SN_DEF" | head -1)
+u_builtin=$(first_of ev_payload "$EV_DIR/$SN_DEF")
 [ -n "$u_builtin" ] || fail "no default sink before the USB card arrives"
 ev_video_start usb-arrives
 ev_audio_start arrival 1100
@@ -3222,8 +3243,8 @@ ev_qemu device-add "EV-QEMU: device_add usb-audio,id=s774snd,audiodev=snd0,bus=x
 ev_note "device_add usb-audio at $t_plug (the guest's clock), about 4 s into the pod's 20 s tone"
 u_sink=""
 for _ in $(seq 15); do
-    u_sink=$(comm -13 <(ev_payload "$EV_DIR/$SB_SINKS" | awk '{print $2}' | sort) \
-                      <(gq desk pactl list short sinks 2>/dev/null | awk '{print $2}' | sort) | head -1)
+    u_sink=$(first_of comm -13 <(ev_payload "$EV_DIR/$SB_SINKS" | awk '{print $2}' | sort) \
+                               <(gq desk pactl list short sinks 2>/dev/null | awk '{print $2}' | sort))
     [ -n "$u_sink" ] && break
     sleep 1
 done
@@ -3447,7 +3468,8 @@ else
     r_src=""
     for _ in $(seq 30); do
         r_src=$(comm -13 <(ev_payload "$EV_DIR/$SB_SOURCES" | awk '{print $2}' | sort) \
-                         <(gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | sort) | grep '^alsa_input\.' | head -1 || true)
+                         <(gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | sort))
+        r_src=$(grep -m1 '^alsa_input\.' <<<"$r_src" || true)
         [ -n "$r_src" ] && break
         sleep 1
     done
@@ -3468,7 +3490,8 @@ else
         "device_del s777cap" >/dev/null || fail "QEMU refused device_del s777cap"
     r_gone=no
     for _ in $(seq 30); do
-        gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qxF -- "$r_src" || { r_gone=yes; break; }
+        srcs=$(gq desk pactl list short sources 2>/dev/null) || { sleep 1; continue; }
+        awk -v s="$r_src" '$2 == s {f = 1} END {exit !f}' <<<"$srcs" || { r_gone=yes; break; }
         sleep 1
     done
     snd_set off "after device_del s777cap"

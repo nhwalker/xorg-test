@@ -257,7 +257,7 @@ mt_field() { # <table> <unit> <key>
 # S10.1.2 and S10.1.1 on the first boot, with read-only probes only (the VM
 # host has already seen the desktop on the screen).
 mt_firstboot() {
-    local b0 b1 tck xorg mwm m_x m_mwm first out who line indent u st su tf ds pf
+    local b0 b1 tck xorg mwm m_x m_mwm first out who line indent u st su tf ds pf jl
     mt_begin S10.1.2
     b0=$(mt_get boot-before) b1=$(cat /proc/sys/kernel/random/boot_id)
     [ -n "$b0" ] && [ "$b1" != "$b0" ] || fail "this is not a new boot: boot id $b1, before the block's reboot ${b0:-unknown}"
@@ -267,18 +267,19 @@ mt_firstboot() {
 
     # Who came first: the desktop, or a login?
     tck=$(getconf CLK_TCK)
-    xorg=$(pgrep -u desktop -x Xorg | head -n1) mwm=$(pgrep -u desktop -x mwm | head -n1)
+    xorg=$(first_of pgrep -u desktop -x Xorg) mwm=$(first_of pgrep -u desktop -x mwm)
     [ -n "$xorg" ] && [ -n "$mwm" ] || fail "no Xorg or no mwm of the desktop user's on the host (Xorg '$xorg', mwm '$mwm')"
     m_x=$(awk -v t="$tck" '{printf "%.2f", $22 / t}' "/proc/$xorg/stat") || fail "could not read Xorg's start time"
     m_mwm=$(awk -v t="$tck" '{printf "%.2f", $22 / t}' "/proc/$mwm/stat") || fail "could not read mwm's start time"
-    first=$(journalctl -b -u sshd -o json --no-pager | python3 -c '
+    jl=$(journalctl -b -u sshd -o json --no-pager) || fail "could not read sshd's journal for this boot"
+    first=$(python3 -c '
 import json, sys
 for line in sys.stdin:
     e = json.loads(line)
     m = e.get("MESSAGE")
     if isinstance(m, str) and m.startswith("Accepted "):
         print("%.2f %s" % (int(e["__MONOTONIC_TIMESTAMP"]) / 1e6, m))
-        break')
+        break' <<<"$jl")
     ev_text login-order "EV-STATE: when the desktop came up and when anyone first logged in to the host this boot, in seconds since the kernel started: Xorg's and mwm's start (/proc/<pid>/stat) and sshd's first accepted login (journalctl -b -u sshd)" \
         "Xorg (pid $xorg) started at $m_x s
 mwm (pid $mwm) started at $m_mwm s
@@ -331,7 +332,7 @@ first login: ${first:-(none this boot)}"
     pf=$(mt_get S10.1.2-booted-preflight)
     out=$(mt_saved "$pf")
     [ "$(mt_saved_rc "$pf")" = 0 ] && grep -q 'done: 0 FAIL' <<<"$out" \
-        || fail "desktop-preflight reported FAILs on the first boot: $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+        || fail "desktop-preflight reported FAILs on the first boot: $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     ev_pass "desktop-preflight exits 0 on the first boot: 0 FAILs"
     mt_state_diff applied booted "what the first boot did"
     who=$(ev_save ssh-host "EV-STATE: ssh host whoami, run in the desktop container as the session user (S5.7.2): desktop-shell" \
@@ -345,7 +346,7 @@ first login: ${first:-(none this boot)}"
     ev_copy "$EV_ROOT/S10.1.2/$pf" preflight "EV-STATE: desktop-preflight's whole report on the first boot of the host the documented line provisioned: no FAIL and no WARN line"
     out=$(mt_saved "$EV_LAST")
     [ "$(mt_saved_rc "$EV_LAST")" = 0 ] || fail "desktop-preflight did not exit 0"
-    ! grep -q 'WARN:' <<<"$out" || fail "desktop-preflight has something to report: $(grep 'WARN:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+    ! grep -q 'WARN:' <<<"$out" || fail "desktop-preflight has something to report: $(grep -m3 'WARN:' <<<"$out" | tr '\n' ' ')"
     ev_pass "desktop-preflight exits 0 with no WARN: line: the documented packages leave it nothing to report"
     who=$(ev_save ssh-host "EV-STATE: ssh host whoami from the desktop container as the session user: Host Terminal's path works on this host (S5.7.2)" \
         podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) || true
@@ -402,10 +403,10 @@ mt_selinux() { # took|skipped
     if [ "$n" = 0 ]; then
         ev_note "on the first boot of this host, which $1 the line, restorecon -n would relabel nothing under its paths: the labels agree with the policy everywhere there"
     else
-        ev_note "on the first boot of this host, which $1 the line, restorecon -n would relabel $n path(s): $(grep 'Would relabel' <<<"$out" | head -n 3 | tr '\n' ' ')"
+        ev_note "on the first boot of this host, which $1 the line, restorecon -n would relabel $n path(s): $(grep -m3 'Would relabel' <<<"$out" | tr '\n' ' ')"
     fi
     if grep -qv 'Would relabel' <<<"$out"; then
-        ev_note "restorecon -n also said: $(grep -v 'Would relabel' <<<"$out" | head -n 3 | tr '\n' ' ')"
+        ev_note "restorecon -n also said: $(grep -m3 -v 'Would relabel' <<<"$out" | tr '\n' ' ')"
     fi
     out=$(ev_save probe-display "EV-STATE: S7.1.1's confined display probe: a client given only desktop.local/display=all; its own SELinux label, then xdpyinfo's verdict" \
         podman run --rm --device desktop.local/display=all localhost/desktop-container:latest \
@@ -741,7 +742,7 @@ mt_captured() { sed -n 1p "$MT/captured-outputs"; }
 # F10.4's before and after steps (E10's common set: the state, the pids, the
 # logs for the window, every desktop process new after the restart).
 mt_layout_capture() {
-    local rc=0 name
+    local rc=0 name geom
     mt_begin S10.3.1
     ev_save xrandr-before "EV-STATE: xrandr --query --verbose, autodetected" xrv >/dev/null || true
     mt_put S10.3.1-xrv-before "$EV_LAST"
@@ -753,7 +754,9 @@ mt_layout_capture() {
     grep -vE '^[[:space:]]*(#|$)' "$MT/capture.txt" > "$MT/captured-outputs" || true
     [ -s "$MT/captured-outputs" ] || fail "the capture declares no output"
     name=$(mt_captured | awk '{print $1}')
-    mt_put autogeom "$(xr_line "$name" | grep -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+' | head -n1)"
+    geom=$(xr_line "$name")
+    geom=$(grep -m1 -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+' <<<"$geom" || true)
+    mt_put autogeom "${geom%%$'\n'*}"
     cp "$MT/capture.txt" "$MT_MONCONF"
     ev_copy "$MT_MONCONF" monitors-conf "EV-CONFIG: /etc/desktop-container/monitors.conf after the paste: the capture's stdout, unmodified"
     [ "$(sha256sum < "$MT/capture.txt")" = "$(sha256sum < "$MT_MONCONF")" ] || fail "monitors.conf is not the capture's stdout"
@@ -788,7 +791,7 @@ mt_layout_pinned() {
     ev_pass "the container preflight says: $(grep -m1 'preflight: PASS: fixed monitor layout declares' <<<"$out" | sed 's/.*preflight: //')"
     read -r name mode pos _ <<<"$(mt_captured)"
     geom="${mode%%@*}$pos"
-    conn=$(ls -d /sys/class/drm/card*-"$name" 2>/dev/null | head -n1)
+    conn=$(first_of ls -d /sys/class/drm/card*-"$name")
     [ -n "$conn" ] || fail "no DRM connector named $name"
     dims0=$(dpy_dims)
     echo off > "$conn/status"
@@ -919,7 +922,7 @@ mt_image_back() {
     mt_begin S10.3.4
     desk_back
     out=$(ev_save preflight-back "EV-STATE: desktop-preflight with the image loaded and the desktop restarted" desktop-preflight) || rc=$?
-    [ "$rc" = 0 ] || fail "desktop-preflight still FAILs: $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+    [ "$rc" = 0 ] || fail "desktop-preflight still FAILs: $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     ev_pass "loading the image and restarting was the whole fix: the desktop is back and desktop-preflight reports 0 FAILs"
     mt_state_diff gone back "the image loaded, the desktop restarted"
     ev_end
@@ -994,7 +997,7 @@ mt_route_check() { # orig|alt pin|tag
     [ "${pub%% *}" = "$sum" ] || fail "the published toolkit is not the $1 image's (${pub%% *}, want $sum)"
     ev_pass "$2 route, the $1 image: the desktop runs it ($id) and published its toolkit (sha256 $sum)"
     out=$(ev_save "preflight-$2-$1" "EV-STATE: desktop-preflight ($2, $1)" desktop-preflight) || rc=$?
-    [ "$rc" = 0 ] || fail "desktop-preflight FAILs ($2, $1): $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+    [ "$rc" = 0 ] || fail "desktop-preflight FAILs ($2, $1): $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     if [ -e "$MT_PIN" ]; then
         grep -q 'PASS: quadlet drop-ins present .* (podman merges them)' <<<"$out" || fail "desktop-preflight does not report the drop-in"
         ev_pass "desktop-preflight: 0 FAILs, and its drop-in line: $(grep -m1 'drop-ins present' <<<"$out" | sed 's/^host-preflight: //')"
@@ -1273,7 +1276,9 @@ mt_entry() { # <lead>: quote the entry
 }
 mt_span() { # <lead> <ERE>: the entry's inline command matching it, as written
     local s
-    s=$(python3 ci/doc-blocks.py README.md Troubleshooting --entry "$1" --spans | grep -E -m1 -- "$2") \
+    s=$(python3 ci/doc-blocks.py README.md Troubleshooting --entry "$1" --spans) \
+        || fail "README.md has no Troubleshooting entry '$1' any more"
+    s=$(grep -E -m1 -- "$2" <<<"$s") \
         || fail "README.md's '$1' entry no longer gives a command matching /$2/"
     printf '%s\n' "$s"
 }
@@ -1398,7 +1403,7 @@ mt_input_devs() { # every input device with an event node: QMP's events reach X 
         if ls -d "$d"/event* >/dev/null 2>&1; then readlink -f "$d"; fi
     done
 }
-mt_input_events() { local d e; while read -r d; do e=$(ls -d "$d"/event* | head -n 1); echo "/dev/input/${e##*/}"; done < "$MT/seat-devs"; }
+mt_input_events() { local d e; while read -r d; do e=$(first_of ls -d "$d"/event*); echo "/dev/input/${e##*/}"; done < "$MT/seat-devs"; }
 mt_seat_stage() {
     local d n=0
     mt_begin S10.5.2
@@ -1658,7 +1663,7 @@ mt_gid_check() { # <path>: the session after a recovery path
                 || ev_fail "after the final restart Xorg runs as $(awk 'NR == 1 {print $1}' <<<"$u")"
             ev_save xwrapper-final "EV-CONFIG: /etc/X11/Xwrapper.config in the container after the final restart" \
                 podman exec desktop cat /etc/X11/Xwrapper.config >/dev/null || true
-            if podman exec desktop cat /etc/X11/Xwrapper.config | cmp -s - image/xorg/Xwrapper.config; then
+            if cmp -s <(podman exec desktop cat /etc/X11/Xwrapper.config) image/xorg/Xwrapper.config; then
                 ev_pass "the shipped Xwrapper.config is back"
             else
                 ev_fail "Xwrapper.config is not the shipped one (image/xorg/Xwrapper.config)"
@@ -1753,7 +1758,7 @@ mt_stop() {
     grep -q 'WARN: desktop.service not started' <<<"$out" || fail "desktop-preflight does not say 'desktop.service not started'"
     grep -q 'PASS: no DRM/VT holders' <<<"$out" || fail "desktop-preflight does not say 'no DRM/VT holders'"
     [ "$rc" = 0 ] && grep -q 'done: 0 FAIL' <<<"$out" \
-        || fail "desktop-preflight reports FAILs with the desktop stopped: $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+        || fail "desktop-preflight reports FAILs with the desktop stopped: $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     ev_pass "desktop-preflight describes it: desktop.service not started (WARN), no DRM/VT holders (PASS), 0 FAILs"
     t1=$(date +%s.%N)
     out=$(ev_save client "EV-STATE: a confined client given desktop.local/display=all tries the display while the desktop is stopped: what xdpyinfo says, and its exit status" \
@@ -1788,7 +1793,7 @@ mt_held() {
     ev_pass "desktop.service is still inactive 120 s after the stop, and nothing started it: its activation times and restart count are what they were right after the stop"
     ev_save uid-procs-held "EV-PIDS: every uid-61000 process on the host 120 s after the stop (ps -u 61000): none" \
         sh -c 'ps -u 61000 -o pid,ppid,lstart,comm,args || echo "(none)"' >/dev/null || true
-    ! pgrep -u desktop >/dev/null || fail "a desktop process runs 120 s into the stop: $(pgrep -u desktop -a | head -n 3)"
+    ! pgrep -u desktop >/dev/null || fail "a desktop process runs 120 s into the stop: $(ps_all=$(pgrep -u desktop -a); head -n 3 <<<"$ps_all")"
     mt_no_getty "$t0" "120 s into the stop"
     ev_end
 }
@@ -1946,7 +1951,7 @@ mt_live_state() { # readme|deploy
     if [ "$(mt_saved_rc "$(mt_get S10.1.4-live-preflight)")" = 0 ] && grep -q 'done: 0 FAIL' <<<"$out"; then
         ev_pass "desktop-preflight exits 0: 0 FAILs"
     else
-        ev_fail "desktop-preflight reported FAILs: $(grep 'FAIL:' <<<"$out" | head -n 3 | tr '\n' ' ')"
+        ev_fail "desktop-preflight reported FAILs: $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     fi
     mt_state_diff applied live "what came up after the path's commands"
     since=$(date +%s)
@@ -2374,7 +2379,7 @@ mt_unprov_pod() {
 # S10.6.2: the desktop's start publishes; the same pod object schedules, runs
 # and captures, with nobody deleting or recreating it.
 mt_unprov_start() {
-    local phase="" log="" out uid name dims scr t=0
+    local phase="" log="" out uid name dims scr t=0 xd
     mt_k8s_begin S10.6.2
     ev_save start "EV-PROCEDURE: systemctl start desktop.service: the desktop's first start on this node, which publishes the toolkit" \
         systemctl start desktop.service >/dev/null || fail "systemctl start desktop.service failed"
@@ -2419,7 +2424,8 @@ mt_unprov_start() {
 d = open(sys.argv[1], "rb").read(24)
 assert d[:8] == b"\x89PNG\r\n\x1a\n"
 print("%dx%d" % struct.unpack(">II", d[16:24]))' "$EV_DIR/$name" 2>/dev/null || true)
-    scr=$(desk xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}' || true)
+    xd=$(desk xdpyinfo 2>/dev/null || true)
+    scr=$(awk '/dimensions:/ {print $2; exit}' <<<"$xd")
     [ -n "$dims" ] && [ "$dims" = "$scr" ] || fail "the pod's capture is not a PNG of the screen: ${dims:-not a PNG}, the screen ${scr:-unknown}"
     ev_pass "the capture is a PNG of the whole screen, $dims"
     ev_end

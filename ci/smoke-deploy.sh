@@ -50,10 +50,11 @@ first_xorg() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null || tru
 # identical from the outside: a published binary and no spec. Print enough to
 # tell them apart, so a red run does not cost a whole cycle just to diagnose.
 tools_diag() {
+    local st
     echo "--- desktop-tools-cdi.path" >&2
-    systemctl status desktop-tools-cdi.path --no-pager -l 2>&1 | head -20 >&2 || true
+    st=$(systemctl status desktop-tools-cdi.path --no-pager -l 2>&1 || true); head -20 <<<"$st" >&2
     echo "--- desktop-tools-cdi.service" >&2
-    systemctl status desktop-tools-cdi.service --no-pager -l 2>&1 | head -20 >&2 || true
+    st=$(systemctl status desktop-tools-cdi.service --no-pager -l 2>&1 || true); head -20 <<<"$st" >&2
     journalctl -u desktop-tools-cdi.service --no-pager -o cat 2>&1 | tail -20 >&2 || true
     echo "--- $TOOLS_BIN" >&2
     ls -la "$TOOLS_BIN" >&2 || true
@@ -717,8 +718,9 @@ for _ in $(seq 15); do
 done
 [ "$sess" = 1 ] || { systemctl status desktop-session.service --no-pager -l || true; \
     fail "desktop-session.service did not become active"; }
-loginctl list-sessions --no-pager | grep -Eq 'desktop +seat0' \
-    || { loginctl list-sessions --no-pager || true; fail "no logind session for desktop on seat0"; }
+sessions=$(loginctl list-sessions --no-pager 2>&1 || true)
+grep -Eq 'desktop +seat0' <<<"$sessions" \
+    || { printf '%s\n' "$sessions"; fail "no logind session for desktop on seat0"; }
 [ -d /run/user/61000 ] || fail "logind did not mount /run/user/61000"
 
 log "stub CDI resolved through the container start (marker env on the init process)"
@@ -1124,9 +1126,9 @@ ev_text log "EV-LOG-DESKTOP: xorg-gpu-conf's lines in the desktop's log this boo
 ev_save sysfs "EV-STATE: the runner's DRM connectors, which the container's sysfs shows too (cat /sys/class/drm/card*-*/status)" \
     sh -c 'for f in /sys/class/drm/card*-*/status; do [ -e "$f" ] && echo "$f: $(cat "$f")"; done; true' >/dev/null || true
 grep -q '^xorg-gpu-conf: decision:' <<<"$gpu_block" || fail "xorg-gpu-conf's log has no decision line"
-dline=$(grep -n '^xorg-gpu-conf: decision:' <<<"$gpu_block" | head -1 | cut -d: -f1)
+dline=$(grep -n -m1 '^xorg-gpu-conf: decision:' <<<"$gpu_block" | cut -d: -f1)
 for what in "DRM nodes:" "NVIDIA nodes:"; do
-    n=$(grep -nF "xorg-gpu-conf: $what" <<<"$gpu_block" | head -1 | cut -d: -f1)
+    n=$(grep -nF -m1 "xorg-gpu-conf: $what" <<<"$gpu_block" | cut -d: -f1 || true)
     [ -n "$n" ] && [ "$n" -lt "$dline" ] || fail "\"$what\" is not logged before the decision"
     ev_pass "\"$what\" is logged (line $n) before the decision (line $dline)"
 done
@@ -1285,7 +1287,9 @@ ev_copy /etc/desktop-container/monitors.conf host-monitors "EV-CONFIG: the layou
 ev_save container-view "EV-STATE: the same file read inside the container, and its mount there (ro in the mount options)" \
     podman exec desktop sh -c 'cat /etc/desktop-container/monitors.conf; echo "-- mount"; grep " /etc/desktop-container " /proc/self/mountinfo' >/dev/null \
     || fail "the container cannot read /etc/desktop-container/monitors.conf"
-opts=$(podman exec desktop sh -c 'grep " /etc/desktop-container " /proc/self/mountinfo' | awk '{print $6; exit}')
+mi=$(podman exec desktop sh -c 'grep " /etc/desktop-container " /proc/self/mountinfo') \
+    || fail "the container's mountinfo has no /etc/desktop-container line"
+opts=$(awk '{print $6; exit}' <<<"$mi")
 case ",$opts," in
     *,ro,*) ;;
     *) fail "/etc/desktop-container is mounted '$opts' in the container, not read-only" ;;

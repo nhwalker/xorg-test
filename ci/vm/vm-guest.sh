@@ -108,7 +108,8 @@ diagnostics() {
     echo "---- diagnostics: SELinux mode + client-facing labels ----"
     getenforce 2>/dev/null || true
     ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin 2>/dev/null || true
-    systemctl status desktop-selinux.service --no-pager -l  2>/dev/null | head -20 || true
+    local st
+    st=$(systemctl status desktop-selinux.service --no-pager -l 2>/dev/null || true); head -20 <<<"$st"
     echo "---- diagnostics: recent SELinux denials ----"
     ausearch --input-logs -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
     if command -v k3s >/dev/null; then
@@ -293,8 +294,8 @@ phase_deploy() {
     [ -n "$first" ] || fail "no DRM connector reads connected on the VM"
     card=/dev/dri/${first%%-*}
     ev_pass "the first connected connector is $first, so the card is $card"
-    decision=$(podman logs desktop 2>/dev/null | tr -d '\r' | grep '^xorg-gpu-conf: ' \
-        | awk '{print} /^xorg-gpu-conf: decision:/{exit}' || true)
+    decision=$(podman logs desktop 2>/dev/null | tr -d '\r' || true)
+    decision=$(awk '/^xorg-gpu-conf: /{print} /^xorg-gpu-conf: decision:/{exit}' <<<"$decision")
     ev_text log "EV-LOG-DESKTOP: xorg-gpu-conf's lines in the desktop's log this boot, up to its decision" "${decision:-(none)}"
     grep -qx "xorg-gpu-conf: decision: modesetting driver on $card" <<<"$decision" \
         || fail "xorg-gpu-conf did not log 'decision: modesetting driver on $card'"
@@ -456,8 +457,9 @@ phase_deploy() {
         || fail "host could not capture :0 with the published binary - denied on the X socket?"
     [ -s "$hostshot" ] || fail "host screenshot produced an empty file"
     # PNG magic, so a truncated or half-written file cannot pass as success.
-    head -c8 "$hostshot" | od -An -tx1 | tr -d ' \n' | grep -qi '^89504e470d0a1a0a' \
-        || fail "host screenshot is not a PNG"
+    local magic
+    magic=$(head -c8 "$hostshot" | od -An -tx1 | tr -d ' \n')
+    [ "$magic" = 89504e470d0a1a0a ] || fail "host screenshot is not a PNG (its first bytes: ${magic:-none})"
     log pd "  host captured $(stat -c%s "$hostshot") bytes with no X client stack installed"
     ev_copy "$hostshot" host-capture "EV-SHOT-CLIENT (host variant): the desktop as the published screenshot binary captured it from the host, over /tmp/.X11-unix/X0"
     ev_pass "the published screenshot binary, run on the host, captured :0 ($(stat -c%s "$hostshot") bytes, a PNG)"
@@ -618,7 +620,7 @@ phase_deploy() {
     ev_copy /etc/cdi/desktop-display.yaml display-spec "EV-CONFIG: /etc/cdi/desktop-display.yaml: DISPLAY and the /tmp/.X11-unix directory, rbind rw; nothing about audio"
     ev_copy /etc/cdi/desktop-audio.yaml audio-spec "EV-CONFIG: /etc/cdi/desktop-audio.yaml: both audio env vars and the /run/desktop-audio directory, rbind rw; nothing about the display"
     for f in probe-display probe-audio probe-both probe-none; do
-        src=$(ls "$EV_ROOT/S7.1.1/"*"-$f.txt" 2>/dev/null | head -n1 || true)
+        src=$(first_of ls "$EV_ROOT/S7.1.1/"*"-$f.txt")
         [ -z "$src" ] || ev_copy "$src" "$f" "EV-STATE: the $f client's env and mounts, as S7.1.1 ran it (copied here)"
     done
     grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml || fail "display spec kind wrong"
@@ -778,8 +780,8 @@ conn_connected() { [ "$(cat "$1/status")" = connected ]; }
 
 # The two connectors' sysfs directories, into conn and conn2.
 layout_connectors() {
-    conn=$(ls -d /sys/class/drm/card*-Virtual-1 2>/dev/null | head -n1)
-    conn2=$(ls -d /sys/class/drm/card*-Virtual-2 2>/dev/null | head -n1)
+    conn=$(first_of ls -d /sys/class/drm/card*-Virtual-1)
+    conn2=$(first_of ls -d /sys/class/drm/card*-Virtual-2)
     [ -n "$conn" ] || fail "no Virtual-1 DRM connector: the virtio GPU is not what this expects"
     [ -n "$conn2" ] || fail "no Virtual-2 connector: vm-e2e.sh must boot virtio-vga with max_outputs=2"
 }
@@ -1390,7 +1392,7 @@ EOF
 ad_edid() { # prep|on|off|gone: S3.10.7, around the host's plug, shot and unplug
     local T=$LAYOUT_TMP dbg dims0 v1 xl0 v2modes kmodes unoffered v1cur kedid xedid want=640x480,800x600,1024x768
     layout_connectors
-    dbg=$(ls -d /sys/kernel/debug/dri/*/Virtual-2 2>/dev/null | head -n1 || true)
+    dbg=$(first_of ls -d /sys/kernel/debug/dri/*/Virtual-2)
     ev_begin S3.10.7 "A plugged-in monitor with an EDID exposes modes" T3
     case "${1:-}" in
         prep)
@@ -1741,7 +1743,7 @@ deploy_checks() {
     block=$(grep 'preflight:' <<<"$dlog" || true)
     ev_text preflight "EV-LOG-DESKTOP: the container preflight's lines in the desktop's log" "${block:-(none)}"
     [ -n "$block" ] || fail "the desktop's log has no preflight: lines"
-    ! grep -q 'preflight: FAIL:' <<<"$block" || fail "the container preflight reports: $(grep 'preflight: FAIL:' <<<"$block" | head -3)"
+    ! grep -q 'preflight: FAIL:' <<<"$block" || fail "the container preflight reports: $(grep -m3 'preflight: FAIL:' <<<"$block")"
     ev_pass "the container preflight ran ($(wc -l <<<"$block") lines) and reported no FAIL"
     ev_end
 }
@@ -2006,8 +2008,12 @@ deploy_reboot() {
         [ "$st" = active/success ] || fail "$u.service is $st after the reboot"
     done
     ev_pass "after the reboot desktop.service is active, X answers, mwm runs, and the five boot oneshots are active and succeeded"
-    wait_for 60 2 "the tools spec, advertised this boot" test -s /etc/cdi/desktop-tools.yaml
+    # The spec persists across the reboot, so its presence says nothing about
+    # this boot: wait for the rewrite itself (the toolkit's publish triggers
+    # the .path unit some time after desktop.service is active).
     boot_epoch=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))
+    spec_this_boot() { [ -s /etc/cdi/desktop-tools.yaml ] && [ "$(stat -c %Y /etc/cdi/desktop-tools.yaml)" -ge "$boot_epoch" ]; }
+    wait_for 60 2 "the tools spec, rewritten this boot" spec_this_boot
     mt=$(stat -c %Y /etc/cdi/desktop-tools.yaml)
     [ "$mt" -ge "$boot_epoch" ] || fail "the tools spec was not rewritten this boot (mtime $mt, boot $boot_epoch)"
     [ "$(systemctl show -p Result --value desktop-tools-cdi.service)" = success ] || fail "desktop-tools-cdi.service did not succeed this boot"
@@ -2027,7 +2033,7 @@ deploy_reboot() {
     ev_save cdi "EV-STATE: ls -l --full-time /etc/cdi after the reboot" ls -l --full-time /etc/cdi >/dev/null || true
     j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -b -u desktop-seat-prep: this boot's seat-prep, on a converged seat" \
         journalctl -b --no-pager -o short-iso -u desktop-seat-prep.service) || true
-    ! grep -q 'seat-prep: ' <<<"$j" || fail "seat-prep changed something this boot: $(grep 'seat-prep: ' <<<"$j" | head -3)"
+    ! grep -q 'seat-prep: ' <<<"$j" || fail "seat-prep changed something this boot: $(grep -m3 'seat-prep: ' <<<"$j")"
     ev_pass "seat-prep logged nothing this boot: on a converged seat it changes nothing"
     ev_save sessions "EV-STATE: loginctl list-sessions after the reboot" loginctl list-sessions --no-pager >/dev/null || true
     ev_end
@@ -2082,7 +2088,7 @@ session_groups() {
                  f {print}' <<<"$dlog")
     [ -n "$table" ] || fail "align-device-groups logged no final-state table"
     for g in video render input audio; do
-        line=$(grep -E "^align-device-groups: +$g: " <<<"$table" | head -n1 || true)
+        line=$(grep -m1 -E "^align-device-groups: +$g: " <<<"$table" || true)
         [ -n "$line" ] || fail "align-device-groups' final state has no $g line"
         cg=$(sed -n 's/.*container gid \([0-9]*\),.*/\1/p' <<<"$line")
         node=$(sed -n 's/.*, device \(\/dev\/[^ ]*\) has gid.*/\1/p' <<<"$line")
@@ -2221,7 +2227,7 @@ $(loginctl list-sessions --no-pager 2>&1)
             [ "$st" = not-found ] || fail "desktop-session is still known to systemd: LoadState $st"
             dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
             ev_text log "EV-LOG-DESKTOP: desktop-init's lines and the audio stack's start, with no desktop-session unit" \
-                "$(grep '^desktop-init: \|^start-audio: ' <<<"$dlog" | head -20)"
+                "$(grep -m20 '^desktop-init: \|^start-audio: ' <<<"$dlog")"
             grep -q '^desktop-init: no host login session appeared; creating /run/user/61000 standalone' <<<"$dlog" \
                 || fail "desktop-init did not log 'no host login session appeared; creating /run/user/61000 standalone'"
             ev_pass "desktop-init logged 'no host login session appeared; creating /run/user/61000 standalone'"
@@ -2289,7 +2295,7 @@ kbd_sys() { # the USB keyboard's inputN directory
     done
     return 1
 }
-kbd_event() { local e; e=$(ls -d "$1"/event* 2>/dev/null | head -n1); [ -n "$e" ] && echo "/dev/input/${e##*/}"; }
+kbd_event() { local e; e=$(first_of ls -d "$1"/event*); [ -n "$e" ] && echo "/dev/input/${e##*/}"; }
 kbd_udev() { udevadm info "$1"; echo; udevadm info "$(kbd_event "$1")"; }
 foreign_tags() { grep -hE '^E:ID_SEAT=' /run/udev/data/* 2>/dev/null | grep -v '=seat0$' | sort -u || true; }
 # The same, entry by entry: the udev database file of each device tagged for
@@ -2299,7 +2305,7 @@ foreign_entries() {
         | sed 's|^/run/udev/data/||; s|:E:ID_SEAT=| ID_SEAT=|' || true
 }
 seat_tags() { # attach|fix
-    local sys ev b j0 j pf
+    local sys ev b j0 j pf props
     sys=$(kbd_sys) || fail "no 'QEMU QEMU USB Keyboard' input device on the VM host"
     ev=$(kbd_event "$sys")
     [ -n "$ev" ] || fail "the USB keyboard ($sys) has no event node"
@@ -2316,7 +2322,8 @@ seat_tags() { # attach|fix
                 sh -c 'for f in /etc/udev/rules.d/72-seat-*.rules; do echo "== $f"; cat "$f"; done' >/dev/null || true
             ev_save udev-attached "EV-STATE: udevadm info of the keyboard after loginctl attach seat1" kbd_udev "$sys" >/dev/null || true
             ev_diff udev-attach "EV-DIFF: udevadm info across loginctl attach seat1 (ID_SEAT=seat1 appears)" "$b" "$EV_LAST"
-            udevadm info -q property -n "$ev" | grep -qx 'ID_SEAT=seat1' || fail "$ev is not tagged ID_SEAT=seat1 after loginctl attach"
+            props=$(udevadm info -q property -n "$ev") || fail "udevadm info could not read $ev"
+            grep -qx 'ID_SEAT=seat1' <<<"$props" || fail "$ev is not tagged ID_SEAT=seat1 after loginctl attach"
             ev_save tagged-attached "EV-STATE: every udev database entry tagged for a seat other than seat0, after loginctl attach seat1: the keyboard's input device and the devices under it" \
                 foreign_entries >/dev/null || true
             ev_pass "loginctl attach seat1 tagged the keyboard: $ev reads ID_SEAT=seat1 ($(foreign_tags | paste -sd' ' -) in the udev database)"
@@ -2344,13 +2351,14 @@ seat_tags() { # attach|fix
                 journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$j0") || true
             grep -q 'seat-prep: removing custom seat attachment rule /etc/udev/rules.d/72-seat-' <<<"$j" \
                 || fail "seat-prep did not log removing the 72-seat-* rule at the desktop's restart"
-            ev_pass "seat-prep logged: $(grep -o 'seat-prep: removing custom seat attachment rule [^ ]*' <<<"$j" | head -n1)"
+            ev_pass "seat-prep logged: $(grep -m1 -o 'seat-prep: removing custom seat attachment rule [^ ]*' <<<"$j")"
             ev_save rules-after "EV-STATE: ls -l /etc/udev/rules.d after seat-prep: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is still there after seat-prep"
             ev_save udev-after "EV-STATE: udevadm info of the keyboard after seat-prep" kbd_udev "$sys" >/dev/null || true
             ev_save tagged-after "EV-STATE: every udev database entry tagged for a seat other than seat0, after seat-prep: none" \
                 foreign_entries >/dev/null || true
-            ! udevadm info -q property -n "$ev" | grep -q '^ID_SEAT=' || fail "$ev still carries $(udevadm info -q property -n "$ev" | grep '^ID_SEAT=')"
+            props=$(udevadm info -q property -n "$ev") || fail "udevadm info could not read $ev"
+            ! grep -q '^ID_SEAT=' <<<"$props" || fail "$ev still carries $(grep '^ID_SEAT=' <<<"$props")"
             [ -z "$(foreign_tags)" ] || fail "the udev database still has a foreign seat tag: $(foreign_entries | paste -sd' ' -)"
             ev_pass "the rule is gone and udev re-read the keyboard: $ev has no ID_SEAT, and no device in the udev database is tagged for another seat"
             pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
@@ -2563,8 +2571,10 @@ k8s_k3s() { # <log tag>
     fi
 
     log "$1" "k3s brought its own SELinux policy module (required on an enforcing EL host)"
-    if semodule -l 2>/dev/null | grep -qi '^k3s'; then
-        log "$1" "  policy module loaded: $(semodule -l | grep -i '^k3s' | tr '\n' ' ')"
+    local mods rt
+    mods=$(semodule -l 2>/dev/null || true)
+    if grep -qi '^k3s' <<<"$mods"; then
+        log "$1" "  policy module loaded: $(grep -i '^k3s' <<<"$mods" | tr '\n' ' ')"
         rpm -q k3s-selinux >/dev/null 2>&1 && log "$1" "  from $(rpm -q k3s-selinux)"
     else
         echo "---- selinux lines from the k3s installer ----" >&2
@@ -2576,8 +2586,9 @@ k8s_k3s() { # <log tag>
     wait_for 60 5 "k3s node ready" \
         sh -c "k3s kubectl get nodes | grep -q ' Ready'"
     # Prove the node really runs CRI-O, not the bundled containerd.
-    k3s kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' \
-        | grep -q cri-o || fail "node runtime is not cri-o"
+    rt=$(k3s kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' 2>&1) \
+        || fail "could not read the node's container runtime: $rt"
+    grep -q cri-o <<<"$rt" || fail "node runtime is not cri-o: $rt"
 
     curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
         | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
@@ -3344,7 +3355,7 @@ verify_audio_x_restart() {
     ev_begin S4.5.1 "Audio survives an X session restart" T3
     ev_save pids-before "EV-PIDS: Xorg, mwm and the three audio daemons before Xorg is killed" \
         ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
-    x_before=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1 || true)
+    x_before=$(first_of podman exec desktop pgrep -x Xorg)
 
     # Kill the X server, not the container: the session dies, desktop-init
     # notices and starts a new one. That is the ordinary failure this is
@@ -3358,13 +3369,13 @@ verify_audio_x_restart() {
     date +%s.%N > /run/verify-audio-x.kill
     podman exec -u desktop desktop pkill -u desktop -x Xorg || true
     ev_note "Xorg (pid $x_before) killed at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
-    x_new() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1); [ -n "$p" ] && [ "$p" != "$x_before" ] && session_up; }
+    x_new() { local p; p=$(first_of podman exec desktop pgrep -x Xorg); [ -n "$p" ] && [ "$p" != "$x_before" ] && session_up; }
     wait_for 45 2 "a new X session (a new Xorg and mwm)" x_new
     log al "  the X session restarted"
     ev_note "a new Xorg and mwm up at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     ev_save pids-after "EV-PIDS: Xorg, mwm and the three audio daemons after the session came back" \
         ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
-    ev_pass "the X session restarted: Xorg $x_before -> $(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1)"
+    ev_pass "the X session restarted: Xorg $x_before -> $(first_of podman exec desktop pgrep -x Xorg)"
 
     pw_after=$(pipewire_pid)
     [ "$pw_after" = "$pw_before" ] \
@@ -3414,7 +3425,7 @@ verify_audio_lifecycle() {
     ev_begin S2.4.4 "WirePlumber waits for PipeWire's socket" T3
     ev_save pids-boot "EV-PIDS: the audio daemons as booted (pid, ppid, session, user, start time)" \
         podman exec desktop ps -o pid,ppid,sess,user,lstart,comm -C pipewire,wireplumber,pipewire-pulse >/dev/null || true
-    wp_boot=$(podman exec desktop pgrep -x wireplumber 2>/dev/null | head -1 || true)
+    wp_boot=$(first_of podman exec desktop pgrep -x wireplumber)
     [ -n "$wp_boot" ] || fail "no wireplumber after boot"
     ev_pass "wireplumber is alive after boot (pid $wp_boot)"
     ev_end
@@ -3457,11 +3468,11 @@ verify_audio_lifecycle() {
     ev_pass "pactl info over the export succeeds after the restart (pipewire $pw_before -> $recovered)"
     ev_end
     ev_begin S2.4.4 "WirePlumber waits for PipeWire's socket" T3
-    wp_new() { local p; p=$(podman exec desktop pgrep -x wireplumber 2>/dev/null | head -1); [ -n "$p" ] && [ "$p" != "$wp_boot" ]; }
+    wp_new() { local p; p=$(first_of podman exec desktop pgrep -x wireplumber); [ -n "$p" ] && [ "$p" != "$wp_boot" ]; }
     wait_for 30 2 "a new wireplumber after the audio stack restarted" wp_new
     ev_save pids-restart "EV-PIDS: the audio daemons after pipewire was killed and the stack restarted" \
         podman exec desktop ps -o pid,ppid,sess,user,lstart,comm -C pipewire,wireplumber,pipewire-pulse >/dev/null || true
-    ev_pass "wireplumber is alive after the stack restart (pid $wp_boot -> $(podman exec desktop pgrep -x wireplumber | head -1))"
+    ev_pass "wireplumber is alive after the stack restart (pid $wp_boot -> $(first_of podman exec desktop pgrep -x wireplumber))"
     ev_end
 
     # And the session must not have been collateral damage in the other
@@ -3494,13 +3505,13 @@ verify_postmortem() {
     # for the reason above, and read the log from just before the kill.
     log al "a killed X server leaves a postmortem"
     ev_begin S2.3.5 "Postmortem runs on abnormal exit only" T3
-    x_before=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1 || true)
+    x_before=$(first_of podman exec desktop pgrep -x Xorg)
     [ -n "$x_before" ] || fail "no Xorg to kill"
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     sleep 1
     podman exec -u desktop desktop pkill -KILL -u desktop -x Xorg || true
     ev_note "Xorg (pid $x_before) killed with SIGKILL just after $since"
-    x_new() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1); [ -n "$p" ] && [ "$p" != "$x_before" ] && session_up; }
+    x_new() { local p; p=$(first_of podman exec desktop pgrep -x Xorg); [ -n "$p" ] && [ "$p" != "$x_before" ] && session_up; }
     wait_for 60 2 "a new X session after Xorg was killed with SIGKILL" x_new
     pm=$(ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log from just before the kill (podman logs --since $since): the session's exit, the postmortem, the new session" \
         podman logs --since "$since" desktop) || true
@@ -3509,7 +3520,7 @@ verify_postmortem() {
     # here: desktop-init reads the server's log, says the server did not shut
     # down cleanly, and only then runs the postmortem. In that order, the
     # session's exit line last.
-    line_of() { grep -n "$1" <<<"$pm" | head -1 | cut -d: -f1; }
+    line_of() { grep -n -m1 -- "$1" <<<"$pm" | cut -d: -f1 || true; }
     n_unclean=$(line_of '^desktop-init: the X server did not shut down cleanly')
     n_pm=$(line_of '^postmortem: X session ended abnormally')
     n_exit=$(line_of '^desktop-init: session exited (rc=')
@@ -3861,13 +3872,13 @@ host pid 1: $(readlink /proc/1/ns/cgroup 2>&1)"
     kill "$other" 2>/dev/null || true
     grep -q 'Operation not permitted' <<<"$k" && ! grep -q '^rc=0$' <<<"$k" \
         || fail "container root could signal a host process of another uid: $(echo $k)"
-    ev_pass "kill -0 on another uid's host process: $(grep -v '^rc=' <<<"$k" | head -1)"
+    ev_pass "kill -0 on another uid's host process: $(grep -m1 -v '^rc=' <<<"$k")"
     grep -qE 'Permission denied|Operation not permitted' <<<"$e" && ! grep -q '^rc=0$' <<<"$e" \
         || fail "container root could read pid 1's environ: $(echo $e)"
-    ev_pass "pid 1's environ is refused: $(grep -v '^rc=' <<<"$e" | head -1)"
+    ev_pass "pid 1's environ is refused: $(grep -m1 -v '^rc=' <<<"$e")"
     grep -qE 'Permission denied|Operation not permitted' <<<"$m" && ! grep -q '^rc=0$' <<<"$m" \
         || fail "container root could read pid 1's memory: $(echo $m)"
-    ev_pass "pid 1's memory is refused: $(grep -v '^rc=' <<<"$m" | head -1)"
+    ev_pass "pid 1's memory is refused: $(grep -m1 -v '^rc=' <<<"$m")"
     ev_end
 
     # S6.2.2: the host's network namespace, not a copy of it.

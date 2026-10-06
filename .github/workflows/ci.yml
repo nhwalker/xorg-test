@@ -119,7 +119,7 @@ jobs:
         # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/script-list.py ci/preflight-rows.py ci/doc-blocks.py ci/layout-keywords.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/e9-guard.py ci/script-list.py ci/preflight-rows.py ci/doc-blocks.py ci/layout-keywords.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the
@@ -212,6 +212,43 @@ jobs:
           else ev_fail "a client asks for --privileged or label=disable, or the guard's self-test failed (see its output)"; fi
           ev_end
           exit "$rc"
+      - name: the test suite keeps its own rules (E9's static guard)
+        # Requirements.md E9's rules that a read of the tree can hold, each
+        # its own story: ci/e9-guard.py reads ci/'s shell and Python and the
+        # workflows' run blocks. Each rule's self-test first judges planted
+        # files, a violation flagged and an allowed form passed, and requires
+        # each of its ALLOW entries (the tree's documented exceptions) to
+        # still excuse something; then every finding in the tree is printed,
+        # allowed or not.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/e9-guard.py)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          f=0
+          rule() { # <story> <title> <what the tree holds to>
+            local rc=0
+            ev_begin "$1" "$2" T0
+            ev_save guard "ci/e9-guard.py --rule $1 --self-test: the rule's self-test, then each finding in the tree, allowed (with the reason) or a violation, and the rule's summary" \
+              python3 ci/e9-guard.py --rule "$1" --self-test >/dev/null || rc=$?
+            if [ "$rc" = 0 ]; then ev_pass "$3; the self-test flags each planted violation and passes each allowed form"
+            else ev_fail "a violation of $1 in the tree, or the rule's self-test failed (see the guard's output)"; f=1; fi
+            ev_end
+          }
+          rule S9.1.3 "Read the container's init, never /proc/1" \
+            "no test reaches the desktop's processes through /proc/1 or by name: each such read in ci/ is one the guard's ALLOW list names (a client's own pid 1, the host's on purpose, a refusal under test)"
+          rule S9.1.5 "No early-exiting reader on a live pipeline under pipefail" \
+            "no reader that stops early (grep -q/-m/-l, head, sed q, awk exit, read, cmp, a loop or python that breaks) reads a live pipeline under pipefail in ci/'s shell or a workflow's run block"
+          rule S9.2.1 "Nothing weakens the system under test" \
+            "no setenforce; no --privileged or label=disable on a podman run, create or exec; no -e or -v that duplicates an edit of a CDI device the container requests; an -e of a CDI variable into a client only from its own pid 1; no write under /etc/containers/systemd but the documented procedures the ALLOW list names"
+          rule S9.2.2 "Narrow fixtures stay narrow" \
+            "each *-only pod requests exactly one desktop.local resource, and no client pod declares more than its requests"
+          rule S9.2.4 "Probes yield integers, or fail" \
+            "each counter read from the guest is an integer, or a failed read that fails or retries, before it is compared: never a stand-in number"
+          rule S9.3.1 "Every story emits its named evidence on pass and on fail" \
+            "every story the harness begins is one Requirements.md defines, and the evidence check fails each of five incomplete story directories and passes a complete one"
+          exit "$f"
       - name: helm lint + template assertions (and S7.3.3's static half)
         # The chart's golden assertions, then every client manifest's: each
         # requests a desktop.local resource and declares nothing of its own.
