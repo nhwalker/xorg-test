@@ -53,3 +53,17 @@ if command -v restorecon >/dev/null; then
     restorecon -R "$DIR" "$ak" || true
 fi
 echo "host shell converged: fresh key for '$user', trust at $ak"
+
+# A desktop already running installed what it found when it started (the
+# last key, or none), and installs again only at its next start. Hand it this
+# key too, so "Host Terminal" works without a desktop restart: starting this
+# unit by hand is what the menu entry's failure screen says to do. At boot the
+# unit runs before desktop.service, and there is no desktop yet.
+ctr=${DESKTOP_CONTAINER:-desktop}
+if [ "$(podman container inspect -f '{{.State.Running}}' "$ctr" 2>/dev/null)" = true ]; then
+    if timeout 60 podman exec -u 0 "$ctr" /usr/local/bin/host-shell-setup.sh; then
+        echo "handed the new key to the running desktop ($ctr)"
+    else
+        echo "the running desktop ($ctr) did not take the new key; it will at its next start" >&2
+    fi
+fi
