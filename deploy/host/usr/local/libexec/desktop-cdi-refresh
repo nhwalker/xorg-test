@@ -17,6 +17,9 @@
 set -euo pipefail
 
 SPEC=/etc/cdi/nvidia.yaml
+# The loaded-module list the no-downgrade rule below reads. A test points it
+# at a fabricated list (Requirements.md, Appendix A); nothing else should.
+PROC_MODULES=${CDI_PROC_MODULES:-/proc/modules}
 
 if command -v nvidia-ctk >/dev/null && [ -e /dev/nvidiactl ]; then
     mkdir -p /etc/cdi
@@ -33,7 +36,7 @@ fi
 # GPU acceleration - a possibly-stale real spec fails loudly at container
 # creation instead, which is the better failure.
 if [ -f "$SPEC" ] && ! grep -q NVIDIA_CDI_STUB "$SPEC"; then
-    if [ -e /dev/nvidiactl ] || grep -q '^nvidia ' /proc/modules 2>/dev/null; then
+    if [ -e /dev/nvidiactl ] || grep -q '^nvidia ' "$PROC_MODULES" 2>/dev/null; then
         echo "keeping existing real CDI spec: NVIDIA hardware present but toolkit unusable this boot" >&2
         exit 0
     fi
