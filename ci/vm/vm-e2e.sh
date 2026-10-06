@@ -192,6 +192,9 @@ read_pair() {
 }
 # hotplug-probe: "<container input nodes> <Xorg input adds>"; snd-probe:
 # "<container ALSA control nodes> <WirePlumber alsa devices>".
+# The Xorg log's length, the line a story's slice of the log starts after. A
+# failed read is not 0: a slice from the top would hold earlier stories' lines.
+xorg_len() { host_count 'sudo repo/ci/vm/vm-guest.sh xorg-log-lines'; }
 # --- hotplug evidence (Requirements.md F3.9 and F4.7 common sets) ---------------
 # One of vm-guest.sh's read-only probes (desk, ctr-pids, xorg-log-lines,
 # xorg-log-since), so the commands here need no quoting through ssh.
@@ -356,10 +359,14 @@ xi_count() { xi_names < "$1" | grep -cxF -- "$2" || true; }
 # Poll until xinput lists fewer than <count> entries for the name (10 s at
 # most): the judgement is the story's, on the picture taken after.
 xi_wait_gone() { # <name> <count before>
-    local n
+    local n out
     for _ in $(seq 10); do
-        n=$(gq desk xinput list 2>/dev/null | xi_names | grep -cxF -- "$1" || true)
-        [ "${n:-0}" -lt "$2" ] && return 0
+        # A failed read is not a count of 0, which would end the wait while
+        # the name is still listed (Requirements.md S9.2.4): it is read again.
+        if out=$(gq desk xinput list 2>/dev/null); then
+            n=$(xi_names <<<"$out" | grep -cxF -- "$1" || true)
+            [ "$n" -lt "$2" ] && return 0
+        fi
         sleep 1
     done
 }
@@ -1324,7 +1331,7 @@ log "input hotplug: add a virtio keyboard while X runs"
 ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
 input_set before-pci "before device_add virtio-keyboard-pci"
 input_keep
-xl0=$(gq xorg-log-lines 2>/dev/null || echo 0)
+xl0=$(xorg_len) || fail "could not read the Xorg log's length before device_add virtio-keyboard-pci"
 before_host=$(host_count 'ls /dev/input/event* | wc -l') || fail "could not count the VM host's input event nodes"
 read_pair hotplug-probe before_nodes before_adds || fail "could not read the container's input counts (hotplug-probe)"
 log "  before: host=$before_host container-nodes=$before_nodes xorg-adds=$before_adds"
@@ -1393,7 +1400,7 @@ ev_video_start kvm-cycle
 ev_begin S3.9.3 "Keyboard plug-out removes the node from the container" T3
 input_set base "before device_del kvmkbd"
 input_keep
-xl1=$(gq xorg-log-lines 2>/dev/null || echo 0)
+xl1=$(xorg_len) || fail "could not read the Xorg log's length before device_del kvmkbd"
 kvm_base_host=$(host_count 'ls /dev/input/event* | wc -l') || fail "could not count the VM host's input event nodes"
 read_pair hotplug-probe kvm_base_nodes _ || fail "could not read the container's input counts (hotplug-probe)"
 log "  base:    host=$kvm_base_host container-nodes=$kvm_base_nodes"
@@ -1446,7 +1453,7 @@ ev_end
 # guest, so the id is free by the time the removal shows up in /dev.
 ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
 input_import S3.9.3 switched-away "after device_del kvmkbd (the KVM switched away)"
-xl2=$(gq xorg-log-lines 2>/dev/null || echo 0)
+xl2=$(xorg_len) || fail "could not read the Xorg log's length before the KVM switches back"
 ev_qemu device-add-usb "EV-QEMU: device_add usb-kbd,id=kvmkbd,bus=xhci.0 (the KVM switches back) and QEMU's reply (empty: accepted)" \
     "device_add usb-kbd,id=kvmkbd,bus=xhci.0" >/dev/null || fail "QEMU refused to re-add the USB keyboard"
 kvm_on_host=$kvm_off_host kvm_on_nodes=$kvm_off_nodes
@@ -1571,7 +1578,7 @@ PTRS=("QEMU QEMU USB Mouse" "QEMU QEMU USB Tablet")
 ev_begin S3.9.7 "Pointer plug-in reaches the container" T3
 input_set base-ptr "before device_add usb-mouse and usb-tablet"
 input_keep
-xlp=$(gq xorg-log-lines 2>/dev/null || echo 0)
+xlp=$(xorg_len) || fail "could not read the Xorg log's length before device_add usb-mouse and usb-tablet"
 ptr_base_host=$(host_count 'ls /dev/input/event* | wc -l') || fail "could not count the VM host's input event nodes"
 read_pair hotplug-probe ptr_base_nodes _ || fail "could not read the container's input counts (hotplug-probe)"
 ev_qemu device-add-mouse "EV-QEMU: device_add usb-mouse,id=hotmouse,bus=xhci.0 (relative) and QEMU's reply (empty: accepted)" \
@@ -1625,7 +1632,7 @@ ev_end
 
 ev_begin S3.9.9 "Pointer plug-out removes the node from the container" T3
 input_import S3.9.7 plugged "with the USB mouse and tablet plugged in"
-xlq=$(gq xorg-log-lines 2>/dev/null || echo 0)
+xlq=$(xorg_len) || fail "could not read the Xorg log's length before the mouse and tablet are removed"
 ptr_nodes=""
 for name in "${PTRS[@]}"; do ptr_nodes="$ptr_nodes $(dev_events "$EV_DIR/$B_DEV" "$name")"; done
 ptr_nodes=$(echo $ptr_nodes)

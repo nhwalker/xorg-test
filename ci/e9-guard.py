@@ -17,7 +17,10 @@
           are not seen;
   S9.2.2  the narrow fixtures stay narrow: an *-only pod requests exactly one
           desktop.local resource, and no pod declares more than requests;
-  S9.2.4  a counter read over ssh is an integer before it is compared;
+  S9.2.4  a count read from the guest is an integer or a failed read (one
+          that fails, or a poll that retries), never a number standing in
+          for one: no `|| echo 0` on the read, no `${n:-0}` in a comparison,
+          no Python handler that returns one;
   S9.3.1  every story the harness begins is one Requirements.md defines, and
           the evidence check (ci/evlib.py check) fails each kind of
           incomplete story directory.
@@ -670,8 +673,10 @@ def rule_s913(root, rep):
 
 
 def rule_s924(root, rep):
-    """S9.2.4: a counter read over ssh is an integer before it is compared."""
+    """S9.2.4: a count read from the guest is an integer or a failed read,
+    never a number standing in for one."""
     seen = 0
+    fix = "fail, or retry, on a failed read (host_count, read_pair, guest_count)"
     for rel in shell_files(root):
         text = read(os.path.join(root, rel))
         lines = text.split("\n")
@@ -692,22 +697,37 @@ def rule_s924(root, rep):
             while e < len(text) and d:
                 d += {"(": 1, ")": -1}.get(text[e], 0)
                 e += 1
-            if re.search(r"\|\|\s*(echo|printf)\s+['\"]?0", text[start:e]):
-                continue                           # defaulted inside the substitution
-            at = text.count("\n", 0, m.start()) + 1
+            at = text.count("\n", 0, m.start(1)) + 1
+            shown = " ".join(lines[at - 1].split())[:90]
+            dflt = re.search(r"\|\|\s*(?:echo|printf)\s+['\"]?(-?\d+)\b", text[start:e])
+            if dflt:
+                seen += 1
+                rep.flag("S9.2.4", rel, at, lines[at - 1].strip(),
+                         f"${m.group(1)} is read over ssh with {dflt.group(1)} standing in for a failed read: {shown}", fix)
+                continue
+            if re.match(r"\s*\|\|\s*(fail|exit|return)\b", text[e:e + 40]):
+                seen += 1
+                rep.ok("S9.2.4", rel, at, f"${m.group(1)} is read over ssh, and a failed read fails: {shown}")
+                continue
             raw[(scope[at - 1], m.group(1))] = at
         for (sc, name), at in raw.items():
-            use = re.compile(rf"\"?\$\{{?{name}\b[^:]?[^\"\s]*\"?\s+-(eq|ne|lt|le|gt|ge)\b"
-                             rf"|-(eq|ne|lt|le|gt|ge)\s+\"?\$\{{?{name}\b(?!:-)"
-                             rf"|\$\(\([^)]*(?<![\w%])\$?{name}\b(?!:-)|^\s*\(\([^)]*(?<![\w%])\$?{name}\b")
+            use = re.compile(rf"\"?\$\{{?{name}\b[^\"\s]*\"?\s+-(eq|ne|lt|le|gt|ge)\b"
+                             rf"|-(eq|ne|lt|le|gt|ge)\s+\"?\$\{{?{name}\b"
+                             rf"|\$\(\([^)]*(?<![\w%])\$?{name}\b|^\s*\(\([^)]*(?<![\w%])\$?{name}\b")
             for n, l in enumerate(lines, 1):
                 if n <= at or scope[n - 1] != sc or not use.search(l):
                     continue
-                if re.search(rf"\$\{{{name}:-|-n\s+\"\$\{{?{name}\b", l):
-                    continue                       # defaulted, or tested for presence first
                 seen += 1
-                rep.flag("S9.2.4", rel, n, l.strip(), f"${name}, read over ssh at line {at}, compared as a number: {' '.join(l.split())[:80]}",
-                         "read it through a helper that yields an integer or a failed read (host_count)")
+                shown = " ".join(l.split())[:80]
+                if re.search(rf"-n\s+\"\$\{{?{name}\b", l):
+                    rep.ok("S9.2.4", rel, n, f"${name}, read over ssh at line {at}, is tested for presence before it is compared: {shown}")
+                    continue
+                d = re.search(rf"\$\{{{name}:-(-?\d+)", l)
+                if d:
+                    rep.flag("S9.2.4", rel, n, l.strip(),
+                             f"${name}, read over ssh at line {at}, is compared with {d.group(1)} standing in for a failed read: {shown}", fix)
+                    continue
+                rep.flag("S9.2.4", rel, n, l.strip(), f"${name}, read over ssh at line {at}, is compared as a number unchecked: {shown}", fix)
     for path in sorted(glob.glob(os.path.join(root, "ci", "**", "*.py"), recursive=True)):
         rel = os.path.relpath(path, root)
         try:
@@ -730,17 +750,26 @@ def rule_s924(root, rep):
                     or any(isinstance(c, ast.Name) and c.id in from_sh for c in ast.walk(arg))
                 if not reads:
                     continue
-                guarded = False
+                seen += 1
+                shown = " ".join(ast.unparse(node).split())[:90]
+                handlers = []
                 for t in ast.walk(fn):
                     if isinstance(t, ast.Try) and any(node in list(ast.walk(b)) for b in t.body):
-                        names = {ast.unparse(h.type) for h in t.handlers if h.type is not None} | {"" for h in t.handlers if h.type is None}
-                        if any(re.search(r"ValueError|RuntimeError|Exception|^$", x) for x in names):
-                            guarded = True
-                seen += 1
-                if not guarded:
-                    rep.flag("S9.2.4", rel, node.lineno, ast.unparse(node), f"int() of a guest read: {ast.unparse(node)[:90]}",
-                             "count through a helper that turns a failed read into None (not a number)")
-    return f"S9.2.4: {seen} numeric use(s) of a guest read; {len(rep.violations('S9.2.4'))} violation(s)"
+                        handlers += [h for h in t.handlers
+                                     if h.type is None or re.search(r"ValueError|RuntimeError|Exception", ast.unparse(h.type))]
+                if not handlers:
+                    rep.flag("S9.2.4", rel, node.lineno, shown, f"int() of a guest read, with no try: {shown}", fix)
+                    continue
+                # A handler that yields a number makes it stand in for the read.
+                stand_in = [x for h in handlers for x in ast.walk(h)
+                            if isinstance(x, (ast.Return, ast.Assign)) and isinstance(x.value, ast.Constant)
+                            and isinstance(x.value.value, (int, float)) and not isinstance(x.value.value, bool)]
+                if stand_in:
+                    rep.flag("S9.2.4", rel, node.lineno, shown,
+                             f"int() of a guest read whose failure yields {stand_in[0].value.value!r}: {shown}", fix)
+                else:
+                    rep.ok("S9.2.4", rel, node.lineno, f"int() of a guest read, its failure caught and not turned into a number: {shown}")
+    return f"S9.2.4: {seen} read(s) or numeric use(s) of a guest read judged; {len(rep.violations('S9.2.4'))} violation(s)"
 
 
 def defined_stories(root):
@@ -1258,13 +1287,16 @@ PLANTS = {
     ],
     "S9.2.4": [
         ("ci/c1.sh", "#!/bin/bash\nset -e\nn=$(vm_ssh_quick 'ls | wc -l')\n[ \"$n\" -gt 0 ]\n", True),
-        ("ci/c2.sh", "#!/bin/bash\nset -e\nn=$(vm_ssh_quick 'ls | wc -l' 2>/dev/null || echo 0)\n[ \"$n\" -gt 0 ]\n", False),
-        ("ci/c3.sh", "#!/bin/bash\nn=$(gq 'ls | wc -l')\n[ \"${n:-0}\" -gt 0 ]\n", False),
+        ("ci/c2.sh", "#!/bin/bash\nset -e\nn=$(vm_ssh_quick 'ls | wc -l' 2>/dev/null || echo 0)\n[ \"$n\" -gt 0 ]\n", True),
+        ("ci/c3.sh", "#!/bin/bash\nn=$(gq 'ls | wc -l')\n[ \"${n:-0}\" -gt 0 ]\n", True),
+        ("ci/c9.sh", "#!/bin/bash\nxl=$(gq xorg-log-lines 2>/dev/null || echo 0)\ngq xorg-log-since \"$xl\"\n", True),
+        ("ci/c10.sh", "#!/bin/bash\nn=$(vm_ssh_quick 'ls | wc -l') || fail \"no count\"\n[ \"$n\" -gt 0 ]\n", False),
         ("ci/c6.sh", "#!/bin/bash\nf() {\n    n=$(gq 'ls | wc -l')\n    echo \"$n\"\n}\ng() {\n    n=3\n    [ \"$n\" -gt 1 ]\n}\n", False),
         ("ci/c7.sh", "#!/bin/bash\nt=$(vm_ssh_quick 'date +%s.%N')\n[ -n \"$t\" ] && [ \"$now\" -ge \"${t%.*}\" ]\n", False),
         ("ci/c8.sh", "#!/bin/bash\nb=$(vm_ssh_quick 'ls /dev/snd | wc -l')\nsleep 1\nwhile [ $((b + 1)) -gt 2 ]; do :; done\n", True),
         ("ci/c4.py", "def f(g):\n    return int(g.sh('ls | wc -l').strip())\n", True),
         ("ci/c5.py", "def f(g):\n    try:\n        return int(g.sh('ls | wc -l').strip())\n    except (RuntimeError, ValueError):\n        return None\n", False),
+        ("ci/c11.py", "def f(g):\n    try:\n        return int(g.sh('ls | wc -l').strip())\n    except ValueError:\n        return 0\n", True),
     ],
     "S9.3.1": [
         ("ci/s1.sh", "ev_begin S99.1.1 \"no such story\" T0\n", True),
