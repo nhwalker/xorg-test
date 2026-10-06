@@ -226,15 +226,20 @@ mt_shot_quiet() { # <moment> <what>
     rm -f "$ppm"
 }
 # A capture with no pitch to check (the checklist's audio lines play a voice
-# sample): check-audio.py's duration and level alone. 0 when it was heard.
+# sample): check-audio.py's duration and level alone, and its broadband level
+# plot (S9.3.4: a recording is heard, seen and judged). 0 when it was heard.
 mt_heard() { # <wav name in the open story> <what>
-    local rep rc=0
+    local m rep plot rc=0
     audio_capture_stop
     [ -s "$EV_DIR/$1" ] || { ev_note "no capture was written for: $2"; return 1; }
     ev_attach "$1" "$2"
-    rep=$(ev_name "${1%.wav}-verdict" txt)
-    python3 check-audio.py --report "$EV_DIR/$rep" "$EV_DIR/$1" 0.8 0.02 || rc=$?
+    m=${1%.wav}
+    m=${m#*-}
+    rep=$(ev_name "$m-verdict" txt)
+    plot=$(ev_name "$m-level" png)
+    python3 check-audio.py --report "$EV_DIR/$rep" --plot "$EV_DIR/$plot" "$EV_DIR/$1" 0.8 0.02 || rc=$?
     [ -s "$EV_DIR/$rep" ] && ev_attach "$rep" "check-audio.py's verdict on $1: its duration and peak level (no pitch: the line plays a voice sample)"
+    [ -s "$EV_DIR/$plot" ] && ev_attach "$plot" "the broadband (RMS) level across $1, one bar per 0.1 s on a -60..0 dBFS scale: a voice sample has no one pitch to plot"
     return "$rc"
 }
 
@@ -279,7 +284,7 @@ mt_verify() {
             judged=no
             case "$tool:$v" in pw-play:met|paplay:met|aplay:written) judged=yes ;; esac
             mt_open S10.2.1
-            wav=$(ev_name "$tool-$v" wav)
+            wav=$(ev_name "$tool-$v-voice" wav)
             mon_cmd "wavcapture $EV_DIR/$wav snd0 44100 16 2"
             sleep 1
             ev_save "$tool-$v" "EV-STATE: the README checklist's $tool line ($v): what it printed and its exit status" \

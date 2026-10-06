@@ -317,6 +317,15 @@ def check_dir(d):
 #           the pids, or of the container's id and restart count for a
 #           container, either a before/after pair or the two files a diff
 #           compares
+#   S9.3.4  each recording (a .wav in the index) has a picture and a verdict
+#           whose lines in the index name it, and its name says what a
+#           reviewer should hear: a pitch (440hz), "voice" or "silence"; a
+#           source word in its name (pulse, paplay, pipewire, pw-play, alsa,
+#           aplay, recording) comes with that source's pitch from the
+#           evidence standard
+#   S9.3.6  every line of the story's timeline (both sides') starts with an
+#           ISO UTC timestamp, and each file in the index has its "file" line
+#           in its side's timeline
 
 NUMBERED = re.compile(r"^h?\d+-(.+)$")
 MEDIA = (".png", ".gif", ".wav", ".mp4", ".ppm", ".jpg")
@@ -477,11 +486,68 @@ def survival_problems(d, files):
     return problems
 
 
+# The evidence standard's pitch for each path (Requirements.md, EV-AUDIO), by
+# the words a recording's name uses for it.
+SOURCE_PITCH = (({"pulse"}, 440), ({"paplay"}, 440), ({"pipewire"}, 880), ({"pw", "play"}, 880),
+                ({"alsa"}, 1320), ({"aplay"}, 1320), ({"recording"}, 660))
+PITCH = re.compile(r"(?:^|-)(\d+)hz(?:-|$)")
+NO_PITCH = re.compile(r"(?:^|-)(?:silence|voice)(?:-|$)")
+
+
+def audio_problems(files):
+    """S9.3.4 for one story directory."""
+    problems = []
+    for _, name, _ in files:
+        if not name.endswith(".wav"):
+            continue
+        for ext, kind in ((".png", "picture (a spectrogram, or the level plot)"),
+                          (".txt", "verdict (the analyser's report)")):
+            if not any(n.endswith(ext) and name in what for _, n, what in files):
+                problems.append(f"{name} has no {kind} whose line in the index names it")
+        stem = unnumbered(name)[:-len(".wav")]
+        m = PITCH.search(stem)
+        if not m and not NO_PITCH.search(stem):
+            problems.append(f"{name}: its name says neither its pitch (440hz) nor 'voice' or 'silence'")
+        words = set(stem.split("-"))
+        for need, hz in SOURCE_PITCH:
+            if m and need <= words and int(m.group(1)) != hz:
+                problems.append(f"{name}: a {'-'.join(sorted(need))} recording plays at {hz} Hz "
+                                f"(the evidence standard), not {m.group(1)}")
+    return problems
+
+
+TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ")
+
+
+def timeline_problems(d):
+    """S9.3.6 for one story directory."""
+    problems, filed = [], {}
+    for side in SIDES:
+        p = os.path.join(d, side + "timeline.log")
+        if not os.path.exists(p):
+            continue
+        with open(p, errors="replace", newline="\n") as f:
+            lines = f.read().split("\n")
+        bad = [(i, l) for i, l in enumerate(lines, 1) if l and not TIMESTAMP.match(l)]
+        if bad:
+            problems.append(f"{side}timeline.log: {len(bad)} line(s) with no ISO timestamp, the first "
+                            f"line {bad[0][0]}: {bad[0][1][:80]}")
+        filed[side] = {l.split(" file ", 1)[1].split(":", 1)[0].strip()
+                       for l in lines if TIMESTAMP.match(l) and " file " in l}
+    for side in SIDES:
+        for _, name, _ in _rows(os.path.join(d, side + "files.tsv"), 3):
+            if name not in filed.get(side, set()):
+                problems.append(f"{name} has no 'file' line in {side}timeline.log")
+    return problems
+
+
 def discipline(d):
     """[(rule, problem)]: what in a story's directory the F9.3 rules find."""
     files = read_files(d)
     out = [("S9.3.2", p) for p in pair_problems(d, files)]
     out += [("S9.3.3", p) for p in survival_problems(d, files)]
+    out += [("S9.3.4", p) for p in audio_problems(files)]
+    out += [("S9.3.6", p) for p in timeline_problems(d)]
     return out
 
 

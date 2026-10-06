@@ -777,6 +777,7 @@ podman exec desktop sh -c 'tr "\0" "\n" </proc/$(cat /run/desktop-init.pid)/envi
 log "host terminal: loopback ssh as desktop-shell with the boot-fresh key"
 [ -f /etc/desktop-container/host-shell-key ] || fail "boot-fresh key missing"
 [ "$(stat -c %a /etc/desktop-container/host-shell-key)" = 400 ] || fail "key perms not 0400"
+ev_log ssh "-i /etc/desktop-container/host-shell-key desktop-shell@127.0.0.1 whoami (the loopback login the Host Terminal makes)"
 who=$(ssh -i /etc/desktop-container/host-shell-key -o BatchMode=yes -o ConnectTimeout=5 \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null desktop-shell@127.0.0.1 whoami)
 [ "$who" = desktop-shell ] || fail "host ssh whoami returned '$who', want desktop-shell"

@@ -1720,6 +1720,7 @@ deploy_checks() {
     ev_pass "a remote port forward is refused when it is set up: ssh -R with ExitOnForwardFailure=yes exits $rc"
     # A local forward is refused only when something uses it: sshd turns
     # down the channel then, not the listening ssh's setup.
+    ev_log ssh "-o ExitOnForwardFailure=yes -L 127.0.0.1:40023:127.0.0.1:22 desktop-shell@127.0.0.1 'sleep 6' (in the background, a connection then made through the forward)"
     ssh "${o[@]}" -o ExitOnForwardFailure=yes -L 127.0.0.1:40023:127.0.0.1:22 desktop-shell@127.0.0.1 'sleep 6' \
         > /tmp/ev-s573-local.log 2>&1 &
     sp=$!
