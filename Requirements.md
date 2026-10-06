@@ -1809,64 +1809,86 @@ These govern every test written against the stories in this document (E10
 and E11, which follow, included); the suite's own history (see comments in
 `ci/`) is the reason each exists.
 
+`ci/e9-guard.py`, in the static job, holds the rules that a read of the tree
+can check: S9.1.3, S9.1.5, S9.2.1, S9.2.2, S9.2.4 and S9.3.1's static half,
+each as its own story with its own evidence. Nothing checks the others yet;
+their Coverage lines say what holds them today.
+
 ### F9.1 Assertion discipline
 
 **S9.1.1 Every assertion has been seen to fail**
 - Requirement: a new assertion is verified against a deliberate mutation before it is merged.
 - Acceptance: the PR description names the mutation.
+- Tier: T0 · Coverage: ❌ no check reads a pull request's description: the repository has no PR template, and no workflow reads the event's body. The static guards hold the rule for themselves: `ci/client-guard.py`, `ci/e9-guard.py`, `ci/script-list.py` and `ci/layout-keywords.py` each run a self-test first that plants what their checks must flag.
 
 **S9.1.2 Assert generated output, not source text**
 - Requirement: quadlet/CDI/config assertions read the *generated* artefact, anchored so comments cannot match.
+- Tier: T0 · Coverage: ❌ no check finds an assertion that reads source text, or one that a comment in a generated file could satisfy. Some reads are anchored by construction: `ci.yml`'s quadlet dry-run and `ci/unit-directives.py` read the generated unit's directives and skip its comments, and `ci/hw/acceptance.sh` reads the generated unit's `ExecStart` (S8.1.4). An audit of the tree found `ci/helm-assertions.sh` reading the CDI kinds from the generator's source text, and about a hundred greps over generated files that carry comments (the CDI specs, `30-monitors.conf`, `20-gpu.conf`, the chart's rendered output) that a comment could match, though none does today.
 
 **S9.1.3 Read the container's init, never `/proc/1`**
 - Requirement: under `--pid=host`, process-level assertions use `/run/desktop-init.pid`.
+- Tier: T0 · Coverage: ✅ `ci/e9-guard.py --rule S9.1.3`, run by the static job, reads every shell script and Python file under `ci/` for `/proc/1`, `pidof`, and `pgrep` or `ps -C` of `desktop-init`, and finds each such read to be one its ALLOW list names, with the reason: a client container's own pid 1 (op-observer, S7.7.3's client, S10.3.4's client, `operator-e2e.py`'s client capture), the host's pid 1 on purpose (its cgroup namespace compared with the container's), the reads of the host's pid 1 that S6.2.1 requires container root to be refused, and one listing by name kept as S10.2.2's evidence beside the pid file's. Its self-test flags a planted `/proc/1` read and a `pidof`, passes a read of `/run/desktop-init.pid`, and requires each ALLOW entry to still excuse a line. The guard's output is under `artifacts/S9.1.3/` (artifact `evidence-static`).
 
 **S9.1.4 Poll log lines; read live state once**
 - Requirement: a log-line assertion is polled; process/socket state may be read directly.
+- Tier: T0 · Coverage: ❌ no check finds a log line read once where it must be polled. Some reads poll (`vm-guest.sh` polls the journal where it documents the journal's lag), but an audit counted about 43 one-shot reads of `podman logs`, `journalctl` or `kubectl logs` that feed an assertion, 16 of them confirmed by reading the code.
 
 **S9.1.5 No early-exiting reader (`grep -q`, `grep -m`, `head`) on a live pipeline under `pipefail`**
 - Requirement: capture output to a variable first.
+- Tier: T0 · Coverage: ✅ `ci/e9-guard.py --rule S9.1.5`, run by the static job, reads every shell script under `ci/` and every workflow `run:` block the way the shell does (quotes, comments, heredoc bodies, `case` patterns, `$(…)` nesting). It knows where `pipefail` is on: a script's own `set`, the sourcing script's for `maint-e2e.sh`, `maint-guest.sh` and `evidence.sh`, `acceptance-tests.sh`'s from the line that sources `acceptance.sh`, and a workflow step's `shell: bash` or its own `set`. It finds no reader that can stop early (`grep -q`/`-m`/`-l`, `head`, `sed …q`, `awk …exit`, `read`, `cmp`, a loop that breaks, python that exits) on a live pipeline under it; a print of a variable already captured, the requirement's own remedy, passes. Its self-test flags planted pipes into `grep -q`, `head`, `awk …exit` and a loop that breaks, and passes a here-string, a pipe inside a quoted `sh -c`, a print of a captured variable, a pipe in a comment, a `case` pattern, `grep -c`, `head -n -1` and a script without `pipefail`. It flagged 75 such pipes before the harness was rewritten to capture first. The guard's output is under `artifacts/S9.1.5/` (artifact `evidence-static`).
 
 ### F9.2 Fixture and environment discipline
 
 **S9.2.1 Nothing weakens the system under test**
 - Requirement: no `setenforce`, no `label=disable`, no `--privileged` on clients, no `-v`/`-e` that duplicates a CDI edit (except `-e` on a `podman exec` into a CDI client, with the value read from that container's PID 1: podman applies a CDI device's env edits only to the process the container starts with), no test-only quadlet changes.
+- Tier: T0 · Coverage: ✅ `ci/e9-guard.py --rule S9.2.1`, run by the static job, reads every shell script under `ci/` and every workflow `run:` block, with the command lines quoted inside them (`ssh`, `sh -c`, `undo_later`), every Python file and every pod manifest. It finds no `setenforce`; no `--privileged` or `label=disable` on a `podman run`, `create` or `exec` (`ci/client-guard.py`'s checks of the Python and the manifests included); no `-e` or `-v` that duplicates an edit of a CDI device the container requests, the edits read from the generators' spec templates (display: `DISPLAY`, `/tmp/.X11-unix`; audio: `PULSE_SERVER`, `PIPEWIRE_REMOTE`, `/run/desktop-audio`; tools: `DESKTOP_TOOLS_BIN`, `/opt/desktop-tools/bin`; `nvidia.com/gpu`: `NVIDIA_CDI_STUB`); an `-e` of one of those variables into a container other than the desktop only with a value read from that container's own `/proc/1/environ`; and no write under `/etc/containers/systemd` but the documented procedures its ALLOW list names (`README.md`'s NVIDIA fallback drop-in, S8.1.4; `deploy/README.md`'s image pin, S5.2.6 and S10.3.3, and its Host Terminal off-switch, S5.7.7 and S10.3.5). Options a shell array holds are not seen. Its self-test flags ten planted violations, one inside an `ssh` string and one in a workflow, and passes three allowed forms. Two violations it found are fixed: `operator-e2e.py`'s probes passed `-e DISPLAY=:0` into the observer, and S5.11.2's stub case set `NVIDIA_CDI_STUB=1` by `-e`. The guard's output is under `artifacts/S9.2.1/` (artifact `evidence-static`).
 
 **S9.2.2 Narrow fixtures stay narrow**
 - Requirement: `display-only`/`audio-only` request exactly one resource; verifier pods declare nothing but requests.
+- Tier: T0 · Coverage: ✅ `ci/e9-guard.py --rule S9.2.2`, run by the static job, reads every pod manifest (`examples/*.yaml`, `ci/vm/*-pod.yaml`) by indentation: no pod declares `securityContext`, `volumes`, `hostNetwork`, `hostPID`, `hostIPC` or `annotations`; each container declares only `name`, `image`, `imagePullPolicy`, `command`, `args`, `resources` and `workingDir`; and each `*-only` pod requests exactly one `desktop.local` resource. Its self-test flags a narrow pod that requests two resources and a pod with `env`, and passes a narrow pod whose comment names `env:`. `ci/helm-assertions.sh` (S7.3.3) checks the same manifests from its own list. The guard's output is under `artifacts/S9.2.2/` (artifact `evidence-static`).
 
 **S9.2.3 Failures are diagnosable from the job log**
 - Requirement: every failure handler tees diagnostics to stdout as well as to an artifact; the failing message is repeated last.
+- Tier: T0 · Coverage: ❌ no check that a failure is diagnosable from the job log. `vm-guest.sh`'s `fail` prints its diagnostics to the log and into the open story's evidence, and repeats the message last; an audit found 23 places where a failing command ends a shell script under `errexit` with no message, about 9 checks in `ci.yml` that fail without one, and three failure handlers missing a part.
 
-**S9.2.4 Probes default to integers**
-- Requirement: counters read over ssh default to `0` on error.
+**S9.2.4 Probes yield integers, or fail**
+- Requirement: a count read from the guest is an integer, or a failed read: a poll retries it, a one-shot read fails the story with a message. No number stands in for a failed read: a `0` for one can pass a check that a count dropped, or start a log slice at the top of the log.
+- Tier: T0 · Coverage: ✅ `ci/e9-guard.py --rule S9.2.4`, run by the static job, follows each variable a shell script assigns from an ssh reader (`vm_ssh`, `vm_ssh_quick`, `gq`, `gqw`, `guest_ev`, `ssh`) within its function. It flags a number standing in for a failed read (`|| echo 0` on the read, `${n:-0}` in a comparison) and a numeric use with no check, and passes a read whose failure fails (`|| fail`, `|| return`) or one tested for presence before it is compared; in the Python, it flags an `int()` of a guest read outside a `try`, or in one whose handler returns a number. `vm-e2e.sh` reads its counts and Xorg log offsets through `host_count` and `read_pair`, an integer or status 1, and `operator-e2e.py` through `guest_count`, which retries three times and then fails the story. Its self-test flags each stand-in, an unchecked comparison, arithmetic in a loop and an `int()` with no `try`, and passes a guarded read, the same name in another function, a presence test and an `int()` whose failure yields `None`. On the tree before the harness was rewritten it finds 42: 28 unchecked comparisons, 5 `int()`s with no `try`, and 9 stand-ins, five of them Xorg log offsets and one a wait that took a failed read for a count of 0. The guard's output is under `artifacts/S9.2.4/` (artifact `evidence-static`).
 
 **S9.2.5 Restore what you changed**
 - Requirement: a test that writes host config restores the shipped state and *asserts* the restore took effect.
+- Tier: T0 · Coverage: ❌ no check that a test restores what it changed and asserts the restore. Some do both (S5.2.6 removes its drop-in, restarts the desktop and checks it runs `:latest` again), but an audit found four restores that are not asserted, in `ci.yml`, `smoke-deploy.sh`, `vm-guest.sh` and `operator-e2e.py`.
 
 **S9.2.6 Documented procedures are run from the document**
 - Requirement: a test of a documented maintainer procedure extracts the block from the document at the run's git sha and runs it unmodified; placeholders are the only substitutions, each listed in the index; a harness step interleaved with the procedure is named there as harness-only. A procedure retyped into the harness tests the harness, and drifts from the document unnoticed.
+- Tier: T0 · Coverage: ❌ no check that a documented procedure is run from the document. The maintainer journeys and `ci/hw/acceptance.sh` run theirs that way (`ci/doc-blocks.py` extracts each block at the run's commit, and a moved heading or block fails the run), but an audit found five places where the harness retypes a documented procedure, or interleaves its own steps without naming them harness-only: `smoke-deploy.sh` twice, `maint-guest.sh` twice and `vm-guest.sh` once.
 
 ### F9.3 Evidence discipline
 
 **S9.3.1 Every story emits its named evidence on pass and on fail**
 - Requirement: a story's test writes `artifacts/<story>/evidence.md` and the files it names, whichever way the assertion went; a missing evidence file fails the run.
 - Acceptance: a post-run check lists every executed story id and every file its `evidence.md` references, and each exists and is non-empty.
+- Tier: T0 · Coverage: ✅ at run time, `ci/evlib.py`'s `check` and `gate` (`ci.yml`'s `coverage-gate` job, `maintainer.yml`'s gate, `base-rebuild.yml`'s check) require each story directory's `evidence.md`, `meta.tsv`, `result` and every file its index names, present and non-empty, nothing unindexed, and fail a FAIL result; a failing story still writes its directory (the shell's `fail` ends the open story through `ev_abort`, and `operator-e2e.py` finishes a failed story with its error). At T0, `ci/e9-guard.py --rule S9.3.1` checks that every story id the harness begins (`ev_begin`, `story_begin`, `mt_begin`, a story id in the Python) is one this document defines, and that `check_dir` fails each of five incomplete directories (an indexed file missing, one empty, a file nothing indexes, no `result`, no `evidence.md`) and passes a complete one. A story that runs without ever beginning its directory is caught only if it is marked ✅. The guard's output is under `artifacts/S9.3.1/` (artifact `evidence-static`).
 
 **S9.3.2 Before/after pairs are diffed, not eyeballed**
 - Requirement: every EV-STATE pair ships with its `diff -u`, and the index states which lines are expected to differ.
+- Tier: T0 · Coverage: ❌ no check that each before/after pair has its diff: the harness makes one with `ev_diff` (`ci/evidence.sh`) where it calls it, and the gate does not look for pairs without one.
 
 **S9.3.3 "No restart" is measured**
 - Requirement: a claim that a container or process survived an event carries its container id / `restartCount` / pid before and after.
+- Tier: T0 · Coverage: ❌ no check: nothing lists the stories that claim a survival, or checks that each carries the container id, restart count and pids from before and after.
 
 **S9.3.4 Audio evidence is audible and visible**
 - Requirement: every EV-AUDIO/EV-AUDIO-REC is a WAV plus a spectrogram (or, where no spectrogram tool is installed, the harness's level plot at the story's pitch with each event marked) plus the analyser verdict; distinct frequencies per source as listed in the evidence standard.
+- Tier: T0 · Coverage: ❌ no check. The VM harness's audio helpers save the WAV, the level plot and the analyser's verdict together (`ev_audio_stop` and `ev_audio_check` in `vm-e2e.sh`, `tone_to` in `operator-e2e.py`), but nothing checks that every recording goes through them; an audit found one that does not, `maint-e2e.sh`'s `mt_heard`, with a verdict and no plot.
 
 **S9.3.5 Video covers every dynamic step**
 - Requirement: any story whose event changes the screen over time (a restart, a reflow, a display or input hotplug) attaches an EV-VIDEO with the event frames named in the index.
+- Tier: T0 · Coverage: ❌ no check: nothing lists the stories whose event changes the screen over time, or checks that each attaches an EV-VIDEO with its event frames named.
 
 **S9.3.6 The timeline is the spine**
 - Requirement: every harness action is appended to `timeline.log` with an ISO timestamp, and every evidence file name appears in the timeline at the moment it was captured.
+- Tier: T0 · Coverage: ❌ no check. Each evidence file is logged to `timeline.log` as it is attached (`ev_attach`; `StoryWriter`), but the harness's transport actions (`vm_ssh`, the QEMU monitor's commands) are not, and nothing checks either.
 
 ---
 
@@ -2301,7 +2323,7 @@ for its player and recorder.
 
 ## Appendix D — Coverage summary
 
-Counts are of stories in E1–E7, E10 and E11 (E8 is all 🔧, E9 is cross-cutting). A story
+Counts are of stories in E1–E7 and E9–E11 (E8 is all 🔧). A story
 with a mixed mark is counted under its weakest mark; a story whose only mark
 is 🔧 is counted in that column. Since the evidence standard was added, a
 story whose assertion exists but whose named evidence is not yet captured
@@ -2310,7 +2332,8 @@ gap by this document's definition. The coverage lines were re-checked against
 the code story by story on 2026-10-05 and now follow this rule; the counts
 before that review were 69 ✅, 42 🟡, 136 ❌ and 4 🔧. Since then each story
 moves to ✅ only when a CI run has saved its evidence, which the
-`coverage-gate` job then keeps true.
+`coverage-gate` job then keeps true. E9, the test suite's own rules, is
+counted since its stories got Coverage lines (2026-10-06).
 
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
@@ -2321,14 +2344,15 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | E5 Deploy tree | 50 | 49 | 0 | 0 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 40 | 0 | 0 | 0 |
+| E9 Test-suite quality | 17 | 6 | 0 | 11 | 0 |
 | E10 Maintainer experience | 23 | 22 | 0 | 0 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **245** | **0** | **0** | **6** |
+| **Total** | **268** | **251** | **0** | **11** | **6** |
 
 Regenerate after editing with:
 
 ```sh
-for e in 1 2 3 4 5 6 7 10 11; do
+for e in 1 2 3 4 5 6 7 9 10 11; do
   printf 'E%s ' "$e"
   awk -v e="$e" '/^## /{on=($0 ~ "^## E"e" ")} on && /^\*\*S/{n++} on && /^\*\*S/{s=$0} on && /Coverage:/{ if($0~/❌/)x++; else if($0~/🟡/)p++; else if($0~/✅/)c++ } END{printf "stories=%d ok=%d partial=%d gap=%d hw=%d\n", n, c, p, x, n-c-p-x}' Requirements.md
 done
