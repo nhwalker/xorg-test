@@ -37,11 +37,15 @@ def tokens(text):
     return list(lex)
 
 
-def logical_commands(path):
+def logical_commands(path, source=None):
     """(line number, text) for each shell command line, continuations and
-    multi-line quoted strings joined, heredoc bodies skipped."""
-    with open(path, errors="replace") as f:
-        lines = f.read().split("\n")
+    multi-line quoted strings joined, heredoc bodies skipped. `source`, when
+    given, is read in place of the file (ci/e9-guard.py: a workflow's run:
+    block)."""
+    if source is None:
+        with open(path, errors="replace") as f:
+            source = f.read()
+    lines = source.split("\n")
     i, out = 0, []
     while i < len(lines):
         start, text = i, lines[i]
@@ -175,7 +179,9 @@ def scan(root, report):
             errors += scan_manifest(path, report)
             continue
         if rel.endswith(".py"):
-            if rel != os.path.join("ci", "client-guard.py"):
+            # The guards themselves (this one and ci/e9-guard.py, which
+            # checks S9.2.1 over the same ground) name the flags to find them.
+            if rel not in (os.path.join("ci", "client-guard.py"), os.path.join("ci", "e9-guard.py")):
                 errors += scan_python(path, report)
             continue
         try:
