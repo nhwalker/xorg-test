@@ -26,8 +26,8 @@ mkdir -p "$ART"
 # parallel. "all" runs every part in one VM, in the order below (local runs).
 SHARD=${1:-all}
 case "$SHARD" in
-    all|core|operator|k8s|soundless) ;;
-    *) echo "usage: $0 [all|core|operator|k8s|soundless]" >&2; exit 2 ;;
+    all|core|operator|k8s|soundless|maint-*) ;;
+    *) echo "usage: $0 [all|core|operator|k8s|soundless|maint-<journey>]" >&2; exit 2 ;;
 esac
 in_shard() { [ "$SHARD" = all ] || [ "$SHARD" = "$1" ]; }
 # The soundless shard boots a different machine - no intel-hda, so no sound
@@ -85,11 +85,14 @@ mon_cmd() {
     echo "$1" | socat - "UNIX-CONNECT:$MON" >/dev/null
 }
 
-# Copy the guest's evidence tree over the host's (see EV_ROOT above).
+# Copy the guest's evidence tree over the host's (see EV_ROOT above): under
+# $ART, or under $ART/<host> for a later stock host (vm_fresh_host).
+VM_HOST=""
 ev_pull() {
     [ "$VM_UP" = 1 ] || return 0
+    mkdir -p "$ART/$VM_HOST"
     VM_SSH_TIMEOUT=120 vm_ssh "sudo tar -C $GUEST_EV -cf - . 2>/dev/null" 2>/dev/null \
-        | tar -C "$ART" -xf - 2>/dev/null || true
+        | tar -C "$ART/$VM_HOST" -xf - 2>/dev/null || true
 }
 # Whatever happened, leave every story directory rendered and the guest's
 # half copied back: a red run must be as reviewable as a green one.
@@ -205,17 +208,17 @@ vnc_head() { # <moment> <width> <height> <what>
     ev_save "$1" "$4" python3 vnc-head.py "$VNC1" "$2" "$3" >/dev/null
 }
 
-# EV-VIDEO into the open story: screendumps at 2 fps on the video monitor (a
-# QMP socket of its own, so the hotplug commands never queue behind a frame)
-# until ev_video_stop, which indexes the frames and a gif of them. The
-# recorder keeps the directory it started in; reopen that story before
-# ev_video_stop, which attaches to the open one.
+# EV-VIDEO into the open story: screendumps at 2 fps (EV_VID_FPS) on the
+# video monitor (a QMP socket of its own, so the hotplug commands never queue
+# behind a frame) until ev_video_stop, which indexes the frames and a gif of
+# them. The recorder keeps the directory it started in; reopen that story
+# before ev_video_stop, which attaches to the open one.
 EV_VID="" EV_VID_PID=""
 ev_video_start() { # <moment>
     EV_VID="" EV_VID_PID=""
     [ -n "$EV_DIR" ] || return 0
     EV_VID=$(ev_name "$1" "")
-    python3 qmp-tool.py video "$QMPV" "$EV_DIR/$EV_VID" 2 &
+    python3 qmp-tool.py video "$QMPV" "$EV_DIR/$EV_VID" "${EV_VID_FPS:-2}" &
     EV_VID_PID=$!
     sleep 1
 }
@@ -712,9 +715,12 @@ rmse() { # $1: image; $2: reference; $3: imagemagick transform for the reference
 audio_capture_start() { mon_cmd "wavcapture $PWD/$ART/$1.wav snd0 44100 16 2"; sleep 1; }
 audio_capture_stop()  { mon_cmd "stopcapture 0"; sleep 1; }
 
+# The VM's serial console, and QEMU's own trace (-D), for this stock host.
+VM_SERIAL="$ART/serial.log"
+vm_boot() {
 log "prepare disk and cloud-init seed"
 qemu-img create -f qcow2 -b "$IMG" -F qcow2 "$DISK" 20G >/dev/null
-ssh-keygen -q -t ed25519 -N '' -f id_ed25519
+[ -f id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f id_ed25519
 cat > user-data <<EOF
 #cloud-config
 users:
@@ -784,8 +790,8 @@ qemu-system-x86_64 \
     -monitor "unix:$MON,server,nowait" \
     -qmp "unix:$QMP,server,nowait" \
     -qmp "unix:$QMPV,server,nowait" \
-    -serial "file:$ART/serial.log" \
-    -msg timestamp=on -D "$PWD/$ART/qemu-trace.log" \
+    -serial "file:$VM_SERIAL" \
+    -msg timestamp=on -D "$PWD/$(dirname "$VM_SERIAL")/qemu-trace.log" \
     -trace enable=hda_audio_overrun -trace enable=hda_audio_adjust \
     -daemonize -pidfile qemu.pid
 
@@ -796,6 +802,8 @@ for _ in $(seq 60); do
 done
 vm_ssh_quick true || fail "VM never became reachable"
 VM_UP=1
+}
+vm_boot
 
 # The run's manifest (Requirements.md, report layout): what was tested, on
 # what, so evidence from different shards and runs can be compared. Written
@@ -828,12 +836,52 @@ PY
 }
 write_manifest
 
+vm_transfer() {
 log "transfer repo + images"
 git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
+# Every image archive the workflow handed over: ci.yml's three, and what a
+# maintainer.yml shard gets beside them (maint-config's second desktop
+# image, maint-session's bases).
 scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null repo.tgz \
-    images-desktop.tar images-plugin.tar images-testclient.tar \
+    -o UserKnownHostsFile=/dev/null repo.tgz images-*.tar \
     rocky@127.0.0.1:/tmp/
+}
+vm_transfer
+
+# Another stock host in the same job, for a maintainer journey that needs one
+# (Requirements.md E10: "a fresh qcow2 overlay per variant"). The VM so far
+# is powered off with its evidence copied back and its overlay thrown away;
+# a new one boots from the same cloud image and gets the repo and images.
+# Its serial log, QEMU trace and evidence (host and guest side alike) go
+# under $ART/<name>/.
+vm_fresh_host() { # <name>
+    local pid
+    ev_pull
+    VM_UP=0
+    pid=$(cat qemu.pid 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+        ! kill -0 "$pid" 2>/dev/null || fail "QEMU (pid $pid) did not exit"
+    fi
+    rm -f "$DISK"
+    VM_HOST=$1
+    mkdir -p "$ART/$VM_HOST"
+    export EV_ROOT="$PWD/$ART/$VM_HOST"
+    VM_SERIAL="$ART/$VM_HOST/serial.log"
+    vm_boot
+    vm_transfer
+}
+
+# The maintainer's journeys (ci/vm/maint-e2e.sh) start from this stock host,
+# with nothing deployed: the documents' own procedures do that.
+if [ "${SHARD#maint-}" != "$SHARD" ]; then
+    # shellcheck source=ci/vm/maint-e2e.sh
+    . ./maint-e2e.sh
+    maint_main "${SHARD#maint-}"
+    log "vm e2e passed (shard: $SHARD)"
+    exit 0
+fi
 
 # Every failure handler below tees its diagnostic rather than redirecting it.
 # Redirecting put the journal, the AVC denials and the pod descriptions in an

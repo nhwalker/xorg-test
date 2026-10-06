@@ -102,21 +102,28 @@ fi
     && pass "logind NAutoVTs/ReserveVT drop-in present" \
     || fail "logind drop-in missing: host logind may spawn gettys on VT switches"
 
-# DRM/VT holders are only a problem when the desktop is NOT the holder.
-if systemctl is-active --quiet desktop.service 2>/dev/null; then
-    pass "desktop.service active (skipping DRM/VT holder check: Xorg legitimately holds them)"
-elif command -v fuser >/dev/null; then
+# DRM/VT holders other than the desktop, whether desktop.service is active or
+# not: a desktop whose X session crash-loops on drmSetMaster is active too,
+# and this is when the check matters. The desktop's Xorg opens the
+# container's own device nodes, which podman creates apart from the host's,
+# so the host's fuser does not list it; a process in desktop.service's cgroup
+# is left out anyway, in case a runtime shares the host's nodes.
+if command -v fuser >/dev/null; then
     shopt -s nullglob
     holders=""
     for dev in /dev/dri/card* "/dev/$VT"; do
         [ -e "$dev" ] || continue
-        pids=$(fuser "$dev" 2>/dev/null) && [ -n "${pids// /}" ] && holders="$holders $dev"
+        others=""
+        for pid in $(fuser "$dev" 2>/dev/null); do
+            grep -qsE '/desktop\.service(/|$)' "/proc/$pid/cgroup" || others="$others $pid"
+        done
+        [ -z "$others" ] || holders="$holders $dev"
     done
     shopt -u nullglob
     if [ -n "$holders" ]; then
-        fail "processes hold$holders while desktop.service is inactive - Xorg would fail drmSetMaster (fuser -v shows who)"
+        fail "processes other than the desktop hold$holders - Xorg would fail drmSetMaster (fuser -v shows who)"
     else
-        pass "no DRM/VT holders"
+        pass "no DRM/VT holders but the desktop's own"
     fi
 else
     warn "fuser not available (install psmisc); cannot check DRM/VT holders"

@@ -1233,11 +1233,15 @@ who=$(ev_save new-key-ssh "the new private key: whoami" \
     ssh "${sshopt[@]}" -i /etc/desktop-container/host-shell-key desktop-shell@127.0.0.1 whoami) || fail "the new key does not log in"
 [ "$(tail -n 1 <<<"$who")" = desktop-shell ] || fail "the new key logged in as '$who'"
 ev_pass "the new private key logs in as desktop-shell"
-if ev_save container-before "the container's ssh host before desktop.service restarts: it still holds the old key" \
-        podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami >/dev/null; then
-    fail "the container still logs in with its copy of the old key"
-fi
-ev_pass "until desktop.service restarts the container, holding the old key, is refused"
+# The second run hands the new key to the running desktop (the last step of
+# desktop-host-shell-setup), so the container logs in with no restart.
+ev_save handoff-journal "EV-LOG-JOURNAL: desktop-host-shell.service's journal: the second run, and its hand-off to the running desktop" \
+    journalctl --no-pager -o short-precise -u desktop-host-shell.service -n 20 >/dev/null || true
+cwho=$(ev_save container-before "the container's ssh host after the second run, before any desktop restart: the key the unit handed over" \
+    podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) \
+    || fail "the running container did not get the new key: its ssh host is refused until desktop.service restarts"
+[ "$(tail -n 1 <<<"$cwho")" = desktop-shell ] || fail "the container's ssh host answered '$cwho'"
+ev_pass "the running container took the new key: its ssh host logs in as desktop-shell with no desktop restart"
 rm -f /tmp/ev-old-key
 ev_end
 

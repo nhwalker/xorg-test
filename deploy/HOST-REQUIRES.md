@@ -41,7 +41,12 @@ the intended state there.
 - **No X/graphics stack, no display manager** — the container owns the
   display; a host display manager would fight it for the seat.
 - **No PipeWire/PulseAudio daemon** — the container owns `/dev/snd`; host
-  *clients* talk to its sockets via the configs this tree ships.
+  *clients* talk to its sockets via the configs this tree ships. On EL9,
+  `alsa-plugins-pulseaudio` above pulls `pipewire-pulseaudio` and
+  `wireplumber` in, and systemd's user presets enable their sockets and
+  WirePlumber in every user session;
+  the tree masks those user units (`etc/systemd/user`, see
+  deploy/README.md), so the packages are there and no daemon runs.
 - **No build tooling, no git** — the image arrives prebuilt.
 - **`@core` covers the rest** — systemd (sysusers/tmpfiles/udevadm),
   policycoreutils (`restorecon`), glibc-common (`getent`), coreutils —

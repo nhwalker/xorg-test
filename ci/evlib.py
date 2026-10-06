@@ -29,6 +29,10 @@ a run's evidence against the document:
     evlib.py gate --requirements Requirements.md [--report out.md] <root>...
                                        check, then: every story the document
                                        marks ✅ has a passing evidence dir
+    evlib.py gate --workflow maintainer.yml --requirements ... <root>...
+                                       the same for a workflow other than
+                                       ci.yml: only the stories whose Coverage
+                                       line names it ("(workflow `NAME`)")
 
 Standard library only: it runs on the CI runner and inside the Rocky guest.
 """
@@ -49,8 +53,8 @@ def stamp():
 
 
 def one_line(text):
-    """TSV-safe: no tabs or newlines inside a field."""
-    return " ".join(str(text).replace("\t", " ").split("\n")).strip()
+    """TSV-safe: no tabs, newlines or carriage returns inside a field."""
+    return " ".join(str(text).replace("\t", " ").replace("\r", " ").split("\n")).strip()
 
 
 # --- writing ------------------------------------------------------------------
@@ -145,9 +149,11 @@ class StoryWriter:
 def _rows(path, width):
     out = []
     try:
-        with open(path) as f:
+        # Rows end at \n alone: a stray \r inside a field (an ssh message
+        # kept before the writers dropped them) is not a row break.
+        with open(path, newline="\n") as f:
             for line in f:
-                line = line.rstrip("\n")
+                line = line.rstrip("\n").replace("\r", " ")
                 if not line:
                     continue
                 parts = line.split("\t")
@@ -190,7 +196,7 @@ def read_result(d):
     """('PASS'|'FAIL'|'INCOMPLETE', reason). A host-side failed check fails
     the story even though only the guest side writes `result`."""
     try:
-        first = open(os.path.join(d, "result")).read().strip().split("\t", 1)
+        first = open(os.path.join(d, "result"), newline="\n").read().replace("\r", " ").strip().split("\t", 1)
     except FileNotFoundError:
         first = None
     failed = [c for c in read_checks(d) if c[1] != "PASS"]
@@ -379,6 +385,16 @@ def cmd_gate(args):
         # Coverage line ("(workflow `base-rebuild.yml`)"): a run of this one
         # need not carry it, but any evidence it does carry still counts.
         other = re.search(r"\(workflow `([\w.-]+\.yml)`\)", s["coverage"])
+        if args.workflow:
+            # That workflow's own gate: its stories are the ones in scope.
+            # Any other story's evidence it left was checked above, and is
+            # listed, but its absence is ci.yml's business.
+            if not other or other.group(1) != args.workflow:
+                if dirs:
+                    rows.append((sid, s["mark"], ", ".join(sorted({os.path.relpath(d, os.path.commonpath([d] + list(args.roots))) for d in dirs})),
+                                 "/".join(results) + " (not this workflow's story)"))
+                continue
+            other = None
         if s["mark"] == "✅" and not passed and not dirs and other:
             elsewhere.append(f"{sid}: its evidence is kept by {other.group(1)}")
             rows.append((sid, s["mark"], f"workflow {other.group(1)}", "-"))
@@ -391,9 +407,15 @@ def cmd_gate(args):
         rows.append((sid, s["mark"], ", ".join(sorted({os.path.relpath(d, os.path.commonpath([d] + list(args.roots))) for d in dirs})) or "-",
                      "/".join(results) or "-"))
     marks = {m: sum(1 for s in stories.values() if s["mark"] == m) for m in MARKS}
+    scope = ""
+    if args.workflow:
+        mine = [sid for sid, s in stories.items()
+                if re.search(r"\(workflow `" + re.escape(args.workflow) + "`\\)", s["coverage"])]
+        scope = (f" {len(mine)} of them name `{args.workflow}` on their Coverage line, and only "
+                 "those are this run's to prove.")
     lines = ["# Coverage gate", "",
              f"{len(stories)} stories in `{args.requirements}`; this run left evidence for "
-             f"{len(found)}.", "",
+             f"{len(found)}.{scope}", "",
              "| Mark | Stories |", "|---|---|"] + [f"| {m} | {n} |" for m, n in marks.items()]
     lines += ["", f"## Errors ({len(errors)})", ""] + ([f"- {e}" for e in errors] or ["none"])
     lines += ["", f"## Evidence kept by another workflow ({len(elsewhere)})", ""] + ([f"- {e}" for e in elsewhere] or ["none"])
@@ -425,6 +447,8 @@ def main(argv=None):
     g.add_argument("--requirements", required=True)
     g.add_argument("--report")
     g.add_argument("--json")
+    g.add_argument("--workflow", help="gate only the stories whose Coverage line names this "
+                   "workflow (\"(workflow `maintainer.yml`)\"), for that workflow's own runs")
     g.add_argument("roots", nargs="+")
     args = ap.parse_args(argv)
     return {"render": cmd_render, "check": cmd_check, "gate": cmd_gate}[args.cmd](args)

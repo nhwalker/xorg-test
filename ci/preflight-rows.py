@@ -262,9 +262,12 @@ def host_cases(w):
         dict(id="no-logind-dropin", what="the logind drop-in hidden under /dev/null",
              hide=["/etc/systemd/logind.conf.d/50-desktop-container.conf"],
              rows=["logind drop-in missing: host logind may spawn gettys on VT switches"]),
-        dict(id="holder", what=f"desktop.service inactive (the fake) while a sleep holds {card}, the host's first DRM card",
+        # The row fires whether desktop.service is active or not (a desktop
+        # crash-looping on drmSetMaster is active); the fake keeps the case
+        # apart from the runner's own desktop.
+        dict(id="holder", what=f"a sleep holds {card}, the host's first DRM card (desktop.service inactive, the fake)",
              sc=inactive, holder=card,
-             rows=["processes hold$holders while desktop.service is inactive - Xorg would fail drmSetMaster (fuser -v shows who)"]),
+             rows=["processes other than the desktop hold$holders - Xorg would fail drmSetMaster (fuser -v shows who)"]),
         dict(id="no-fuser", what="desktop.service inactive (the fake), no fuser on PATH",
              sc=inactive, hide_cmd=["fuser"],
              rows=["fuser not available (install psmisc); cannot check DRM/VT holders"]),
