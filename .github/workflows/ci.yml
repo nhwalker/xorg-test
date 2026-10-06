@@ -89,6 +89,18 @@ jobs:
           EV_ROOT: artifacts
           EV_SOURCE: "ci.yml static (ci/monitor-layout-tests.sh)"
         run: ci/monitor-layout-tests.sh
+      - name: script unit tests (T1)
+        # Host and image scripts driven on the runner through their test
+        # overrides (Requirements.md, Appendix A) and fakes first on PATH:
+        # build-bases.sh against a fake registry, start-audio with fake
+        # daemons, the postmortem on fabricated Xorg logs, host-terminal with
+        # a fake ssh, desktop-host-shell-setup on a scratch directory and
+        # desktop-monitors-capture on canned xrandr. Root only through sudo,
+        # for the capture tool, which refuses anything else.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/script-unit-tests.sh)"
+        run: ci/script-unit-tests.sh
       - name: build args stay global (multi-stage ARG scoping)
         # An ARG declared before the first FROM is global and usable in every
         # FROM line; one declared AFTER a FROM belongs to that stage alone and
