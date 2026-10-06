@@ -1811,11 +1811,11 @@ and E11, which follow, included); the suite's own history (see comments in
 
 `ci/e9-guard.py`, in the static job, holds the rules that a read of the tree
 can check: S9.1.1's static half, S9.1.2, S9.1.3, S9.1.4, S9.1.5, S9.2.1,
-S9.2.2, S9.2.3, S9.2.4, S9.2.5, S9.2.6 and the static halves of S9.3.1, S9.3.2
-and S9.3.3, each as its own story with its own evidence. Their run-time
-halves are `ci/evlib.py`'s `check` and `gate`, which read every story
-directory a run leaves. Nothing checks the others yet; their Coverage lines
-say what holds them today.
+S9.2.2, S9.2.3, S9.2.4, S9.2.5, S9.2.6 and the static halves of S9.3.1,
+S9.3.2, S9.3.3, S9.3.4 and S9.3.6, each as its own story with its own
+evidence. Their run-time halves are `ci/evlib.py`'s `check` and `gate`,
+which read every story directory a run leaves. Nothing checks the others
+yet; their Coverage lines say what holds them today.
 
 ### F9.1 Assertion discipline
 
@@ -1883,7 +1883,7 @@ say what holds them today.
 
 **S9.3.4 Audio evidence is audible and visible**
 - Requirement: every EV-AUDIO/EV-AUDIO-REC is a WAV plus a spectrogram (or, where no spectrogram tool is installed, the harness's level plot at the story's pitch with each event marked) plus the analyser verdict; distinct frequencies per source as listed in the evidence standard.
-- Tier: T0 · Coverage: ❌ no check. The VM harness's audio helpers save the WAV, the level plot and the analyser's verdict together (`ev_audio_stop` and `ev_audio_check` in `vm-e2e.sh`, `tone_to` in `operator-e2e.py`), but nothing checks that every recording goes through them; an audit found one that does not, `maint-e2e.sh`'s `mt_heard`, with a verdict and no plot.
+- Tier: T0 · Coverage: ✅ at run time, `ci/evlib.py`'s `check` and `gate` read every recording (a `.wav` in a story's index). Each must have a picture (a `.png`) and a verdict (a `.txt`) whose lines in the index name it. Its name must say what to hear: a pitch (`440hz`), `voice` or `silence`. A pitch it names must be its source's from the evidence standard when the name also names the source (pulse, paplay, pipewire, pw-play, alsa, aplay, recording). No spectrogram tool is installed, so the picture is `check-audio.py`'s level plot: at the story's pitch, or the broadband level for a voice sample or silence. The plot is now written with Python's standard library alone, and an empty capture gets an empty scale. At T0, `ci/e9-guard.py --rule S9.3.4` checks that each of the nine places in the harness that name a recording (`ev_name … wav`, a `Story`'s `name(…, "wav")`) judges and pictures it where it is named. It also runs the gate's check on seven planted story directories. It fails five: no plot, no verdict, a plot and verdict that do not name the recording, a name that says nothing of what to hear, and a pulse tone at pipewire's pitch. It passes a tone and a voice sample with theirs. On batch 13a's evidence (`ci.yml` 37445408722, `maintainer.yml` 37445404359), the check found 12 recordings in five stories with no picture naming them. Four of them had no verdict either: S4.7.9's and S7.7.7's silent captures, S7.7.8's capture through the switch and S11.3.1's. The other eight were S10.2.1's voice captures, and ten of the twelve had names that said nothing of what to hear. Each is now judged, pictured and named, and this batch's runs (`ci.yml` 37448916423, `maintainer.yml` 37448913357) leave none. The guard's output is under `artifacts/S9.3.4/` (artifact `evidence-static`).
 
 **S9.3.5 Video covers every dynamic step**
 - Requirement: any story whose event changes the screen over time (a restart, a reflow, a display or input hotplug) attaches an EV-VIDEO with the event frames named in the index.
@@ -1891,7 +1891,7 @@ say what holds them today.
 
 **S9.3.6 The timeline is the spine**
 - Requirement: every harness action is appended to `timeline.log` with an ISO timestamp, and every evidence file name appears in the timeline at the moment it was captured.
-- Tier: T0 · Coverage: ❌ no check. Each evidence file is logged to `timeline.log` as it is attached (`ev_attach`; `StoryWriter`), but the harness's transport actions (`vm_ssh`, the QEMU monitor's commands) are not, and nothing checks either.
+- Tier: T0 · Coverage: ✅ at run time, the same `check` and `gate` read each story's timeline. Every line, on both sides, must start with an ISO UTC timestamp. Each file in a side's index must have its `file` line in that side's timeline. At T0, `ci/e9-guard.py --rule S9.3.6` checks: that `ci/evidence.sh` wraps `podman` and `kubectl`, so each call a script makes with evidence on is a line of the timeline before it runs; that `ev_log` stamps each line and keeps it to one; that each of the 12 `ssh`, `scp`, `socat` or `nc` commands in the shell is logged first (`vm_ssh`, `mon_cmd`, the image `scp`, the direct probes) or kept by `ev_save`; that the Python sends its ssh and QMP through the classes that log them; and that nothing but those writers opens a timeline. The one exception is EV-VIDEO's frame screendumps, two a second, whose times are in the video's `index.txt`. The rule also runs the gate's check on three planted story directories. On batch 13a's evidence the check found two timelines, the operator phase's, with entries over several lines (a Host Terminal failure text). `Run.log` now keeps each entry to one line, and this batch's runs leave none. A `podman` call inside `sh -c`, `timeout` or `xargs` runs the binary directly and is not logged. The guard's output is under `artifacts/S9.3.6/` (artifact `evidence-static`).
 
 ---
 
@@ -2347,10 +2347,10 @@ counted since its stories got Coverage lines (2026-10-06).
 | E5 Deploy tree | 50 | 49 | 0 | 0 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 40 | 0 | 0 | 0 |
-| E9 Test-suite quality | 17 | 13 | 1 | 3 | 0 |
+| E9 Test-suite quality | 17 | 15 | 1 | 1 | 0 |
 | E10 Maintainer experience | 23 | 22 | 0 | 0 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **268** | **258** | **1** | **3** | **6** |
+| **Total** | **268** | **260** | **1** | **1** | **6** |
 
 Regenerate after editing with:
 
@@ -2382,9 +2382,11 @@ reused by every story. Each story's directory is written in one format
 | `ev_shot <moment> <what>` | `ci/vm/vm-e2e.sh` (host) | QEMU screendump into the open story |
 | `guest_ev <root\|""> <phase…>`, `ev_pull` | `ci/vm/vm-e2e.sh` (host) | runs a `vm-guest.sh` phase with evidence on and copies the guest's story directories back |
 | `ev_audio_start <moment> <hz>` / `ev_audio_stop <what> <secs> <peak> <hz>`, `ev_audio_check` | `ci/vm/vm-e2e.sh` (host) | `wavcapture` straight into the open story; on stop the WAV is indexed and `check-audio.py --report --plot` keeps its verdict and a level plot at the story's pitch beside it |
+| `ev_audio_silence <wav>`, `mt_heard <wav> <what>` | `ci/vm/vm-e2e.sh`, `ci/vm/maint-e2e.sh` (host) | a recording with no pitch to check (silence by design; a voice sample): `check-audio.py`'s report and its broadband level plot beside it |
+| `ev_log <kind> <text>`; `podman`, `kubectl` | `ci/evidence.sh` | one line of the timeline, the run's and the open story's, stamped and kept to one line; sourcing the file wraps `podman` and `kubectl` so each call is such a line before it runs (`vm_ssh`, `mon_cmd` and the direct probes log theirs) |
 | `QMP_TRANSCRIPT=<file>` | `ci/vm/qmp-type.py` | writes every QMP command it sends, timestamped (EV-QEMU) |
 | `write_manifest` | `ci/vm/vm-e2e.sh` (host) | `run.json`: image ids, QEMU, guest kernel and podman versions, git sha, date |
-| `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance), that its pairs are diffed and its diffs say what they may differ in (S9.3.2), and that its survival claims are measured (S9.3.3); holds the ✅ marks in this document to the run's evidence |
+| `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance), that its pairs are diffed and its diffs say what they may differ in (S9.3.2), that its survival claims are measured (S9.3.3), that each recording is judged, pictured and named for what to hear (S9.3.4), and that its timeline is stamped line by line and logs each file (S9.3.6); holds the ✅ marks in this document to the run's evidence |
 
 **Still to build** (the stories that name them stay ❌ until they exist):
 
