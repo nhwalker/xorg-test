@@ -130,4 +130,7 @@ check "unknown group: the log names it and the known ones" \
 check "unknown group: no group changes" test "$BEFORE" = "$AFTER"
 
 ev_end
+# Each failed check again, last, where the end of the job log shows it
+# (Requirements.md S9.2.3).
+ev_failures
 exit "$f"

@@ -26,7 +26,39 @@ log()  { echo "== $*"; }
 # an open story records that story as FAIL before the script exits.
 # shellcheck source=ci/evidence.sh
 . ci/evidence.sh
-fail() { echo "FAIL: $*" >&2; ev_abort "$*"; exit 1; }
+# What fail() prints and keeps: the containers, the desktop's log and its
+# unit's journal, as the job's "collect diagnostics" step prints them.
+smoke_diagnostics() {
+    echo "---- diagnostics: podman ps -a ----"
+    podman ps -a 2>&1 || true
+    echo "---- diagnostics: podman logs desktop (tail) ----"
+    podman logs desktop 2>&1 | tail -n 100 || true
+    echo "---- diagnostics: journalctl -u desktop.service (tail) ----"
+    journalctl -u desktop.service --no-pager 2>&1 | tail -n 50 || true
+}
+fail() {
+    trap - ERR
+    local msg="FAIL: $*" d
+    echo "$msg" >&2
+    d=$(smoke_diagnostics 2>&1)
+    printf '%s\n' "$d" >&2
+    ev_text failure-diagnostics "what fail() printed when this story failed: the containers, the desktop's log and its unit's journal" "$d"
+    ev_abort "$*"
+    echo "$msg" >&2
+    exit 1
+}
+# A command that fails where nothing handles it (errexit would end the
+# script with no word of why) reports through fail(): the command, its line,
+# the diagnostics, and the message repeated last (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    trap - ERR
+    fail "unhandled failure (exit $1) at $3: $2"
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 # First line of <text> matching <regex>, as a line number (empty when none:
 # under pipefail grep's no-match status would otherwise end the script, with
 # no FAIL saying why, at the caller's assignment).

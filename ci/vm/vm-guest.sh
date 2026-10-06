@@ -75,6 +75,7 @@ fail() {
     # around 200 lines of diagnostics, which leaves the one line saying WHY
     # scrolled far off the bottom of the job log. Reading the tail of a failed
     # run should not require counting backwards past the Xorg log.
+    trap - ERR
     _failmsg="FAIL: vm-guest: $*"
     echo "$_failmsg" >&2
     local d
@@ -135,6 +136,23 @@ diagnostics() {
         journalctl -u k3s --no-pager -o cat 2>/dev/null | tail -20 || true
     fi
 }
+
+# A command that fails where nothing handles it (errexit would end the
+# script with no word of why) reports through fail(): the command, its line,
+# the diagnostics, and the message repeated last (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails. Only inside a story: outside one this script
+# answers the host, and a probe's status is its answer (gq, read_pair and
+# host_count poll on it), which the host's own fail() reports, with this
+# script's diagnostics, when it is a failure.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    [ -n "${EV_STORY:-}" ] || return 0
+    trap - ERR
+    fail "unhandled failure (exit $1) at $3: $2"
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 
 wait_for() { # tries interval description command...
     local tries="$1" interval="$2" desc="$3"
@@ -5472,7 +5490,7 @@ soundless() { # before|plugged|realign|played|after
 # shellcheck source=ci/vm/maint-guest.sh
 . ci/vm/maint-guest.sh
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-checks|deploy-tail|deploy-reboot|deploy-proof|session-groups|mwm-exit|standalone|seat-tags|host-audio|soundless|maint}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|diag|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-checks|deploy-tail|deploy-reboot|deploy-proof|session-groups|mwm-exit|standalone|seat-tags|host-audio|soundless|maint}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -5524,6 +5542,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     operator-setup) operator_setup ;;
     pod-state) pod_state "${2:?pod}" ;;
     desk) shift; desk "$@" ;;
+    diag) diagnostics ;;
     xorg-log-lines) xorg_log_lines ;;
     xorg-log-since) xorg_log_since "${2:-}" ;;
     ctr-pids) ctr_pids "${2:-}" ;;

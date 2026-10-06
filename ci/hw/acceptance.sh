@@ -974,6 +974,8 @@ case "${1:-}" in
             undo_all
         done
         echo "evidence: $EV_ROOT (pack makes a tarball of it)" >&2
+        # Each failed check of the stories run, again, last (Requirements.md S9.2.3).
+        ev_failures
         ;;
     *) usage; exit 2 ;;
 esac

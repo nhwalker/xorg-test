@@ -14,7 +14,41 @@ set -euo pipefail
 REGISTRY=${REGISTRY:?set REGISTRY to the GHCR namespace, e.g. ghcr.io/<owner>}
 PREV="$REGISTRY/desktop-container-base:latest"
 LOGS=$(mktemp -d)
-fail() { echo "FAIL: $*" >&2; ev_abort "$*"; exit 1; }
+# What fail() prints and keeps: the images in root's podman storage and the
+# tail of each build's log so far.
+rebuild_diagnostics() {
+    echo "---- diagnostics: sudo podman images ----"
+    sudo podman images 2>&1 || true
+    local f
+    for f in "$LOGS"/*; do
+        [ -f "$f" ] || continue
+        echo "---- diagnostics: ${f##*/} (tail) ----"
+        tail -n 40 "$f" 2>&1 || true
+    done
+}
+fail() {
+    trap - ERR
+    local msg="FAIL: $*" d
+    echo "$msg" >&2
+    d=$(rebuild_diagnostics 2>&1)
+    printf '%s\n' "$d" >&2
+    ev_text failure-diagnostics "what fail() printed when this story failed: the images in root's storage and each build log's tail" "$d"
+    ev_abort "$*"
+    echo "$msg" >&2
+    exit 1
+}
+# A command that fails where nothing handles it (errexit would end the
+# script with no word of why) reports through fail(): the command, its line,
+# the diagnostics, and the message repeated last (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    trap - ERR
+    fail "unhandled failure (exit $1) at $3: $2"
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 mkdir -p "$EV_ROOT"
 ev_begin S1.1.2 "Bases rebuild from current upstream" T2
 

@@ -10,7 +10,8 @@ T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 fails=0
 ok()  { echo "ok   $*"; }
-bad() { echo "FAIL $*"; fails=$((fails + 1)); }
+bad() { echo "FAIL $*"; fails=$((fails + 1)); failed+=("$*"); }
+failed=()
 
 # The functions only: everything above the command line.
 sed -n '1,/^# --- the command line/p' "$REPO/ci/hw/acceptance.sh" | sed "s#^REPO=.*#REPO=$REPO#" > "$T/fns.sh"
@@ -246,5 +247,8 @@ sed -i '1i # not the stub: no NVIDIA_CDI_STUB=1 env line in this spec' "$SPEC"
 if spec_is_stub; then bad "spec_is_stub took a comment naming the marker for the stub"
 else ok "spec_is_stub: a comment naming the marker is not the stub"; fi
 
+# Each failure again, last, where the end of the output shows it
+# (Requirements.md S9.2.3).
+[ "$fails" = 0 ] || printf 'FAIL %s\n' "${failed[@]}"
 echo "---- $fails failure(s)"
 exit "$fails"

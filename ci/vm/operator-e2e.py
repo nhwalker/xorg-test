@@ -1058,6 +1058,7 @@ class Ctx:
 
     def diagnostics(self):
         st = self.st
+        kept = set(os.listdir(st.dir)) if os.path.isdir(st.dir) else set()
         with contextlib.suppress(Exception):
             self.shot("failure", "the screen when the story failed")
         with contextlib.suppress(Exception):
@@ -1068,6 +1069,15 @@ class Ctx:
             self.save_cmd("failure-desktop-log", "podman logs --tail 60 desktop 2>&1",
                           "the desktop container's log (EV-LOG-DESKTOP), last 60 lines",
                           label="podman logs desktop")
+        # The same, in the job log (Requirements.md S9.2.3): the head of each
+        # text file kept just now. The story's FAIL line follows them.
+        for name in sorted(os.listdir(st.dir)) if os.path.isdir(st.dir) else []:
+            if name not in kept and name.endswith(".txt"):
+                with contextlib.suppress(Exception):
+                    with open(os.path.join(st.dir, name), errors="replace") as f:
+                        head = f.read().splitlines()[:40]
+                    print(f"---- diagnostics: {name} (head) ----", flush=True)
+                    print("\n".join(head), flush=True)
 
 
 # US layout, which is what the session gets: nothing configures another.

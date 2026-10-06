@@ -11,6 +11,7 @@
 # on it: the shard fails at the end, naming every story that failed.
 
 MT_FAILED=""
+MT_WHY=()
 # A maint step on the guest, its evidence copied back afterwards.
 mg() { guest_ev "$GUEST_EV" maint "$@"; }
 # A maint step that ends by rebooting the guest: the connection goes with the
@@ -23,6 +24,7 @@ mt_open() { EV_SIDE=h-; ev_begin "$1" "$(mt_title "$1")" T3; }
 mt_close() { ev_end; EV_SIDE=; }
 mt_failed() { # <story> <why>: the story failed; the journey goes on where it can
     MT_FAILED="$MT_FAILED $1"
+    MT_WHY+=("$1: $2")
     log "FAIL, and the journey goes on: $1: $2"
     if [ -n "$EV_STORY" ]; then ev_fail "$2"; mt_close; fi
 }
@@ -1102,6 +1104,8 @@ maint_main() { # <journey>
         *) fail "no maintainer journey named '$1'" ;;
     esac
     write_manifest
-    [ -z "$MT_FAILED" ] || fail "maintainer stories failed:$MT_FAILED (each story's evidence.md says why)"
+    # fail() repeats its message last (Requirements.md S9.2.3): each failed
+    # story, with why.
+    [ -z "$MT_FAILED" ] || fail "maintainer stories failed:$MT_FAILED (each story's evidence.md says more):$(printf '\n  %s' "${MT_WHY[@]}")"
     bad=$(mt_verdict) || fail "maintainer stories did not pass: $bad"
 }
