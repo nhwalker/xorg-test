@@ -985,6 +985,40 @@ layout_unplug() {
     [ -z "$moved" ] || fail "a window changed across the unplug and re-plug: $(echo $moved)"
     ev_pass "no client window moved or resized across the unplug and re-plug"
     ev_end
+
+    # The other direction, on the connector nothing is plugged into: a
+    # monitor arriving where the layout already scans out. Only xrandr's word
+    # for it may change.
+    log pd "fixed monitor layout: force the empty connector on under the running server"
+    ev_begin S3.10.4 "Monitor plug-in on an empty connector, layout declared" T3
+    layout_copy replugged "before Virtual-2 is forced on (taken in S3.10.3)"
+    xl0=$(xorg_log_lines 2>/dev/null || echo 0)
+    echo on > "$conn2/status"
+    wait_for 10 1 "sysfs to read Virtual-2 connected" conn_connected "$conn2"
+    ev_note "$conn2/status forced on at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    v2_on() { xr_is Virtual-2 connected 1024x768+1024+0; }
+    wait_for 10 1 "xrandr to report Virtual-2 connected at 1024x768+1024+0" v2_on
+    layout_set v2-on "after Virtual-2 was forced on"
+    xorg_slice "$xl0" "$T/v2-on-xorg-log.txt"
+    ev_copy "$T/v2-on-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before Virtual-2 was forced on"
+    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across Virtual-2's plug-in" "$T/replugged-xrandr.txt" "$T/v2-on-xrandr.txt"
+    ev_diff_paths tree "EV-DIFF: the window tree across Virtual-2's plug-in (empty: no window changed)" "$T/replugged-tree.txt" "$T/v2-on-tree.txt"
+    ev_pass "RandR reports Virtual-2 connected where the layout put it: $(xr_line Virtual-2)"
+    dims=$(dpy_dims)
+    [ "$dims" = 2048x768 ] || fail "the screen is $dims after Virtual-2 was forced on, want 2048x768"
+    xr_is Virtual-1 connected 1024x768+0+0 \
+        || fail "Virtual-1 changed when Virtual-2 was forced on: $(xr_line Virtual-1)"
+    ev_pass "the screen is still 2048x768 and Virtual-1 still connected at 1024x768+0+0"
+    moved=$(diff <(client_windows "$T/replugged-tree.txt") <(client_windows "$T/v2-on-tree.txt") || true)
+    [ -z "$moved" ] || fail "a window changed when Virtual-2 was forced on: $(echo $moved)"
+    ev_pass "no client window moved or resized"
+    echo detect > "$conn2/status"
+    ev_note "$conn2/status set back to detect at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    v2_off() { xr_is Virtual-2 disconnected 1024x768+1024+0; }
+    wait_for 10 1 "xrandr to report Virtual-2 disconnected at 1024x768+1024+0 again" v2_off
+    layout_set v2-detect "after Virtual-2 was set back to detect"
+    ev_pass "set back to detect, Virtual-2 reads disconnected again, still at 1024x768+1024+0"
+    ev_end
 }
 
 layout_restore() {
@@ -1232,13 +1266,13 @@ EOF
     log p2 "phase2 passed"
 }
 
-gen_tone() { # $1: frequency Hz, $2: outfile (.wav -> WAV, else raw s16le)
-    # 1.5s stereo sine at 60% full scale: audibly a beep in the artifact,
-    # and unmistakably non-silent for the host-side amplitude check.
-    python3 - "$1" "$2" <<'EOF'
+gen_tone() { # $1: frequency Hz, $2: outfile (.wav -> WAV, else raw s16le), $3: seconds (1.5)
+    # A stereo sine at 60% full scale, 1.5 s unless asked: audibly a beep in
+    # the artifact, and unmistakably non-silent for the host-side check.
+    python3 - "$1" "$2" "${3:-1.5}" <<'EOF'
 import math, sys, wave
 freq, out = float(sys.argv[1]), sys.argv[2]
-rate, dur, amp = 44100, 1.5, 0.6
+rate, dur, amp = 44100, float(sys.argv[3]), 0.6
 pcm = bytearray()
 for i in range(int(rate * dur)):
     s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
@@ -2232,6 +2266,46 @@ xorg_slice() { # <line count> <file>
 # pid, ppid, start time and name of the named processes in the container.
 ctr_pids() { podman exec desktop ps -o pid,ppid,lstart,comm -C "${1:?comm,comm}"; }
 
+# The X ids of the slave devices with exactly that name, one per line.
+xi_id() { # <name>
+    desk xinput list --short | awk -v want="$1" '
+        /slave/ {
+            line = $0; sub(/^.*↳ /, "", line)
+            id = line; sub(/^.*id=/, "", id); sub(/[^0-9].*$/, "", id)
+            name = line; sub(/[[:space:]]*id=.*$/, "", name)
+            if (name == want) print id
+        }'
+}
+# `xinput test` on one X device, in the background, line-buffered into
+# /tmp/xinput-test.txt in the container: the events that device delivered.
+xi_test_start() { # <X id>
+    podman exec desktop rm -f /tmp/xinput-test.txt
+    podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
+        sh -c "timeout 60 stdbuf -oL xinput test ${1:?X id} > /tmp/xinput-test.txt 2>&1"
+}
+xi_test_read() { podman exec desktop cat /tmp/xinput-test.txt 2>/dev/null || true; }
+xi_test_stop() { podman exec desktop pkill -f 'xinput test' 2>/dev/null || true; }
+
+# A tone played by a pulse client in the background, as the session user:
+# paplay, to <sink> (or the default sink with "-"), for <seconds>. Its stderr
+# and exit status land in /tmp/<tag>.log and /tmp/<tag>.rc in the container;
+# tone_status says "running" until the .rc exists.
+tone_start() { # <tag> <hz> <seconds> <sink|->
+    local tag="${1:?tag}" hz="${2:?hz}" secs="${3:?seconds}" sink="${4:--}" dev=""
+    gen_tone "$hz" "/tmp/$tag.wav" "$secs"
+    podman cp "/tmp/$tag.wav" "desktop:/tmp/$tag.wav"
+    podman exec desktop rm -f "/tmp/$tag.log" "/tmp/$tag.rc"
+    [ "$sink" = - ] || dev="--device=$sink"
+    podman exec -d -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop \
+        sh -c "paplay $dev /tmp/$tag.wav > /tmp/$tag.log 2>&1; echo \$? > /tmp/$tag.rc"
+}
+tone_status() { # <tag>
+    local rc
+    rc=$(podman exec desktop cat "/tmp/${1:?tag}.rc" 2>/dev/null || true)
+    if [ -n "$rc" ]; then echo "exited $rc"; else echo running; fi
+    podman exec desktop cat "/tmp/$1.log" 2>/dev/null || true
+}
+
 # --- operator stories (E11) -------------------------------------------------------
 # ci/vm/operator-e2e.py drives the desktop the way the operator does - every
 # pointer and key event through QEMU's devices - and LOOKS at X from here: a
@@ -2541,7 +2615,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|verify-postmortem|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|verify-postmortem|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -2575,6 +2649,12 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     xorg-log-lines) xorg_log_lines ;;
     xorg-log-since) xorg_log_since "${2:-}" ;;
     ctr-pids) ctr_pids "${2:-}" ;;
+    xi-id) shift; xi_id "$*" ;;
+    xi-test-start) xi_test_start "${2:-}" ;;
+    xi-test-read) xi_test_read ;;
+    xi-test-stop) xi_test_stop ;;
+    tone-start) tone_start "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    tone-status) tone_status "${2:-}" ;;
     operator-teardown) operator_teardown ;;
     *) fail "unknown phase $1" ;;
 esac

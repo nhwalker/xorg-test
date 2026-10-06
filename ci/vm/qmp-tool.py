@@ -42,10 +42,7 @@ class Qmp:
         self.f.readline()                      # the greeting
         self.cmd("qmp_capabilities")
 
-    def cmd(self, name, **args):
-        msg = {"execute": name}
-        if args:
-            msg["arguments"] = args
+    def raw(self, msg):
         self.f.write(json.dumps(msg) + "\n")
         self.f.flush()
         while True:                            # skip async events
@@ -53,10 +50,17 @@ class Qmp:
             if not line:
                 raise SystemExit("qmp: connection closed")
             reply = json.loads(line)
-            if "error" in reply:
-                raise SystemExit(f"qmp error: {reply['error']}")
-            if "return" in reply:
-                return reply["return"]
+            if "error" in reply or "return" in reply:
+                return reply
+
+    def cmd(self, name, **args):
+        msg = {"execute": name}
+        if args:
+            msg["arguments"] = args
+        reply = self.raw(msg)
+        if "error" in reply:
+            raise SystemExit(f"qmp error: {reply['error']}")
+        return reply["return"]
 
 
 def hmp(sock, command):

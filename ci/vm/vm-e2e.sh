@@ -305,21 +305,33 @@ xi_judge_added() { # <story> <devices before> <devices after> <xinput before> <x
         fi
     done <<<"$names"
 }
-# S3.9.4: the removed device left xinput list, and Xorg logged its removal.
-xi_judge_removed() { # <story> <xinput before> <xinput after> <xorg log> <name>
-    local src="$ART/$1" xb xa xl nb na
+# S3.9.4, S3.9.10: each removed device left xinput list, and Xorg logged
+# its removal.
+xi_judge_removed() { # <story> <xinput before> <xinput after> <xorg log> <name>...
+    local src="$ART/$1" xb xa xl nb na name
     ev_copy "$src/$2" xinput-before "EV-STATE: xinput list before the removal (taken in $1)"; xb=$EV_LAST
-    ev_copy "$src/$3" xinput-after "EV-STATE: xinput list after the removal, polled until '$5' left or 10 s passed (taken in $1)"; xa=$EV_LAST
+    ev_copy "$src/$3" xinput-after "EV-STATE: xinput list after the removal, polled until the removed device left or 10 s passed (taken in $1)"; xa=$EV_LAST
     ev_diff xinput "EV-DIFF: xinput list across the removal" "$xb" "$xa"
     ev_copy "$src/$4" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the removal (taken in $1)"; xl=$EV_LAST
-    nb=$(xi_count "$EV_DIR/$xb" "$5")
-    na=$(xi_count "$EV_DIR/$xa" "$5")
-    [ "$nb" -gt 0 ] || fail "xinput list had no '$5' before the removal, so its leaving would prove nothing"
-    [ "$na" -lt "$nb" ] || fail "'$5' did not leave xinput list after the removal ($nb -> $na entries)"
-    ev_pass "'$5' left xinput list: $nb -> $na entries"
-    grep -qF "removing device $5" "$EV_DIR/$xl" \
-        || fail "the Xorg log has no 'removing device $5' since the removal"
-    ev_pass "the Xorg log records the removal: $(grep -F "removing device $5" "$EV_DIR/$xl" | head -1 | sed 's/^ *//')"
+    shift 4
+    for name in "$@"; do
+        nb=$(xi_count "$EV_DIR/$xb" "$name")
+        na=$(xi_count "$EV_DIR/$xa" "$name")
+        [ "$nb" -gt 0 ] || fail "xinput list had no '$name' before the removal, so its leaving would prove nothing"
+        [ "$na" -lt "$nb" ] || fail "'$name' did not leave xinput list after the removal ($nb -> $na entries)"
+        ev_pass "'$name' left xinput list: $nb -> $na entries"
+        grep -qF "removing device $name" "$EV_DIR/$xl" \
+            || fail "the Xorg log has no 'removing device $name' since the removal"
+        ev_pass "the Xorg log records the removal: $(grep -F "removing device $name" "$EV_DIR/$xl" | head -1 | sed 's/^ *//')"
+    done
+}
+# The role of each entry with that name in a saved xinput list: pointer or
+# keyboard (xinput's "slave pointer" and "slave keyboard").
+xi_roles() { # <saved xinput list> <name>
+    awk -v want="$2" '/slave/ {
+        line = $0; sub(/^.*↳ /, "", line); name = line; sub(/[[:space:]]*id=.*$/, "", name)
+        if (name != want) next
+        if (line ~ /slave +pointer/) print "pointer"; else if (line ~ /slave +keyboard/) print "keyboard"; else print "other" }' "$1"
 }
 
 # F4.7's common set into the open story as <moment>-* files: QEMU's USB
@@ -1076,12 +1088,170 @@ ev_pass "Xorg kept its pid across the cycle ($x_pids_before): the session carrie
 log "  the session still accepts input after a full switch cycle"
 ev_end
 
+log "input routing: keys sent to the display reach the keyboard bound to it"
+# S3.9.6's kvmok proves the session, not the device: QEMU gives a key event
+# that names no display to the newest keyboard bound to none. Re-added with
+# display=vga0, the USB keyboard is bound to the virtio-vga's console, and the
+# key events sent to that console go to it alone: `xinput test` on its own X
+# device sees them while the sink xterm reads the text.
+#
+# The events name the display (vga0, head 0), never the keyboard. QMP's
+# device is a display device, and this QEMU (8.2.2) aborts on a lookup that
+# matches no display head: the search reaches a text console without a
+# "device" property and dies on error_abort ("Property
+# 'qemu-fixed-text-console.device' not found"). Run 37318468363 lost its VM
+# that way, to an input-send-event naming kvmkbd.
+ev_begin S3.9.5 "A hot-added keyboard delivers keystrokes" T3
+kb_n=$(gq desk xinput list 2>/dev/null | xi_names | grep -cxF "QEMU QEMU USB Keyboard" || true)
+ev_qemu device-del "EV-QEMU: device_del kvmkbd, to bring it back bound to the display, and QEMU's reply (empty: accepted)" \
+    "device_del kvmkbd" >/dev/null || fail "QEMU refused device_del kvmkbd"
+xi_wait_gone "QEMU QEMU USB Keyboard" "${kb_n:-1}"
+ev_qemu device-add-bound "EV-QEMU: device_add usb-kbd,id=kvmkbd,bus=xhci.0,display=vga0 (the keyboard bound to the virtio-vga's console) and QEMU's reply (empty: accepted)" \
+    "device_add usb-kbd,id=kvmkbd,bus=xhci.0,display=vga0" >/dev/null || fail "QEMU refused to add the keyboard bound to vga0"
+kid=""
+for _ in $(seq 15); do
+    kid=$(gq xi-id QEMU QEMU USB Keyboard 2>/dev/null | head -1 || true)
+    [ -n "$kid" ] && break
+    sleep 1
+done
+ev_save xinput "EV-STATE: xinput list with the bound keyboard back" gq desk xinput list >/dev/null || true
+[ -n "$kid" ] || fail "xinput never listed 'QEMU QEMU USB Keyboard' after it was re-added bound to vga0"
+ev_note "the bound keyboard's X device: id $kid"
+gq xi-test-start "$kid" >/dev/null || fail "could not start xinput test on id $kid"
+sleep 1
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
+sleep 2
+qlog=$(ev_name qmp-input txt)
+QMP_TRANSCRIPT="$EV_DIR/$qlog" QMP_KEY_DEVICE=vga0 QMP_KEY_HEAD=0 python3 qmp-type.py "$QMP" "$res" 550 395 boundkey
+ev_attach "$qlog" "EV-QEMU: every QMP command sent: the pointer to the sink xterm's centre (550,395 on $res) and a click, naming no display, then b o u n d k e y Return, every key event naming device vga0, head 0"
+sleep 2
+ev_shot typed "EV-SHOT: the sink xterm (title inputtest) right after boundkey was typed through the bound keyboard"
+xt=$(ev_save xinput-test "EV-STATE: xinput test on the bound keyboard's own X device (id $kid) while the keys were sent: a key press and a key release per key" \
+    gq xi-test-read) || true
+gq xi-test-stop >/dev/null 2>&1 || true
+ev_save sink-file "EV-LOG-CLIENT: what the sink xterm's shell read (/tmp/inputproof in the desktop container); must be exactly 'boundkey'" \
+    vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null; echo' >/dev/null || true
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check boundkey' \
+    || fail "the sink xterm did not read 'boundkey' typed through the keyboard bound to vga0"
+ev_pass "the focused xterm's shell read 'boundkey', every key event sent to display vga0"
+presses=$(grep -c '^key press' <<<"$xt" || true)
+[ "${presses:-0}" -ge 9 ] \
+    || fail "xinput test on the bound keyboard (id $kid) saw ${presses:-0} key presses, want at least 9 (b o u n d k e y and Return): the keys did not come through it"
+ev_pass "xinput test on the bound keyboard's own device (id $kid) saw $presses key presses for the 9 keys sent: they came through the re-added keyboard"
+ev_end
+
 printf 'hotplug-add     host %s -> %s / container-nodes %s -> %s / xorg-adds %s -> %s\n' \
     "$before_host" "$after_host" "$before_nodes" "$after_nodes" "$before_adds" "$after_adds" \
     > "$ART/xorg-input-count.txt"
 printf 'kvm-cycle       host %s -> %s -> %s / container-nodes %s -> %s -> %s\n' \
     "$kvm_base_host" "$kvm_off_host" "$kvm_on_host" \
     "$kvm_base_nodes" "$kvm_off_nodes" "$kvm_on_nodes" >> "$ART/xorg-input-count.txt"
+
+log "pointer hotplug: a USB mouse (relative) and a USB tablet (absolute), in and out"
+# The pointer side of the KVM cable, both kinds: a relative mouse moves the
+# pointer by deltas, an absolute tablet places it. The same evidence as the
+# keyboard cycle above.
+PTRS=("QEMU QEMU USB Mouse" "QEMU QEMU USB Tablet")
+ev_begin S3.9.7 "Pointer plug-in reaches the container" T3
+input_set base-ptr "before device_add usb-mouse and usb-tablet"
+input_keep
+xlp=$(gq xorg-log-lines 2>/dev/null || echo 0)
+ptr_base_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+read -r ptr_base_nodes _ <<<"$(hotplug_probe)"
+ev_qemu device-add-mouse "EV-QEMU: device_add usb-mouse,id=hotmouse,bus=xhci.0 (relative) and QEMU's reply (empty: accepted)" \
+    "device_add usb-mouse,id=hotmouse,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-mouse"
+ev_qemu device-add-tablet "EV-QEMU: device_add usb-tablet,id=hottablet,bus=xhci.0 (absolute) and QEMU's reply (empty: accepted)" \
+    "device_add usb-tablet,id=hottablet,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-tablet"
+ptr_on_host=$ptr_base_host ptr_on_nodes=$ptr_base_nodes
+for _ in $(seq 20); do
+    ptr_on_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+    read -r ptr_on_nodes _ <<<"$(hotplug_probe)"
+    [ "$ptr_on_host" -ge $((ptr_base_host + 2)) ] && [ "$ptr_on_nodes" -ge $((ptr_base_nodes + 2)) ] && break
+    sleep 1
+done
+# Xorg's side (S3.9.8) is polled too: xinput may lag the nodes.
+for _ in $(seq 10); do
+    xn=$(gq desk xinput list 2>/dev/null | xi_names || true)
+    grep -qxF "${PTRS[0]}" <<<"$xn" && grep -qxF "${PTRS[1]}" <<<"$xn" && break
+    sleep 1
+done
+log "  plugged in: host=$ptr_on_host container-nodes=$ptr_on_nodes"
+input_set on-ptr "with the USB mouse and tablet plugged in"
+input_diffs on-ptr "the pointers' arrival"
+ev_save xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the pointers were added" \
+    gq xorg-log-since "$xlp" >/dev/null || true
+PTR_B_DEV=$B_DEV PTR_A_DEV=$IN_DEV PTR_B_XI=$B_XI PTR_A_XI=$IN_XI PTR_XLOG=$EV_LAST
+[ "$ptr_on_host" -ge $((ptr_base_host + 2)) ] \
+    || fail "the VM host did not gain the two pointers' event nodes ($ptr_base_host -> $ptr_on_host)"
+ev_pass "the VM host gained the pointers' event nodes: $ptr_base_host -> $ptr_on_host"
+missing=""
+for name in "${PTRS[@]}"; do
+    nodes=$(dev_events "$EV_DIR/$IN_DEV" "$name")
+    [ -n "$nodes" ] || { missing="$missing '$name' (not in /proc/bus/input/devices)"; continue; }
+    for n in $nodes; do grep -qE " $n\$" "$EV_DIR/$IN_CTR" || missing="$missing $n ($name)"; done
+    ev_note "'$name': event node(s) $nodes"
+done
+[ -z "$missing" ] || fail "the new pointers' nodes are not all in the container's /dev/input:$missing"
+[ "$ptr_on_nodes" -ge $((ptr_base_nodes + 2)) ] \
+    || fail "the container's event-node count rose only $ptr_base_nodes -> $ptr_on_nodes for two new pointers"
+ev_pass "both pointers' own event nodes are in the container's /dev/input, and its count rose $ptr_base_nodes -> $ptr_on_nodes"
+ev_end
+
+ev_begin S3.9.8 "Pointer plug-in is adopted by Xorg" T3
+xi_judge_added S3.9.7 "$PTR_B_DEV" "$PTR_A_DEV" "$PTR_B_XI" "$PTR_A_XI" "$PTR_XLOG" "the pointers' add"
+for name in "${PTRS[@]}"; do
+    roles=$(xi_roles "$ART/S3.9.7/$PTR_A_XI" "$name" | paste -sd' ')
+    grep -qw pointer <<<"$roles" || fail "'$name' is not in xinput list as a pointer: ${roles:-absent}"
+    ev_pass "'$name' is listed as a pointer (slave pointer)"
+done
+ev_end
+
+ev_begin S3.9.9 "Pointer plug-out removes the node from the container" T3
+input_import S3.9.7 plugged "with the USB mouse and tablet plugged in"
+xlq=$(gq xorg-log-lines 2>/dev/null || echo 0)
+ptr_nodes=""
+for name in "${PTRS[@]}"; do ptr_nodes="$ptr_nodes $(dev_events "$EV_DIR/$B_DEV" "$name")"; done
+ptr_nodes=$(echo $ptr_nodes)
+[ -n "$ptr_nodes" ] || fail "no USB mouse or tablet node in /proc/bus/input/devices before the removal"
+ev_note "the pointers' event node(s) before the removal: $ptr_nodes"
+mouse_n=$(xi_count "$EV_DIR/$B_XI" "${PTRS[0]}")
+tablet_n=$(xi_count "$EV_DIR/$B_XI" "${PTRS[1]}")
+ev_qemu device-del-mouse "EV-QEMU: device_del hotmouse and QEMU's reply (empty: accepted)" \
+    "device_del hotmouse" >/dev/null || fail "QEMU refused device_del hotmouse"
+ev_qemu device-del-tablet "EV-QEMU: device_del hottablet and QEMU's reply (empty: accepted)" \
+    "device_del hottablet" >/dev/null || fail "QEMU refused device_del hottablet"
+ptr_off_host=$ptr_on_host ptr_off_nodes=$ptr_on_nodes
+for _ in $(seq 20); do
+    ptr_off_host=$(vm_ssh_quick 'ls /dev/input/event* | wc -l')
+    read -r ptr_off_nodes _ <<<"$(hotplug_probe)"
+    [ "$ptr_off_host" -le "$ptr_base_host" ] && [ "$ptr_off_nodes" -le "$ptr_base_nodes" ] && break
+    sleep 1
+done
+xi_wait_gone "${PTRS[0]}" "$mouse_n"
+xi_wait_gone "${PTRS[1]}" "$tablet_n"
+log "  unplugged: host=$ptr_off_host container-nodes=$ptr_off_nodes"
+input_set off-ptr "after device_del hotmouse and hottablet"
+input_diffs off-ptr "the pointers' removal"
+ev_save xorg-log-off "EV-LOG-XORG: the Xorg log's lines since just before the removal" \
+    gq xorg-log-since "$xlq" >/dev/null || true
+PTR_OFF_XLOG=$EV_LAST PTR_OFF_B_XI=$B_XI PTR_OFF_A_XI=$IN_XI
+[ "$ptr_off_host" -le "$ptr_base_host" ] \
+    || fail "the VM host kept the pointers' nodes after device_del ($ptr_on_host -> $ptr_off_host, baseline $ptr_base_host)"
+ev_pass "the VM host lost the pointers' nodes: $ptr_on_host -> $ptr_off_host event nodes"
+left=""
+for n in $ptr_nodes; do grep -qE " $n\$" "$EV_DIR/$IN_CTR" && left="$left $n"; done
+[ -z "$left" ] || fail "the removed pointers' node(s)$left are still in the container's /dev/input"
+[ "$ptr_off_nodes" = "$ptr_base_nodes" ] \
+    || fail "the container has $ptr_off_nodes event nodes after the removal, want the $ptr_base_nodes from before the pointers were added"
+ev_pass "the pointers' own node(s) ($ptr_nodes) are gone from the container, and its count is back to its baseline: $ptr_base_nodes -> $ptr_on_nodes -> $ptr_off_nodes"
+ev_end
+
+ev_begin S3.9.10 "Pointer plug-out is seen by Xorg" T3
+xi_judge_removed S3.9.9 "$PTR_OFF_B_XI" "$PTR_OFF_A_XI" "$PTR_OFF_XLOG" "${PTRS[@]}"
+ev_end
+printf 'ptr-hotplug     host %s -> %s -> %s / container-nodes %s -> %s -> %s\n' \
+    "$ptr_base_host" "$ptr_on_host" "$ptr_off_host" \
+    "$ptr_base_nodes" "$ptr_on_nodes" "$ptr_off_nodes" >> "$ART/xorg-input-count.txt"
 
 log "audio hotplug: plug and unplug a USB sound card while the desktop runs"
 # The same test as the KVM input cycle, on the other cable. /dev/snd was an
@@ -1240,6 +1410,174 @@ printf 'snd-hotplug     host %s -> %s -> %s / container-nodes %s -> %s -> %s / w
     "$snd_base_host" "$snd_on_host" "$snd_off_host" \
     "$snd_base_nodes" "$snd_on_nodes" "$snd_off_nodes" \
     "$snd_base_devs" "$snd_on_devs" "$snd_off_devs" >> "$ART/xorg-input-count.txt"
+
+log "audio hotplug, again: the new card is the one heard, and a stream on it when it goes"
+# A second cycle of the same card. Both cards feed QEMU's one audiodev, so for
+# S4.7.3 the built-in card's sink is muted while the new card's is the
+# default: a tone heard then came out of the new card. For S4.7.7 a long
+# stream is playing on the new card when it is unplugged.
+ev_begin S4.7.3 "A hot-added card plays, and it is the new card that is heard" T3
+snd_set base "before the card is plugged in again"
+snd_keep
+read -r s2_base_nodes s2_base_devs <<<"$(snd_probe)"
+builtin_sink=$(ev_payload "$EV_DIR/$SN_DEF" | head -1)
+ev_qemu device-add "EV-QEMU: device_add usb-audio,id=hotsnd2,audiodev=snd0,bus=xhci.0 and QEMU's reply (empty: accepted)" \
+    "device_add usb-audio,id=hotsnd2,audiodev=snd0,bus=xhci.0" >/dev/null || fail "QEMU refused device_add usb-audio"
+s2_on_nodes=$s2_base_nodes s2_on_devs=$s2_base_devs
+for _ in $(seq 30); do
+    read -r s2_on_nodes s2_on_devs <<<"$(snd_probe)"
+    [ "$s2_on_nodes" -gt "$s2_base_nodes" ] && [ "$s2_on_devs" -gt "$s2_base_devs" ] && break
+    sleep 1
+done
+# The new card's sink shows in pactl a moment after its Device.
+usb_sink=""
+for _ in $(seq 15); do
+    usb_sink=$(comm -13 <(ev_payload "$EV_DIR/$SB_SINKS" | awk '{print $2}' | sort) \
+                        <(gq desk pactl list short sinks 2>/dev/null | awk '{print $2}' | sort) | head -1)
+    [ -n "$usb_sink" ] && break
+    sleep 1
+done
+snd_set on "with the USB sound card plugged in again"
+snd_diffs on "the card's arrival"
+[ -n "$usb_sink" ] || fail "no new sink appeared after the card was plugged in again ($s2_base_devs -> $s2_on_devs alsa devices)"
+[ -n "$builtin_sink" ] || fail "there was no default sink before the card was plugged in: nothing to mute"
+ev_note "the new card's sink: $usb_sink; the built-in card's: $builtin_sink"
+gq desk pactl set-default-sink "$usb_sink" >/dev/null || fail "pactl set-default-sink $usb_sink failed"
+gq desk pactl set-sink-mute "$builtin_sink" 1 >/dev/null || fail "pactl set-sink-mute $builtin_sink 1 failed"
+# WirePlumber gives a new device 0.40 on wpctl's cubic scale: 0.064 linear,
+# about -24 dB, and the USB card applies it as such. A tone at 0.6 of full
+# scale then peaks near 0.04, under check-audio's silence floor of 0.05 (run
+# 37321986539 measured 0.036). At full volume the question is only which
+# card is heard.
+gq desk pactl set-sink-volume "$usb_sink" 100% >/dev/null || fail "pactl set-sink-volume $usb_sink 100% failed"
+ev_save wpctl-selected "EV-STATE: wpctl status with the new card's sink made the default (marked *) at full volume, and the built-in card's sink muted" \
+    gq desk wpctl status >/dev/null || true
+ev_save builtin-mute "EV-STATE: pactl get-sink-mute for the built-in card's sink" gq desk pactl get-sink-mute "$builtin_sink" >/dev/null || true
+heard=yes
+ev_audio_start new-card 990
+gq tone-start newcard 990 4 - >/dev/null || { audio_capture_stop; fail "could not start the 990 Hz player"; }
+sleep 2
+mid=$(ev_save sink-inputs-mid "EV-STATE: pactl list short sink-inputs mid-playback (the second column is the sink's index)" \
+    gq desk pactl list short sink-inputs) || true
+sinks_mid=$(ev_save sinks-mid "EV-STATE: pactl list short sinks mid-playback (index, then name)" gq desk pactl list short sinks) || true
+for _ in $(seq 15); do st=$(gq tone-status newcard 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+ev_save player "EV-LOG-CLIENT: the 990 Hz player's status (exited and its code) and its stderr" gq tone-status newcard >/dev/null || true
+ev_audio_stop "EV-AUDIO: the machine's output while a pulse client played 990 Hz on the default sink, the new card's, with the built-in card's sink muted: what is heard came out of the new card - listen for one beep" 1 0.05 990 \
+    || heard=no
+gq desk pactl set-sink-mute "$builtin_sink" 0 >/dev/null || true
+gq desk pactl set-default-sink "$builtin_sink" >/dev/null || true
+ev_save restored "EV-STATE: wpctl status after the built-in card's sink was unmuted and made the default again" \
+    gq desk wpctl status >/dev/null || true
+usb_idx=$(awk -v n="$usb_sink" '$2 == n {print $1}' <<<"$sinks_mid")
+[ -n "$usb_idx" ] || fail "the new card's sink $usb_sink is not among the sinks listed mid-playback"
+on_usb=$(awk -v i="$usb_idx" 'NF > 2 && $2 == i' <<<"$mid" | wc -l)
+[ "$on_usb" -ge 1 ] || fail "mid-playback no stream sat on the new card's sink (index $usb_idx): $(echo $mid)"
+ev_pass "mid-playback the player's stream sat on the new card's sink: $usb_sink (index $usb_idx)"
+[ "$heard" = yes ] || fail "the 990 Hz tone was not heard with the built-in card's sink muted: the new card did not render it"
+ev_pass "with the built-in card's sink muted, the machine's output carried the 990 Hz tone: the new card rendered it"
+ev_end
+
+ev_begin S4.7.7 "A stream playing on the card that is unplugged fails cleanly" T3
+pids_b=$(audio_pids)
+ev_save pids-before "EV-PIDS: the three audio daemons before the card is unplugged under a playing stream" \
+    gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+pb=$EV_LAST
+ev_audio_start removal 660
+gq tone-start longplay 660 15 "$usb_sink" >/dev/null || { audio_capture_stop; fail "could not start the long player on $usb_sink"; }
+sleep 3
+ev_save sink-inputs-before "EV-STATE: pactl list short sink-inputs with the long stream playing on the new card" \
+    gq desk pactl list short sink-inputs >/dev/null || true
+ev_save sinks-before "EV-STATE: pactl list short sinks with the long stream playing" gq desk pactl list short sinks >/dev/null || true
+ev_note "device_del hotsnd2 sent at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), about 3 s into the 15 s stream"
+ev_qemu device-del "EV-QEMU: device_del hotsnd2 under the playing stream, and QEMU's reply (empty: accepted)" \
+    "device_del hotsnd2" >/dev/null || { audio_capture_stop; fail "QEMU refused device_del hotsnd2"; }
+t_del=$(date +%s)
+outcome=""
+for _ in $(seq 10); do
+    st=$(gq tone-status longplay 2>/dev/null | head -1)
+    if [ "${st%% *}" = exited ]; then
+        outcome="exited (code ${st#exited }) $(( $(date +%s) - t_del )) s after the removal"
+        break
+    fi
+    sk=$(gq desk pactl list short sinks 2>/dev/null || true)
+    if ! awk -v n="$usb_sink" '$2 == n {f = 1} END {exit !f}' <<<"$sk"; then
+        moved=$(gq desk pactl list short sink-inputs 2>/dev/null \
+            | awk 'NR == FNR {name[$1] = $2; next} NF > 2 && ($2 in name) {print name[$2]; exit}' <(printf '%s\n' "$sk") - || true)
+        if [ -n "$moved" ]; then
+            outcome="kept playing, its stream moved to $moved $(( $(date +%s) - t_del )) s after the removal"
+            break
+        fi
+    fi
+    sleep 1
+done
+ev_save sink-inputs-after "EV-STATE: pactl list short sink-inputs after the removal" gq desk pactl list short sink-inputs >/dev/null || true
+ev_save sinks-after "EV-STATE: pactl list short sinks after the removal" gq desk pactl list short sinks >/dev/null || true
+for _ in $(seq 15); do st=$(gq tone-status longplay 2>/dev/null | head -1); [ "${st%% *}" = exited ] && break; sleep 1; done
+ev_save player "EV-LOG-CLIENT: the long player's status (exited and its code, or running) and its stderr" gq tone-status longplay >/dev/null || true
+ev_audio_stop "EV-AUDIO: the machine's output from the stream's start, about 3 s before device_del (see notes), to its end: the tone goes on where the stream was moved to a remaining sink, and stops where the player ended - listen across the removal" 1 0.05 660 \
+    || ev_note "check-audio's verdict on the capture is not a pass (see its report): judged on the player and the graph instead"
+vm_ssh_quick 'sudo podman exec desktop pkill -x paplay' >/dev/null 2>&1 || true
+pids_a=$(audio_pids)
+ev_save pids-after "EV-PIDS: the three audio daemons after the removal" gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+ev_diff pids "EV-DIFF: the audio daemons across the removal (empty: none restarted)" "$pb" "$EV_LAST"
+export_ok=yes
+ev_save pactl-info "EV-STATE: pactl info from the VM host over the export, after the removal" \
+    vm_ssh_quick 'sudo env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info' >/dev/null || export_ok=no
+[ -n "$pids_b" ] && [ "$pids_b" = "$pids_a" ] \
+    || fail "the audio daemons changed across the removal ($pids_b -> $pids_a): the stack restarted rather than carried on"
+ev_pass "pipewire, wireplumber and pipewire-pulse kept their pids across the removal ($pids_b)"
+[ "$export_ok" = yes ] || fail "pactl info over the export failed after the removal"
+ev_pass "the export still answers pactl info"
+[ -n "$outcome" ] || fail "10 s after the card went, the player neither had exited nor had its stream on a remaining sink"
+ev_pass "within 10 s of the removal the player $outcome"
+ev_end
+snd_wait_default
+
+log "audio hotplug: a capture-capable card on PCI"
+# usb-audio has no capture path, and QEMU's HDA codec bus refuses device_add,
+# so a hot-added capture card can only be a PCI card with its codec built in:
+# AC97 or ES1370, if the guest kernel has a driver for one.
+cap_probe=$(vm_ssh_quick 'for m in snd-intel8x0 snd-ens1370; do printf "%s: " "$m"; modinfo -n "$m" 2>&1 | head -1; done' || true)
+cap_model=""
+grep -q '^snd-intel8x0: /' <<<"$cap_probe" && cap_model=AC97
+[ -z "$cap_model" ] && grep -q '^snd-ens1370: /' <<<"$cap_probe" && cap_model=ES1370
+if [ -z "$cap_model" ]; then
+    # S4.7.8 stays T4: its attempt is kept, outside any story.
+    mkdir -p "$ART/S4.7.8-attempt"
+    printf '%s\n' "$cap_probe" > "$ART/S4.7.8-attempt/modinfo.txt"
+    log "  no AC97 or ES1370 driver in the guest kernel; S4.7.8's attempt is in S4.7.8-attempt/"
+else
+    ev_begin S4.7.8 "Capture device plug-in and plug-out reach WirePlumber" T3
+    ev_text modinfo "EV-STATE: modinfo -n for the two candidate drivers on the VM host" "$cap_probe"
+    snd_set base "before device_add $cap_model"
+    snd_keep
+    ev_qemu device-add "EV-QEMU: device_add $cap_model,id=hotcap,audiodev=snd0 and QEMU's reply (empty: accepted)" \
+        "device_add $cap_model,id=hotcap,audiodev=snd0" >/dev/null || fail "QEMU refused device_add $cap_model"
+    new_src=""
+    for _ in $(seq 30); do
+        new_src=$(comm -13 <(ev_payload "$EV_DIR/$SB_SOURCES" | awk '{print $2}' | sort) \
+                           <(gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | sort) | grep '^alsa_input\.' | head -1 || true)
+        [ -n "$new_src" ] && break
+        sleep 1
+    done
+    snd_set on "with the $cap_model card plugged in"
+    snd_diffs on "the $cap_model card's arrival"
+    [ -n "$new_src" ] || fail "no alsa_input source appeared within 30 s of device_add $cap_model"
+    ev_pass "the $cap_model card brought a capture source: $new_src"
+    snd_keep
+    ev_qemu device-del "EV-QEMU: device_del hotcap and QEMU's reply (empty: accepted; the PCI unplug then waits on the guest)" \
+        "device_del hotcap" >/dev/null || fail "QEMU refused device_del hotcap"
+    gone=no
+    for _ in $(seq 30); do
+        gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qxF -- "$new_src" || { gone=yes; break; }
+        sleep 1
+    done
+    snd_set off "after device_del hotcap"
+    snd_diffs off "the $cap_model card's removal"
+    [ "$gone" = yes ] || fail "the capture source $new_src was still listed 30 s after device_del hotcap"
+    ev_pass "the capture source left with the card: $new_src is gone from pactl list short sources"
+    ev_end
+fi
 
 fi # ---- end shard: core ----------------------------------------------------------
 
