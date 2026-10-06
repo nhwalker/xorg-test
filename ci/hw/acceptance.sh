@@ -158,7 +158,7 @@ unit_has_x_driver() { grep -qE '^ExecStart=.*nvidia_drv\.so'; }
 # $1: a CDI spec; the driver version its versioned library paths carry.
 spec_version() {
     local v
-    v=$(grep -m1 -oE 'libnvidia-glcore\.so\.[0-9][0-9.]*' "$1" 2>/dev/null)
+    v=$(gen_grep -m1 -oE 'libnvidia-glcore\.so\.[0-9][0-9.]*' "$1" 2>/dev/null)
     v=${v%%$'\n'*}
     printf '%s' "${v#libnvidia-glcore.so.}"
 }
@@ -285,12 +285,12 @@ gpu_mode() {
 # S3.1.2 and S8.1.4: NVIDIA nodes with no X driver injected, then the
 # documented fallback.
 no_xdriver() {
-    local keep="$HW_STATE/nvidia.yaml.real" n conf log glx pf0 pf1 unit real_f staged=no
+    local keep="$HW_STATE/nvidia.yaml.real" n conf log glx pf0 pf1 unit real_f staged=no entry
     nvidia_host || { say "S3.1.2 and S8.1.4 need an NVIDIA host."; return 1; }
     story_begin S3.1.2 "NVIDIA nodes without the X driver fall back to modesetting" T4
     ev_copy "$SPEC" spec-real "EV-CONFIG: /etc/cdi/nvidia.yaml as this host's toolkit generated it"
     real_f=$EV_LAST
-    if grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
+    if gen_grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
         staged=yes
         say "This host's toolkit injects nvidia_drv.so. The stories are about an older toolkit that does not. The script can stage that: a copy of the spec with the X driver's mounts dropped, and nvidia-ctk set aside so nothing regenerates it, both undone at the end."
         yes_no "Stage it?" || { ev_abort "not staged: this toolkit injects the X driver and the tester declined the staging"; return 1; }
@@ -298,7 +298,7 @@ no_xdriver() {
         ctk_aside || { ev_abort "could not set nvidia-ctk aside"; return 1; }
         undo_later "$(ctk_back_cmd); cp -a '$keep' '$SPEC'; systemctl restart desktop-cdi-refresh.service; systemctl restart desktop.service"
         n=$(spec_without_xdriver "$keep" "$SPEC")
-        if [ "${n:-0}" -lt 1 ] || grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
+        if [ "${n:-0}" -lt 1 ] || gen_grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
             ev_abort "the X driver's mounts could not be dropped from the spec (dropped ${n:-0})"; return 1
         fi
         ev_note "harness-only staging: the spec without the X driver's $n mount(s), as an older toolkit writes it"
@@ -326,14 +326,16 @@ no_xdriver() {
     if grep -q 'WARN: NVIDIA device nodes present but nvidia_drv.so NOT injected' "$EV_DIR/$pf0"; then
         ev_pass "the container preflight WARNs: nvidia_drv.so NOT injected"
     else ev_fail "the container preflight does not WARN that nvidia_drv.so is not injected"; fi
-    ev_text readme "EV-PROCEDURE: README.md's \"nvidia_drv.so missing\" entry, as this run read it" \
-        "$(python3 "$REPO/ci/doc-blocks.py" "$REPO/README.md" Troubleshooting --entry 'nvidia_drv.so missing' 2>&1)"
+    entry=$(python3 "$REPO/ci/doc-blocks.py" "$REPO/README.md" "GPU notes" --entry 'nvidia_drv.so missing' 2>&1) \
+        || { ev_abort "README.md has no \"nvidia_drv.so missing\" entry under \"GPU notes\" any more: $entry"; return 1; }
+    ev_text readme "EV-PROCEDURE: README.md's \"nvidia_drv.so missing\" entry (\"GPU notes\"), as this run read it" "$entry"
     if [ -z "$(fallback_lines)" ]; then ev_abort "the quadlet has no commented Volume= lines for the X driver to make the fallback from"; return 1; fi
     mkdir -p "$DROPIN_DIR"
     { echo "# ci/hw/acceptance.sh S8.1.4: README.md's fallback, the quadlet's commented lines"; echo "[Container]"; fallback_lines; } > "$DROPIN"
     undo_later "rm -f '$DROPIN'; systemctl daemon-reload; systemctl restart desktop.service"
     ev_copy "$DROPIN" dropin "EV-CONFIG: the fallback drop-in, from the quadlet's commented Volume= lines"
-    ev_save daemon-reload "EV-PROCEDURE: systemctl daemon-reload" systemctl daemon-reload >/dev/null || true
+    ev_save daemon-reload "EV-PROCEDURE: harness-only: systemctl daemon-reload, which a new quadlet drop-in needs before it reaches the unit (the entry gives no command for it)" \
+        systemctl daemon-reload >/dev/null || true
     unit=$(ev_save unit "EV-STATE: systemctl cat desktop.service with the drop-in: the drop-in's Volume= lines reach ExecStart as -v (quadlet merges drop-ins from podman 5.0)" \
         systemctl cat desktop.service) || true
     if unit_has_x_driver <<<"$unit"; then ev_pass "the generated unit's ExecStart carries the drop-in's X driver volume"
@@ -464,7 +466,7 @@ no_modeset() {
 
 # S5.4.3: a stale real spec fails container creation; README's remedy.
 stale_spec() {
-    local ver real stale jr out
+    local ver real stale jr out entry spans remedy
     nvidia_host || { say "S5.4.3 needs an NVIDIA host with a real spec."; return 1; }
     spec_is_stub && { say "S5.4.3 needs a real spec; this one is the stub."; return 1; }
     ver=$(spec_version "$SPEC")
@@ -486,7 +488,8 @@ stale_spec() {
     ev_diff staging "EV-DIFF: the real spec (-) against the stale one (+)" "$real" "$stale"
     ev_note "harness-only staging: the spec's .so.$ver paths renamed, as after a driver update"
     jr=$(date '+%Y-%m-%d %H:%M:%S')
-    ev_save restart "EV-PROCEDURE: systemctl restart desktop.service, the spec stale" systemctl restart desktop.service >/dev/null || true
+    ev_save restart "EV-PROCEDURE: harness-only staging: systemctl restart desktop.service on the stale spec, as the first start after a driver update" \
+        systemctl restart desktop.service >/dev/null || true
     sleep 20
     if systemctl is-active --quiet desktop.service; then ev_fail "the desktop started on a stale spec"
     else ev_pass "the desktop does not start on the stale spec ($(systemctl show -p ActiveState --value desktop.service))"; fi
@@ -494,17 +497,21 @@ stale_spec() {
         journalctl --no-pager -o short-precise -u desktop.service --since "$jr") || true
     if grep -qiE "$ver-gone|no such file" <<<"$out"; then ev_pass "the journal names the failure: $(grep -m1 -iE "$ver-gone|no such file" <<<"$out" | cut -c1-200)"
     else ev_fail "the journal does not name the stale spec"; fi
-    ev_save ctk-back "EV-PROCEDURE: the toolkit back, as on the host after its driver update" sh -c "$(ctk_back_cmd)" >/dev/null || true
+    ev_save ctk-back "EV-PROCEDURE: harness-only staging: the toolkit back (nvidia-ctk), as on the host after its driver update" \
+        sh -c "$(ctk_back_cmd)" >/dev/null || true
     jr=$(date '+%Y-%m-%d %H:%M:%S')
-    ev_text readme "EV-PROCEDURE: README.md's \"CDI spec staleness\" entry, as this run read it" \
-        "$(python3 "$REPO/ci/doc-blocks.py" "$REPO/README.md" Troubleshooting --entry 'CDI spec staleness' 2>&1)"
-    ev_save remedy "EV-PROCEDURE: systemctl restart desktop-cdi-refresh.service, README.md's remedy" \
-        systemctl restart desktop-cdi-refresh.service >/dev/null || true
+    entry=$(python3 "$REPO/ci/doc-blocks.py" "$REPO/README.md" "GPU notes" --entry 'CDI spec staleness' 2>&1) \
+        || { ev_abort "README.md has no \"CDI spec staleness\" entry under \"GPU notes\" any more: $entry"; return 1; }
+    ev_text readme "EV-PROCEDURE: README.md's \"CDI spec staleness\" entry (\"GPU notes\"), as this run read it" "$entry"
+    spans=$(python3 "$REPO/ci/doc-blocks.py" "$REPO/README.md" "GPU notes" --entry 'CDI spec staleness' --spans)
+    remedy=$(grep -m1 '^systemctl ' <<<"$spans") \
+        || { ev_abort "README.md's \"CDI spec staleness\" entry no longer gives a systemctl command: $entry"; return 1; }
+    ev_save remedy "EV-PROCEDURE: \`$remedy\`, the entry's remedy, as the entry writes it" sh -c "$remedy" >/dev/null || true
     ev_save cdi-journal "EV-LOG-JOURNAL: desktop-cdi-refresh's journal after the remedy" \
         journalctl --no-pager -o short-precise -u desktop-cdi-refresh.service --since "$jr" >/dev/null || true
     ev_copy "$SPEC" spec-regenerated "EV-CONFIG: the spec after the remedy"
     ev_diff remedy "EV-DIFF: the stale spec (-) against the regenerated one (+)" "$stale" "$EV_LAST"
-    if ! grep -q "$ver-gone" "$SPEC" && ! spec_is_stub; then ev_pass "the remedy regenerated a real spec"
+    if ! gen_grep -q "$ver-gone" "$SPEC" && ! spec_is_stub; then ev_pass "the remedy regenerated a real spec"
     else ev_fail "after the remedy the spec is still stale or the stub"; fi
     if wait_desktop 60; then ev_pass "after the remedy alone the desktop is back"
     else
@@ -559,8 +566,9 @@ capture_layout() {
         ev_note "the captured layout stays installed; the shipped file is at $HW_STATE/monitors.conf.before"
     else
         cp -a "$HW_STATE/monitors.conf.before" /etc/desktop-container/monitors.conf
-        restart_desktop restore || true
-        ev_note "monitors.conf put back as it was, and the desktop restarted"
+        if cmp -s "$HW_STATE/monitors.conf.before" /etc/desktop-container/monitors.conf && restart_desktop restore; then
+            ev_pass "monitors.conf put back as it was, and the desktop restarted on it"
+        else ev_fail "monitors.conf is not back as it was, or the desktop did not restart on it"; fi
     fi
     ev_end
 }

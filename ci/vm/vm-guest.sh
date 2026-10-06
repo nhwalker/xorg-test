@@ -189,7 +189,7 @@ phase_deploy() {
         fail "getty@tty1 is not active - the seat is already clean, so seat-prep would prove nothing"
     fi
 
-    log pd "apply the deploy tree (verbatim README command)"
+    log pd "apply the deploy tree: deploy/README.md's Apply commands, typed (S5.1.1 checks them against the document), then the harness's own steps"
     rsync -a --chown=root:root deploy/host/ /
     # S7.2.5's "before": /etc/cdi as the tree leaves it, before the desktop's
     # first start. Kept now, attached to the story once the spec appears.
@@ -225,7 +225,7 @@ phase_deploy() {
     log pd "stub CDI spec resolved (no NVIDIA in the VM; marker on the init process)"
     ev_begin S5.4.1 "Stub on a GPU-less host, resolvable by podman" T3
     ev_copy /etc/cdi/nvidia.yaml nvidia-cdi-spec "EV-CONFIG: /etc/cdi/nvidia.yaml as desktop-cdi-refresh wrote it on this GPU-less VM: the stub, whose only edit is NVIDIA_CDI_STUB=1"
-    grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
+    gen_grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
     ev_pass "with no toolkit and no NVIDIA hardware, desktop-cdi-refresh wrote the stub spec"
     # /proc/1 is the HOST's systemd under --pid=host; the CDI env edits land
     # on the container's init process, whose (host) pid desktop-init records.
@@ -237,9 +237,9 @@ phase_deploy() {
     ev_end
 
     log pd "the tree's oneshot wrote both client CDI specs"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "desktop-client-cdi did not write a usable display spec"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "desktop-client-cdi did not write a usable audio spec"
 
     log pd "the desktop published its toolkit and the watcher advertised it"
@@ -251,7 +251,7 @@ phase_deploy() {
     wait_for 30 1 "tools CDI spec" test -s /etc/cdi/desktop-tools.yaml
     [ -s /var/lib/desktop-container/bin/screenshot ] \
         || fail "the desktop did not publish screenshot into /var/lib/desktop-container/bin"
-    grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
+    gen_grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
         || fail "desktop-tools-cdi.path did not advertise the toolkit after the desktop published"
     ev_begin S7.2.5 "Advertised only after provisioning" T3
     ev_copy /tmp/ev-cdi-before-start.txt cdi-before-first-start "EV-STATE: ls -l --full-time /etc/cdi right after the tree was applied, before the desktop's first start: no desktop-tools.yaml"
@@ -302,7 +302,7 @@ phase_deploy() {
     ev_pass "xorg-gpu-conf logged 'decision: modesetting driver on $card'"
     gpuconf=$(ev_save config "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf in the running container" \
         podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || fail "no 20-gpu.conf in the container"
-    grep -qF "Option     \"kmsdev\" \"$card\"" <<<"$gpuconf" || fail "20-gpu.conf does not name $card as kmsdev"
+    gen_grep_text -qF "Option     \"kmsdev\" \"$card\"" "$gpuconf" || fail "20-gpu.conf does not name $card as kmsdev"
     ev_pass "20-gpu.conf names $card as kmsdev, with the modesetting driver"
     ev_end
 
@@ -623,18 +623,18 @@ phase_deploy() {
         src=$(first_of ls "$EV_ROOT/S7.1.1/"*"-$f.txt")
         [ -z "$src" ] || ev_copy "$src" "$f" "EV-STATE: the $f client's env and mounts, as S7.1.1 ran it (copied here)"
     done
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml || fail "display spec kind wrong"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml || fail "audio spec kind wrong"
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml || fail "display spec kind wrong"
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml || fail "audio spec kind wrong"
     ev_pass "the two specs carry the kinds desktop.local/display and desktop.local/audio"
-    if grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' /etc/cdi/desktop-display.yaml \
-        || grep -qE 'DISPLAY=|X11-unix' /etc/cdi/desktop-audio.yaml; then
+    if gen_grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' /etc/cdi/desktop-display.yaml \
+        || gen_grep -qE 'DISPLAY=|X11-unix' /etc/cdi/desktop-audio.yaml; then
         fail "the specs are not disjoint: one carries the other's edits"
     fi
     ev_pass "disjoint: neither spec carries the other's env or mount"
-    grep -q 'hostPath: /tmp/.X11-unix$' /etc/cdi/desktop-display.yaml \
-        && grep -q 'hostPath: /run/desktop-audio$' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'hostPath: /tmp/.X11-unix$' /etc/cdi/desktop-display.yaml \
+        && gen_grep -q 'hostPath: /run/desktop-audio$' /etc/cdi/desktop-audio.yaml \
         || fail "the specs do not mount the two directories"
-    grep -q '"rbind", "rw"' /etc/cdi/desktop-display.yaml && grep -q '"rbind", "rw"' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q '"rbind", "rw"' /etc/cdi/desktop-display.yaml && gen_grep -q '"rbind", "rw"' /etc/cdi/desktop-audio.yaml \
         || fail "the spec mounts are not rbind rw"
     ev_pass "each mounts its directory (not a socket file), rbind and rw"
     printf 'cdiVersion: 0.5.0\nkind: desktop.local/display\ndevices: []\n' > /etc/cdi/desktop.yaml
@@ -776,6 +776,8 @@ desktop_up() {
         podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo
 }
 
+# A file's sha256, or "absent": what a restore is compared with.
+file_state() { if [ -e "$1" ]; then sha256sum < "$1" | cut -d' ' -f1; else echo absent; fi; }
 conn_connected() { [ "$(cat "$1/status")" = connected ]; }
 
 # The two connectors' sysfs directories, into conn and conn2.
@@ -967,11 +969,11 @@ EOF
         podman logs desktop 2>&1 | grep xorg-monitor-conf >&2 || true
         fail "the declared layout generated no /etc/X11/xorg.conf.d/30-monitors.conf"
     fi
-    echo "$out" | grep -q 'Option      "Enable" "true"' \
+    gen_grep_text -q 'Option      "Enable" "true"' "$out" \
         || fail "outputs were not forced enabled"
-    echo "$out" | grep -q 'Modeline "1024x768_60.00"' \
+    gen_grep_text -q 'Modeline "1024x768_60.00"' "$out" \
         || fail "no derived timing for the declared mode"
-    echo "$out" | grep -q 'Virtual 2048 768' \
+    gen_grep_text -q 'Virtual 2048 768' "$out" \
         || fail "framebuffer not pinned to the declared extents"
     ev_pass "the generated config forces both outputs enabled, carries a derived 1024x768_60.00 Modeline and pins the framebuffer at 2048x768"
     ev_save sysfs "EV-STATE: every DRM connector's status in sysfs: Virtual-2 is disconnected" \
@@ -1503,7 +1505,9 @@ monitors_set() { # two|shipped
     case "${1:-}" in
         two) printf 'Virtual-1  1024x768@60  +0+0      primary\nVirtual-2  1024x768@60  +1024+0\n' \
                 > /etc/desktop-container/monitors.conf ;;
-        shipped) install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf ;;
+        shipped) install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf
+            cmp -s deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf \
+                || fail "monitors-set shipped: the shipped file is not back" ;;
         *) fail "monitors-set: two or shipped" ;;
     esac
     systemctl restart desktop.service
@@ -1536,6 +1540,7 @@ deploy_applied() {
     [ "$(grep -v '^#' <<<"$block" | sed '/^[[:space:]]*$/d')" = "$want" ] \
         || fail "deploy/README.md's Apply block is no longer rsync, daemon-reload and reboot; phase-deploy runs the first two as this check reads them"
     ev_pass "the README's Apply block is rsync -a --chown=root:root deploy/host/ /, systemctl daemon-reload and reboot, and phase-deploy ran the first two as written"
+    ev_note "harness-only, after the two commands and before the deploy tail's reboot (S5.1.3): systemd-sysusers, systemd-tmpfiles --create (its failures tolerated), systemctl reload sshd, S5.3.1's start of desktop-seat-prep.service on its own, then systemctl start desktop.service"
     ev_save symlinks "EV-STATE: find /etc/systemd/system -maxdepth 2 -type l -ls after the two commands" \
         find /etc/systemd/system -maxdepth 2 -type l -ls >/dev/null || true
     [ "$(readlink /etc/systemd/system/default.target)" = /usr/lib/systemd/system/multi-user.target ] \
@@ -1861,13 +1866,25 @@ deploy_tail() {
     ev_begin S5.2.6 "Image pin drop-in" T3
     ev_save podman-version "EV-STATE: podman --version" podman --version >/dev/null || true
     podman tag localhost/desktop-container:latest localhost/desktop-container:ev-pinned
+    # The drop-in as deploy/README.md "Overriding the image reference" gives
+    # it, read from the document; its one placeholder, the image reference,
+    # is this run's second name for the same image.
+    pin_blk=$(python3 ci/doc-blocks.py deploy/README.md "Overriding the image reference" 1 --lang ini) \
+        || fail "deploy/README.md has no ini block under \"Overriding the image reference\": $pin_blk"
+    ev_text pin-block "EV-PROCEDURE: deploy/README.md's \"Overriding the image reference\" block, as this run read it" "$pin_blk"
+    [ "$(sed -n '1s/^# *//p' <<<"$pin_blk")" = /etc/containers/systemd/desktop.container.d/50-image.conf ] \
+        || fail "the block no longer opens with the drop-in's path, 50-image.conf: $(sed -n 1p <<<"$pin_blk")"
+    pin_ph='registry.example.com/desktop-container@sha256:...'
+    grep -qxF "Image=$pin_ph" <<<"$pin_blk" || fail "the block's Image= line is no longer the placeholder $pin_ph"
     mkdir -p /etc/containers/systemd/desktop.container.d
-    printf '[Container]\nImage=localhost/desktop-container:ev-pinned\n' > /etc/containers/systemd/desktop.container.d/50-image.conf
-    ev_copy /etc/containers/systemd/desktop.container.d/50-image.conf drop-in "EV-CONFIG: the drop-in: desktop.container.d/50-image.conf, pinning localhost/desktop-container:ev-pinned (a second name for the same image)"
+    printf '%s\n' "${pin_blk/"Image=$pin_ph"/"Image=localhost/desktop-container:ev-pinned"}" \
+        > /etc/containers/systemd/desktop.container.d/50-image.conf
+    ev_note "the block's one placeholder, $pin_ph, is localhost/desktop-container:ev-pinned here, a second name for the same image"
+    ev_copy /etc/containers/systemd/desktop.container.d/50-image.conf drop-in "EV-CONFIG: the drop-in as written: the documented block, its placeholder localhost/desktop-container:ev-pinned"
     systemctl daemon-reload
     c=$(ev_save unit "EV-CONFIG: systemctl cat desktop.service with the drop-in in place: the unit quadlet generated" \
         systemctl cat desktop.service) || fail "systemctl cat desktop.service failed"
-    grep -q 'localhost/desktop-container:ev-pinned' <<<"$c" || fail "the generated desktop.service does not carry the drop-in's image"
+    gen_grep_text -q 'localhost/desktop-container:ev-pinned' "$c" || fail "the generated desktop.service does not carry the drop-in's image"
     ev_pass "the generated desktop.service carries the drop-in's image"
     systemctl restart desktop.service
     desk_back
@@ -1983,6 +2000,7 @@ deploy_tail() {
     systemctl stop display-manager.service
     rm -f /etc/systemd/system/display-manager.service
     systemctl daemon-reload
+    ! systemctl cat display-manager.service >/dev/null 2>&1 || fail "a display-manager.service is still installed"
     systemctl start desktop.service
     desk_back
     ev_save journal "EV-LOG-JOURNAL: desktop, getty@tty1 and display-manager through the test" \
@@ -2490,6 +2508,7 @@ host_audio() { # pulse-play|autospawn|alsa-setup|alsa-play|alsa-control|null-on|
         null-on) # S4.2.3
             ev_begin S4.2.3 "A host-local asound.conf still wins" T3
             [ ! -e /etc/asound.conf ] || cp -a /etc/asound.conf /etc/asound.conf.ev-saved
+            file_state /etc/asound.conf > /run/ev-asound-before
             printf 'pcm.!default {\n    type null\n}\n' > /etc/asound.conf
             ev_copy /etc/asound.conf asound-conf "EV-CONFIG: the host-local /etc/asound.conf: default routed to null"
             ev_end
@@ -2503,11 +2522,15 @@ host_audio() { # pulse-play|autospawn|alsa-setup|alsa-play|alsa-control|null-on|
             rm -f /etc/asound.conf
             [ -e /etc/asound.conf.ev-saved ] && mv /etc/asound.conf.ev-saved /etc/asound.conf
             ev_text removed "EV-STATE: /etc/asound.conf after the test" "$(ls -l /etc/asound.conf 2>&1 || true)"
+            want=$(cat /run/ev-asound-before) || fail "the state of /etc/asound.conf before the test was not kept"
+            got=$(file_state /etc/asound.conf)
+            [ "$got" = "$want" ] || fail "/etc/asound.conf is not back as it was: $got, before the test $want"
+            ev_pass "/etc/asound.conf is back as it was before the test: $got"
             ev_end
             ;;
         cleanup)
             pa_stub_remove
-            rm -f /run/ev-pulseaudio-starts.log /run/ev-empty-client.conf /tmp/s421.wav /tmp/s422.wav
+            rm -f /run/ev-pulseaudio-starts.log /run/ev-empty-client.conf /run/ev-asound-before /tmp/s421.wav /tmp/s422.wav
             ;;
         *) fail "host-audio: pulse-play, autospawn, alsa-setup, alsa-play, alsa-control, null-on, null-play, null-off or cleanup" ;;
     esac
@@ -2657,9 +2680,9 @@ phase2() {
     # phase-deploy's desktop-client-cdi.service wrote them and the tree is
     # still applied - only the quadlet unit was removed above.
     log p2 "both client CDI specs are on the node"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "/etc/cdi/desktop-display.yaml missing or malformed before k3s install"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "/etc/cdi/desktop-audio.yaml missing or malformed before k3s install"
 
     # Everything downstream rests on CRI-O scanning /etc/cdi. That IS the
@@ -2669,11 +2692,14 @@ phase2() {
     # relying on it is both invisible and unverifiable from outside.
     # An unknown key here would stop crio starting, which k8s_crio_start
     # catches - a loud, immediate failure rather than a puzzling one later.
+    # The drop-in is README.md's, read from the document (S10.6.1 runs the
+    # same in the maintainer journey).
     mkdir -p /etc/crio/crio.conf.d
-    cat > /etc/crio/crio.conf.d/12-cdi.conf <<'EOF'
-[crio.runtime]
-cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
-EOF
+    crio_blk=$(python3 ci/doc-blocks.py README.md "Kubernetes (single-node k3s + CRI-O)" --lang toml) \
+        || fail "README.md has no CRI-O drop-in (a toml block under \"Kubernetes (single-node k3s + CRI-O)\"): $crio_blk"
+    [ "$(sed -n '1s/^# *//p' <<<"$crio_blk")" = /etc/crio/crio.conf.d/12-cdi.conf ] \
+        || fail "README.md's CRI-O block no longer opens with /etc/crio/crio.conf.d/12-cdi.conf: $(sed -n 1p <<<"$crio_blk")"
+    printf '%s\n' "$crio_blk" > /etc/crio/crio.conf.d/12-cdi.conf
     k8s_crio_start
     log p2 "crio configured to scan /etc/cdi for device specs"
 
@@ -5170,9 +5196,9 @@ verify_teardown() {
     cdi_a=$(ls -l --time-style=full-iso /etc/cdi)
     ev_text cdi-after "EV-STATE: ls -l --time-style=full-iso /etc/cdi after the uninstall" "$cdi_a"
     ev_diff cdi "EV-DIFF: /etc/cdi before and after the uninstall (no differences: the host's specs untouched)" "$cdi_bf" "$EV_LAST"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "helm uninstall removed the host display spec - it is host state"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "helm uninstall removed the host audio spec - it is host state"
     [ "$cdi_a" = "$cdi_b" ] || fail "/etc/cdi changed with the uninstall (see the diff)"
     ev_pass "/etc/cdi is unchanged, every spec in it with the same size and time: the specs are the host's, not the charts'"

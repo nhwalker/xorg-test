@@ -50,6 +50,16 @@ _ev_one() { printf '%s' "$*" | tr '\t\n\r' '   '; }
 # writes again (Requirements.md S9.1.5). The command's own status is not kept.
 first_of() { local o; o=$("$@" 2>/dev/null) || true; printf '%s' "${o%%$'\n'*}"; }
 
+# An assertion over a generated artefact (a CDI spec, an Xorg config, a unit
+# as systemd has it, a rendered chart) reads it without its comment lines, so
+# a comment that names what is asserted cannot answer it (Requirements.md
+# S9.1.2). gen_grep takes grep's options and pattern, then the file;
+# gen_grep_text the same, then the text. Each keeps grep's own matching and
+# exit status. No pipe: the comments are dropped before grep reads a line.
+gen_uncommented() { grep -v -E '^[[:space:]]*(#|;)' -- "$@" || true; }
+gen_grep() { local t; t=$(gen_uncommented "${@: -1}"); grep "${@:1:$#-1}" <<<"$t"; }
+gen_grep_text() { local t; t=$(gen_uncommented <<<"${@: -1}"); grep "${@:1:$#-1}" <<<"$t"; }
+
 ev_log() { # <kind> <text>
     [ -n "$EV_ROOT" ] || return 0
     local line

@@ -81,7 +81,7 @@ ev_begin S5.4.2 "Real generation, transient failure, no-downgrade, recovery to s
 log "cdi converger: stub on a GPU-less host"
 rm -f "$SPEC"
 cdi_leg 1-stub "no toolkit, no hardware" || fail "the converger failed on a GPU-less host"
-grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub spec not written"
+gen_grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub spec not written"
 ev_pass "no toolkit and no hardware: the stub (NVIDIA_CDI_STUB=1)"
 
 log "cdi converger: real generation with (fake) toolkit + hardware"
@@ -95,21 +95,21 @@ chmod +x "$FAKEBIN/nvidia-ctk"
 touch /dev/nvidiactl
 cdi_leg 2-generate "a (fake) toolkit and /dev/nvidiactl: nvidia-ctk generates the real spec" PATH="$FAKEBIN:$PATH" \
     || fail "the converger failed with a working toolkit"
-grep -q GENERATED "$SPEC" || fail "generation path did not write the real spec"
+gen_grep -q GENERATED "$SPEC" || fail "generation path did not write the real spec"
 ev_pass "toolkit and hardware: the real spec nvidia-ctk generated (GENERATED=1)"
 
 log "cdi converger: transient toolkit failure keeps the real spec"
 printf '#!/bin/sh\nexit 1\n' > "$FAKEBIN/nvidia-ctk"
 cdi_leg 3-transient "nvidia-ctk fails while the hardware is still there" PATH="$FAKEBIN:$PATH" || true
 grep -q keeping <<<"$CDI_OUT" || fail "no keep on transient failure"
-grep -q GENERATED "$SPEC" || fail "real spec lost on transient failure"
+gen_grep -q GENERATED "$SPEC" || fail "real spec lost on transient failure"
 ev_pass "a failing nvidia-ctk keeps the real spec (the converger says it is keeping it)"
 
 log "cdi converger: no downgrade while hardware visible; stub after removal"
 rm -f "$FAKEBIN/nvidia-ctk"
 cdi_leg 4-no-toolkit "the toolkit gone, /dev/nvidiactl still there" || true
 grep -q keeping <<<"$CDI_OUT" || fail "downgraded to stub despite visible hardware"
-grep -q GENERATED "$SPEC" || fail "real spec lost while hardware visible"
+gen_grep -q GENERATED "$SPEC" || fail "real spec lost while hardware visible"
 ev_pass "no toolkit but the hardware visible: the real spec is kept, no downgrade"
 rm -f /dev/nvidiactl
 # The driver's module loaded and its device node not there yet (the race
@@ -121,14 +121,14 @@ ev_save 5-modules "EV-STATE: the fabricated module list the next leg reads (CDI_
     grep -n '^nvidia ' "$MODS" >/dev/null || true
 cdi_leg 5-module "no toolkit, no /dev/nvidiactl, the nvidia module loaded (CDI_PROC_MODULES lists it)" CDI_PROC_MODULES="$MODS" || true
 grep -q keeping <<<"$CDI_OUT" || fail "downgraded to stub despite the nvidia module loaded"
-grep -q GENERATED "$SPEC" || fail "real spec lost while the nvidia module is loaded"
+gen_grep -q GENERATED "$SPEC" || fail "real spec lost while the nvidia module is loaded"
 ev_pass "no toolkit and no device node, but the nvidia module loaded: the real spec is kept, no downgrade"
 rm -f "$MODS"
 ev_save 6-proc-modules "EV-STATE: grep -c '^nvidia ' /proc/modules on the runner: the next leg reads the real list, which has no nvidia module (0)" \
     grep -c '^nvidia ' /proc/modules >/dev/null || true
 ! grep -q '^nvidia ' /proc/modules || fail "this runner has an nvidia module loaded: the leg back to the stub cannot run here"
 cdi_leg 6-recovered "neither the toolkit nor the hardware, and no nvidia module (the runner's own /proc/modules)" || fail "the converger failed after the hardware went"
-grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub not restored after hardware removal"
+gen_grep -q NVIDIA_CDI_STUB "$SPEC" || fail "stub not restored after hardware removal"
 ev_pass "neither toolkit nor hardware nor module: back to the stub"
 ev_end
 
@@ -136,22 +136,22 @@ ev_end
 log "client cdi: defaults write two disjoint specs"
 rm -f "$DISPLAY_SPEC" "$AUDIO_SPEC"
 "$CLIENT_CDI" >/dev/null
-grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" || fail "display spec kind wrong"
-grep -q 'kind: desktop.local/audio'   "$AUDIO_SPEC"   || fail "audio spec kind wrong"
-grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "display spec missing default DISPLAY"
-grep -q 'hostPath: /tmp/.X11-unix' "$DISPLAY_SPEC" || fail "display spec missing X11 mount"
-grep -q 'hostPath: /run/desktop-audio' "$AUDIO_SPEC" || fail "audio spec missing audio mount"
+gen_grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" || fail "display spec kind wrong"
+gen_grep -q 'kind: desktop.local/audio'   "$AUDIO_SPEC"   || fail "audio spec kind wrong"
+gen_grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" || fail "display spec missing default DISPLAY"
+gen_grep -q 'hostPath: /tmp/.X11-unix' "$DISPLAY_SPEC" || fail "display spec missing X11 mount"
+gen_grep -q 'hostPath: /run/desktop-audio' "$AUDIO_SPEC" || fail "audio spec missing audio mount"
 # The whole point of the split: neither device carries the other's edits.
-if grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' "$DISPLAY_SPEC"; then
+if gen_grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' "$DISPLAY_SPEC"; then
     fail "display spec leaks audio edits"
 fi
-if grep -qE 'DISPLAY=|X11-unix' "$AUDIO_SPEC"; then
+if gen_grep -qE 'DISPLAY=|X11-unix' "$AUDIO_SPEC"; then
     fail "audio spec leaks display edits"
 fi
 # rw, not ro: a read-only bind would let a client see the socket and then
 # fail connect(2) on it - the single most likely silent regression here.
-grep -q '"rbind", "rw"' "$DISPLAY_SPEC" || fail "display spec mounts are not rw"
-grep -q '"rbind", "rw"' "$AUDIO_SPEC"   || fail "audio spec mounts are not rw"
+gen_grep -q '"rbind", "rw"' "$DISPLAY_SPEC" || fail "display spec mounts are not rw"
+gen_grep -q '"rbind", "rw"' "$AUDIO_SPEC"   || fail "audio spec mounts are not rw"
 
 log "client cdi: the superseded combined spec is removed"
 printf 'cdiVersion: 0.5.0\nkind: desktop.local/display\ndevices: []\n' > /etc/cdi/desktop.yaml
@@ -178,17 +178,17 @@ ev_copy /etc/desktop-container/client-cdi.conf override "EV-CONFIG: the override
 "$CLIENT_CDI" >/dev/null
 ev_copy "$DISPLAY_SPEC" display-overridden "EV-CONFIG: the display spec written with the override file"
 ev_copy "$AUDIO_SPEC" audio-overridden "EV-CONFIG: the audio spec written with the override file"
-grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" || fail "override DISPLAY not applied"
+gen_grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" || fail "override DISPLAY not applied"
 ev_pass "DISPLAY_VALUE reaches the display spec (DISPLAY=:3)"
-grep -q 'hostPath: /tmp/other-x11' "$DISPLAY_SPEC" && grep -q 'containerPath: /tmp/other-x11' "$DISPLAY_SPEC" \
+gen_grep -q 'hostPath: /tmp/other-x11' "$DISPLAY_SPEC" && gen_grep -q 'containerPath: /tmp/other-x11' "$DISPLAY_SPEC" \
     || fail "override X11_DIR not applied to the display spec's mount"
 ev_pass "X11_DIR reaches the display spec's mount (/tmp/other-x11, both ends)"
-grep -q 'PULSE_SERVER=unix:/run/other-audio/pulse' "$AUDIO_SPEC" \
-    && grep -q 'PIPEWIRE_REMOTE=/run/other-audio/pipewire-0' "$AUDIO_SPEC" \
-    && grep -q 'hostPath: /run/other-audio' "$AUDIO_SPEC" \
+gen_grep -q 'PULSE_SERVER=unix:/run/other-audio/pulse' "$AUDIO_SPEC" \
+    && gen_grep -q 'PIPEWIRE_REMOTE=/run/other-audio/pipewire-0' "$AUDIO_SPEC" \
+    && gen_grep -q 'hostPath: /run/other-audio' "$AUDIO_SPEC" \
     || fail "override AUDIO_DIR not applied to the audio spec"
 ev_pass "AUDIO_DIR reaches the audio spec: PULSE_SERVER, PIPEWIRE_REMOTE and the mount"
-if grep -q 'other-x11' "$AUDIO_SPEC" || grep -q 'other-audio' "$DISPLAY_SPEC"; then
+if gen_grep -q 'other-x11' "$AUDIO_SPEC" || gen_grep -q 'other-audio' "$DISPLAY_SPEC"; then
     fail "an override crossed into the other device's spec"
 fi
 ev_pass "each override lands in its own spec only"
@@ -213,9 +213,9 @@ if ev_save rejected "the generator on the malformed value: its message and exit 
     fail "generator accepted a malformed DISPLAY_VALUE"
 fi
 ev_pass "the generator rejects DISPLAY_VALUE=nonsense (non-zero exit)"
-grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" \
+gen_grep -q 'DISPLAY=:3' "$DISPLAY_SPEC" \
     || fail "failed run clobbered the display spec (validation must precede any write)"
-grep -q '/run/other-audio' "$AUDIO_SPEC" \
+gen_grep -q '/run/other-audio' "$AUDIO_SPEC" \
     || fail "failed run clobbered the audio spec (validation must precede any write)"
 ev_pass "before any write: both specs still carry the previous overrides"
 ev_save cdi-rejected "EV-STATE: ls -la /etc/cdi after the rejected run" ls -la /etc/cdi >/dev/null || true
@@ -226,8 +226,8 @@ rm -f /etc/desktop-container/client-cdi.conf
 "$CLIENT_CDI" >/dev/null
 ev_copy "$DISPLAY_SPEC" display-defaults "EV-CONFIG: the display spec once the override file is removed"
 ev_copy "$AUDIO_SPEC" audio-defaults "EV-CONFIG: the audio spec once the override file is removed"
-grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" && grep -q 'hostPath: /tmp/.X11-unix' "$DISPLAY_SPEC" \
-    && grep -q 'hostPath: /run/desktop-audio' "$AUDIO_SPEC" \
+gen_grep -q 'DISPLAY=:0' "$DISPLAY_SPEC" && gen_grep -q 'hostPath: /tmp/.X11-unix' "$DISPLAY_SPEC" \
+    && gen_grep -q 'hostPath: /run/desktop-audio' "$AUDIO_SPEC" \
     || fail "defaults not restored after removing the override"
 ev_pass "with the file removed the defaults return (DISPLAY=:0, /tmp/.X11-unix, /run/desktop-audio)"
 ev_end
@@ -345,7 +345,7 @@ shopt -u nullglob
 ev_pass "the runner has no sound card: no /dev/snd/controlC*"
 ev_end
 
-log "apply the deploy tree (verbatim README command)"
+log "apply the deploy tree: README.md's first Install commands, typed for this runner (tmpfiles' failures on the runner's own entries tolerated)"
 rsync -a --chown=root:root deploy/host/ /
 [ -L /etc/systemd/system/getty@tty1.service ] || fail "getty mask did not survive as a symlink"
 [ "$(readlink /etc/systemd/system/default.target)" = /usr/lib/systemd/system/multi-user.target ] \
@@ -440,8 +440,8 @@ chmod 755 "$tx/tool"
 out=$(tools_case populated "one regular file") || fail "desktop-tools-cdi failed on a populated TOOLS_DIR"
 [ -e "$TOOLS_SPEC" ] || fail "a populated TOOLS_DIR produced no spec"
 ev_copy "$TOOLS_SPEC" spec "EV-CONFIG: the spec written for the populated directory"
-grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' "$TOOLS_SPEC" && grep -q "hostPath: $tx" "$TOOLS_SPEC" \
-    && grep -q '"rbind", "ro"' "$TOOLS_SPEC" || fail "the spec lacks DESKTOP_TOOLS_BIN, the TOOLS_DIR mount or ro"
+gen_grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' "$TOOLS_SPEC" && gen_grep -q "hostPath: $tx" "$TOOLS_SPEC" \
+    && gen_grep -q '"rbind", "ro"' "$TOOLS_SPEC" || fail "the spec lacks DESKTOP_TOOLS_BIN, the TOOLS_DIR mount or ro"
 ev_pass "one regular file: a spec with DESKTOP_TOOLS_BIN and a read-only mount of TOOLS_DIR"
 n_rel=$(line_in "$out" 'nothing to label')
 n_wrote=$(line_in "$out" '^wrote ')
@@ -531,9 +531,9 @@ for u in desktop-client-cdi desktop-selinux; do
     [ "$(systemctl is-enabled "$u.service")" = enabled ] \
         || fail "$u.service not enabled for multi-user.target after rsync"
 done
-grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" \
+gen_grep -q 'kind: desktop.local/display' "$DISPLAY_SPEC" \
     || fail "display CDI spec missing after the tree boot"
-grep -q 'kind: desktop.local/audio' "$AUDIO_SPEC" \
+gen_grep -q 'kind: desktop.local/audio' "$AUDIO_SPEC" \
     || fail "audio CDI spec missing after the tree boot"
 
 # The toolkit delivery chain, end to end on this runner: the desktop container
@@ -550,9 +550,9 @@ done
     || fail "the desktop did not publish screenshot into $TOOLS_BIN"
 [ "$(stat -c %a "$TOOLS_BIN/screenshot")" = 755 ] \
     || fail "published screenshot is not mode 755"
-grep -q 'kind: desktop.local/tools' "$TOOLS_SPEC" \
+gen_grep -q 'kind: desktop.local/tools' "$TOOLS_SPEC" \
     || { tools_diag; fail "tools CDI spec missing after the desktop published its toolkit"; }
-grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' "$TOOLS_SPEC" \
+gen_grep -q 'DESKTOP_TOOLS_BIN=/opt/desktop-tools/bin' "$TOOLS_SPEC" \
     || fail "tools spec does not inject DESKTOP_TOOLS_BIN"
 log "toolkit published and desktop.local/tools advertised by the .path unit"
 
@@ -1301,13 +1301,13 @@ if [ -z "$mon" ]; then
     fail "the declared layout produced no /etc/X11/xorg.conf.d/30-monitors.conf"
 fi
 ev_text generated "EV-CONFIG: the 30-monitors.conf the container generated from it at this start" "$mon"
-echo "$mon" | grep -q 'Identifier  "DP-2"' || fail "generated config does not name the declared outputs"
+gen_grep_text -q 'Identifier  "DP-2"' "$mon" || fail "generated config does not name the declared outputs"
 ev_pass "the generated config names the declared outputs"
 # A runner with no KMS falls through to the modesetting branch, which is the
 # one that has to invent a timing; on a runner with a DRM device it is the
 # same branch, because no runner has an NVIDIA GPU.
-echo "$mon" | grep -q 'Option      "Enable" "true"' || fail "outputs not forced enabled"
-echo "$mon" | grep -q 'Modeline "1920x1080_60.00"' || fail "no derived timing for the declared mode"
+gen_grep_text -q 'Option      "Enable" "true"' "$mon" || fail "outputs not forced enabled"
+gen_grep_text -q 'Modeline "1920x1080_60.00"' "$mon" || fail "no derived timing for the declared mode"
 ev_pass "it forces them enabled, with the derived 1920x1080_60.00 timing"
 layout_log=$(podman logs desktop 2>/dev/null | grep 'xorg-monitor-conf: fixed layout' || true)
 ev_text generator-log "EV-LOG-DESKTOP: the generator's 'fixed layout' lines in the desktop's log (one per start that applied a layout)" \
@@ -1333,8 +1333,11 @@ esac
 ev_pass "the preflight warns about both names: $pf"
 ev_end
 # Put the shipped default back, so nothing after this point sees a layout the
-# tree does not actually ship.
+# tree does not actually ship; the desktop's next start (S5.7.7's, below)
+# reads it.
 install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf
+cmp -s deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf \
+    || fail "the shipped monitors.conf is not back in /etc/desktop-container"
 
 # After the restart above: what it changed.
 log "after the restart: both units moved, the toolkit republished, the container's key renewed"
