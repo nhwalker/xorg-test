@@ -1157,9 +1157,10 @@ eff=$(ev_save sshd-config "EV-STATE: sshd -T's authorizedkeysfile: what sshd mak
 grep -qix 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u' <<<"$eff" \
     || fail "sshd's AuthorizedKeysFile is '$eff', want the stock .ssh/authorized_keys first and /etc/ssh/authorized_keys.d/%u after it"
 ev_pass "sshd reads both paths, the stock home-dir one first: $eff"
+# The journal is polled (log_wait): a login's own "Accepted" line can lag it.
 login=$(ev_save login "EV-STATE: a fresh ssh login as rocky, its home-dir key file, and from sshd's journal this boot: the reload, then the newest accepted key login for rocky" \
-    vm_ssh_quick 'echo "logged in as $(id -un)"; ls -l ~/.ssh/authorized_keys; sudo journalctl -u sshd -b --no-pager -o short-iso | grep -m1 "Received SIGHUP"; sudo journalctl -u sshd -b --no-pager -o short-iso | grep "Accepted publickey for rocky" | tail -1') \
-    || fail "ssh as rocky failed with the drop-in active"
+    log_wait 10 1 'Accepted publickey for rocky' vm_ssh_quick 'echo "logged in as $(id -un)"; ls -l ~/.ssh/authorized_keys; sudo journalctl -u sshd -b --no-pager -o short-iso | grep -m1 "Received SIGHUP"; sudo journalctl -u sshd -b --no-pager -o short-iso | grep "Accepted publickey for rocky" | tail -1') \
+    || fail "ssh as rocky failed with the drop-in active, or sshd's journal shows no key login accepted for rocky"
 grep -qx 'logged in as rocky' <<<"$login" || fail "the login did not land as rocky"
 hup=$(grep -m1 'Received SIGHUP' <<<"$login" | cut -d' ' -f1)
 acc=$(grep 'Accepted publickey for rocky' <<<"$login" | tail -1 | cut -d' ' -f1)

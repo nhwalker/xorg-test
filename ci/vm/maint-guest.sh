@@ -103,6 +103,8 @@ mt_no_getty() { # <since epoch> <when>
     units=$(ev_save gettys "EV-STATE: systemctl list-units 'getty@tty*' 'autovt@*' $2: nothing" \
         systemctl list-units --no-pager --no-legend 'getty@tty*' 'autovt@*') || true
     [ -z "$(grep -v '^[[:space:]]*$' <<<"$units")" ] || fail "a getty runs on a VT $2: $units"
+    # An absence, polled: any getty line, looked for over 3 s (none is the pass).
+    log_wait 3 1 . journalctl --no-pager -q -o short-precise --since "@$1" -u 'getty@*' -u 'autovt@*' >/dev/null || true
     j=$(ev_save getty-journal "EV-LOG-JOURNAL: journalctl -q -u 'getty@*' -u 'autovt@*' since $(date -u -d "@$1" +%H:%M:%S) UTC: empty, no getty on any VT did anything" \
         journalctl --no-pager -q -o short-precise --since "@$1" -u 'getty@*' -u 'autovt@*') || true
     [ -z "$(grep -v '^[[:space:]]*$' <<<"$j")" ] || fail "a getty was active $2: $(grep -m1 . <<<"$j")"
@@ -271,7 +273,8 @@ mt_firstboot() {
     [ -n "$xorg" ] && [ -n "$mwm" ] || fail "no Xorg or no mwm of the desktop user's on the host (Xorg '$xorg', mwm '$mwm')"
     m_x=$(awk -v t="$tck" '{printf "%.2f", $22 / t}' "/proc/$xorg/stat") || fail "could not read Xorg's start time"
     m_mwm=$(awk -v t="$tck" '{printf "%.2f", $22 / t}' "/proc/$mwm/stat") || fail "could not read mwm's start time"
-    jl=$(journalctl -b -u sshd -o json --no-pager) || fail "could not read sshd's journal for this boot"
+    jl=$(log_wait 30 1 '"MESSAGE":"Accepted ' sh -c 'journalctl -b -u sshd -o json --no-pager 2>/dev/null') \
+        || fail "no login accepted in sshd's journal for this boot within 30 s (this run's own ssh login is one)"
     first=$(python3 -c '
 import json, sys
 for line in sys.stdin:
@@ -787,6 +790,7 @@ mt_layout_pinned() {
     m0=$(grep -m1 '\*' "$EV_DIR/$(mt_get S10.3.1-xrv-before)" | awk '{print $1}')
     m1=$(grep -m1 '\*' "$EV_DIR/$EV_LAST" | awk '{print $1}')
     ev_note "the current mode's name: $m0 autodetected, $m1 pinned (the expected change, when there is one, is to the cvt(1) name)"
+    log_wait 30 1 '^preflight: (PASS|WARN|FAIL): .*monitor layout' podman logs desktop >/dev/null || true
     out=$(ev_save log-lines "EV-LOG-DESKTOP: the desktop log's xorg-monitor-conf: and preflight: lines" \
         sh -c 'podman logs desktop 2>&1 | grep -E "xorg-monitor-conf:|preflight:"') || true
     grep -q 'preflight: PASS: fixed monitor layout declares' <<<"$out" || fail "the container preflight did not print its fixed-layout PASS line"
@@ -837,6 +841,8 @@ mt_layout_case_check() { # the same case, after the restart
     mt_begin S10.3.2
     desk_back
     read -r name mode pos _ <<<"$(mt_captured)"
+    # The generator's line comes after the preflight's in a start's log.
+    log_wait 30 1 '^xorg-monitor-conf: ' podman logs desktop >/dev/null || true
     log=$(ev_save "monconf-$1" "EV-LOG-DESKTOP: podman logs desktop | grep xorg-monitor-conf, the case '$1'" \
         sh -c 'podman logs desktop 2>&1 | grep xorg-monitor-conf') || true
     pf=$(ev_save "preflight-$1" "EV-LOG-DESKTOP: podman logs desktop | grep preflight:, the case '$1'" \
@@ -1153,6 +1159,7 @@ mt_hostterm_after() {
     for f in "$MT_HSKEY" "$MT_HSAK"; do
         if [ -e "$f" ]; then ev_fail "$f still exists after the switch and a reboot"; else ev_pass "$f does not exist"; fi
     done
+    log_wait 30 1 '^preflight: (PASS|WARN|FAIL): .*host shell' podman logs desktop >/dev/null || true
     pf=$(ev_save preflight-lines "EV-LOG-DESKTOP: podman logs desktop | grep -E 'preflight:|host-shell-setup:', this boot" \
         sh -c 'podman logs desktop 2>&1 | grep -E "preflight:|host-shell-setup:"') || true
     if grep -q 'WARN: no host shell material' <<<"$pf"; then
@@ -1183,6 +1190,7 @@ mt_hostterm_start_state() {
     local pf
     mt_begin S10.3.6
     desk_back
+    log_wait 30 1 '^preflight: (PASS|WARN|FAIL): .*host shell' podman logs desktop >/dev/null || true
     pf=$(ev_save preflight-lines "EV-LOG-DESKTOP: podman logs desktop | grep -E 'preflight:|host-shell-setup:', the desktop restarted without the material" \
         sh -c 'podman logs desktop 2>&1 | grep -E "preflight:|host-shell-setup:"') || true
     grep -q 'WARN: no host shell material' <<<"$pf" || fail "the start state is not S10.3.5's intended one: the container's preflight does not WARN 'no host shell material'"
@@ -1393,6 +1401,7 @@ mt_drm_remedy() {
 mt_drm_after() {
     local out n
     mt_begin S10.5.1
+    log_wait 30 1 '^X\.Org X Server ' podman logs --since "$(mt_get since-remedy)" desktop >/dev/null || true
     out=$(ev_save remedy-log "EV-LOG-DESKTOP: podman logs desktop since the kill: the session's next start" \
         podman logs --since "$(mt_get since-remedy)" desktop) || true
     n=$(grep -c 'session exited' <<<"$out" || true)

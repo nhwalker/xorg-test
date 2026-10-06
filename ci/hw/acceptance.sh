@@ -242,6 +242,8 @@ gpu_mode_checks() { # the GPU mode, into the open story; sets GPU_CONF GPU_LOG G
     GPU_CONF=$(ev_save gpu-conf "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf in the desktop" podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || true
     if conf_driver_is nvidia <<<"$GPU_CONF"; then ev_pass '20-gpu.conf says Driver "nvidia"'
     else ev_fail '20-gpu.conf does not say Driver "nvidia"'; fi
+    # xorg-gpu-conf's decision comes after the preflight's lines in a start's log.
+    log_wait 60 2 'xorg-gpu-conf: decision:' gpu_lines >/dev/null || true
     GPU_LOG=$(ev_save gpu-log "EV-LOG-DESKTOP: podman logs desktop | grep -E 'xorg-gpu-conf|preflight:'" gpu_lines) || true
     if grep -q 'preflight: PASS: NVIDIA GPU injected together with X driver module' <<<"$GPU_LOG"; then
         ev_pass "the container preflight: PASS: NVIDIA GPU injected together with X driver module"
@@ -309,6 +311,7 @@ no_xdriver() {
     fi
     restart_desktop restart-staged || ev_fail "the desktop did not come back after the restart"
     conf=$(ev_save gpu-conf "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf in the desktop" podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || true
+    log_wait 60 2 'xorg-gpu-conf: decision:' gpu_lines >/dev/null || true
     log=$(ev_save gpu-log "EV-LOG-DESKTOP: podman logs desktop | grep -E 'xorg-gpu-conf|preflight:'" gpu_lines) || true
     if conf_driver_is modesetting <<<"$conf"; then ev_pass "20-gpu.conf takes the modesetting branch"
     else ev_fail "20-gpu.conf is not the modesetting branch"; fi
@@ -390,6 +393,7 @@ stub_toolkit() {
     hpf=$(ev_save host-preflight "EV-STATE: desktop-preflight on the host" desktop-preflight) || true
     if grep -q 'FAIL: STUB CDI spec but NVIDIA hardware present' <<<"$hpf"; then ev_pass "the host preflight FAILs: STUB CDI spec but NVIDIA hardware present"
     else ev_fail "the host preflight does not FAIL on the stub with hardware"; fi
+    log_wait 60 2 'xorg-gpu-conf: decision:' podman logs desktop >/dev/null || true
     cpf=$(ev_save ctr-preflight "EV-LOG-DESKTOP: the container preflight" sh -c 'podman logs desktop 2>&1 | grep preflight:') || true
     if grep -q 'FAIL: NVIDIA hardware visible but the host injected a STUB CDI spec' <<<"$cpf"; then ev_pass "the container preflight FAILs: NVIDIA hardware visible but a STUB CDI spec"
     else ev_fail "the container preflight does not FAIL on the stub with hardware"; fi
@@ -436,6 +440,7 @@ no_modeset() {
         else ev_pass "no /dev/dri/card* on the host"; fi
         if spec_is_stub; then ev_pass "no injection: the stub spec"; else ev_fail "the spec is not the stub"; fi
         sleep 20
+        log_wait 30 2 'preflight: FAIL: no /dev/dri/card' podman logs desktop >/dev/null || true
         cpf=$(ev_save ctr-preflight "EV-LOG-DESKTOP: podman logs desktop | grep preflight:, the desktop's last start" sh -c 'podman logs desktop 2>&1 | grep preflight:') || true
         if grep -q 'FAIL: no /dev/dri/card\* visible.*nvidia_drm.modeset=1' <<<"$cpf"; then
             ev_pass "the container preflight FAILs: no /dev/dri/card* visible, naming nvidia_drm.modeset=1"
@@ -493,6 +498,7 @@ stale_spec() {
     sleep 20
     if systemctl is-active --quiet desktop.service; then ev_fail "the desktop started on a stale spec"
     else ev_pass "the desktop does not start on the stale spec ($(systemctl show -p ActiveState --value desktop.service))"; fi
+    log_wait 30 2 "$ver-gone|[Nn]o such file" journalctl --no-pager -o short-precise -u desktop.service --since "$jr" >/dev/null || true
     out=$(ev_save journal-stale "EV-LOG-JOURNAL: journalctl -u desktop.service since the restart: the creation error" \
         journalctl --no-pager -o short-precise -u desktop.service --since "$jr") || true
     if grep -qiE "$ver-gone|no such file" <<<"$out"; then ev_pass "the journal names the failure: $(grep -m1 -iE "$ver-gone|no such file" <<<"$out" | cut -c1-200)"
@@ -880,6 +886,9 @@ gpu_from_docs() {
         gpu_mode_checks
         hpf=$(ev_save host-preflight "EV-STATE: desktop-preflight on the host" desktop-preflight) || true
         if grep -q 'done: 0 FAIL' <<<"$hpf"; then ev_pass "the host preflight: 0 FAILs"; else ev_fail "the host preflight has FAILs: $(grep -m1 'FAIL:' <<<"$hpf")"; fi
+        # An absence: read once xorg-gpu-conf's decision, which follows the
+        # preflight's lines, is in the log.
+        log_wait 60 2 'xorg-gpu-conf: decision:' podman logs desktop >/dev/null || true
         cpf=$(ev_save ctr-preflight "EV-LOG-DESKTOP: the container preflight" sh -c 'podman logs desktop 2>&1 | grep preflight:') || true
         if ! grep -q 'preflight: FAIL:' <<<"$cpf"; then ev_pass "the container preflight: 0 FAILs"; else ev_fail "the container preflight has FAILs: $(grep -m1 'FAIL:' <<<"$cpf")"; fi
         observe "the desktop came up on its own after the documented reboot, accelerated, with no step beyond the documents"

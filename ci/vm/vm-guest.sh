@@ -312,7 +312,7 @@ phase_deploy() {
     [ -n "$first" ] || fail "no DRM connector reads connected on the VM"
     card=/dev/dri/${first%%-*}
     ev_pass "the first connected connector is $first, so the card is $card"
-    decision=$(podman logs desktop 2>/dev/null | tr -d '\r' || true)
+    decision=$(log_wait 30 1 '^xorg-gpu-conf: decision:' podman logs desktop) || true
     decision=$(awk '/^xorg-gpu-conf: /{print} /^xorg-gpu-conf: decision:/{exit}' <<<"$decision")
     ev_text log "EV-LOG-DESKTOP: xorg-gpu-conf's lines in the desktop's log this boot, up to its decision" "${decision:-(none)}"
     grep -qx "xorg-gpu-conf: decision: modesetting driver on $card" <<<"$decision" \
@@ -1024,7 +1024,8 @@ EOF
 
     # S3.4.11's T3 half: names that exist pass the preflight.
     ev_begin S3.4.11 "Preflight warns about unknown output names" T3
-    pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*monitor layout' | tail -n1 || true)
+    pf=$(log_wait 30 1 '^preflight: .*monitor layout' podman logs desktop) || true
+    pf=$(grep '^preflight: .*monitor layout' <<<"$pf" | tail -n1 || true)
     ev_text preflight "EV-LOG-DESKTOP: the container preflight's monitor-layout line, Virtual-1 and Virtual-2 declared" "${pf:-(none)}"
     ev_save drm "EV-STATE: ls /sys/class/drm: the connectors the declared names are matched against" ls /sys/class/drm >/dev/null || true
     [ "$pf" = "preflight: PASS: fixed monitor layout declares Virtual-1 Virtual-2, all present as DRM connectors" ] \
@@ -1245,7 +1246,8 @@ layout_restore() {
     ev_save xorg-conf-d "EV-STATE: ls /etc/X11/xorg.conf.d in the container after the restore: no 30-monitors.conf" \
         podman exec desktop ls -l /etc/X11/xorg.conf.d >/dev/null || true
     ev_pass "after the restore the container has no 30-monitors.conf (asserted above)"
-    noop=$(podman logs desktop 2>/dev/null | tr -d '\r' | grep '^xorg-monitor-conf: ' || true)
+    noop=$(log_wait 30 1 '^xorg-monitor-conf: ' podman logs desktop) || true
+    noop=$(grep '^xorg-monitor-conf: ' <<<"$noop" || true)
     ev_text generator-log "EV-LOG-DESKTOP: the generator's lines in the desktop's log at this start" "${noop:-(none)}"
     grep -q 'no fixed layout' <<<"$noop" || fail "the generator did not log its no-op after the restore"
     ev_pass "the generator logged its no-op"
@@ -1752,7 +1754,9 @@ deploy_checks() {
     tty=$(ps -o tty= -p "$lead" | tr -d ' ')
     [ "$tty" = "?" ] || fail "desktop-session-lead has a controlling tty: $tty"
     ev_pass "the host session's lead process has no controlling tty ($lead: ?)"
-    dlog=$(podman logs desktop 2>&1 | tr -d '\r')
+    # An absence: read once the log has the X server's banner, which comes
+    # after setsid -c took the tty (or failed to).
+    dlog=$(log_wait 30 1 '^X\.Org X Server ' podman logs desktop) || true
     hits=$(grep 'failed to set the controlling terminal' <<<"$dlog" || true)
     ev_text grep "EV-LOG-DESKTOP: the desktop log's lines saying 'failed to set the controlling terminal'" "${hits:-(none)}"
     [ -z "$hits" ] || fail "the desktop's log says it failed to set the controlling terminal"
@@ -2067,6 +2071,11 @@ deploy_reboot() {
     done
     ev_pass "the three client directories are container_file_t again after the reboot (/run/desktop-audio is new this boot)"
     ev_save cdi "EV-STATE: ls -l --full-time /etc/cdi after the reboot" ls -l --full-time /etc/cdi >/dev/null || true
+    # An absence, polled: a seat-prep line, looked for over 5 s (none is the
+    # pass). systemd's own "Finished" line is no marker for it: journald
+    # reads the unit's output and systemd's messages from different sockets.
+    log_wait 5 1 'seat-prep: ' \
+        journalctl -q -b --no-pager -o short-iso -u desktop-seat-prep.service >/dev/null || true
     j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -b -u desktop-seat-prep: this boot's seat-prep, on a converged seat" \
         journalctl -b --no-pager -o short-iso -u desktop-seat-prep.service) || true
     ! grep -q 'seat-prep: ' <<<"$j" || fail "seat-prep changed something this boot: $(grep -m3 'seat-prep: ' <<<"$j")"
@@ -2078,7 +2087,8 @@ deploy_reboot() {
     ev_begin S5.3.1 "Dirty seat is walked back" T3
     ev_save logind-journal "EV-LOG-JOURNAL: journalctl -b -u systemd-logind: logind this boot, started once" \
         journalctl -b --no-pager -o short-iso -u systemd-logind.service >/dev/null || true
-    n=$(journalctl -b --no-pager -o cat -u systemd-logind.service | grep -c '^Started ' || true)
+    n=$(log_wait 30 1 '^Started ' journalctl -b --no-pager -o cat -u systemd-logind.service) || true
+    n=$(grep -c '^Started ' <<<"$n" || true)
     [ "$n" = 1 ] || fail "systemd-logind started $n times this boot, want once"
     ev_pass "on the steady-state boot seat-prep logged nothing, and logind started once, at boot: no restart"
     ev_end
@@ -2116,7 +2126,7 @@ after:  $fp1"
 session_groups() {
     local dlog table g line cg node hg pf k
     ev_begin S3.2.2 "Group gids are aligned to the host's device nodes" T3
-    dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+    dlog=$(log_wait 30 1 '^align-device-groups: desktop user:' podman logs desktop) || true
     ev_text align "EV-LOG-DESKTOP: align-device-groups' lines in this container's log (its start runs every group; an audio restart runs the audio group alone)" \
         "$(grep '^align-device-groups:' <<<"$dlog" || echo '(none)')"
     table=$(awk '/^align-device-groups: final state:/ {f = 1; next}
@@ -2180,7 +2190,9 @@ verify_mwm_exit() {
     ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across mwm's exit (Xorg and mwm new, desktop-init the same)" "$p_before" "$EV_LAST"
     ev_save log "EV-LOG-DESKTOP: podman logs desktop from mwm's SIGTERM on" \
         sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
-    since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) | tr -d '\r' || true)
+    # The session's exit line is the last of its end: a postmortem would
+    # come before it.
+    since=$(log_wait 30 1 '^desktop-init: session exited \(rc=' sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))") || true
     grep -q '^desktop-init: session exited (rc=0); restarting in 3s' <<<"$since" \
         || fail "desktop-init did not log a clean end after mwm's exit: no 'session exited (rc=0); restarting in 3s'"
     ! grep -q '^postmortem:' <<<"$since" || fail "a postmortem ran for mwm's clean exit"
@@ -2219,7 +2231,7 @@ $SESSION_WANTS: $(ls -l "$SESSION_WANTS" 2>&1 || true)"
             systemctl start desktop.service
             desk_back
             st=$(systemctl is-active desktop-session.service || true)
-            dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+            dlog=$(log_wait 30 1 '^desktop-init: (.*runtime dir|no host login session)' podman logs desktop) || true
             ln=$(grep '^desktop-init: .*runtime dir\|^desktop-init: no host login session' <<<"$dlog" || true)
             ev_text disabled-started "EV-STATE: desktop-session and desktop-init's runtime-dir line after the desktop started with the unit disabled" \
                 "is-enabled: $(systemctl is-enabled desktop-session.service 2>&1 || true)
@@ -2261,7 +2273,7 @@ $(loginctl list-sessions --no-pager 2>&1)
             desk_back
             st=$(systemctl show -p LoadState --value desktop-session.service)
             [ "$st" = not-found ] || fail "desktop-session is still known to systemd: LoadState $st"
-            dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+            dlog=$(log_wait 30 1 '^desktop-init: (.*runtime dir|no host login session)' podman logs desktop) || true
             ev_text log "EV-LOG-DESKTOP: desktop-init's lines and the audio stack's start, with no desktop-session unit" \
                 "$(grep -m20 '^desktop-init: \|^start-audio: ' <<<"$dlog")"
             grep -q '^desktop-init: no host login session appeared; creating /run/user/61000 standalone' <<<"$dlog" \
@@ -2302,7 +2314,7 @@ desktop.service: $(systemctl is-active desktop.service 2>&1 || true)"
             systemctl start desktop.service
             desk_back
             wait_for 30 1 "desktop-session active again" systemctl is-active --quiet desktop-session.service
-            dlog=$(podman logs desktop 2>&1 | tr -d '\r' || true)
+            dlog=$(log_wait 30 1 '^desktop-init: (.*runtime dir|no host login session)' podman logs desktop) || true
             grep -q 'runtime dir /run/user/61000 provided by the host login session' <<<"$dlog" \
                 || fail "back with desktop-session, desktop-init did not get the host's runtime dir"
             [ "$(systemctl is-enabled desktop-session.service)" = enabled ] || fail "desktop-session is not enabled again"
@@ -2383,6 +2395,8 @@ seat_tags() { # attach|fix
             j0=$(ev_since)
             systemctl restart desktop.service
             desk_back
+            log_wait 30 1 'seat-prep: removing custom seat attachment rule' \
+                journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$j0" >/dev/null || true
             j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -u desktop-seat-prep from the desktop's restart: seat-prep runs before every desktop start" \
                 journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$j0") || true
             grep -q 'seat-prep: removing custom seat attachment rule /etc/udev/rules.d/72-seat-' <<<"$j" \
@@ -2397,7 +2411,8 @@ seat_tags() { # attach|fix
             ! grep -q '^ID_SEAT=' <<<"$props" || fail "$ev still carries $(grep '^ID_SEAT=' <<<"$props")"
             [ -z "$(foreign_tags)" ] || fail "the udev database still has a foreign seat tag: $(foreign_entries | paste -sd' ' -)"
             ev_pass "the rule is gone and udev re-read the keyboard: $ev has no ID_SEAT, and no device in the udev database is tagged for another seat"
-            pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
+            pf=$(log_wait 30 1 '^preflight: .*seat' podman logs desktop) || true
+            pf=$(grep '^preflight: .*seat' <<<"$pf" || true)
             ev_text preflight-after "EV-LOG-DESKTOP: the container preflight's seat line at that start, after seat-prep" "${pf:-(none)}"
             grep -qx 'preflight: PASS: no foreign seat tags in the udev database' <<<"$pf" \
                 || fail "the preflight does not pass the seat check after seat-prep: ${pf:-no seat line}"
@@ -3557,6 +3572,7 @@ verify_postmortem() {
     ev_note "Xorg (pid $x_before) killed with SIGKILL just after $since"
     x_new() { local p; p=$(first_of podman exec desktop pgrep -x Xorg); [ -n "$p" ] && [ "$p" != "$x_before" ] && session_up; }
     wait_for 60 2 "a new X session after Xorg was killed with SIGKILL" x_new
+    log_wait 30 1 '^desktop-init: session exited \(rc=' podman logs --since "$since" desktop >/dev/null || true
     pm=$(ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log from just before the kill (podman logs --since $since): the session's exit, the postmortem, the new session" \
         podman logs --since "$since" desktop) || true
     pm=$(tr -d '\r' <<<"$pm")
@@ -4502,7 +4518,7 @@ verify_runtime() {
     # Read whole, then searched: `podman logs | grep -q` under pipefail fails
     # on podman's SIGPIPE once grep has its match.
     local dlog
-    dlog=$(podman logs desktop 2>&1 || true)
+    dlog=$(log_wait 30 1 'preflight: (PASS|WARN|FAIL): .*udev' podman logs desktop) || true
     grep -q 'preflight: PASS: host udev database mounted at /run/udev' <<<"$dlog" \
         || fail "the preflight did not pass its udev line"
     ev_pass "the container's preflight reports PASS: host udev database mounted at /run/udev"
@@ -4625,7 +4641,7 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
     ev_save log "EV-LOG-DESKTOP: podman logs desktop from the kill on" \
         sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
     local since
-    since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) || true)
+    since=$(log_wait 30 1 '^desktop-init: session exited \(rc=' sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))") || true
     grep -q 'desktop-init: session exited (rc=[0-9]*); restarting in 3s' <<<"$since" \
         || fail "desktop-init did not log 'session exited (rc=N); restarting in 3s' after the kill"
     ev_pass "desktop-init logged the session's exit and its restart in 3 s"
@@ -4689,7 +4705,7 @@ verify_audio_restarts() {
         ev_diff "pids-$victim" "EV-DIFF: the audio daemons across $victim's exit (all three new)" "$b" "$EV_LAST"
         ev_save "log-$victim" "EV-LOG-DESKTOP: podman logs desktop from $victim's kill on" \
             sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
-        since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) || true)
+        since=$(log_wait 30 1 '^desktop-init: audio stack exited \(rc=' sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))") || true
         grep -q "start-audio: $victim exited" <<<"$since" \
             || fail "start-audio did not log '$victim exited'"
         grep -q 'desktop-init: audio stack exited (rc=[0-9]*); restarting in 3s' <<<"$since" \
@@ -5358,7 +5374,7 @@ soundless() { # before|plugged|realign|played|after
             ev_save group-container "EV-STATE: getent group audio in the container: the image's gid, nothing having aligned it" podman exec desktop getent group audio >/dev/null || true
             [ -n "$cgid" ] && [ "$cgid" != "$SL_GID" ] || fail "the container's audio group is '${cgid:-absent}', not the image's own gid"
             ev_pass "the container's audio group is gid $cgid, the image's: it differs from the host's $SL_GID"
-            log=$(podman logs desktop 2>&1 | tr -d '\r')
+            log=$(log_wait 30 1 '^start-audio: started' podman logs desktop) || true
             ev_text align-boot "EV-LOG-DESKTOP: every align-device-groups line since the container started: the boot pass, then the audio supervisor's pass before the first audio start" \
                 "$(grep '^align-device-groups:' <<<"$log" || echo '(none)')"
             rows=$(sl_narrow_rows "$log")
@@ -5389,7 +5405,7 @@ soundless() { # before|plugged|realign|played|after
                 ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
             echo "$EV_LAST" > /run/ev-sl-daemons
             ev_save client-log-early "EV-LOG-CLIENT: the client's first tries, with no card's sink to play to" podman logs "$SL_CLIENT" >/dev/null || true
-            clog=$(sl_clog)
+            clog=$(log_wait 30 1 '^try 1 at ' sl_clog) || true
             grep -q '^try 1 at ' <<<"$clog" || fail "the client logged no failed try with no card"
             ! sl_played || fail "the client played with no card"
             ev_pass "the client runs and keeps trying: no card's sink yet"
@@ -5425,7 +5441,7 @@ soundless() { # before|plugged|realign|played|after
             ev_note "pipewire killed at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), the audio group then gid $old"
             wait_for 45 1 "the container's audio group on gid $SL_GID" sh -c "[ \"\$(podman exec desktop getent group audio | cut -d: -f3)\" = $SL_GID ]"
             wait_for 45 1 "the export answering again" audio_reachable
-            since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) | tr -d '\r')
+            since=$(log_wait 30 1 '^align-device-groups: audio: gid ' sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))") || true
             ev_text log-realign "EV-LOG-DESKTOP: podman logs desktop from pipewire's kill on: the stack's exit, the alignment, the new start" "$since"
             grep -qE "^align-device-groups: audio: gid $old -> $SL_GID \\(from /dev/snd/controlC[0-9]+\\)$" <<<"$since" \
                 || fail "no 'audio: gid $old -> $SL_GID' line from the alignment before the new start"

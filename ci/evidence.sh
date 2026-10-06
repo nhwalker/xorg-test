@@ -56,6 +56,31 @@ _ev_one() { printf '%s' "$*" | tr '\t\n\r' '   '; }
 # writes again (Requirements.md S9.1.5). The command's own status is not kept.
 first_of() { local o; o=$("$@" 2>/dev/null) || true; printf '%s' "${o%%$'\n'*}"; }
 
+# A log, read until it has the line an assertion is about: <cmd...> (podman
+# logs, journalctl, kubectl logs, or a helper that prints one) run every
+# <interval> s until a line of its output (stderr included, CRs dropped)
+# matches <ERE>, at most <tries> times. Prints the last output read, so
+# `log=$(log_wait ...)` hands the assertion all of it; returns 1 if no line
+# matched. A log lags what it records, journald most of all, so a log line
+# is polled where a process or a socket may be read once (Requirements.md
+# S9.1.4). An assertion that a line is absent reads after a log_wait for a
+# line the same stream writes later, or polls for the absent line itself
+# over a few seconds, its status 1 the pass.
+log_wait() { # <tries> <interval> <ERE> <cmd...>
+    local tries=$1 interval=$2 ere=$3 out="" i
+    shift 3
+    for ((i = 1; i <= tries; i++)); do
+        out=$("$@" 2>&1 | tr -d '\r') || true
+        if grep -qE -- "$ere" <<<"$out"; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+        [ "$i" = "$tries" ] || sleep "$interval"
+    done
+    printf '%s\n' "$out"
+    return 1
+}
+
 # An assertion over a generated artefact (a CDI spec, an Xorg config, a unit
 # as systemd has it, a rendered chart) reads it without its comment lines, so
 # a comment that names what is asserted cannot answer it (Requirements.md

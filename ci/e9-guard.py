@@ -11,6 +11,15 @@
           gives it a generated artefact;
   S9.1.3  the desktop's processes are found through /run/desktop-init.pid,
           never /proc/1 or a lookup by name;
+  S9.1.4  a log line an assertion reads is polled: every read of a
+          container log, the journal or a pod log in ci/'s shell (podman
+          logs, journalctl, kubectl logs, or a helper that prints one)
+          whose text an assertion reads goes through ci/evidence.sh's
+          log_wait, runs in a poll (a for over $(seq ...) or ((...)), a
+          while or until loop, or a function a poller runs), or follows a
+          poll of the same log in its function, or within 20 commands at a
+          script's top level (the log current to a line it waited for: how
+          an absence is read);
   S9.1.5  no reader that stops early (grep -q/-m/-l, head, sed q, awk exit,
           read, cmp, a loop or python that breaks) on a live pipeline under
           pipefail;
@@ -82,6 +91,9 @@ import tempfile
 # Exceptions, keyed on content, never on line numbers. Each must excuse a
 # finding in the tree (the self-test checks), so none outlives its reason.
 ALLOW = [
+    ("S9.1.4", "ci/smoke-deploy.sh", r"^cursor=\$\(journalctl -q -n 1 -o cat --show-cursor",
+     "the journal's position (its cursor), read once to bound the slice read after the unit's second run: "
+     "state, not a log line, which S9.1.4 lets be read directly"),
     ("S9.1.3", "ci/vm/vm-guest.sh", r"readlink /proc/1/ns/cgroup",
      "the host's pid 1 on purpose: its cgroup namespace is compared with the container's"),
     ("S9.1.3", "ci/vm/vm-guest.sh", r"cat /proc/1/environ 2>&1 > /dev/null; echo rc=",
@@ -2661,7 +2673,225 @@ def rule_s923(root, rep):
             f"{len(rep.violations('S9.2.3'))} violation(s)")
 
 
-RULES = {"S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
+# --- S9.1.4: a log line is polled ------------------------------------------------------
+
+LOG_READ = re.compile(r"\b(?:podman|docker)\s+(?:container\s+)?logs\b|\bjournalctl\b|\b(?:k3s\s+)?kubectl\s+logs\b")
+POLLERS = {"log_wait", "wait_for", "wait_until"}
+# What an assertion does with log text: match it, count it, cut it, test it.
+# A line that only says something: a message is not an assertion.
+MESSAGE = re.compile(r"^\s*(?:ev_text|ev_note|ev_pass|ev_fail|echo|printf|log)\b")
+ASSERTS = r"\b(?:grep|egrep|awk|sed|wc|case|cut|tail|head|test)\b|=~|\[\[?\s|<<<"
+
+
+def code_of(line):
+    """A line without its comment (a # that starts a word, outside quotes)."""
+    out, q = [], None
+    for i, c in enumerate(line):
+        if q:
+            if c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (i == 0 or line[i - 1] in " \t;"):
+            break
+        out.append(c)
+    return "".join(out)
+
+
+def poll_lines(lines):
+    """Line numbers (1-based) inside a polling loop: a for over $(seq ...) or
+    ((...)), a while or an until (not `while read`, which walks text), from
+    its head to its done."""
+    inside, stack = set(), []
+    for n, l in enumerate(lines, 1):
+        c = code_of(l)
+        if any(stack):
+            inside.add(n)
+        for m in re.finditer(r"(?:^\s*|[;&|{(]\s*|\b(?:then|do|else)\s+)(for|while|until)\b", c):
+            rest = c[m.start(1):]
+            poll = bool(re.match(r"for\s+\w+\s+in\s+\$\(\s*seq\b|for\s+\(\(|until\b", rest)) or (
+                rest.startswith("while") and not re.match(r"while\s+(?:IFS=\S*\s+)?read\b", rest))
+            stack.append(poll)
+            if poll:
+                inside.add(n)
+        for _ in re.findall(r"(?:^|[;&|]\s*|\s)done\b", c):
+            if stack:
+                stack.pop()
+    return inside
+
+
+def strip_desc(text):
+    """A command without its evidence descriptions ("EV-..."), which name the
+    command they describe."""
+    return re.sub(r'"EV-(?:[^"\\]|\\.)*"', '""', text)
+
+
+def log_source(text):
+    """(verb, name) of the first log read in a command: the container, pod or
+    unit whose log it reads."""
+    text = strip_desc(text)
+    m = LOG_READ.search(text)
+    if not m:
+        return None
+    verb = "journalctl" if "journalctl" in m.group(0) else m.group(0).split()[-2] if "kubectl" not in m.group(0) else "kubectl logs"
+    rest = text[m.end():]
+    try:
+        words = shlex.split(rest, comments=False)
+    except ValueError:
+        words = rest.split()
+    if verb == "journalctl":
+        for i, w in enumerate(words):
+            if w == "-u" and i + 1 < len(words):
+                return (verb, re.split(r"[\s|;)'\"]", words[i + 1])[0])
+            if re.match(r"^(?:--unit|_SYSTEMD_UNIT|UNIT)=", w):
+                return (verb, re.split(r"[\s|;)'\"]", w.split("=", 1)[1])[0])
+        return (verb, "")
+    skip_value = {"--since", "--until", "--tail", "-n", "--container", "-c", "--namespace", "-l"}
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w in skip_value:
+            i += 2
+            continue
+        if w.startswith("-") or w in ("2>&1", "2>/dev/null"):
+            i += 1
+            continue
+        return (verb, re.split(r"[\s|;)'\"]", w)[0])
+    return (verb, "")
+
+
+def log_helpers(funcs):
+    """Functions whose own output is a log: one command, a log read neither
+    captured nor sent elsewhere (desktop_log, sl_clog, pod_logs, ...)."""
+    out = set()
+    for name, first, flines in funcs:
+        body = [code_of(l) for l in flines]
+        if len(flines) == 1:
+            m = re.match(r"^[A-Za-z_][\w-]*\s*\(\)\s*\{(.*)\}\s*$", body[0])
+            cmds = [m.group(1)] if m else []
+        else:
+            cmds = [l for l in body[1:-1] if l.strip()]
+        if len(cmds) != 1 or "diagnostics" in name:
+            continue
+        c = cmds[0]
+        bare = re.sub(r"\d?>&\d|2>\s*/dev/null", "", c)
+        if LOG_READ.search(c) and not re.search(r"\w+=\$\(|>\s*\S|\bev_save\b|\bgrep\s+-\w*q", bare):
+            out.add(name)
+    return out
+
+
+def rule_s914(root, rep):
+    """S9.1.4: a log line an assertion reads is polled."""
+    cg = client_guard()
+    reads = polled = evidence = 0
+    for rel in shell_files(root):
+        if rel == "ci/evidence.sh":
+            continue
+        text = read(os.path.join(root, rel))
+        lines = text.split("\n")
+        funcs = shell_functions(text)
+        owner = {}
+        for f in funcs:
+            for k in range(f[1], f[1] + len(f[2])):
+                owner[k] = f
+        loops = poll_lines(lines)
+        helpers = log_helpers(funcs)
+        cmds = [(n, line, toks) for n, line, toks in cg.logical_commands(rel, source=text)]
+        # functions a poll runs: the command a poller is given, or one run in
+        # a polling loop
+        polled_fns = set()
+        for n, line, toks in cmds:
+            c = code_of(line)
+            for m in re.finditer(r"\b(?:log_wait|wait_for|wait_until)\s+(?:(?:\S+|\"[^\"]*\")\s+){2,3}?([A-Za-z_][\w-]*)\b", c):
+                polled_fns.add(m.group(1))
+            if n in loops:
+                polled_fns.update(re.findall(r"(?:^|[\s;&|(!])([A-Za-z_][\w-]*)\b", c))
+
+        def reads_log(c, toks):
+            c = strip_desc(c)
+            if LOG_READ.search(c):
+                return LOG_READ.search(c).group(0)
+            for t in toks or []:
+                for h in helpers:
+                    if t == h or t.startswith(f"$({h}") or re.search(rf"(?:^|[\s(`]){re.escape(h)}(?:\s|$|\))", t):
+                        return h
+            return None
+
+        helper_src = {}
+        for name, first, flines in funcs:
+            if name in helpers:
+                helper_src[name] = log_source(code_of(" ".join(flines)))
+
+        def source_of(c, toks):
+            h = reads_log(c, toks)
+            return log_source(c) or helper_src.get(h)
+
+        def judge(i, n, c, toks, src, fn):
+            """polled, or the same log waited on earlier: in the function, or
+            within the 20 commands before at a script's top level"""
+            if n in loops or (fn and fn[0] in polled_fns):
+                return True
+            if re.search(r"\b(?:log_wait|wait_for|wait_until)\b", c.split(src)[0]):
+                return True
+            mine = source_of(c, toks)
+            earlier = [x for x in cmds[:i] if (fn and fn[1] <= x[0]) or (not fn and x[0] not in owner)]
+            if not fn:
+                earlier = earlier[-20:]
+            for k, l2, t2 in earlier:
+                u = code_of(l2)
+                if k in loops or re.search(r"\b(?:log_wait|wait_for|wait_until)\b", u):
+                    theirs = source_of(u, t2)
+                    if mine and theirs and mine[1] == theirs[1] and mine[1]:
+                        return True
+            return False
+
+        for i, (n, line, toks) in enumerate(cmds):
+            c = code_of(line)
+            if not c.strip() or toks is None or CASE_LABEL.match(c):
+                continue
+            fn = owner.get(n)
+            if fn and (fn[0] in helpers or "diagnostics" in fn[0] or fn[0] in ("fail", "log_wait")):
+                continue
+            src = reads_log(c, toks)
+            if not src:
+                continue
+            reads += 1
+            one = " ".join(c.split())[:90]
+            cap = re.match(r"^\s*(?:local\s+)?([A-Za-z_]\w*)=\$\(", c)
+            after = c[c.index(src) + len(src):]
+            to_check = re.search(r"\|\s*(?:grep|egrep|awk|wc|sed\s+-n)\b", after) and not re.search(r">\s*/dev/null|>&2|\|\s*tee\b", after)
+            asserted = False
+            if cap:
+                v = cap.group(1)
+                end = (fn[1] + len(fn[2])) if fn else n + 60
+                for k, l2, _ in cmds[i + 1:]:
+                    if k > end:
+                        break
+                    u = code_of(l2)
+                    if re.match(rf"^\s*(?:local\s+)?{v}=", u) and not re.search(rf"\$\{{?{v}\b", u.split("=", 1)[1]):
+                        break
+                    if re.search(rf"\$\{{?{v}\b", u) and re.search(ASSERTS, u) and not MESSAGE.match(u):
+                        asserted = True
+                        break
+            elif to_check and not MESSAGE.match(c):
+                asserted = True
+            if not asserted:
+                evidence += 1
+                rep.ok("S9.1.4", rel, n, f"a log read kept as evidence, or for a later read, not asserted on here: {one}")
+                continue
+            if judge(i, n, c, toks, src, fn):
+                polled += 1
+                rep.ok("S9.1.4", rel, n, f"a log read an assertion reads, polled: {one}")
+            else:
+                rep.flag("S9.1.4", rel, n, one, f"a log read once that an assertion then reads: {one}",
+                         "read it with log_wait (ci/evidence.sh) for the line asserted, or, for an absence, after a "
+                         "log_wait on the same log for a line it writes later")
+    return (f"S9.1.4: {reads} read(s) of a container log, the journal or a pod log in ci/'s shell: {evidence} kept "
+            f"as evidence or not asserted on, {polled} that an assertion reads, polled; "
+            f"{len(rep.violations('S9.1.4'))} violation(s)")
+
+
+RULES = {"S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
 
 # --- the self-test --------------------------------------------------------------------
 
@@ -2676,6 +2906,17 @@ PLANTS = {
         ("ci/p7.sh", "#!/bin/bash\nset -euo pipefail\nn=$(ls | wc -l)  # a | grep -q in a comment\ncase \"$x\" in head|tail) : ;; esac\n", False),
         ("ci/p8.sh", "#!/bin/bash\nset -euo pipefail\npodman logs d 2>&1 | while read -r l; do [ \"$l\" = x ] && break; done\n", True),
         ("ci/p9.sh", "#!/bin/bash\nset -euo pipefail\npodman logs d 2>&1 | grep -c x\npodman ps | sort | head -n -1\n", False),
+    ],
+    "S9.1.4": [
+        ('ci/l1.sh', '#!/bin/bash\nset -euo pipefail\nout=$(podman logs desktop 2>&1)\ngrep -q \'^ready\' <<<"$out" || fail \'not ready\'\n', True),
+        ('ci/l2.sh', '#!/bin/bash\nset -euo pipefail\nn=$(journalctl -u x.service --no-pager | grep -c started || true)\n[ "$n" -gt 0 ] || fail \'never started\'\n', True),
+        ('ci/l3.sh', '#!/bin/bash\nset -euo pipefail\ndlog() { podman logs desktop 2>&1; }\nx=$(dlog)\ngrep -q \'^ready\' <<<"$x" || fail \'not ready\'\n', True),
+        ('ci/l4.sh', '#!/bin/bash\nset -euo pipefail\ncheck() {\n    local l\n    l=$(kubectl logs pod-a)\n    grep -q \'capture ok\' <<<"$l"\n}\ncheck || fail \'no capture\'\n', True),
+        ('ci/l5.sh', '#!/bin/bash\nset -euo pipefail\nout=$(log_wait 30 1 \'^ready\' podman logs desktop) || true\ngrep -q \'^ready\' <<<"$out" || fail \'not ready\'\n', False),
+        ('ci/l6.sh', '#!/bin/bash\nset -euo pipefail\nfor _ in $(seq 10); do\n    out=$(podman logs d 2>&1)\n    grep -q x <<<"$out" && break\n    sleep 1\ndone\n', False),
+        ('ci/l7.sh', '#!/bin/bash\nset -euo pipefail\nev_save log "EV-LOG: podman logs desktop" podman logs desktop >/dev/null || true\npodman logs desktop 2>&1 | tail -n 5 >&2 || true\n', False),
+        ('ci/l8.sh', '#!/bin/bash\nset -euo pipefail\nf() {\n    local out\n    log_wait 30 1 \'^done\' podman logs desktop >/dev/null || true\n    out=$(podman logs desktop 2>&1)\n    ! grep -q bad <<<"$out" || fail \'bad\'\n}\n', False),
+        ('ci/l9.sh', '#!/bin/bash\nset -euo pipefail\nseen() { local l; l=$(podman logs d 2>&1); grep -q x <<<"$l"; }\nwait_for 10 1 \'x in the log\' seen\n', False),
     ],
     "S9.1.3": [
         ("ci/i1.sh", "podman exec desktop cat /proc/1/environ\n", True),
