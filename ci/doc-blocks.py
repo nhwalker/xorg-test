@@ -9,6 +9,12 @@ the maintainer journeys (Requirements.md E10) to run verbatim.
                                     continuation lines joined, comments and
                                     blank lines dropped, a trailing "# ..."
                                     comment kept apart after a tab
+  doc-blocks.py FILE HEADING [N] --lang LANG
+                                    the Nth ```LANG block instead: a file the
+                                    document gives whole, such as README.md's
+                                    ```toml drop-in for CRI-O; indented under
+                                    a list entry or not, it comes out without
+                                    the fence's indentation
 
   doc-blocks.py FILE HEADING --para PHRASE [--spans]
                                     the paragraph under HEADING that contains
@@ -31,7 +37,12 @@ import re
 import sys
 
 
-def block(path, heading, n=1):
+def block(path, heading, n=1, lang=None):
+    """The Nth fenced block under the first heading starting with HEADING: of
+    LANG, or by default an sh, bash or unlabelled one. A fence may be
+    indented (a block inside a list entry); its lines lose that indentation.
+    A block of another language is passed over whole, so neither a "# ..."
+    line in it nor its closing fence is read as anything else."""
     lines = open(path, encoding="utf-8").read().split("\n")
     start = None
     for i, l in enumerate(lines):
@@ -41,23 +52,30 @@ def block(path, heading, n=1):
             break
     if start is None:
         raise SystemExit(f"{path}: no heading starting {heading!r}")
-    found, inside, cur = 0, False, []
+    want = re.compile(r"^(\s*)```" + (re.escape(lang) if lang else r"(?:sh|bash)?") + r"\s*$")
+    found, fence, indent, cur = 0, None, "", []
     for l in lines[start:]:
-        m = re.match(r"^(#+)\s", l)
-        if not inside and m and len(m.group(1)) <= level:
-            break                                   # the section ended
-        if not inside and re.match(r"^```(sh|bash)?\s*$", l):
-            inside, cur = True, []
+        if fence is None:
+            m = re.match(r"^(#+)\s", l)
+            if m and len(m.group(1)) <= level:
+                break                                   # the section ended
+            o = want.match(l)
+            if o:
+                fence, indent, cur = "take", o.group(1), []
+            elif re.match(r"^\s*```", l):
+                fence = "pass"                          # another language's block
             continue
-        if inside and l.startswith("```"):
-            inside = False
-            found += 1
-            if found == n:
-                return cur
+        if re.match(r"^\s*```\s*$", l):
+            if fence == "take":
+                found += 1
+                if found == n:
+                    return cur
+            fence = None
             continue
-        if inside:
-            cur.append(l)
-    raise SystemExit(f"{path}: under {heading!r} there are {found} command blocks, not {n}")
+        if fence == "take":
+            cur.append(l[len(indent):] if l.startswith(indent) else l.lstrip())
+    what = f"```{lang} blocks" if lang else "command blocks"
+    raise SystemExit(f"{path}: under {heading!r} there are {found} {what}, not {n}")
 
 
 def section(path, heading):
@@ -163,7 +181,7 @@ def main():
         print("\n".join(re.findall(r"`([^`]+)`", text)) if "--spans" in a else text)
         return
     n = int(a[2]) if len(a) > 2 and a[2].isdigit() else 1
-    b = block(path, heading, n)
+    b = block(path, heading, n, a[a.index("--lang") + 1] if "--lang" in a else None)
     print("\n".join(commands(b) if "--commands" in a else b))
 
 

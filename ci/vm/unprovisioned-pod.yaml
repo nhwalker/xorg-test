@@ -1,0 +1,35 @@
+# A client that needs the desktop's toolkit (Requirements.md S10.6.2;
+# test-only), applied to a node staged as one the desktop has never
+# provisioned: it must stay Pending, the scheduler saying why, and run once
+# the desktop's start publishes the toolkit - the same pod object, which
+# nobody deletes or recreates. It requests the display and the toolkit and
+# captures the screen with the toolkit's screenshot. The desktop publishes
+# the toolkit before its X server is up (desktop-init's oneshots), so it
+# retries until the display answers, as an application has to, each try
+# logged with its time; then it stays up for the capture to be read out.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unprovisioned
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: localhost/desktop-container:latest
+      imagePullPolicy: Never
+      command: ["sh", "-c"]
+      args:
+        - |
+          n=0
+          until "$DESKTOP_TOOLS_BIN"/screenshot /tmp/shot.png 2> /tmp/shot.err && [ -s /tmp/shot.png ]; do
+            n=$((n + 1))
+            echo "$(date -u +%T.%3N) try $n: no capture: $(tr '\n' ' ' < /tmp/shot.err)"
+            [ "$n" -lt 60 ] || { echo "no capture after $n tries"; exit 1; }
+            sleep 1
+          done
+          echo "$(date -u +%T.%3N) capture ok after $n failed tries: /tmp/shot.png, $(wc -c < /tmp/shot.png) bytes"
+          exec sleep 3600
+      resources:
+        limits:
+          desktop.local/display: 1
+          desktop.local/tools: 1

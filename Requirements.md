@@ -209,7 +209,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the three base images build from scratch against the live UBI image and Rocky repos, and the offline layers still build on the result.
 - Acceptance: weekly `--pull --no-cache` rebuild succeeds and the offline builds pass on it.
 - Evidence: build logs; `rpm -qa` of the fresh base (EV-STATE) diffed against the previous week's (EV-DIFF) so package drift is visible.
-- Tier: T2 · Coverage: ❌ evidence not saved: `base-rebuild.yml` uploads nothing and records no `rpm -qa` list or week-on-week diff; the weekly rebuild and the offline builds on it are asserted by `base-rebuild.yml`.
+- Tier: T2 · Coverage: ✅ (workflow `base-rebuild.yml`) `ci/base-rebuild.sh` runs the rebuild and keeps its evidence, and the workflow uploads it as `evidence-base-rebuild` whether the builds pass or not. The three bases build from current upstream (`--pull --no-cache`) and the three application layers build offline (`--network=none`) on them, a check and the build's log for each. `rpm -qa` of the desktop base GHCR held before the run (its `:latest`, pulled first) and of the fresh base are kept, with their diff: the week's package drift. The bases are pushed only after a successful rebuild, by every scheduled run and by a dispatched one whose `push` input is on. Under `S1.1.2/` (artifact `evidence-base-rebuild` of a `base-rebuild.yml` run).
 
 **S1.1.3 Base images are content-addressed**
 - Requirement: `ci/build-bases.sh` reuses a GHCR base whose tag is the hash of its inputs and rebuilds only on a miss.
@@ -271,7 +271,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: every script under `image/` and `deploy/host/usr/local/` passes `shellcheck -S error`; every script `Containerfile` installs is mode 0755; the shellcheck list in `ci.yml` is complete.
 - Acceptance: a `find`-derived list equals the list in `ci.yml`; `find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755` in the image is empty.
 - Evidence: both lists and their diff (EV-DIFF); the `find` output (EV-STATE).
-- Tier: T0/T2 · Coverage: ❌ list completeness and modes untested; `ci.yml` "shellcheck (error severity)" checks a hand list that already omits `image/session/xinitrc.desktop` and `deploy/host/usr/local/libexec/desktop-session-lead`.
+- Tier: T0/T2 · Coverage: ✅ `static`'s "every shipped script is shellchecked (S1.2.6's list)" step: `ci/script-list.py` finds every shell script git tracks under `image/` and `deploy/host/usr/local/` by its `#!` line (22 of them) and the scripts the "shellcheck (error severity)" step names there, its globs expanded; the two lists' diff is empty. Its self-test takes a listed script out of the step and must name it. Both lists, their diff and the self-test are under `artifacts/S1.2.6/` (artifact `evidence-static`); the shellcheck step itself passes in the same job. `smoke` runs `find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755` in a scratch container of the image: empty, the twelve files under `/usr/local/bin` and `xinitrc.desktop` all `755 root:root`, under `artifacts/S1.2.6/` (artifact `evidence-smoke`).
 
 **S1.2.7 Image carries no NVIDIA userspace**
 - Requirement: no `nvidia_drv.so`, `libnvidia*`, `libglxserver_nvidia*` in the image.
@@ -325,9 +325,9 @@ the same directory also receives the diagnostics the harness already prints
 
 **S2.2.2 Standalone fallback fabricates the runtime dir**
 - Requirement: with no host session unit, desktop-init creates `/run/user/61000` (0700, desktop) after the wait, logs `no host login session appeared; creating ... standalone`, and the desktop works.
-- Acceptance: `systemctl mask --now desktop-session`, restart desktop; the fallback line is logged; audio sockets export; the X session starts (T3). Unmask and restart afterwards. (`disable` is not enough: the quadlet's `Wants=desktop-session.service` starts the unit again whenever `desktop.service` starts.)
+- Acceptance: with the desktop stopped, move the tree's unit file aside, as on a host without it, and `daemon-reload` (`systemctl mask` is refused: the unit file is the tree's own, at `/etc/systemd/system/desktop-session.service`, the path mask's `/dev/null` link would take); start the desktop; the fallback line is logged; the dir is desktop-init's (0700, desktop, no mount); audio sockets export; the X session starts (T3). Put the unit file back and restart afterwards. (`disable` is not enough: the quadlet's `Wants=desktop-session.service` starts the unit again whenever `desktop.service` starts.)
 - Evidence: EV-LOG-DESKTOP (fallback line); `stat` of the dir (EV-STATE); EV-SHOT of the desktop up (T3); EV-AUDIO of a tone (T3).
-- Tier: T2 · Coverage: ❌ the acceptance's own procedure (desktop-session masked on a full deploy, the X session up, T3 EV-SHOT and EV-AUDIO) is not run. Saved: `smoke`'s scratch container of the image, with no host login session at all, logs the fallback line and makes `/run/user/61000` `drwx------ desktop:desktop`, under `artifacts/S2.2.2/` (artifact `evidence-smoke`).
+- Tier: T2/T3 · Coverage: ✅ `guest:standalone_desktop`, in the core shard, moves the unit file aside with the desktop stopped, and logind takes `/run/user/61000` away. desktop-init then logs `no host login session appeared; creating /run/user/61000 standalone` and makes the dir itself: `0700 desktop:desktop`, no mount. The audio export answers (`pactl info` over it from the host: `PulseAudio (on PipeWire 1.4.11)`), X answers and the session's mwm runs. The VM host shoots the screen and hears a pulse client in the session play 440 Hz (1.97 s, peak 0.547). The unit file then goes back as the tree ships it, and the runtime dir is logind's again. Under `artifacts/S2.2.2/` (artifact `evidence-vm-core`): the log, the dir in the container and on the host, the export, the screendump, the recording with check-audio.py's verdict and level plot, and the restored state. `smoke`'s scratch container, with no host login session at all, shows the same fallback and dir, under `artifacts/S2.2.2/` (artifact `evidence-smoke`).
 
 **S2.2.3 tty1 is handed to the session user**
 - Requirement: `/dev/tty1` in the container is owned `desktop:tty` before every session start.
@@ -377,7 +377,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
 - Acceptance: kill mwm as uid desktop (SIGTERM, `kill`'s default: mwm quits without asking, since the image drops `kill` from mwm's `showFeedback`); Xorg pid changes; new mwm; display answers.
 - Evidence: EV-VIDEO; EV-PIDS before/after; EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: 🟡 the acceptance's trigger is asserted at T2, its own EV-VIDEO not taken: `smoke` sends mwm SIGTERM as the session user and saves desktop-init, Xorg and mwm before and after (a new Xorg and mwm, the same desktop-init, the display answering) and the log's clean end (`session exited (rc=0)`, no postmortem), under `artifacts/S2.3.6/` (artifact `evidence-smoke`). "Quit session" is asserted with its video, pid tables and desktop log by `operator-e2e:menu_quit_session` in `artifacts/S11.1.1/`.
+- Tier: T3 · Coverage: ✅ `guest:verify_mwm_exit`, in the core shard, sends mwm SIGTERM (`kill`'s default) as the session user. desktop-init logs `session exited (rc=0); restarting in 3s` and runs no postmortem; Xorg and mwm are new (40291 → 58054, 40301 → 58064) under the same desktop-init, and the display answers 4.5 s after the signal. The VM host records the display throughout. Under `artifacts/S2.3.6/` (artifact `evidence-vm-core`): the pids before and after with their diff, the desktop log from the SIGTERM on, the video (its index.txt timed against the guest's notes) and the new session's screendump. `smoke` asserts the same at T2, under `artifacts/S2.3.6/` (artifact `evidence-smoke`). "Quit session" is asserted with its video, pid tables and desktop log by `operator-e2e:menu_quit_session` in `artifacts/S11.1.1/`.
 
 ### F2.4 Audio supervision
 
@@ -415,7 +415,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `align-device-groups.sh audio` runs before each stack start, so a card that appears after a soundless boot is openable.
 - Acceptance: VM booted **without** `intel-hda`, and with the host's `audio` group renumbered away from the image's (on the stock VM both are 63, so the check could not fail): first audio start logs `audio: no device nodes present, skipping`; hot-add `usb-audio`; kill pipewire; after restart the container's `audio` gid equals the host node's gid and WirePlumber lists the card.
 - Evidence: EV-LOG-DESKTOP (both align lines); `getent group audio` in the container and `stat -c %g` of the host node (EV-STATE pair); `wpctl status` after; EV-AUDIO of a tone through the card.
-- Tier: T3 · Coverage: ❌ (see also S4.7.10, S7.7.9).
+- Tier: T3 · Coverage: ✅ `guest:soundless`, in the soundless shard: a second VM booted without `intel-hda`, so with no sound card, its `audio` group renumbered to 1063 before the tree is applied (the image's is 63). The audio supervisor's pass before the first audio start logs `audio: no device nodes present, skipping`, and PipeWire lists no card. The VM host hot-adds `usb-audio`, the VM's first card: its control node is on gid 1063, and the container sees it through the live bind mount, its own `audio` group still 63. pipewire is killed. Before the new start the supervisor's pass logs `audio: gid 63 -> 1063 (from /dev/snd/controlC0)`; the container's `audio` group then equals the host node's gid, WirePlumber lists the card, and a 770 Hz tone the session user plays through it is heard. Under `artifacts/S2.4.6/` (artifact `evidence-vm-soundless`): `/dev/snd` and the `audio` group on the host and in the container before and after, every align line from the container's start on, `podman logs` across the realignment, `wpctl status` before and after, QEMU's `device_add`, and the tone with its verdict. Recorded: with the card plugged in and the stack not yet restarted, PipeWire already listed it, the container's gid 63 against the node's 1063. The nodes carry logind's uaccess ACL for the desktop user (`user:desktop:rw-`, kept in `07-acl.txt`), and the container's desktop user is the same uid. logind gives that ACL to the active session's user, so while desktop-session holds seat0 the nodes are open to the desktop user without the alignment; the alignment is what opens them to a desktop without that session (S5.8.4's standalone desktop). See also S4.7.10, S7.7.9.
 
 **S2.4.7 Export sockets are connectable by other uids**
 - Requirement: `umask 0000` makes the exported sockets world-connectable.
@@ -499,7 +499,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: for video/render/input/audio, the container group is renumbered to the host node's gid; collisions move the other group to a free gid ≥ 60000; missing groups are created; root-group and absent nodes are skipped with a log line; the final-state table and `id desktop` are logged; the narrow form touches only the named groups.
 - Acceptance: T1 in a scratch container with fabricated nodes per branch; T3 preflight `desktop user can read` PASS for all three node kinds.
 - Evidence: T1 `getent group` before/after per branch (EV-DIFF); T3 EV-LOG-DESKTOP align table + preflight lines; `ls -ln /dev/dri /dev/input /dev/snd` host and container (EV-STATE).
-- Tier: T1/T3 · Coverage: ❌ no branch test and no evidence saved; the container preflight's `desktop user can read` lines are never asserted, so alignment shows only through rootless Xorg opening DRM and evdev (`guest:phase_deploy`, `e2e` "input: type into an xterm").
+- Tier: T1/T3 · Coverage: ✅ the T1 half: `build-smoke`'s "align-device-groups' branches (S3.2.2's T1 half)" step (`ci/align-groups-tests.sh`) runs `align-device-groups.sh` as root in a scratch container of the image per branch, a plain file with the wanted group standing in for each node (the script reads only whether a node exists and its group). Renumber: video 39 becomes the node's 2001, the desktop user in it. Collision: the group squatting on the target gid moves to 60001, the first free gid from 60000 (60000 taken), and render takes 2002. Missing group: input is created with the node's gid. A root-group node and an absent node are skipped with their log lines, the gids unchanged. Already aligned: nothing moves, and the final table names all four groups with their devices' gids and ends with `id desktop`. The narrow form renumbers audio alone, the table its one row. An unknown group is named and changes nothing. Per branch under `artifacts/S3.2.2/` (artifact `evidence-smoke`): the setup, the transcript, `getent group` before and after, and their diff. ✅ the T3 half: `guest:session_groups`, in the core shard. Every group in align-device-groups' final-state table carries the gid of the host node it names: video 39 (`/dev/dri/card0`), render 105 (`/dev/dri/renderD128`), input 104 (`/dev/input/event0`), audio 63 (`/dev/snd/controlC0`). The table ends with `id desktop`, and the container preflight passes `desktop user can read` for `/dev/dri/card0`, `/dev/input/event0` and `/dev/snd/controlC0`. Under `artifacts/S3.2.2/` (artifact `evidence-vm-core`): the align lines, the preflight lines, `ls -ln` of the nodes on the host and in the container, and `getent group` with `id desktop`.
 
 **S3.2.3 VT nodes are created when the runtime does not expose them**
 - Requirement: `ensure-vt-devices.sh` creates `/dev/tty0` (c 4:0) and `/dev/tty1` (c 4:1), mode 620, `root:tty` (desktop-init then hands `tty1` to the session user), no-op when present.
@@ -611,7 +611,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: an output name with no matching DRM connector yields the WARN line; known names yield the PASS line.
 - Acceptance: `smoke` (DP-1/DP-2 on the runner) asserts the WARN; T3 asserts the PASS.
 - Evidence: EV-LOG-DESKTOP preflight lines; `ls /sys/class/drm/` (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌.
+- Tier: T2/T3 · Coverage: ✅ `smoke` declares DP-1 and DP-2 on a runner that has neither: the preflight WARNs about both (`fixed monitor layout names output(s) DP-1 DP-2 with no matching DRM connector (Virtual-1 )`), under `artifacts/S3.4.11/` (artifact `evidence-smoke`) with the runner's `ls /sys/class/drm`. `guest:layout_declare` declares Virtual-1 and Virtual-2 in the VM: the preflight PASSes both (`fixed monitor layout declares Virtual-1 Virtual-2, all present as DRM connectors`), under `artifacts/S3.4.11/` (artifact `evidence-vm-core`) with the VM's `ls /sys/class/drm`.
 
 **S3.4.12 `desktop-monitors-capture` prints a valid, round-trippable block**
 - Requirement: one line per enabled output; refuses non-root; fails cleanly when the desktop is down; its output through the generator reproduces the geometry.
@@ -643,7 +643,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the theme's screendump stddev stays ≥ 2× the 0.02 threshold.
 - Acceptance: ≥ 0.04 on the deploy screendump.
 - Evidence: the measurement in the index.
-- Tier: T3 · Coverage: ❌ not asserted (`e2e:assert_nonblank` checks > 0.02 only), and the measurement is only in the job log.
+- Tier: T3 · Coverage: ✅ `e2e` keeps `assert_nonblank`'s measurement of the deploy screendump (mwm's root and the deploy-proof xterm) and checks it against twice the render test's 0.02: 0.0510978 ≥ 0.04. The screendump and the measurement are under `artifacts/S3.5.4/` (artifact `evidence-vm-core`).
 
 ### F3.6 Window manager
 
@@ -669,7 +669,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: the entry opens an xterm whose shell is on the host as `desktop-shell`.
 - Acceptance: `ssh host whoami` from the container returns `desktop-shell` (✅); the failure path keeps the window open with the hint (S5.7.8).
 - Evidence: EV-SHOT of the host-terminal xterm showing `whoami` and its answer; the answer as text in the index; sshd's journal line for the login (EV-LOG-JOURNAL).
-- Tier: T2/T3 · Coverage: 🟡 the success path is asserted by `operator-e2e:menu_host_terminal`, evidence under `artifacts/S11.1.1/` (the window showing `whoami` and its answer, sshd's journal); the failure path's hint is not asserted (S5.7.8 tracks it).
+- Tier: T2/T3 · Coverage: ✅ the success path: `operator-e2e:menu_host_terminal`, under `artifacts/S11.1.1/` (artifact `evidence-vm-operator`): the window showing `whoami` and its answer, and sshd's journal. ✅ the failure path: `operator-e2e:s5_7_8` (S5.7.8's T3 half) opens the entry with the host refusing the key; the window keeps the reason, the enablement command and `Press Enter to close.` until Enter, under `artifacts/S5.7.8/` (artifact `evidence-vm-operator`).
 
 ### F3.7 Window-to-pod identity
 
@@ -712,9 +712,9 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.8.6 Foreign seat tags are detected and undone**
 - Requirement: a device attached to another seat is reported by preflight as a WARN until `seat-prep` removes the rule and re-triggers udev.
-- Acceptance: `loginctl attach seat1 <device>`; `udevadm info` shows `ID_SEAT=seat1`; restart `desktop-seat-prep`; rule gone, tag absent; restart desktop; preflight `PASS: no foreign seat tags`.
-- Evidence: `udevadm info` before/after (EV-DIFF); `ls /etc/udev/rules.d/72-seat-*` before/after; EV-LOG-JOURNAL of `desktop-seat-prep`; EV-LOG-DESKTOP preflight line; the keyboard still types afterwards (EV-SHOT).
-- Tier: T3 · Coverage: ❌ evidence not saved; `smoke` asserts only that `seat-prep` removes a fake empty `72-seat-*` rule, with no real attach, tag check or preflight line.
+- Acceptance: `loginctl attach seat1 <device>`; `udevadm info` shows `ID_SEAT=seat1`; with the desktop running, `desktop-preflight` FAILs naming the rule and the container's preflight, run in the running desktop, WARNs; restart the desktop: seat-prep, which runs before every desktop start, removes the rule and re-triggers udev, and no entry in the udev database is tagged for another seat, the device's children (a keyboard's LEDs) included; the preflight at that start prints `PASS: no foreign seat tags`.
+- Evidence: `udevadm info` before/after (EV-DIFF); `ls /etc/udev/rules.d/72-seat-*` before/after; both preflights while the tag is in place; EV-LOG-JOURNAL of `desktop-seat-prep` at the restart; EV-LOG-DESKTOP preflight line; the keyboard still types afterwards (EV-SHOT).
+- Tier: T3 · Coverage: ✅ `guest:seat_tags`, in the core shard. `loginctl attach seat1` puts the USB keyboard (kvmkbd) on seat1 (`/dev/input/event4` reads `ID_SEAT=seat1`). With the desktop running, `desktop-preflight` FAILs naming the `72-seat-*` rule, and the container's preflight, run in the running desktop, WARNs about the foreign tag. The desktop restarted: seat-prep, which runs before every desktop start since `claude/fix-oneshots-every-start`, logs the rule's removal; the rule is gone, no udev database entry is tagged for another seat, and the preflight at that start PASSes the seat check. Before that fix, seat-prep ran once per boot and this story restarted it by hand with the desktop stopped. The keyboard types again: the VM host types `seatok` into a sink xterm through QEMU's keyboard, the sink's shell reads exactly that, and `xinput test` on the USB keyboard's own X device sees the key presses. Under `artifacts/S3.8.6/` (artifact `evidence-vm-core`): the rules directory and `udevadm info` before and after with their diff, the rule loginctl wrote, every foreign-tagged udev entry after the attach and after seat-prep, both preflights with the tag in place, seat-prep's journal at the restart, the preflight line after it, `xinput list`, the QMP transcript, the screendump, the xinput test and the sink's file.
 
 ### F3.9 HMI hotplug: keyboards and pointers
 
@@ -791,25 +791,28 @@ slice, EV-TIMELINE.
 - Requirement: events through the hot-added device move the pointer and click; the operator sees the cursor move and a window take focus.
 - Acceptance: the events reach the hot-added device (a `usb-tablet` added with `display=<virtio-vga id>` and sent with that `device`; a `usb-mouse`, which has no `display` property, selected with HMP `mouse_set` and shown current by `query-mice`); `xinput test <id>` shows its motion/button events; a click on the sink xterm through the hot-added tablet focuses it and typed text lands.
 - Evidence: EV-VIDEO (cursor crossing the screen, window frame turning the focused colour); `xinput test` output; sink file; EV-QEMU.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_9_11`: a `usb-tablet` added with `display=vga0` is listed by Xorg; driven alone (its events naming `vga0`), it carries the pointer across the screen and clicks the sink xterm. Its own X device sees the motion and the click (`xinput test`), the focus moves from the session's xterm to the sink (the frames `#41637f` and `#22262d`), and the line typed next lands in the sink. A `usb-mouse` added beside it, made QEMU's current mouse with `mouse_set` (`query-mice` before and after), moves the pointer by relative motion and clicks inside the session's xterm, and its own X device sees both. `artifacts/S3.9.11/` (artifact `evidence-vm-operator`) holds F3.9's common set before and with the tablet, each device's `xinput test`, `query-mice` before and after `mouse_set`, a video of each pointer's motion and click, the screen after the tablet's click, and the sink file.
 
 **S3.9.12 Repeated input cycles leave no residue**
 - Requirement: ≥ 5 remove/re-add cycles return node counts and `xinput list` to baseline.
 - Acceptance: counts equal baseline after the last cycle; the session still accepts input.
 - Evidence: per-cycle counter table (EV-STATE); `xinput list` baseline vs final (EV-DIFF empty); EV-PIDS Xorg unchanged.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_9_12`: five remove/re-add cycles of the USB keyboard. Each removal takes it out of `xinput` and its nodes off the host and out of the container, and each return brings the counts back to the baseline (host 8, container 8, one USB keyboard in `xinput`). After the fifth, `xinput` lists the same device names as before the first, Xorg has kept its pid, and a sink xterm still takes a typed line. `artifacts/S3.9.12/` (artifact `evidence-vm-operator`) holds F3.9's common set at the baseline and after the fifth cycle, the counter table (a row per removal and per return), `xinput`'s names before and after with their diff (empty), the sink file and the screen with the typed line.
 
 ### F3.10 HMI hotplug: monitors
 
-Under `-display none` nothing enables a second virtio-gpu scanout and no
-QMP/HMP command can, so a monitor *appearing* is staged through the DRM
-connector-force interface and, where modes are needed, an injected firmware
-EDID; `HotpluggingTestHelp.md` §4.3. QEMU itself does enable or disable a head,
-with an EDID of the requested size, when a display frontend reports a size for
-it: a VNC server bound to that head (`-vnc …,display=<vga id>,head=1`)
-receiving SetDesktopSize, or `-display dbus` SetUIInfo. That route is
-untested here; the hot-plug batch tries it first, and what it cannot prove
-honestly goes to the guided hardware script. The user-facing
+Under `-display none` no QMP or HMP command enables a second virtio-gpu
+scanout. QEMU itself enables or disables a head, with an EDID of the requested
+size, when a display frontend reports a size for it: the e2e binds a VNC server
+to head 1 (`-vnc unix:…,display=vga0,head=1`), and `ci/vm/vnc-head.py` sends it
+RFB SetDesktopSize (0x0 takes the monitor away). virtio-gpu then raises a
+display event, and the guest reads every head's EDID and geometry again. That
+is how a monitor is plugged in here (S3.10.5, S3.10.7). Plug-outs, and the
+plug-in under a declared layout (S3.10.4), go through the DRM connector-force
+interface; a connector forced on gets virtio-gpu's own mode list and no EDID,
+even with an EDID override or `drm.edid_firmware` set, because virtio-gpu
+reads an EDID only at boot and on a display event. `HotpluggingTestHelp.md`
+§4.3 has the mechanics. The user-facing
 outcome: **when the KVM takes the monitors away and brings them back, every
 window is where it was.** **Common set**: `xrandr --query --verbose`
 before/after (EV-DIFF), `xwininfo -root -tree` before/after (EV-DIFF, must be
@@ -845,19 +848,19 @@ event, EV-TIMELINE.
 - Requirement: under autodetection a connector coming up is `connected` in `xrandr`; screen size and existing geometry unchanged (no auto-enable).
 - Acceptance: as stated.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:ad_plugin`, with the host's `vnc-head.py`: QEMU plugs a 1024x768 monitor into Virtual-2 (SetDesktopSize answered `request forwarded`). Under autodetection Virtual-2 reads connected in sysfs and in `xrandr` and is not enabled; the screen stays 1280x800, Virtual-1 stays at `1280x800+0+0`, and no client window moves or resizes. Taken away (0x0), Virtual-2 reads disconnected and unused again. `artifacts/S3.10.5/` (artifact `evidence-vm-core`) holds F3.10's common set before, plugged in and after (sysfs, `xrandr --verbose`, the window tree), the `xrandr` and tree diffs (the tree's empty), the Xorg log since the plug-in, QEMU's answers to the plug and unplug, and a video of head 0 across both.
 
 **S3.10.6 Monitor plug-out without a layout is characterised**
 - Requirement: under autodetection, forcing the only enabled connector down must not crash or restart X; the result is recorded.
 - Acceptance: Xorg pid unchanged; `xdpyinfo` answers; `xrandr` captured.
 - Evidence: common set + EV-PIDS.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:ad_unplug`: under autodetection Virtual-1, the only enabled output, is forced off. Xorg keeps its pid and `xdpyinfo` answers. What X reports is recorded: `Virtual-1 disconnected primary 1280x800+0+0`, the screen still 1280x800. Set back to `detect`, Virtual-1 reads connected and the screen is 1280x800; desktop-init, Xorg and mwm kept their pids and start times. `artifacts/S3.10.6/` (artifact `evidence-vm-core`) holds the pids before and after with their diff (empty), F3.10's common set before, forced off and after the re-detect with the diffs, the Xorg log across it, and a video of head 0.
 
 **S3.10.7 A plugged-in monitor with an EDID exposes modes**
-- Requirement: with an injected EDID on the forced-on connector, `xrandr --verbose` lists its modes; `xrandr --output Virtual-2 --auto` enables it without disturbing `Virtual-1`.
-- Acceptance: as stated; needs `CONFIG_DRM_LOAD_EDID_FIRMWARE` (confirm first).
+- Requirement: with an EDID injected for `Virtual-2` (its debugfs `edid_override`), a monitor QEMU plugs in there carries that EDID: the kernel and X both list exactly its modes; `xrandr --output Virtual-2 --auto` enables it without disturbing `Virtual-1`.
+- Acceptance: the EDID (1024x768@60 preferred, 640x480@60 and 800x600@60 established, no continuous-frequency flag) written to the override; QEMU plugs a 1024x768 monitor into Virtual-2 (`vnc-head.py`); the kernel's sysfs `edid` equals the injected bytes and its `modes` are exactly the three, `xrandr`'s plain query lists exactly the three for Virtual-2 and X's EDID property is the injected EDID; `--auto` enables Virtual-2 at 1024x768 with Virtual-1 unmoved; QEMU's head 1 shows the scanout; off, unplugged, and the override reset with `printf reset` (exactly five bytes: with echo's newline the kernel reads the write as an EDID and refuses it). The connector force cannot carry this story: forced on, virtio-gpu gives its own mode list and no EDID, override or not.
 - Evidence: common set; `cat /sys/class/drm/card*-Virtual-2/edid | od -An -tx1 | head` (EV-STATE); EV-SHOT after enabling.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:ad_edid`, with the host's `vnc-head.py`: the kernel takes the EDID as Virtual-2's override; forced on, Virtual-2 still has no EDID and virtio-gpu's own 24 mode sizes (recorded). QEMU plugs the monitor in, and the kernel gives Virtual-2 the injected EDID byte for byte (128 bytes) and offers exactly its modes, `640x480,800x600,1024x768`. `xrandr` lists exactly those for Virtual-2, and X's EDID property is the injected EDID. After its last output `xrandr` also lists the modes no output offers, here `1280x800 (0x44)`, which Virtual-1 still runs; `--verbose` prints those as it prints an output's own, so the modes are read from the plain query. `xrandr --output Virtual-2 --auto` enables it at `1024x768+0+0` with Virtual-1 at `1280x800+0+0` and the screen 1280x800, and QEMU's head 1 shows the scanout (1024x768, not blank). Turned off and taken away, Virtual-2 reads disconnected and unused, Virtual-1 where it was. `artifacts/S3.10.7/` (artifact `evidence-vm-core`) holds the injection route, the EDID injected and as the kernel reports it, the kernel's modes, F3.10's common set before, plugged in, enabled and after, the plain query, the Xorg log, the `xrandr` and tree diffs (the tree's empty), QEMU's answers, head 1's screendump and a video of head 0.
 
 **S3.10.8 Physical monitor plug-out and plug-in**
 - Requirement: S8.2.2 and S8.2.3.
@@ -870,13 +873,13 @@ event, EV-TIMELINE.
 - Requirement: a KVM switch disconnects every USB device at once; the desktop survives all three leaving in the same instant and all three returning; the operator types, clicks and hears audio afterwards.
 - Acceptance: `device_del` of the USB keyboard, tablet and sound card back to back; all node counts drop; re-add all three; all counts return; typed text lands, the hot-added tablet clicks, and a tone sent to the built-in sink **by name** is captured (WirePlumber makes a returning USB card the default, so an untargeted tone would prove the USB card); Xorg pid and PipeWire pid unchanged.
 - Evidence: EV-VIDEO of the whole cycle; EV-TIMELINE; the three counter tables; EV-PIDS; EV-AUDIO after; EV-SHOT of typed text.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_11_1`: with the KVM's tablet and sound card plugged in beside its keyboard and the built-in card's sink the default, the three are deleted back to back. Every count drops (input and sound nodes on the host and in the container, PipeWire's devices, the keyboard and tablet in `xinput`), and every count returns when the three are added back; Xorg and PipeWire keep their pids. The returned tablet clicks a sink xterm (its own X device sees the press), the line typed next comes through the returned keyboard (13 key presses on its own device) and lands there, and a client's 660 Hz tone sent to the built-in sink by name is heard, its `paplay` exiting 0. `artifacts/S3.11.1/` (artifact `evidence-vm-operator`) holds F3.9's and F4.7's common sets before and away, the three counter tables in one, the desktop's processes before and after, a video of the cycle, each returned device's `xinput test`, the sink file, the screen with the typed line, and the tone's capture with the player's exit status, verdict and level plot.
 
 **S3.11.2 Composite cycle with the video link down at the same time**
 - Requirement: S3.11.1 with `Virtual-1` forced down during the away period and `detect`ed on return, layout declared; geometry and windows hold throughout.
 - Acceptance: S3.11.1's assertions plus dims `2048x768` and an unchanged window tree at every step.
 - Evidence: S3.11.1's set plus the F3.10 common set.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s3_11_2`, last in the operator shard, under the declared two-monitor layout (2048x768): S3.11.1's cycle with Virtual-1 forced off while the devices are away and set back to `detect` as they return. Every count drops and returns. While away the screen stays 2048x768 and Virtual-1 reads disconnected at `1024x768+0+0`; after the return it reads connected there, and no window moves or resizes at either step. Xorg and PipeWire keep their pids, the returned tablet clicks, the returned keyboard types into the sink it clicked, and the tone sent to the built-in sink by name is heard. `artifacts/S3.11.2/` (artifact `evidence-vm-operator`) holds S3.11.1's set plus F3.10's (sysfs and `xrandr --verbose` before, away and after) and the window tree at each step.
 
 ---
 
@@ -900,21 +903,21 @@ event, EV-TIMELINE.
 
 **S4.2.1 Host Pulse clients are routed to the container**
 - Requirement: the host Pulse client drop-in routes an unconfigured host client to the export and never autospawns a daemon.
-- Acceptance: on the VM host **without** `PULSE_SERVER` set, `paplay tone.wav` plays and is captured; a stub `/usr/bin/pulseaudio` that logs every start shows none (without the stub, "no daemon was spawned" cannot fail on a host that has no daemon to spawn).
+- Acceptance: on the VM host **without** `PULSE_SERVER` set, `paplay tone.wav` plays and is captured, and a stub `/usr/bin/pulseaudio` that logs every start shows none. EL9's libpulse does not autospawn unless its client configuration asks it to, so the stub alone could not fail: in a private mount namespace, with the export hidden and `/etc/pulse/client.conf` saying `autospawn = yes`, a client with the drop-in starts no stub, and the control, the drop-in hidden, does.
 - Evidence: EV-AUDIO; `env | grep PULSE` (empty) and `pgrep pulseaudio` (empty) (EV-STATE); the drop-in (EV-CONFIG).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:host_audio`, in the core shard. rocky, with a clean environment and no `PULSE_` variable, plays a 440 Hz tone with `paplay` (exit 0), and the VM host hears it (3.08 s, peak 0.547); the stub `/usr/bin/pulseaudio` records no start, and no pulseaudio runs. In a private mount namespace, the export hidden under an empty tmpfs and `client.conf` saying `autospawn = yes`, rocky's `pactl info` with the drop-in tries only `unix:/run/desktop-audio/pulse` and starts nothing; the control, the drop-in hidden, runs the stub (`/usr/bin/pulseaudio --start`). Under `artifacts/S4.2.1/` (artifact `evidence-vm-core`): the namespace transcript, the probe (the drop-in, `env | grep PULSE`, `pgrep -a pulse`), and the recording with check-audio.py's verdict and level plot.
 
 **S4.2.2 Host ALSA clients are routed through the pulse plugin**
 - Requirement: the ALSA drop-in routes `pcm.!default`/`ctl.!default` to the pulse socket.
-- Acceptance: on the VM host (with `alsa-utils` + `alsa-plugins-pulseaudio`), `aplay tone.wav` plays and is captured at 1320 Hz; `amixer` lists the pulse control.
+- Acceptance: on the VM host (with `alsa-utils` + `alsa-plugins-pulseaudio`), the deploy tree's drop-in loads last in `/etc/alsa/conf.d`, after the package's own `99-pulseaudio-default.conf`, whose server-less `pcm.!default` would otherwise win; `aplay tone.wav`, with libpulse given no default server of its own, plays and is captured at 1320 Hz; `amixer` lists the pulse control; the control, the same aplay with the drop-in hidden, is refused.
 - Evidence: EV-AUDIO; `amixer` output (EV-STATE); the drop-in (EV-CONFIG).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:host_audio`, in the core shard. `/etc/alsa/conf.d` in load order ends with `99-zz-desktop-container.conf`. rocky's `aplay` through ALSA's default, with an empty client config (no default server), exits 0 and the VM host hears 1320 Hz (3.23 s, peak 0.547); `amixer info` names `'pulse'/'PulseAudio'`. With the drop-in hidden (`/dev/null` bound over it in a private mount namespace) the same aplay is refused (`PulseAudio: Unable to connect: Connection refused`). Under `artifacts/S4.2.2/` (artifact `evidence-vm-core`): the packages, `/etc/alsa/conf.d` with each file, the control, the probe, and the recording with its verdict and level plot.
 
 **S4.2.3 A host-local `asound.conf` still wins**
 - Requirement: the drop-in loads before `/etc/asound.conf`, so a host override is honoured.
 - Acceptance: with an `/etc/asound.conf` routing default to `null`, `aplay -D default` produces no capture; remove it.
 - Evidence: EV-AUDIO (silence, analyser fails as expected); the override file.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:host_audio`, in the core shard. With an `/etc/asound.conf` routing default to `null`, rocky's `aplay -D default` of 1320 Hz exits 0 and the VM host hears nothing (peak 0.000; check-audio.py fails, as expected). With the file removed, the same aplay is heard at 1320 Hz (3.20 s, peak 0.547). Under `artifacts/S4.2.3/` (artifact `evidence-vm-core`): the override file, both probes, both recordings with their verdicts and level plots, and `/etc/asound.conf`'s absence afterwards.
 
 ### F4.3 Realtime
 
@@ -1029,19 +1032,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: a client can `parec`/`arecord` from the new source.
 - Acceptance: the stream opens and delivers frames.
 - Evidence: EV-AUDIO-REC (duration > 0, silence with the null backend is acceptable and stated); EV-LOG-CLIENT.
-- Tier: T3/T4 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug: a capture-capable card on PCI": with the AC97 card hot-added (S4.7.8), the session user's `parecord` records its source, `alsa_input.pci-0000_00_0b.0.analog-stereo`, for 3 s and exits 0, and the WAV holds 2.90 s of frames at 44.1 kHz stereo (silence: QEMU's `none` audiodev captures nothing else). What a real microphone records is S4.7.12's, on hardware. `artifacts/S4.7.9/` (artifact `evidence-vm-core`) holds the recorder's command, output and exit status, the recording, and its frames, duration, format and peak.
 
 **S4.7.10 A card that arrives after a soundless boot is openable**
 - Requirement: S2.4.6.
 - Acceptance: VM profile without `intel-hda`; hot-add `usb-audio`; after the next stack start WirePlumber lists it and it plays.
 - Evidence: as S2.4.6.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:soundless` (S2.4.6's run): after the stack's next start WirePlumber lists the card that arrived after the soundless boot, `pactl list short sinks` gives its sink alone (no `auto_null`), and a 990 Hz tone the session user plays through it is heard. Under `artifacts/S4.7.10/` (artifact `evidence-vm-soundless`): `wpctl status`, the sinks, the player's log, and the tone with its verdict; the rest of S2.4.6's set under `artifacts/S2.4.6/`.
 
 **S4.7.11 Repeated audio cycles leave no phantom devices**
 - Requirement: ≥ 5 plug/unplug cycles return node and Device counts to baseline; no `alsa_card` object outlives its node.
 - Acceptance: counts equal baseline after the last cycle; the built-in tone still plays.
 - Evidence: per-cycle counter table; `pw-cli ls Device` baseline vs final (EV-DIFF empty); EV-AUDIO.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "audio hotplug: five plug/unplug cycles leave no phantom devices": five `usb-audio` plug/unplug cycles, each card with an id of its own. Each plug-in raises the container's `controlC*` nodes and WirePlumber's `alsa_card` devices, and each removal brings the host's `/dev/snd` nodes, the container's and WirePlumber's devices back to the baseline (7, 1, 1). After the fifth, `pw-cli ls Device` is the baseline's byte for byte, and the built-in card plays a pulse client's 440 Hz tone, heard. `artifacts/S4.7.11/` (artifact `evidence-vm-core`) holds F4.7's common set before the first cycle and after the fifth with the diffs, the counter table (a row per plug-in and per removal), and the tone's capture with its verdict and level plot.
 
 **S4.7.12 Physical USB audio plug-in and plug-out**
 - Requirement: S8.3.1.
@@ -1058,7 +1061,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `rsync -a --chown=root:root deploy/host/ /` and `systemctl daemon-reload` from `deploy/README.md` "Apply", run as written, install everything (the `reboot` that completes the block is S5.1.3); the two symlinks and the four `multi-user.target.wants` symlinks survive as symlinks.
 - Acceptance: symlink checks; `is-enabled` = `enabled` for `desktop-client-cdi`, `desktop-selinux`, `desktop-session`, `desktop-tools-cdi.path`.
 - Evidence: `find /etc/systemd/system -maxdepth 2 -type l -ls` (EV-STATE); `systemctl is-enabled` output; `systemctl list-units 'desktop*'` (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke` asserts both symlinks and all four `is-enabled` results (`guest:phase_deploy` only `desktop-client-cdi`), but after its own copy of the live-apply commands, not the `deploy/README.md` "Apply" block.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_applied`, in phase-deploy, reads `deploy/README.md`'s "Apply" block and checks it is still `rsync`, `daemon-reload` and `reboot`; phase-deploy runs the first two as written. It checks the two symlinks and the four `multi-user.target.wants` links arrived as symlinks and the four units read `enabled`, and saves the block, `find /etc/systemd/system -maxdepth 2 -type l -ls`, `systemctl is-enabled` of the four and `systemctl list-units --all 'desktop*'` under `artifacts/S5.1.1/` (artifact `evidence-vm-core`). `smoke` asserts the symlinks and `is-enabled` on the runner (job log only).
 
 **S5.1.2 Files land root-owned with correct modes**
 - Requirement: every file from the tree is `root:root`; scripts are executable.
@@ -1070,7 +1073,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: after a reboot with no manual starts, `desktop.service` is active, all oneshots succeeded, the session is up and visible, the tools spec is rewritten, labels are present, and `seat-prep` changed nothing.
 - Acceptance: T3 variant: reboot the VM after phase-deploy and assert the above.
 - Evidence: EV-SHOT of the desktop after reboot; `systemctl status` of every unit (EV-STATE); EV-LOG-JOURNAL `-b` for `desktop-seat-prep` (no `seat-prep:` lines); `ls -Z` of the three dirs; `ls /etc/cdi` with mtimes.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` reboots the VM last in the core shard, after `guest:deploy_tail`, and nothing touches it afterwards. `guest:deploy_reboot` checks a new boot id; `desktop.service` active with X answering and mwm running; the five boot oneshots active and succeeded, and no desktop unit failed; the tools spec rewritten that boot; the three client directories `container_file_t` again; `desktop-seat-prep` logging nothing. It saves the units' status, `systemctl --failed`, `ls -Zd` of the three directories, `ls -l --full-time /etc/cdi`, seat-prep's journal for the boot and `loginctl list-sessions`, and the VM host adds a screendump of the desktop after the reboot, under `artifacts/S5.1.3/` (artifact `evidence-vm-core`).
 
 ### F5.2 Quadlet unit
 
@@ -1102,13 +1105,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `desktop.service` cannot run alongside `getty@tty1.service` or `display-manager.service`.
 - Acceptance: unmask and start `getty@tty1` → desktop stops; restore. Destructive; run last.
 - Evidence: EV-LOG-JOURNAL for both units; `systemctl status` pair.
-- Tier: T3 · Coverage: ❌ no test; `guest:phase_deploy` only shows that starting the desktop stops getty, which seat-prep also does, so it does not isolate `Conflicts=`.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail`, with the desktop running, starts `getty@tty1` (unmasked for the test) and then a stand-in `display-manager.service`: each stops `desktop.service`. Both are then put back: the getty masked again, no display manager, the desktop running. The generated unit's `Conflicts=`, `systemctl status` for each case and the three units' journal through the test are under `artifacts/S5.2.5/` (artifact `evidence-vm-core`).
 
 **S5.2.6 Image pin drop-in**
 - Requirement: on podman ≥ 5.0 a `desktop.container.d/50-image.conf` `Image=` override lands in the generated unit.
 - Acceptance: on the Rocky VM: add a drop-in, `daemon-reload`, `systemctl cat` shows it, restart works; `desktop-preflight` reports the drop-in as merged.
 - Evidence: `systemctl cat desktop.service` (EV-CONFIG); `podman inspect desktop --format '{{.ImageName}}'`; preflight row.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` writes `desktop.container.d/50-image.conf` pinning `localhost/desktop-container:ev-pinned`, a second name for the same image, runs `daemon-reload` and restarts the desktop: the generated unit carries the pin, the desktop runs the pinned image, and `desktop-preflight` reports the drop-in merged and the pinned image in storage. With the drop-in removed the desktop runs `:latest` again. `podman --version`, the drop-in, `systemctl cat desktop.service`, `podman inspect desktop --format '{{.ImageName}}'` and the preflight report are under `artifacts/S5.2.6/` (artifact `evidence-vm-core`).
 
 ### F5.3 Seat convergence (`seat-prep.sh`)
 
@@ -1116,7 +1119,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: seat rules removed, display manager disabled and stopped, default target set, getty masked and stopped, logind restarted only if something changed.
 - Acceptance: `smoke` staged seat rule + fake DM; `guest:phase_deploy`: start `desktop-seat-prep` on its own before `desktop.service`, and assert `getty@tty1` stopped and the `seat-prep: stopping running getty@tty1.service` journal line. (Starting the desktop proves nothing here: its `Conflicts=getty@tty1.service` stops the getty in the same transaction.)
 - Evidence: EV-LOG-JOURNAL of `desktop-seat-prep` and `systemd-logind` (restart present on the dirty run, absent on steady state); `systemctl status getty@tty1 display-manager` before/after (EV-DIFF); `systemctl get-default`.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke` and `dryrun` assert the seat-rule removal, DM stop, default target and getty mask, but not the logind restart. `guest:phase_deploy`'s getty eviction does not show seat-prep working, because the quadlet's `Conflicts=` stops that getty anyway.
+- Tier: T2/T3 · Coverage: ✅ the getty, the default target and logind: `guest:seat_prep_dirty`, in phase-deploy, starts `desktop-seat-prep` on its own on the stock host, before the desktop. `getty@tty1` stops, the journal says `stopping running getty@tty1.service` and `seat converged`, `systemd-logind` restarts (a new MainPID), and the default target is `multi-user.target`. `guest:deploy_reboot` adds the steady half: on the rebooted, converged host seat-prep logs nothing and logind starts once. Both halves' evidence is under `artifacts/S5.3.1/` (artifact `evidence-vm-core`): `getty@tty1`'s and `display-manager`'s status before and after with their diff, seat-prep's and logind's journals, `get-default`. ✅ the seat-rule and display-manager clauses, at T2: the stock VM has neither, so `smoke` stages both on the runner, a `72-seat-*.rules` file and a display manager (`ci-fake-dm.service`, aliased as `display-manager.service`) enabled and running. seat-prep removes the rule and disables and stops the manager, saying so for each; run again on the converged seat, it says nothing. Under `artifacts/S5.3.1/` (artifact `evidence-smoke`): the staged seat, seat-prep's output, the seat after it with the diff, and the second run's output.
 
 **S5.3.2 Steady state is silent and idempotent**
 - Requirement: a second run changes nothing and prints nothing.
@@ -1126,9 +1129,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.3.3 The gate names a culprit and fails**
 - Requirement: a process holding `/dev/dri/card*` or `/dev/tty1` after convergence → exit 1 naming it; `desktop.service` still starts.
-- Acceptance: stop `desktop.service`; hold `/dev/dri/card0` from a background `sleep`; `systemctl restart desktop-seat-prep` fails naming that pid; `systemctl start desktop.service` still starts it; release; `systemctl restart desktop-seat-prep` succeeds. (`start` is a no-op on the already-active `RemainAfterExit=yes` unit, and while the desktop runs Xorg holds `card0` too.)
+- Acceptance: stop `desktop.service`; hold `/dev/dri/card0` from a background `sleep`; `systemctl restart desktop-seat-prep` fails naming that pid; `systemctl start desktop.service` still starts it, and its Xorg meets the conflict the gate named: the sleep opened card0 first, so it is card0's DRM master and the rootless Xorg's `drmSetMaster` fails, as `desktop-seat-prep.service` says it will; release; `systemctl restart desktop-seat-prep` succeeds and the desktop comes up. (`start` is a no-op on the already-active `RemainAfterExit=yes` unit, and while the desktop runs Xorg holds `card0` too.)
 - Evidence: EV-LOG-JOURNAL with the `ERROR: devices still held` line and the `fuser -v` table; `systemctl status` of both units.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` stops the desktop and holds `/dev/dri/card0` from a root `sleep`. `systemctl restart desktop-seat-prep` exits 1, its journal naming card0, the sleep's pid and fuser's table. `desktop.service` still starts (the quadlet only `Wants=` seat-prep), and the Xorg log shows `drmSetMaster` failing. With the sleep gone, seat-prep succeeds and the desktop comes up with X answering. Under `artifacts/S5.3.3/` (artifact `evidence-vm-core`): the holders, seat-prep's journal, the Xorg log's DRM-master lines, both units' status, and what the host's `fuser` shows with the desktop running. Recorded there: the host's `fuser` does not list the container's Xorg, because podman gives the container device nodes of its own and `fuser` matches an open file by its node. The gate runs before the desktop starts, so that does not weaken it, but no host-side `fuser` can show whether the desktop itself holds the card.
 
 **S5.3.4 Degrades without `psmisc`**
 - Requirement: without `fuser`, the gate is skipped with a notice, exit 0.
@@ -1152,9 +1155,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.4.2 Real generation, transient failure, no-downgrade, recovery to stub**
 - Requirement: with `nvidia-ctk` and `/dev/nvidiactl` the real spec is written; a failing `nvidia-ctk` keeps an existing real spec; without a toolkit an existing real spec is kept while `/dev/nvidiactl` exists or the `nvidia` module is loaded (`/proc/modules`); with neither, the stub returns.
-- Acceptance: `smoke` with a fake `nvidia-ctk` and fake `/dev/nvidiactl`; the `/proc/modules` trigger needs an override (Appendix A).
+- Acceptance: `smoke` with a fake `nvidia-ctk` and fake `/dev/nvidiactl`; the `/proc/modules` trigger through the script's `CDI_PROC_MODULES` (Appendix A).
 - Evidence: the spec after each step (EV-CONFIG × 4); the script's stdout.
-- Tier: T2 · Coverage: 🟡 the `/proc/modules` leg is not tested: the script reads `/proc/modules` itself, with no override a test could use (Appendix A). The other legs are asserted by `smoke`, which saves the converger's output and the spec after each of five legs (stub; generated; a failing `nvidia-ctk` keeps the real spec; no toolkit with the device node present keeps it; neither, back to the stub) under `artifacts/S5.4.2/` (artifact `evidence-smoke`).
+- Tier: T2 · Coverage: ✅ `smoke` runs the converger through six legs, saving its output and the spec after each, under `artifacts/S5.4.2/` (artifact `evidence-smoke`): no toolkit and no hardware, the stub; a fake `nvidia-ctk` and a fake `/dev/nvidiactl`, the real spec it generates; a failing `nvidia-ctk` keeps the real spec; no toolkit with the device node present keeps it; no toolkit and no device node with the `nvidia` module loaded keeps it (the module list given as `CDI_PROC_MODULES` is the runner's `/proc/modules` with an `nvidia` line added, kept as evidence); neither, the runner's own `/proc/modules` (no `nvidia` line, its count kept), back to the stub.
 
 **S5.4.3 Stale real spec fails loudly, regenerates on restart**
 - Requirement: after a driver update the stale spec fails container creation; `systemctl restart desktop-cdi-refresh` fixes it.
@@ -1192,13 +1195,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: the service stays active; removing the spec does not re-advertise until the service is stopped; a reboot with a populated dir rewrites it.
 - Acceptance: `rm` the spec; still absent after 5 s; `systemctl stop desktop-tools-cdi.service`; spec reappears; `.path` unit not failed. The reboot half runs in the T3 reboot sub-phase.
 - Evidence: `systemctl status desktop-tools-cdi.{path,service}` at each step (EV-STATE); `ls -l /etc/cdi/desktop-tools.yaml` with mtime; EV-LOG-JOURNAL.
-- Tier: T2/T3 · Coverage: ❌.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_tail` removes the tools spec while `desktop-tools-cdi.service` is active: still absent 5 s later. `systemctl stop desktop-tools-cdi.service` lets the `.path` unit fire again: the spec is back, and the `.path` unit is active, not failed. `guest:deploy_reboot` adds the reboot half: the spec rewritten that boot. The units' and the spec's state at each step, their journal since the removal and their state after the reboot are under `artifacts/S5.5.5/` (artifact `evidence-vm-core`).
 
 **S5.5.6 Specs are host state, independent of the desktop and of kubernetes**
 - Requirement: display/audio specs exist before the desktop is up and survive `helm uninstall`.
 - Acceptance: with `desktop.service` stopped, remove both specs and `systemctl restart desktop-client-cdi`: both reappear; `guest:verify_teardown` with `ls -l --full-time /etc/cdi` before and after `helm uninstall`. (`guest:phase2` checks the specs only once the desktop is already running.)
 - Evidence: `ls -l /etc/cdi` with mtimes before/after (EV-DIFF empty for the two specs).
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_teardown` asserts the specs survive `helm uninstall`, but nothing shows they exist before the desktop is up (`guest:phase2` checks them with the desktop running).
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail`, with `desktop.service` stopped, removes both client specs and restarts `desktop-client-cdi`: both are back, byte for byte the same. `ls -l --full-time /etc/cdi` before, removed and after, with the diffs, are under `artifacts/S5.5.6/` (artifact `evidence-vm-core`). The `helm uninstall` half is `guest:verify_teardown`'s, its evidence under `artifacts/S7.3.6/` (artifact `evidence-vm-k8s`): `/etc/cdi` before and after the uninstall, EV-DIFF empty.
 
 ### F5.6 SELinux labeling (`desktop-selinux`)
 
@@ -1212,37 +1215,37 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: full context `system_u:object_r:container_file_t:s0` (no categories) on all three dirs and the binary, before any client runs.
 - Acceptance: `ls -Zd`.
 - Evidence: `ls -Zd` of the three and `ls -Z` of the binary (EV-STATE); `getenforce`.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:phase_deploy` asserts the type only, so a label carrying categories still passes.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks` checks the full context, `system_u:object_r:container_file_t:s0` with no categories, on the three client directories and on the published `screenshot` binary; `getenforce` and the `ls -Zd`/`ls -Z` listing are under `artifacts/S5.6.2/` (artifact `evidence-vm-core`).
 
 **S5.6.3 The label is policy, including the `/run` equivalency workaround**
-- Requirement: an fcontext rule governs each dir (for `/run/desktop-audio`, under whichever of `/run` or `/var/run` the policy accepts: `desktop-selinux` tries `/run` first, and which spelling Rocky 9 stores has not been recorded yet); `restorecon -R` keeps the labels.
+- Requirement: an fcontext rule governs each dir (for `/run/desktop-audio`, under whichever of `/run` or `/var/run` the policy accepts: `desktop-selinux` tries `/run` first; Rocky 9 stores it under `/var/run`); `restorecon -R` keeps the labels.
 - Acceptance: `semanage fcontext -l -C` lists three rules; `restorecon -Rv` changes nothing.
 - Evidence: the `semanage` listing and `restorecon -Rv` output (EV-STATE); `ls -Zd` after.
-- Tier: T3 · Coverage: ❌ no test; `guest:phase_deploy`'s type check passes the same way when `semanage` fails and the `chcon` fallback does the labeling.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks`: `semanage fcontext -l -C` lists a local `container_file_t` rule for each of the three directories, `/run/desktop-audio`'s stored under `/var/run`, and `restorecon -Rv` of the three relabels nothing. The listing, the `restorecon` output and `ls -Zd` after are under `artifacts/S5.6.3/` (artifact `evidence-vm-core`).
 
 **S5.6.4 chcon fallback without semanage**
 - Requirement: without `semanage` on `PATH`, the dirs are still labelled and the policy note printed.
 - Acceptance: run with a stubbed `PATH` against a probe dir.
 - Evidence: stdout; `ls -Zd` of the probe dir.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` runs `desktop-selinux` on a probe directory with `PATH=/usr/bin:/bin`, so no `semanage`, `restorecon` or `selinuxenabled`: it prints the policy note, labels the probe `container_file_t` with `chcon`, exits 0 and adds no policy rule. `ls -Zd` before and after and the run's output are under `artifacts/S5.6.4/` (artifact `evidence-vm-core`).
 
 **S5.6.5 Verification fails the unit when a label does not land**
 - Requirement: a dir still lacking the type → `FAILED to label` naming it, exit 1.
 - Acceptance: a dir on a filesystem that refuses relabeling.
 - Evidence: stdout/exit code; `ls -Zd`; `mount` line of the probe fs.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` points `desktop-selinux` at a directory on a tmpfs mounted with `context=`, which nothing can relabel (a `chcon` by hand is refused too): it says `FAILED to label`, names the directory with its `tmp_t` label and exits 1. `findmnt`, the refused `chcon`, the run and `ls -Zd` after are under `artifacts/S5.6.5/` (artifact `evidence-vm-core`).
 
 **S5.6.6 Missing directories are reported, not invented**
 - Requirement: a missing dir is warned and skipped; none present → exit 1.
 - Acceptance: two bogus paths → exit 1; one bogus + one real → warning, labelled, exit 0.
 - Evidence: stdout and exit codes for both runs.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` runs `desktop-selinux` on two missing paths: both named in the warning, then `none of the client directories exist yet`, exit 1. Then on one missing and one real: the missing one warned about and not created, the real one labelled, exit 0. Both runs' output and exit status are under `artifacts/S5.6.6/` (artifact `evidence-vm-core`).
 
 **S5.6.7 The host keeps full access after relabeling**
 - Requirement: an unconfined host process can connect to the X and audio sockets and execute the toolkit.
 - Acceptance: `guest:phase_deploy` host `pactl`, host `screenshot --help`, host capture of `:0`.
 - Evidence: the host capture PNG (EV-SHOT-CLIENT host variant); `pactl info`; `ausearch -m avc -ts recent` (empty) (EV-STATE).
-- Tier: T3 · Coverage: ✅ `guest:phase_deploy` saves an unconfined host process running the relabeled `screenshot --help`, its capture of `:0`, `pactl info` over the relabeled socket, and `ausearch -m avc -ts <the start of these checks>` (`<no matches>`), and asserts that last one empty, under `artifacts/S5.6.7/` (artifact `evidence-vm-core`).
+- Tier: T3 · Coverage: ✅ `guest:phase_deploy` saves an unconfined host process running the relabeled `screenshot --help`, its capture of `:0`, `pactl info` over the relabeled socket, and `ausearch --input-logs -m avc -ts <the start of these checks>`, and asserts that last one holds no AVC record. A control comes first: `ausearch --input-logs -m DAEMON_START` must find auditd's own start record, so the search is shown to read the audit log. Before batch 8 the search had no `--input-logs`, and ausearch reads its standard input instead of the log when that is a pipe, as the guest script's is over ssh (the evidence notes it: a fifo), so it read nothing and could not fail. Under `artifacts/S5.6.7/` (artifact `evidence-vm-core`): the binary's `--help`, the capture, `pactl info`, the control and the search.
 
 ### F5.7 Host Terminal
 
@@ -1250,7 +1253,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: ed25519 keypair under `/etc/desktop-container` (0400/0644), `authorized_keys.d/desktop-shell` (0644) with the `from=` and `no-*-forwarding` options.
 - Acceptance: `dryrun`/`smoke`; `guest:phase_deploy` under enforcing.
 - Evidence: `ls -l /etc/desktop-container /etc/ssh/authorized_keys.d` (EV-STATE); the authorized_keys line (EV-CONFIG).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `dryrun` asserts the `from=` loopback restriction and `smoke` the key's 0400 mode, but nothing checks the `no-*-forwarding` options, the key type or the other files' modes.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_checks` checks the private key 0400 root, and the public key and the `authorized_keys.d` entry 0644 root. The entry is one line: `from="127.0.0.1,::1"`, `no-port-forwarding`, `no-agent-forwarding`, `no-X11-forwarding`, then an `ssh-ed25519` key, the one in `host-shell-key.pub`. `guest:deploy_reboot` adds that the reboot makes a new key and the entry carries it. `ls -l` of both directories, the entry and the key's fingerprint before and after the reboot are under `artifacts/S5.7.1/` (artifact `evidence-vm-core`). `dryrun` and `smoke` assert the loopback restriction and the key's mode on the runner (job log only).
 
 **S5.7.2 Login works both directions, and the operator gets a host shell from the menu**
 - Requirement: `ssh -i <key> desktop-shell@127.0.0.1 whoami` from the host and `ssh host whoami` from the container return `desktop-shell`; the "Host Terminal" menu entry shows a prompt on the host.
@@ -1260,15 +1263,15 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.7.3 Restrictions are enforced**
 - Requirement: the key is refused from a non-loopback source; port forwarding is refused.
-- Acceptance: ssh to the VM's non-loopback IP fails; `-L` with `ExitOnForwardFailure=yes` exits nonzero.
+- Acceptance: ssh to the VM's non-loopback IP fails; `-R` with `ExitOnForwardFailure=yes` exits nonzero when the forward is set up; a connection through a `-L` forward is refused when it is made. `ExitOnForwardFailure` does not see that refusal: sshd refuses the channel, not the forward, so `-L` itself exits 0.
 - Evidence: both ssh transcripts with exit codes; EV-LOG-JOURNAL of `sshd` showing the refusals.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks`: the key is accepted from 127.0.0.1 and refused from the VM's own non-loopback address (ssh exit 255). `ssh -R` with `ExitOnForwardFailure=yes` exits 255 at setup. A connection through an `ssh -L` forward gets nothing back: the channel is administratively prohibited. Recorded: the `-L` ssh itself exited 0. The transcripts and sshd's journal are under `artifacts/S5.7.3/` (artifact `evidence-vm-core`).
 
 **S5.7.4 Re-running rotates the key and invalidates the old one**
-- Requirement: a second run writes a different key; the old private key no longer authenticates; the container regains access after `desktop.service` restarts.
+- Requirement: a second run writes a different key; the old private key no longer authenticates; the running container takes the new key at once (the unit hands it to a running desktop), and still has access after `desktop.service` restarts.
 - Acceptance: as stated.
-- Evidence: `ssh-keygen -lf` of old and new public keys (EV-DIFF); old-key ssh transcript (refused); new-key transcript; container `ssh host` before and after the restart.
-- Tier: T2 · Coverage: ✅ `smoke` re-runs `desktop-host-shell.service` and saves `ssh-keygen -lf` of the public key before and after (different, with the diff), the old private key refused by sshd, the new one logging in as `desktop-shell`, and the container's `ssh host` refused before `desktop.service` restarts and logging in after, under `artifacts/S5.7.4/` (artifact `evidence-smoke`).
+- Evidence: `ssh-keygen -lf` of old and new public keys (EV-DIFF); old-key ssh transcript (refused); new-key transcript; the unit's journal of the hand-off; container `ssh host` right after the second run and after the restart.
+- Tier: T2 · Coverage: ✅ `smoke` re-runs `desktop-host-shell.service` and saves `ssh-keygen -lf` of the public key before and after (different, with the diff), the old private key refused by sshd, the new one logging in as `desktop-shell`, the unit's journal of its hand-off to the running desktop, and the container's `ssh host` logging in right after the second run, with no desktop restart, and again after `desktop.service` restarts, under `artifacts/S5.7.4/` (artifact `evidence-smoke`). Before `claude/fix-host-shell-live` the running container was refused until that restart, as this story then required.
 
 **S5.7.5 Empty or missing shell-user / account**
 - Requirement: empty `shell-user` → exit 0, nothing written; missing `shell-user` → exit 1 with a hint (the tree ships the file: re-apply it, or use the quadlet's off-switch to turn the feature off), nothing written; account missing → exit 1 with the sysusers hint.
@@ -1286,21 +1289,21 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: no key → hint logged, exit 0; empty `shell-user` → warning, exit 0; both present → `~/.ssh/config` and a 0400 key copy; preflight WARNs `no host shell material`.
 - Acceptance: T1 in a scratch container; T2 stop the unit, delete the key files, restart desktop.
 - Evidence: EV-LOG-DESKTOP (the hint and the preflight WARN); `~/.ssh/config` (EV-CONFIG); `ls -l /home/desktop/.ssh`; T3 EV-SHOT of the host-terminal xterm showing the failure message and "Press Enter to close".
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: ✅ the T1 half: `build-smoke`'s "host-shell-setup's cases (S5.7.7's T1 half)" step (`ci/host-shell-setup-tests.sh`) runs the image's `host-shell-setup.sh` in a scratch container per case, `/etc/desktop-container` written there as the quadlet's read-only mount would give it. No key: the hint names the missing key and how to enable it, exit 0, no `~/.ssh`, and the preflight WARNs `no host shell material`. No `shell-user` file, and an empty one: a warning naming it, exit 0, no ssh config. Both present: `~/.ssh` 0700, a 0400 key copy byte-identical to the mounted key and a 0600 config (`Host host`, `HostName 127.0.0.1`, the user, `IdentityFile`, `IdentitiesOnly yes`), all `desktop:desktop`, and the preflight PASSes the material. Per case under `artifacts/S5.7.7/` (artifact `evidence-smoke`): the setup and the transcript; the config. ✅ the T2 half: `smoke` applies the documented off-switch (the quadlet's two lines commented out, `daemon-reload`: the unit quadlet generated neither wants nor orders itself after `desktop-host-shell.service`), stops the unit and deletes the key files. The desktop starts and its X session comes up; nothing made a key; host-shell-setup logs the missing key and how to enable it; the preflight WARNs; the container has no `~/.ssh/config`. With the quadlet put back, the next start makes a fresh key and host-shell-setup configures the host shell. The quadlet's lines, the generated unit's dependencies, `/etc/desktop-container`, both starts' log lines and `~/.ssh` are under `artifacts/S5.7.7/` (artifact `evidence-smoke`). ✅ the T3 EV-SHOT the evidence names, shared with S5.7.8: `operator-e2e:s5_7_8` shoots the Host Terminal window showing the failure and "Press Enter to close", under `artifacts/S5.7.8/` (artifact `evidence-vm-operator`). There the host refuses the key rather than the container lacking it; `host-terminal` prints the same text for any failure of `ssh host`.
 
 **S5.7.8 The menu wrapper keeps its window open on failure**
 - Requirement: on `ssh host` failure, `host-terminal` prints the exit code, the enablement command and the common causes, waits for Enter, exits with ssh's code; on success exits 0 at once.
 - Acceptance: T1 with a fake `ssh`.
 - Evidence: stdout and exit codes for both cases; T3 EV-SHOT (see S5.7.7).
-- Tier: T1 · Coverage: ❌ the T3 EV-SHOT the evidence names (the window showing the failure and "Press Enter to close", shared with S5.7.7) is not taken. The rest is asserted, its evidence saved: `script-unit` runs `host-terminal` with a fake `ssh`; on success it exits 0 at once with stdin held open; on failure it prints the exit code, the enablement command and the common causes, waits for Enter and exits with ssh's code (255). Output and exit codes are under `artifacts/S5.7.8/` (artifact `evidence-static`).
+- Tier: T1/T3 · Coverage: ✅ the T1 half: `script-unit` runs `host-terminal` with a fake `ssh`. On success it exits 0 at once, its stdin held open; on failure it prints the exit code, the enablement command and the common causes, waits for Enter and exits with ssh's code (255). Output and exit codes are under `artifacts/S5.7.8/` (artifact `evidence-static`). ✅ the T3 half: `operator-e2e:s5_7_8` moves the host's trust entry for desktop-shell (`/etc/ssh/authorized_keys.d/desktop-shell`) aside, so the key the container holds is refused, and opens Host Terminal from the root menu through QEMU's input devices. The window's text, read back through CUT_BUFFER0, gives the failure with ssh's exit code (255), the enablement command, the other common causes and, last, `Press Enter to close.`; the window is still open seconds later, and Enter closes it. Under `artifacts/S5.7.8/` (artifact `evidence-vm-operator`): the menu and the armed entry, the window's EV-SHOT and its text, sshd's effective authentication settings and its journal on the refused login.
 
 ### F5.8 Host login session (`desktop-session.service`)
 
 **S5.8.1 A real logind session on seat0/tty1**
 - Requirement: `loginctl` shows `desktop` on `seat0`; `/run/user/61000` mounted by logind; utmp has an entry for tty1.
-- Acceptance: `smoke`, `guest:phase_deploy`; ❌ utmp.
+- Acceptance: `smoke`, `guest:deploy_checks` (tty1, the logind mount and utmp included).
 - Evidence: `loginctl list-sessions` and `loginctl show-session <id>` (EV-STATE); `who`; `findmnt /run/user/61000`.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke` and `guest:phase_deploy` assert a `desktop` session on `seat0` and that `/run/user/61000` exists, but not tty1, the logind mount or utmp.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_checks`: logind holds a user session for `desktop` on `seat0`, on `tty1`; `/run/user/61000` is a tmpfs mounted by `user-runtime-dir@61000.service`; utmp records `desktop` on `tty1`. `loginctl list-sessions`, `loginctl show-session`, `findmnt` with the unit that mounted it and `who` are under `artifacts/S5.8.1/` (artifact `evidence-vm-core`). `smoke` asserts the session on the runner (job log only).
 
 **S5.8.2 Moves with the container**
 - Requirement: `PartOf=desktop.service` restarts the session with the container.
@@ -1312,12 +1315,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: the container's `setsid -c` on tty1 succeeds.
 - Acceptance: X comes up and `podman logs` has no `failed to set the controlling terminal`.
 - Evidence: EV-LOG-DESKTOP grep (empty); `ps -o tty= -p <desktop-session-lead>` is `?`.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:phase_deploy` asserts only that X comes up, not that the desktop log lacks `failed to set the controlling terminal` or that the session lead has no tty.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks`: the host session's lead (`desktop-session-lead`) has no controlling tty, and the desktop's log never says `failed to set the controlling terminal`. The lead's `ps` line, the (empty) grep and Xorg's controlling tty in the container are under `artifacts/S5.8.3/` (artifact `evidence-vm-core`).
 
 **S5.8.4 The desktop runs with the unit disabled**
 - Requirement: see S2.2.2.
+- Acceptance: `systemctl disable desktop-session` does not take the unit out of the desktop's start (the quadlet's `Wants=`), and `systemctl mask` is refused, the unit file being the tree's own; with the unit file moved aside (S2.2.2's procedure) the desktop runs.
 - Evidence: as S2.2.2.
-- Tier: T2 · Coverage: ❌ as S2.2.2: the fallback is shown only in a scratch container, not with the unit disabled on a full deploy.
+- Tier: T3 · Coverage: ✅ `guest:standalone_desktop`, in the core shard. With the unit disabled and the desktop started, desktop-session still came up (desktop.container's `Wants=`) and the runtime dir was the host's: disabling is not enough. `systemctl mask desktop-session` is refused (exit 1): the unit file is the tree's own, at the path mask's link would take. With the unit file moved aside the desktop runs: X answers and the audio export answers (S2.2.2 has the runtime dir), and the VM host shoots the screen. Each state is under `artifacts/S5.8.4/` (artifact `evidence-vm-core`).
 
 ### F5.9 Accounts, tmpfiles, sysusers
 
@@ -1357,7 +1361,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: every row listed in the script fires when its condition is staged.
 - Acceptance: T2 table-driven: stage, run, grep, restore.
 - Evidence: per condition: the staging command, the row, the restore (EV-STATE table).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `smoke` runs `ci/preflight-rows.py host` on the runner the tree is applied to. It reads every FAIL and WARN row out of `desktop-preflight` itself (40), stages each row's condition in a case of its own, and checks that the case makes its row fire; a row no case names fails the story, so a row added to the script fails it until a case stages it. Cases run the preflight in a private mount namespace: a path hidden under `/dev/null`, a directory covered by a tmpfs, a command taken off `PATH`, fakes of `systemctl` and `podman` first on `PATH` answering the calls a case lists, a sleep holding the host's first DRM card. All 40 rows fired. Under `artifacts/S5.10.3/` (artifact `evidence-smoke`): the rows read from the source, the preflight with nothing staged, each case's staging and report, and the table of every row, the case that staged it and the line it printed.
 
 ### F5.11 Container preflight (`preflight-check.sh`)
 
@@ -1365,13 +1369,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: no `preflight: FAIL:` lines on the VM.
 - Acceptance: grep.
 - Evidence: EV-LOG-DESKTOP preflight block.
-- Tier: T3 · Coverage: ❌ nothing asserts it: no test greps the desktop log for `preflight: FAIL:`, and `guest:fail` prints the preflight block only after another check has failed.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks` reads the container preflight's lines from the desktop's log: it ran (16 lines) and reported no FAIL. The lines are under `artifacts/S5.11.1/` (artifact `evidence-vm-core`).
 
 **S5.11.2 Each check fires**
 - Requirement: every FAIL/WARN in the script fires when staged (omitted mounts/devices/flags via `podman run`).
 - Acceptance: T2 table-driven.
 - Evidence: per case: the `podman run` command and the preflight block (EV-LOG-DESKTOP).
-- Tier: T2 · Coverage: ❌.
+- Tier: T2 · Coverage: ✅ `build-smoke`'s "every row of the container preflight fires (S5.11.2)" step runs `ci/preflight-rows.py container`: every FAIL and WARN row read out of `preflight-check.sh` (18), each staged in `podman run --rm` of the image with none of the quadlet's devices or mounts and a setup of its own (an unreadable card, a foreign-seat tag, the host pid namespace missing, `/sys` absent or writable, a stub spec with an NVIDIA device node, and the rest); all 18 fired. Under `artifacts/S5.11.2/` (artifact `evidence-smoke`): the rows read from the source, each case's `podman run` command and preflight block, and the table. Its `/sys` cases found a defect, fixed by `claude/fix-preflight-sys-missing` and merged into this branch: with no `/sys` mount the script printed `FAIL: /sys is mounted WRITABLE ()` instead of its own `WARN: /sys not found in /proc/self/mounts`.
 
 ---
 
@@ -1460,7 +1464,7 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: no `label=disable`, no `--privileged` on any client; a static guard keeps it that way.
 - Acceptance: `guest:phase_deploy` probes; a static check finds no `--privileged` or `label=disable` on any `podman run`/`podman create` command or client manifest under `ci/` and `examples/` (a plain grep would match the log and failure messages that name `--privileged` when describing the desktop container).
 - Evidence: `getenforce`; a probe's own SELinux label (`/proc/self/attr/current`, what `ps -Z` shows); `ausearch -m avc` since the probes began (no denial with a `container_t` subject) (EV-STATE); the static guard's verdict.
-- Tier: T3/T0 · Coverage: ✅ the T0 half: `ci/client-guard.py`, run by the static job, reads every `podman run` and `podman create` under `ci/` and `examples/` as the shell would (continuations, quoting, heredoc bodies skipped) and every argv list the Python there builds, and finds none passing `--privileged` or `label=disable`, and no client manifest asking for `privileged: true` or `spc_t`; its self-test first shows that it flags each kind of violation and passes a mere mention. The guard's whole verdict is under `artifacts/S7.1.2/` (artifact `evidence-static`). The T3 half: `guest:phase_deploy` finds SELinux `Enforcing` on the VM host, a confined display client labelled `container_t` that opens `:0`, and no AVC denial with a `container_t` subject since the probes began; `getenforce`, the probe's label with `xdpyinfo`'s verdict, and `ausearch -m avc` since the probes began are under `artifacts/S7.1.2/` (artifact `evidence-vm-core`).
+- Tier: T3/T0 · Coverage: ✅ the T0 half: `ci/client-guard.py`, run by the static job, reads every `podman run` and `podman create` under `ci/` and `examples/` as the shell would (continuations, quoting, heredoc bodies skipped) and every argv list the Python there builds, and finds none passing `--privileged` or `label=disable`, and no client manifest asking for `privileged: true` or `spc_t`; its self-test first shows that it flags each kind of violation and passes a mere mention. The guard's whole verdict is under `artifacts/S7.1.2/` (artifact `evidence-static`). The T3 half: `guest:phase_deploy` finds SELinux `Enforcing` on the VM host, a confined display client labelled `container_t` that opens `:0`, and no AVC denial with a `container_t` subject since the probes began, read with `ausearch --input-logs` after the control S5.6.7 describes (before batch 8 the search read the script's stdin pipe and could not fail); `getenforce`, the probe's label with `xdpyinfo`'s verdict, the control and `ausearch --input-logs -m avc` since the probes began are under `artifacts/S7.1.2/` (artifact `evidence-vm-core`).
 
 > **`podman exec` does not get a device's env.** podman applies the edits
 > when the container starts, to the process it starts with: an exec session
@@ -1660,58 +1664,58 @@ EV-VIDEO of the display across the event; plus the device-specific set from
 the referenced feature.
 
 **S7.7.1 A client window keeps receiving keystrokes across a keyboard remove/re-add**
-- Requirement: a client xterm that had focus before the KVM-style keyboard cycle receives text typed through the re-added keyboard afterwards; same pod, same app pid.
+- Requirement: a client xterm that had focus before the KVM-style keyboard cycle receives text typed through the re-added keyboard afterwards; the same client container, the same app pid.
 - Acceptance: focus a client xterm (sink); `device_del`/`device_add` the USB keyboard; type through `kvmkbd` (S3.9.5); the client's sink file has the text.
-- Evidence: common set; sink file from inside the pod; EV-SHOT of the text in the client's window.
-- Tier: T3 · Coverage: ❌.
+- Evidence: common set; sink file from inside the client; EV-SHOT of the text in the client's window.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_7_1`: a podman client's xterm (holding the CDI display device, as F7.7's common set allows) takes a line typed before the USB keyboard goes. The keyboard is removed and re-added bound to `vga0`, so keys sent to the display come through it alone, and `xinput` lists it again. With no click between, the still-focused client xterm takes the line typed through it (12 key presses on its own X device). Xorg, mwm and the three audio daemons keep their pids; the client is the same container and application (`RestartCount` 0, the application's host pid and start time unchanged), still running. `artifacts/S7.7.1/` (artifact `evidence-vm-operator`) holds the client before and after with the diff (empty), the desktop's processes, F3.9's common set before and after, a video of the cycle, the keyboard's `xinput test`, the client-side sink file with both lines, the screen with them, and the client's log.
 
 **S7.7.2 A client window is clickable with a hot-added pointer**
 - Requirement: a tablet added after the client started can click into the client's window and give it focus.
 - Acceptance: `device_add usb-tablet`; click via that device on the client window; frame turns active; typed text lands.
 - Evidence: common set; EV-SHOT pair (frame colour); sink file.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_7_2`: a tablet plugged in after a podman client started. What the screen shows just after the plug is recorded; then the session's xterm is clicked through the boot pointer, and the client's frame reads the inactive `#22262d`. A click on the client's window through the hot-added tablet (its own X device sees the press) turns the frame the focused `#41637f`, and the keys typed next land in the client's xterm. Xorg, mwm and the three audio daemons keep their pids; the client is the same container and application (`RestartCount` 0). `artifacts/S7.7.2/` (artifact `evidence-vm-operator`) holds the client before and after with the diff (empty), the desktop's processes, F3.9's common set before and with the tablet, the screen just after the plug, before the click and after it, a video, the tablet's `xinput test`, the client-side sink file and the client's log.
 
 **S7.7.3 Client windows stay put across a monitor plug-out and re-plug (layout declared)**
 - Requirement: a client window's geometry (`xwininfo`) is identical before the connector goes down, while it is down, and after it returns; the client is not restarted.
 - Acceptance: `xwininfo -id <client window>` at the three moments equal; `restartCount` 0.
 - Evidence: common set; the three `xwininfo` outputs (EV-DIFF empty); EV-SHOT-CLIENT at the three moments (the client's own view is unchanged); EV-VIDEO.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`, with the host comparing the client's own captures: a podman client's xterm (holding the display and tools devices) on Virtual-1's half of the declared layout lives through S3.4.10's force. Its window's `xwininfo` is the same before, while Virtual-1 is off and after the re-plug. The client's own capture (the toolkit's screenshot), compared on the host over its window (259x82+307+534), has 0 pixels changed during and after, and 0 over the whole screen. The client is the same container and process (`RestartCount` 0); Xorg, mwm and the three audio daemons kept their pids and start times. `artifacts/S7.7.3/` (artifact `evidence-vm-core`) holds the client and the daemons before and after with the diffs (empty), the window's `xwininfo` at the three moments with the diffs (empty), the client's three captures, and its log.
 
 **S7.7.4 A client already playing is heard on a hot-added audio device, without restarting**
 - Requirement: an application container playing a continuous tone to the default sink keeps playing while a USB sound card is added; once that card becomes the default sink (WirePlumber policy, or the test sets it), the client's **existing stream** is heard on the new device; the container and the player are the same process throughout.
-- Acceptance: pod plays a 60 s 1100 Hz tone; `device_add usb-audio`; `wpctl set-default <new sink>` (or observe policy move it); `pactl list short sink-inputs` shows the client's stream now on the USB sink; `wavcapture` on the shared backend carries 1100 Hz throughout with no gap; `restartCount` 0; app pid unchanged.
-- Evidence: common set; EV-AUDIO spanning the event with the `device_add` and default-change timestamps marked on the spectrogram; `pactl list short sink-inputs` at three moments (EV-STATE) showing the stream's sink id change; `wpctl status` pair; EV-QEMU.
-- Tier: T3 · Coverage: 🟡 `operator-e2e:s11_3_1` asserts it with a podman client container in place of the pod (E11's definition of a client); no kubernetes pod variant is run. Under `artifacts/S11.3.1/`: the capture with each mark on a level plot, `info usb`, `/dev/snd` on the host and in the container, `pw-cli ls Device` and `pactl list short` sinks, sources and sink-inputs at four moments with diffs (the stream's sink id moving), a video of the plug, `wpctl status` after every step, the player's inspect before and after, pid tables and the desktop's log.
+- Acceptance: the pod plays a 20 s 1100 Hz tone; about 4 s in, `device_add usb-audio`, and the test makes its sink the default (at full volume); `pactl list short sink-inputs` shows the client's stream now on the USB sink; `wavcapture` on the shared backend carries 1100 Hz throughout with no gap; `restartCount` 0; app pid unchanged.
+- Evidence: common set; EV-AUDIO spanning the event with the `device_add` and default-change times marked on a level plot (no spectrogram tool is installed); `pactl list short sink-inputs` before and on (EV-STATE) showing the stream's sink change; `wpctl status` pair; EV-QEMU.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": the journey pod, running since the journeys began, plays a 20 s 1100 Hz tone; about 4 s in a USB card arrives and its sink is made the default. The pod's existing sink-input moves onto the card's sink; one player process plays before and after and exits 0 after 20.11 s. The capture carries the tone across the arrival with no stretch below -40 dBFS longer than 0.1 s and its whole 20 s span present. Xorg, mwm and the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. `operator-e2e:s11_3_1` asserts the move for a podman client too: its stream follows `wpctl set-default` onto a hot-added USB card with no drop longer than 0.5 s, and the player is not restarted. `artifacts/S7.7.4/` (artifact `evidence-vm-k8s`) holds the pod, the player and the daemons before and after with the diffs, the streams before and on, F4.7's device set before and on with the diffs, QEMU's reply, a video of the arrival, the player's log, and the capture with its verdict and the level plot marking the plug.
 
 **S7.7.5 A client playing on the hot-added device survives its removal**
 - Requirement: with the client's stream on the USB sink, `device_del` moves the stream back to the built-in sink (or ends it cleanly); the client is not restarted; its next playback is heard.
 - Acceptance: continuation of S7.7.4: `device_del`; `pactl list short sink-inputs` shows the stream on the built-in sink or gone with a clean client error; capture continues or resumes; `restartCount` 0.
 - Evidence: common set; EV-AUDIO continuing from S7.7.4 with the removal timestamp marked; EV-LOG-CLIENT.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": the pod's 20 s 880 Hz tone plays on the USB card, and the card is removed about 4 s in. Within 10 s its sink-input moves to the built-in card's sink, and the same player plays on to its end and exits 0. The capture carries the tone through the removal with no quiet stretch longer than 1 s and at most 1.5 s of the 20 lost. The pod's next tone, 660 Hz, is heard, its player exiting 0. Xorg, mwm and the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. `artifacts/S7.7.5/` (artifact `evidence-vm-k8s`) holds the pod and the daemons before and after with the diffs, the streams and sinks before and after the removal, F4.7's device set plugged in and after with the diffs, QEMU's reply, a video, both players' logs, and both captures with their verdicts and level plots (the removal marked).
 
 **S7.7.6 A client started while the hot-added device is present can target it by name**
 - Requirement: a new client can `pw-play --target` / `PULSE_SINK=<usb sink>` and be heard on it.
 - Acceptance: as stated with a 990 Hz tone.
 - Evidence: EV-AUDIO; `pactl list short sink-inputs` naming the sink; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": with the USB card present, the default is the built-in card, muted, and the USB card is at full volume. A new player in the pod, `PULSE_SINK=<the USB card's sink> paplay`, plays 990 Hz: its sink-input sits on that sink and it exits 0, and the tone is heard, so the USB card rendered it. The pod is the same container, `restartCount` 0. `artifacts/S7.7.6/` (artifact `evidence-vm-k8s`) holds `wpctl status` (the default and its mute), the streams and sinks while it played, the player's log, the capture with its verdict and level plot, and the pod before and after with the diff (empty).
 
 **S7.7.7 A client records from a hot-added capture device without restarting**
 - Requirement: a running pod can open the new source and deliver frames.
 - Acceptance: S4.7.8/S4.7.9 from a pod that was running before the hot-add.
 - Evidence: common set; EV-AUDIO-REC.
-- Tier: T3/T4 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": an AC97 card is hot-added under the journey pod, which has run since before it arrived, and brings a capture source. The pod opens it with `parecord`, which exits 0 and delivers 2.90 s of frames at 44.1 kHz stereo (silence: QEMU's `none` audiodev captures nothing else); removed, the card's source leaves with it. Xorg, mwm and the three audio daemons keep their pids, and the pod is the same container, `restartCount` 0. What a real microphone records into a client is S8.3.1's, on hardware. `artifacts/S7.7.7/` (artifact `evidence-vm-k8s`) holds `modinfo`'s answer for the candidate drivers, the pod and the daemons before and after with the diffs, F4.7's device set before, plugged in and after with the diffs, QEMU's replies, a video, the recorder's log, the recording and its frames, duration, format and peak.
 
 **S7.7.8 A client survives the KVM composite event**
-- Requirement: a client xterm and a client audio stream both continue across S3.11.1; afterwards the xterm takes typed text through the re-added keyboard and the stream is still heard; `restartCount` 0 for both pods.
-- Acceptance: S3.11.1 with two client pods in play.
-- Evidence: common set for both pods; EV-AUDIO spanning the event; EV-SHOT of typed text.
-- Tier: T3 · Coverage: ❌.
+- Requirement: a client xterm and a client audio stream both continue across S3.11.1; afterwards the xterm takes typed text through the re-added keyboard and the stream is still heard; both clients unrestarted (`restartCount` 0).
+- Acceptance: S3.11.1 with two client containers in play.
+- Evidence: common set for both clients; EV-AUDIO spanning the event; EV-SHOT of typed text.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_7_8`: two podman clients, an xterm and a player of a 1100 Hz tone, through the KVM switch. The stream plays on the KVM's USB card before the switch; the keyboard, tablet and sound card leave together and come back, every count back to its value before. Afterwards the stream is still playing, on the returned card, and the capture's end carries it (median level 0.0301; -40 dBFS is 0.01). The xterm takes the line typed through the returned keyboard (12 key presses on its own X device). Xorg keeps its pid; both clients are the same containers and applications (`RestartCount` 0), still running. `artifacts/S7.7.8/` (artifact `evidence-vm-operator`) holds both clients before and after with the diffs (empty) and their logs, the desktop's processes, F3.9's and F4.7's common sets away, the counter tables, a video, the capture through the switch with its tail level, the streams after, the keyboard's `xinput test`, the client-side sink file and the screen with the typed line.
 
 **S7.7.9 A client that started on a soundless host plays once a card arrives, without restarting**
 - Requirement: on the no-`intel-hda` profile, a pod whose player loops until success starts before any card exists; after `usb-audio` is added and the stack re-aligns, the tone is heard; `restartCount` 0.
 - Acceptance: S2.4.6 with the pod in play.
 - Evidence: common set; EV-LOG-CLIENT (retries then success); EV-LOG-DESKTOP align lines; EV-AUDIO.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:soundless`: a podman client stands in for the pod, as F7.7's common set allows (the soundless shard runs no cluster): the testclient image holding the CDI audio device, its shell looping once a second until a sink other than `auto_null` is listed and `paplay` of its tone succeeds. It starts before any card exists. Its first tries find no card's sink (`auto_null`), then the stack's restart refuses them; once the card is there and the stack has re-aligned it plays (after 10 failed tries in run 37390904377), and its 550 Hz tone is heard. It is the same container and process throughout: id, pid and start unchanged, `RestartCount` 0, still running. Xorg and mwm are the same processes across the card's arrival and the stack's restart; the three audio daemons are new, by design. Under `artifacts/S7.7.9/` (artifact `evidence-vm-soundless`): the client's command; its EV-PIDS before and after; Xorg, mwm and the audio daemons before and after, with their diff; its early and whole logs; the tone with its verdict; and the EV-VIDEO of the display from before the card was plugged in until after the client played (2 fps, `index.txt` timed). The align lines are under `artifacts/S2.4.6/`.
 
 ### F7.8 Desktop lifecycle as seen by running clients
 
@@ -1880,10 +1884,11 @@ maintenance happens on a machine someone uses to do a job. A documented remedy
 must recover the fault it names with no step the document leaves out, and
 without a reboot unless the document says one is needed.
 
-Several of these procedures, read side by side with the code, look broken
-today. Each such story says so in its coverage note, with the reason. Those
-notes are predictions from reading the code, not test results: none has been
-run, except where a note says it was.
+Several of these procedures, read side by side with the code, looked broken.
+`maintainer.yml` now runs every T3 story here, each in its own stock VM, the
+documents' commands read out of them (`ci/doc-blocks.py`) and run as written.
+Where a prediction held, the story's coverage note says what the journey found
+and names the fix it led to.
 
 "Stock host" means a fresh qcow2 overlay over the Rocky 9 GenericCloud image
 (`vm-e2e.sh` already builds one per run), booted, with nothing installed
@@ -1901,31 +1906,31 @@ not, supposed to happen.
 - Requirement: on a stock minimal EL9 host with no GPU, installing exactly the "Every host" line of `deploy/HOST-REQUIRES.md`, loading the image and applying the tree (S10.1.2) leaves `desktop-preflight` nothing to report (0 FAILs and 0 WARNs), and the host-side paths the documentation promises work: host Pulse and ALSA clients (S4.2.1, S4.2.2) and Host Terminal (S5.7.2).
 - Acceptance: the `dnf install` line extracted from the file and run unmodified; `rsync` (the provisioning tool, not a host requirement) and the probe players are installed separately and listed in the index; `desktop-preflight` exits 0 with no `WARN:` line; host `paplay` and `aplay` tones are heard.
 - Evidence: common set; `rpm -qa | sort` before and after (EV-DIFF), so the reviewer sees exactly what was installed; the full preflight output; EV-AUDIO for both host clients.
-- Tier: T3 · Coverage: ❌. `guest:phase_deploy` installs its own list (`podman psmisc policycoreutils-python-utils rsync pulseaudio-utils audit`), not the documented line, and asserts only `0 FAIL`. `alsa-plugins-pulseaudio` is not in that list, so a gap in the documented line that costs a WARN would pass unnoticed.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-docpath`, on two stock hosts: `deploy/HOST-REQUIRES.md`'s "Every host" line, read out of the file and run unmodified as root at a terminal (dnf's questions answered y); every package it names installed; the journey's own tools (`rsync`, the players) installed apart and kept apart in the evidence. After S10.1.2's Apply block and reboot: `desktop-preflight` exits 0 with no `WARN:` line; the container's `ssh host` is `desktop-shell`; the desktop user's host session runs no PipeWire or WirePlumber unit; and an ordinary user's `paplay` (440 Hz) and `aplay` (1320 Hz), nothing set in their environment, exit 0 and are heard. The journey found the documented line itself bringing a second PipeWire onto the host: `alsa-plugins-pulseaudio` pulls in `pipewire-pulseaudio` and `wireplumber`, whose user units systemd's presets enable for every user, so the desktop user's host session listened on the paths the container's PipeWire serves, and the session's first `paplay` never finished. `claude/fix-host-pipewire-masks` masks the five user units in the tree. Under `artifacts/S10.1.1/` (artifact `evidence-vm-maint-docpath`; the second host under `host-b/`): the stock host, `rpm -qa` before and after the documented line and after the journey's tools (EV-DIFF each), the block and dnf's transcript, the preflight, the container's `ssh host`, the user units, and both players' output, captures and verdicts.
 
 **S10.1.2 The production path is rsync, daemon-reload, reboot, and the desktop is on the screen**
 - Requirement: on a stock host with the documented packages and the image loaded, the three commands of `deploy/README.md` "Apply" (`rsync -a --chown=root:root deploy/host/ /`, `systemctl daemon-reload`, `reboot`) are the whole installation. The first boot creates the accounts and directories, converges the seat, writes the specs and labels and starts the desktop, and the operator sees it without anyone logging in to the host.
 - Acceptance: no `systemd-sysusers`, `systemd-tmpfiles`, `systemctl start` or `restorecon` by hand; after the reboot, with read-only probes only: `desktop.service` active; `desktop-preflight` 0 FAILs; the screen shows the root colour, the initial xterm and mwm frames (S3.3.3's probes); typed text reaches the xterm (S3.8.1); a pulse tone is heard (S4.1.2); `ssh host whoami` from the container is `desktop-shell` (S5.7.2). The time from power-on to the desktop being visible is recorded.
 - Evidence: common set; EV-VIDEO from power-on to the desktop, with the serial log alongside; `journalctl -b -o short-precise -u systemd-sysusers -u systemd-tmpfiles-setup -u 'desktop*'` (EV-LOG-JOURNAL) showing the first-boot order; `id desktop` and `id desktop-shell` (EV-STATE); the time to desktop in the index.
-- Tier: T3 · Coverage: ❌. Nothing in the suite reboots: `smoke` and `guest:phase_deploy` run `systemd-sysusers`, `systemd-tmpfiles` and `systemctl start desktop.service` by hand, so no test shows that the first boot of an rsync'd host creates `desktop` and `desktop-shell` before tmpfiles builds their homes and before `desktop-session.service` logs in as `desktop` (S5.1.3, the reboot of a host the live path set up, is untested too).
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-docpath`, on two stock hosts: the image loaded with `podman load`, then `deploy/README.md`'s "Apply" block read out of the document and run as written, its `reboot` included. Nobody logs in to the host until the desktop is on the screen, which the VM host watches from QEMU's side. On the first boot, with read-only probes: a new boot id; `desktop` (uid 61000) and `desktop-shell` created, `systemd-sysusers` done before `systemd-tmpfiles-setup` started and before `desktop-session` logged in as `desktop`; `desktop.service` active, mwm running and the five boot oneshots succeeded; the session's xterm in mwm's frame; `desktop-preflight` at 0 FAILs; the container's `ssh host` is `desktop-shell`; the screen's root and xterm colours; a word typed through QEMU's keyboard reaches the xterm; a 660 Hz pulse tone is heard. The time from the reboot to the desktop is recorded (19.2 s and 18.5 s in run 37390730582). Under `artifacts/S10.1.2/` (artifact `evidence-vm-maint-docpath`; the second host under `host-b/`): the stock host's state and screen, the block and each command's output, the stat of `/`, `/etc` and `/usr` before and after the rsync, preflight and `systemctl status 'desktop*'` on the stock host, after the commands and on the first boot with their diffs, the first boot's journal and unit timestamps, the EV-VIDEO from before the reboot to the desktop with the serial console, and the typing and tone.
 
 **S10.1.3 The optional `restorecon` step is optional, and runs clean when taken**
 - Requirement: on an enforcing host the desktop and confined clients work whether or not the maintainer runs the "cheap insurance" `restorecon -R …` line in `deploy/README.md` "Apply"; a maintainer who does run it, after `rsync` where the document places it, sees it succeed.
 - Acceptance: two stock hosts through S10.1.2, one with the line and one without; on both, S10.1.2's acceptance plus S7.1.1's confined display and audio probes; the line's exit status is 0; `restorecon -R -n -v` over the same paths on the host that skipped it shows where the rsync-applied labels disagree (expected: nowhere).
 - Evidence: common set; the `restorecon` transcript with its exit code (EV-PROCEDURE); the `-n -v` output (EV-STATE); `ls -Z` of the installed units, scripts and `/etc/desktop-container` on both hosts (EV-DIFF between them).
-- Tier: T3 · Coverage: ❌. No test runs the `restorecon` line; right after `rsync` on a stock host it is predicted to exit nonzero, because it names `/var/lib/desktop-container`, which the tree does not ship and only tmpfiles creates, and it does not pass `-i`.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-docpath`: host A skips the optional line and keeps a dry run of it (`restorecon -R -n -v`) right after the rsync and on the first boot; host B runs it as written right after the rsync, where `deploy/README.md` places it, and it exits 0. On both hosts, enforcing, a confined (`container_t`) display client opens `:0` and a confined audio client reaches the export, and the dry run on the first boot would relabel nothing under the line's paths. As predicted, the line as first written exited 255 right after the rsync (`lstat(/var/lib/desktop-container) failed`: the tree does not ship that directory; tmpfiles creates it at boot). `claude/fix-restorecon-line` names only the five paths the rsync fills. Under `artifacts/S10.1.3/` (artifact `evidence-vm-maint-docpath`; host B under `host-b/`): the line as read, its transcript or the dry runs, both probes, and `ls -Z` of every installed path on each host, with the diff between them.
 
 **S10.1.4 The live-apply paths work as written on a host whose sshd is already running**
 - Requirement: both documented live paths, the `README.md` "Install" block and the one-line sequence in `deploy/README.md` "Apply" (with its "if sshd was already running, `systemctl reload sshd`" clause), run verbatim on a stock, never-graphical host whose sshd started before the tree arrived (the stock case), and give S10.1.2's end state without a reboot, Host Terminal included.
 - Acceptance: each path on its own stock host, run unmodified; then S10.1.2's acceptance.
 - Evidence: common set; EV-LOG-JOURNAL of `sshd` for the container's `ssh host` attempt (accepted, or the failure and its reason).
-- Tier: T3 · Coverage: ❌ neither block runs as written and no evidence is saved: `guest:phase_deploy` and `smoke` apply a retyped hybrid (the `README.md` block plus `systemctl reload sshd`, without the `systemctl restart systemd-logind` of the `deploy/README.md` sequence) and then assert `ssh host whoami`. Predicted: the `README.md` block as written leaves Host Terminal broken until sshd reloads or the host reboots, because the `sshd_config.d` drop-in is read only at sshd start.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-live`, each path on its own stock host whose sshd ran from boot, with the documented packages and the image: host A runs `README.md`'s "Install" block; host B runs the rsync and `deploy/README.md`'s live sequence, then its "if sshd was already running" `systemctl reload sshd`. Every command is read out of the documents and run as written. Neither host reboots; the VM host watches the screen until the desktop is on it. Then S10.1.2's end state: `desktop.service` active and mwm running, both accounts, the session's xterm in mwm's frame, `desktop-preflight` at 0 FAILs, the container's `ssh host` logging in as `desktop-shell`, a word typed and a pulse tone heard. As predicted, the "Install" block as first written left Host Terminal refused (`Permission denied (publickey)`): the sshd that started before the rsync had never read the tree's `sshd_config.d` drop-in. `claude/fix-readme-install-sshd` adds `sudo systemctl try-reload-or-restart sshd` to the block. Under `artifacts/S10.1.4/` (artifact `evidence-vm-maint-live`; host B under `host-b/`): sshd's start time before the tree, the block or sequence as read and each command's output, preflight and status at each moment with their diffs, `sshd -T`, the container's `ssh host`, sshd's journal, the EV-VIDEO, and the typing and tone.
 
 **S10.1.5 Converting a running graphical host ends in the desktop, or in a named culprit that a reboot clears**
 - Requirement: applying the tree live to a host showing a graphical login (a display manager's greeter on tty1, holding DRM master) ends in one of the two states `deploy/README.md` describes. Either the desktop is on the screen with the display manager disabled and stopped, or `desktop-seat-prep` has failed with `ERROR: devices still held after convergence` naming the holder and a plain `reboot` then gives the first state with no further action by the maintainer. A dark screen with no culprit named, or a display manager back after the reboot, fails.
 - Acceptance: a VM profile with `gdm` (AppStream) installed and `graphical.target` as default, booted to the greeter (EV-SHOT shows it); `rsync`, then the `deploy/README.md` live sequence verbatim (the document gives that sequence for never-graphical hosts and leaves conversion to `seat-prep.sh`, which runs ahead of the desktop start the sequence ends in); the outcome classified, and if it is the second, `reboot`; afterwards `systemctl get-default` is `multi-user.target`, `systemctl is-enabled gdm` is `disabled`, `fuser -v /dev/dri/card0` names only the desktop's Xorg, and S10.1.2's screen and input checks hold.
 - Evidence: common set; EV-VIDEO from the greeter to the desktop, across the reboot if one was taken; EV-LOG-JOURNAL of `desktop-seat-prep` and `systemd-logind`; `fuser -v /dev/dri/card* /dev/tty1` before, between and after (EV-STATE).
-- Tier: T3 · Coverage: ❌. `smoke` converges a fake display-manager unit that holds no device (S5.3.1), and `guest:phase_deploy` evicts only a getty; no test starts from a real greeter.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-gdm`: a stock host given `gdm` from AppStream and `graphical.target` (a profile the harness applies), booted to the greeter, which holds the card (`gnome-shell` among the holders; EV-SHOT). Then the rsync and `deploy/README.md`'s live sequence, read out of the document and run as written, with its `systemctl reload sshd`. The outcome is classified against the document's two; the second would get its reboot and the same checks. In run 37390730582 it was the first: the desktop on the screen 8 s after the sequence began; `desktop-seat-prep` succeeded; `gdm` disabled and inactive; `systemctl get-default` `multi-user.target`; only the desktop's Xorg holds a DRM card (read from `/proc/<pid>/fd`: the host's `fuser` cannot see a container's own device nodes); a word typed reaches the xterm. Under `artifacts/S10.1.5/` (artifact `evidence-vm-maint-gdm`): the profile, the greeter's screen and holders, the sequence as read and each command's output, `fuser -v` and the holders before, between and after, the journals of `desktop-seat-prep` and `systemd-logind`, preflight and status before and after with their diffs, the EV-VIDEO from the greeter to the desktop, and the typing.
 
 **S10.1.6 A GPU host provisioned from the documentation comes up accelerated on its first boot**
 - Requirement: a physical NVIDIA host given both lines of `deploy/HOST-REQUIRES.md` (with the driver stack it describes), the image and S10.1.2's three commands shows an accelerated desktop on its first boot, with S8.1.1's checks passing, both preflights at 0 FAILs, and no step beyond those documents.
@@ -1939,13 +1944,13 @@ not, supposed to happen.
 - Requirement: on a host provisioned per S10.1.2, every line of the `README.md` "Verification checklist (on the target host)" block and of the `deploy/README.md` "Verify" block runs as root without error and prints what its inline comment says it shows. A line that needs a tool the host does not have per `deploy/HOST-REQUIRES.md` is a defect in the checklist, not in the host.
 - Acceptance: each line run as written, with one row per line in the index: command, comment, output, exit status, verdict. A line its comment makes conditional ("if declared") is judged on that condition. The host-side audio players (`pw-play`, `paplay`, `aplay`) are client applications the checklist presupposes; they are installed as declared probes.
 - Evidence: EV-PROCEDURE of both blocks; the per-line table.
-- Tier: T3 · Coverage: ❌. No test runs either checklist; predicted to fail as written: `DISPLAY=:0 xrandr` and `DISPLAY=:0 glxinfo -B` run on a host that `HOST-REQUIRES.md` gives no X client tools, and `podman exec -u desktop desktop wpctl status` passes no `XDG_RUNTIME_DIR`, which neither the image nor the quadlet sets, so it cannot reach PipeWire.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-docpath`, on the provisioned host with a client running (S10.2.2): every line of `README.md`'s "Verification checklist" block (15) and of `deploy/README.md`'s "Verify" block (13), read out of the documents and run as root, each judged against its own comment, one row per line in the index. The host-side players are installed as declared probes; `pipewire-utils`, for `pw-play`, also brings PipeWire's daemon package, which the evidence notes. Each audio line runs as written, with its comment's condition met (`PIPEWIRE_REMOTE`, `PULSE_SERVER`) and from a scratch container of the image, and every run is listened to. The judged runs (`pw-play` and `paplay` with the condition met, `aplay` as written) exit 0 and are heard. The rest are recorded: `pw-play` as written cannot reach PipeWire (exit 1), as its comment's condition implies; `aplay` in a scratch container of the desktop image exits 1, the image having no `libasound_module_pcm_pulse.so`, which README.md's audio section asks of an ALSA client's image. As predicted, three lines failed as first written: `DISPLAY=:0 xrandr` and `DISPLAY=:0 glxinfo -B` ran on a host with no X client tools (exit 127), and `wpctl status` had no `XDG_RUNTIME_DIR` (exit 2). `claude/fix-checklist-probes` runs them in the container as the session user. Under `artifacts/S10.2.1/` (artifact `evidence-vm-maint-docpath`): both blocks as read, each line's output and verdict, the probes' install, and each audio run's output, capture and verdict.
 
 **S10.2.2 Verifying a live host disturbs nothing**
 - Requirement: running the two checklists, `desktop-preflight` and `desktop-monitors-capture` on a host whose desktop is in use changes nothing the operator or a client can observe: no process restarts, no configuration changes, no geometry moves, no sound drops.
 - Acceptance: across a full S10.2.1 run, the following are unchanged: the pids of desktop-init, Xorg, mwm, the three audio daemons and a running client pod's application, and that pod's `restartCount`; `xrandr --query --verbose` and `xwininfo -root -tree`; `ls -l --time-style=full-iso` of `/etc/cdi`, `/etc/desktop-container` and (in the container) `/etc/X11/xorg.conf.d`. A client tone playing throughout is uninterrupted.
 - Evidence: EV-PIDS; the state pairs with their (empty) EV-DIFFs; EV-SHOT before and after; EV-AUDIO spanning the run.
-- Tier: T3 · Coverage: ❌. Both tools are documented as read-only; nothing asserts it.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-docpath`: a client of the desktop runs while S10.2.1 runs both checklists, `desktop-preflight` and `desktop-monitors-capture` among their lines. It is a podman client, standing in for the requirement's pod (this journey runs no cluster), with an xterm on the screen and a 90 s 330 Hz tone. Before and after: the pids of the desktop's processes and the client's; `xrandr --query --verbose`; `xwininfo -root -tree`; and `ls -l --time-style=full-iso` of `/etc/cdi`, `/etc/desktop-container` and the container's `/etc/X11/xorg.conf.d`. Each pair is the same (empty EV-DIFFs). The client's player played its whole tone and exited 0, and the capture across the checklists has no gap longer than 0.3 s in the tone's 90 s. Under `artifacts/S10.2.2/` (artifact `evidence-vm-maint-docpath`): the client, the four state pairs and their diffs, the client's log, the screen before, during and after, and the capture with its verdict.
 
 ### F10.3 Changing a running host's configuration
 
@@ -1953,43 +1958,43 @@ not, supposed to happen.
 - Requirement: starting from an autodetected desktop, the maintainer runs `desktop-monitors-capture`, pastes its output into `/etc/desktop-container/monitors.conf` and runs `systemctl restart desktop.service`, as `deploy/README.md` "Fixed monitor layout" says; the desktop returns with the same arrangement, now pinned.
 - Acceptance: the tool's stdout written to the file unmodified; after the restart, `30-monitors.conf` exists in the container and names the captured outputs; per output, the `xrandr --query` geometry equals the captured one (mode names may change to the `cvt(1)` names, as `monitors.conf`'s comments say); preflight prints its fixed-layout PASS line; S3.4.10's live disconnect then holds the geometry.
 - Evidence: common set; the captured block and the generated file (EV-CONFIG); `xrandr --query --verbose` before and after (EV-DIFF, with the expected mode-name changes listed in the index); EV-LOG-DESKTOP `xorg-monitor-conf:` and `preflight:` lines.
-- Tier: T3 · Coverage: ❌. `guest:layout_declare` starts from the autodetected desktop but writes its layout by hand; `guest:layout_roundtrip` (S3.4.12) runs `desktop-monitors-capture` on that declared layout, writes the block's output lines (its comments dropped) to `monitors.conf` and restarts the desktop, and S3.4.10's disconnect then holds. Nothing captures an autodetected arrangement, pastes the output unmodified, or reads preflight's fixed-layout line.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-config`: from the autodetected desktop, `desktop-monitors-capture` run as root, its stdout written to `/etc/desktop-container/monitors.conf` unmodified, and `systemctl restart desktop.service`, watched until the desktop is back. Every desktop process and the container are new, the host session moved with them, and no getty ran. `30-monitors.conf` exists in the container and names the captured output at the captured geometry (`Virtual-1` at `1280x800+0+0`; the mode's name changed to cvt(1)'s `1280x800_74.99`, as `monitors.conf`'s comments say). The container preflight prints its fixed-layout PASS line, and S3.4.10's live disconnect, the connector forced off under the running server, then holds the geometry. Under `artifacts/S10.3.1/` (artifact `evidence-vm-maint-config`): the capture, the pasted file and the generated one, `xrandr --query --verbose` before and after with the diff, the `xorg-monitor-conf:` and `preflight:` lines, preflight and status before and after with their diffs, EV-PIDS, the journals, and the restart's EV-VIDEO.
 
 **S10.3.2 A layout the maintainer gets wrong costs no desktop, and the documented checks say what was wrong**
 - Requirement: whatever the maintainer writes in `monitors.conf`, the desktop comes up after the restart, and `podman logs desktop | grep xorg-monitor-conf` or `podman logs desktop | grep preflight:` (both in `deploy/README.md` "Verify") names the problem; every keyword the documentation offers is one the generator accepts.
 - Acceptance: one restart per case, with the desktop visible each time (EV-SHOT): (a) a malformed position gives an `ERROR` line with the line number, and autodetected geometry; (b) an output name that matches no connector gives preflight's WARN naming it; (c) each global keyword named in `README.md` "Fixed monitor layout (KVM video)" or in `monitors.conf`'s comments, with a valid value and beside a valid output line, gives the layout applied. T0 part: the keywords the documents name, the keywords `xorg-monitor-conf.sh` accepts and the keywords `preflight-check.sh` skips are the same set.
 - Evidence: per case, the file (EV-CONFIG), the two log slices and `xrandr --query`; the three keyword lists (EV-DIFF).
-- Tier: T0/T3 · Coverage: ❌. Nothing tests what the maintainer sees (`layout-tests` covers only the generator's rejections, S3.4.7), and no T0 check compares the three keyword lists. They agree now: `README.md` and `preflight-check.sh` still named a `watch` keyword that `xorg-monitor-conf.sh` had dropped with its re-assert loop (it rejected the whole layout, `mode wants WxH[@Hz], got '5'`), and both were corrected.
+- Tier: T0/T3 · Coverage: ✅ (workflow `maintainer.yml`) the T3 half, `maint-config`: one restart per case, the desktop on the screen after each (EV-SHOT). (a) A malformed position gives `monitors.conf:2: position wants +X+Y`, nothing generated, and the output autodetects. (b) An output name with no connector gives the container preflight's WARN naming it (`HDMI-9`). (c) Each global keyword the documents name (`virtual`, `nvidia-connected`, `nvidia-edid`), with a valid value beside a valid output line, gives the layout applied. On modesetting `virtual` is checked for what `monitors.conf` says it does: `Virtual 2560 800` is in the generated config and the server read it (modes too large for it left out at start), and the screen starts at the declared output's extents (1280x800); xrandr's screen line is recorded. The journey found the documents claiming more for `Virtual` than xserver 1.20's modesetting gives (the screen held at the virtual size); `claude/fix-virtual-docs` corrects them. The shipped `monitors.conf` is restored last. The T0 half: `static`'s `ci/layout-keywords.py` compares the keywords the documents name, those `xorg-monitor-conf.sh` accepts and those `preflight-check.sh` skips, and finds one set; its self-test plants a keyword nothing accepts, which the check must name. Under `artifacts/S10.3.2/` (artifact `evidence-vm-maint-config`): per case the file, the two log slices, `xrandr --query`, preflight and status with their diffs, EV-PIDS and the restart's EV-VIDEO; and (artifact `evidence-static`) the three keyword lists with their diff.
 
 **S10.3.3 Upgrading and rolling back the desktop image**
 - Requirement: the maintainer brings a new desktop image into podman storage, points the unit at it, either by the documented digest pin (`/etc/containers/systemd/desktop.container.d/50-image.conf`, podman ≥ 5.0) or by re-tagging `localhost/desktop-container:latest` (the unit's default), and runs `systemctl restart desktop.service`. The new image runs; the published toolkit becomes the new image's (the "tool versions track the desktop image" claim); the operator gets the desktop back (S10.4.1); running clients behave as S7.8.1 and S7.8.2 require. Pointing back at the previous image and restarting restores it the same way.
 - Acceptance: a second image that differs from the first visibly (e.g. another root colour in `xinitrc.desktop`) and in its toolkit binary's sha256; per route, forward then back: `podman inspect desktop --format '{{.Image}}'` is the intended image id; `sha256sum /var/lib/desktop-container/bin/screenshot` equals that image's `/usr/libexec/desktop-tools/screenshot`; the sampled root-colour pixel is the running image's (S3.3.3's probe); `desktop-preflight` reports 0 FAILs, and on the pin route its `quadlet drop-ins present … (podman merges them)` PASS line; the downtime is recorded.
 - Evidence: common set; `systemctl cat desktop.service` at each state (EV-CONFIG); the inspect and checksum outputs at each state (EV-STATE); EV-SHOT with the sampled pixel at each state; EV-VIDEO of each restart.
-- Tier: T3 · Coverage: ❌. No test upgrades or rolls back the image or checks that the published toolkit follows it; even the drop-in landing in the generated unit (S5.2.6) is untested.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-config`: a second image built from the first, with another root colour (`#2b1b17`) and a toolkit binary with another checksum, and a podman client of the desktop running throughout. Each route goes forward to the second image and back with `systemctl restart desktop.service`: the digest pin (`desktop.container.d/50-image.conf`), then re-tagging `localhost/desktop-container:latest`. At each state: the desktop runs the intended image id; the published toolkit's sha256 is that image's; the screen's root colour is that image's; `desktop-preflight` is at 0 FAILs, with its drop-in PASS line on the pin route; every desktop process is new. The client is the same container (restart count 0), its new xterm is on the screen, the toolkit it sees is the one published, and a new 550 Hz tone from it is heard (S7.8.1). Under `artifacts/S10.3.3/` (artifact `evidence-vm-maint-config`): the two images, `systemctl cat desktop.service` at each state, the inspect and checksum outputs, the client's state and tones, preflight and status with their diffs, EV-PIDS, and each restart's EV-VIDEO and screen.
 
 **S10.3.4 A missing image is named by the first-stop tool, and loading it is the whole fix**
 - Requirement: when the image the unit names is not in podman storage (never loaded, or a mistyped pin), `desktop-preflight` names it, and loading the image then running `systemctl restart desktop.service` restores the desktop without a reboot.
 - Acceptance: on a host with no route to the image's registry (the documents assume provisioning supplies images; the unit sets no `Pull=`, so on a host that can reach the registry podman's default `missing` pull policy would try to fetch it instead): pin an absent digest, or remove the default image with the unit stopped; `systemctl restart desktop.service`; `desktop.service` is not active; `desktop-preflight` exits 1 with `FAIL: image NOT in podman storage: <ref>`; load the image; `systemctl restart desktop.service`; the desktop is visible.
 - Evidence: common set; EV-LOG-JOURNAL of `desktop.service` (the error as the maintainer sees it); `systemctl status desktop.service` at each step.
-- Tier: T3 · Coverage: ❌ (the preflight row is one line of S5.10.3's table; the journey is untested).
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-config`: the default image removed with the unit stopped (its `localhost/` name has no registry podman could pull it from); `systemctl restart desktop.service` exits 1 and the unit is not active; `desktop-preflight` exits 1 with `FAIL: image NOT in podman storage: localhost/desktop-container:latest`. The image loaded with `podman load` and the unit restarted, the desktop is back, every process new and the preflight at 0 FAILs. Under `artifacts/S10.3.4/` (artifact `evidence-vm-maint-config`): `desktop.service`'s journal with the error, `systemctl status` at each step, the preflight, the load, EV-PIDS and the restart's EV-VIDEO.
 
 **S10.3.5 Switching Host Terminal off revokes it, on a host where it has already run**
 - Requirement: after the documented off-switch (comment out the quadlet's `Wants=`/`After=desktop-host-shell.service` lines, `systemctl daemon-reload`, reboot) on a host where Host Terminal was working, no key authenticates as `desktop-shell`; the menu entry shows its failure text and stays open (S5.7.8); the container's preflight WARNs `no host shell material`; the rest of the desktop is unaffected. This is what `deploy/README.md` promises: "With no key generated, nothing can log into the account".
 - Acceptance: before the switch, the container's `ssh host whoami` is `desktop-shell`, and a copy of the then-current private key is kept; apply the switch and reboot; the kept key and the container's `ssh host` are both refused; "Host Terminal" from the menu shows the failure screen (EV-SHOT); neither `/etc/desktop-container/host-shell-key` nor `/etc/ssh/authorized_keys.d/desktop-shell` exists.
 - Evidence: common set; both ssh transcripts with exit codes; EV-LOG-JOURNAL of `sshd` showing the refusals; `ls -l /etc/desktop-container /etc/ssh/authorized_keys.d` before and after (EV-DIFF).
-- Tier: T3 · Coverage: ❌. No test applies the off-switch; predicted to fail: nothing removes the last boot's key or `authorized_keys.d` entry (the unit has no stop action and tmpfiles does not manage those files), so that key keeps working after the switch and a reboot.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-session`: before the switch the container's `ssh host whoami` is `desktop-shell`, a copy of the private key is kept, and "Host Terminal" from the root menu (clicked through QEMU's input devices, `operator-e2e.py --maint`) opens a shell on the host as `desktop-shell`. Then the off-switch as `deploy/README.md` gives it: the quadlet's two lines commented out (no active line names the unit), `systemctl daemon-reload` (the generated unit's `Wants=` and `After=` no longer name it), and `reboot`. After it: `desktop-host-shell.service` did not run; the kept key and the container's `ssh host` are both refused (exit 255); neither key file nor `/etc/ssh/authorized_keys.d/desktop-shell` exists; the container preflight WARNs `no host shell material`; the desktop is back; "Host Terminal" shows its failure text and stays open until Enter (S5.7.8). As predicted, the kept key at first still logged in after the switch and the reboot: nothing removed the last boot's key or its trust entry. `claude/fix-host-shell-revoke` has tmpfiles remove both at boot. Under `artifacts/S10.3.5/` (artifact `evidence-vm-maint-session`): the quadlet before and after with the diff, the generated unit, both ssh transcripts, the key material before and after with the diff, sshd's journal with the refusals, the preflight's lines, the menu and the window's text, and the reboot's EV-VIDEO.
 
 **S10.3.6 Turning Host Terminal on, from its own failure screen**
 - Requirement: the failure screen the operator sees when "Host Terminal" fails (S5.7.8) says what to run on the host (`systemctl start desktop-host-shell.service`); the maintainer running exactly that makes the operator's next "Host Terminal" click open a host shell, or the screen names whatever else is needed.
 - Acceptance: start from S10.3.5's intended end state (switch applied, its files removed, desktop restarted without host-shell material); click "Host Terminal" and get the failure screen, its text quoted in the index; run the command it shows, verbatim, on the host; click "Host Terminal" again and get a `desktop-shell` prompt.
 - Evidence: common set; both EV-SHOTs; `ls -la /home/desktop/.ssh` in the container before and after (EV-STATE); EV-LOG-JOURNAL of `sshd`.
-- Tier: T3 · Coverage: ❌. Predicted: the container installs the key and writes `~/.ssh/config` only at container start (`host-shell-setup.sh` is one of `desktop-init`'s boot oneshots), so a key generated afterwards is not used until `desktop.service` restarts, a step the screen does not mention.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-session`, from S10.3.5's end state, its files removed and the desktop restarted without host-shell material (its preflight WARNs). "Host Terminal" from the menu shows the failure screen, whose text gives `systemctl start desktop-host-shell.service`. That command, read off the screen, is run on the host, and the next "Host Terminal" opens a shell on the host as `desktop-shell`. As predicted, the command at first made a key the running container never took: `host-shell-setup.sh` installs it only at container start. `claude/fix-host-shell-live` has the unit hand a new key to a running desktop. Under `artifacts/S10.3.6/` (artifact `evidence-vm-maint-session`): the start state, the screen's text and the command read from it, the unit's run, the key material, `ls -la /home/desktop/.ssh` before and after with the diff, sshd's journal, both clicks' screens, and the restart's EV-VIDEO.
 
 **S10.3.7 The documented look-and-feel loops work as written**
-- Requirement: each procedure in `README.md` "Look and feel (dark theme)" does what it says: an edit to `/home/desktop/.mwmrc` in the running container takes effect through the root menu's "Restart mwm" with no new X session; an `~/.Xdefaults` edit takes effect after a new X session started the way the README says; a repo-file change, rebuilt offline and deployed with `systemctl restart desktop.service`, is on the screen.
-- Acceptance: a root-menu label edit appears after "Restart mwm" (EV-SHOT; Xorg pid unchanged); an xterm background edit appears on the next xterm after the documented session restart (pixel sample); a rebuilt image with another root colour shows it after the service restart (pixel sample).
+- Requirement: each procedure in `README.md` "Look and feel (dark theme)" does what it says: an edit to `/home/desktop/.mwmrc` in the running container takes effect through the root menu's "Restart mwm" with no new X session; an `~/.Xdefaults` edit takes effect where the README says, in the next client started and in mwm after "Restart mwm", in the same X session; a repo-file change, rebuilt offline and deployed with `systemctl restart desktop.service`, is on the screen.
+- Acceptance: a root-menu label edit appears after "Restart mwm" (EV-SHOT; Xorg pid unchanged); an xterm background edit appears on the next xterm, and a menu background edit on the root menu after "Restart mwm" (pixel samples; Xorg pid unchanged); a rebuilt image with another root colour shows it after the service restart (pixel sample).
 - Evidence: common set; the edited files (EV-CONFIG); EV-PIDS showing which restarts happened.
-- Tier: T3 · Coverage: ❌. No test edits a dotfile or deploys a rebuild (`operator-e2e:menu_restart_mwm` chooses "Restart mwm" without editing `.mwmrc`); the `~/.Xdefaults` loop is expected to fail as written, because the README's `systemctl restart desktop-session.service` "in the container" has no systemd to run it and the host unit of that name does not start a new X session.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-session`, the loops as `README.md` "Look and feel" gives them, the menu clicked through QEMU's devices. `.mwmrc`'s root menu given a longer label, then "Restart mwm" (confirmed in its dialog): mwm's X connection is new, the Xorg pid the same, and the edited label is on the menu (the entry and the menu wider). `~/.Xdefaults` given another `XTerm*background` and `Mwm*menu*background`: the next xterm ("New Terminal") draws the new background, and after a second "Restart mwm", in the same X session, the root menu draws the edited one. The rebuild loop as written, as root: the image built with another root colour, `systemctl restart desktop.service`, the colour on the screen, and the desktop running the image the build made. The journey found the README wrong twice, and `claude/fix-look-and-feel-loops` corrects it. An `~/.Xdefaults` change needs no new X session: the next client reads it, and Restart mwm re-reads it. The README's `systemctl restart desktop-session.service` "in the container" had no systemd to run it there. And a build run as the maintainer put the image in the maintainer's own storage, not root's, so the restart ran the old one. Under `artifacts/S10.3.7/` (artifact `evidence-vm-maint-session`): each file before and after with its diff, the menu's measures and screens around each Restart mwm, EV-PIDS around each, the new xterm, the build and the image the desktop runs, preflight and status with their diffs, and the restarts' EV-VIDEOs.
 
 ### F10.4 Routine operations
 
@@ -1997,13 +2002,13 @@ not, supposed to happen.
 - Requirement: `systemctl restart desktop.service`, the step several documented procedures end in, gives the operator the desktop back (root colour, initial xterm, mwm frames), with typing and sound working, within a stated budget; nothing in between offers a login prompt on the screen. Proposed budget: 60 s from the command; confirm it against measured runs before it gates anything.
 - Acceptance: EV-VIDEO from the command to the first frame showing the desktop, with the elapsed time in the index; typed text lands (S3.8.1); a pulse tone is heard; every desktop pid changed (a restart that was supposed to happen) and the host session moved with it (S5.8.2).
 - Evidence: common set; the time to desktop; EV-AUDIO.
-- Tier: T3 · Coverage: ❌ evidence not saved, and nothing checks what the operator gets back or how long it takes: `smoke` asserts the container and host session return (S5.8.2), `guest:layout_declare`, `guest:layout_roundtrip` and `guest:layout_restore` each wait for X to answer after their restart, and `operator-e2e:s11_3_1` waits for the ready marker and mwm after its own restart.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-docpath`: `systemctl restart desktop.service` on the provisioned host, the screen recorded from the command until the desktop is back. The time is recorded against the proposed 60 s, which does not gate yet: 2.5 s in run 37390730582. Every desktop process and the container are new, and the host session moved with them; no getty ran on any VT; the screen's root and xterm colours; a word typed reaches the xterm; a 660 Hz pulse tone is heard. Under `artifacts/S10.4.1/` (artifact `evidence-vm-maint-docpath`): preflight and status before and after with their diffs, EV-PIDS, the gettys, the journals, the EV-VIDEO with the time to desktop, and the typing and tone.
 
 **S10.4.2 A maintenance stop leaves the seat free and the host quiet; a start restores everything**
 - Requirement: `systemctl stop desktop.service` stops the desktop and its host login session, leaves no `desktop` process on the host, frees `/dev/dri/card*` and `/dev/tty1`, puts no getty on any VT, and nothing restarts the desktop until the maintainer starts it; `desktop-preflight` describes that state accurately; `systemctl start desktop.service` brings back S10.4.1's outcome.
 - Acceptance: after the stop, polled for up to 30 s (logind keeps the user manager for its stop delay): `pgrep -u desktop` on the host is empty; `fuser /dev/dri/card* /dev/tty1` is empty; `systemctl list-units 'getty@tty*' 'autovt@*'` lists nothing; `desktop.service` is still inactive 120 s later; `desktop-preflight` shows `desktop.service not started` (WARN), `no DRM/VT holders` (PASS) and 0 FAILs; a client's connect attempt fails cleanly. After the start: S10.4.1's checks.
 - Evidence: common set; EV-PIDS of every uid-61000 host process at each step; EV-SHOT of the screen while stopped.
-- Tier: T3 · Coverage: ❌. No test stops `desktop.service` and inspects the host it leaves (the container's own SIGTERM path is S2.5.1, also untested).
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-docpath`: `systemctl stop desktop.service`. Within 10 s no process of the desktop's user is left on the host (`pgrep -u desktop`, the container's processes included: the host's `fuser` cannot see a container's own device nodes, S5.3.3), nobody holds `/dev/dri/card*` or `/dev/tty1`, and no getty runs on any VT. `desktop-preflight` shows `desktop.service not started` (WARN), `no DRM/VT holders` (PASS) and 0 FAILs. A client's connect attempt fails cleanly (`xdpyinfo` exits 1 in 0.4 s). 120 s later the unit is still inactive with the same activation times and restart count, and still no getty runs. `systemctl start desktop.service` then brings back S10.4.1's outcome. Under `artifacts/S10.4.2/` (artifact `evidence-vm-maint-docpath`): every uid-61000 process at each step, `fuser`, the gettys, the client's attempt, the unit's properties at the stop and 120 s on, preflight and status at each step with their diffs, the journals, the screen while stopped, and the start's EV-VIDEO, typing and tone.
 
 ### F10.5 Diagnosing and recovering from documented faults
 
@@ -2019,27 +2024,27 @@ restores the host after itself (S9.2.5).
 
 **S10.5.1 A process holding DRM master: named, removed, recovered without a reboot**
 - Requirement: when a host process holds DRM master on the card, the maintainer can name it from the documented first stops, including `desktop-preflight`, which `deploy/README.md` calls the first stop; once it is gone, the desktop recovers by itself, without a reboot or a service restart (`desktop-init` retries the session every 3 s).
-- Acceptance: with the desktop stopped, a root process opens `/dev/dri/card0` first and keeps it open (S5.3.3's `sleep` holder); start the desktop; the desktop does not appear; `systemctl status desktop-seat-prep` shows `ERROR: devices still held` naming the pid; `podman logs desktop | grep postmortem:` shows `LIKELY CAUSE: another process holds DRM master`; `desktop-preflight` reports a FAIL naming the holder; `fuser -v /dev/dri/card0` (the README's command) names it; kill it; the desktop appears within one session-restart cycle (the 3 s back-off plus Xorg start-up) with no further command.
+- Acceptance: with the desktop stopped, a root process opens `/dev/dri/card0` first and keeps it open (S5.3.3's `sleep` holder); start the desktop; the desktop does not appear; `systemctl status desktop-seat-prep` shows `ERROR: devices still held` naming the pid; `podman logs desktop | grep postmortem:` shows `LIKELY CAUSE: another process holds DRM master`; `desktop-preflight` reports a FAIL for the held card, pointing at `fuser -v`; `fuser -v /dev/dri/card0` (the README's command) names it; kill it; the desktop appears within one session-restart cycle (the 3 s back-off plus Xorg start-up) with no further command.
 - Evidence: common set; EV-VIDEO from the start to recovery; the `fuser -v` output; the three log slices.
-- Tier: T3 · Coverage: ❌. Predicted: `desktop-preflight` skips its DRM/VT holder check whenever `desktop.service` is active ("Xorg legitimately holds them"), and a desktop whose X session is crash-looping on this fault is active, so the documented first stop is expected to print no FAIL while the desktop is down.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-faults`: with the desktop stopped, a root `sleep` opens `/dev/dri/card0`; the desktop is started; 30 s on there is no desktop on the screen. The first stops: `desktop-preflight` FAILs on the held card (`processes other than the desktop hold /dev/dri/card0 ... (fuser -v shows who)`); the desktop log's postmortem says `LIKELY CAUSE: another process holds DRM master`; `systemctl status desktop-seat-prep` shows its ERROR naming the pid; the README's `fuser -v /dev/dri/card0` names it. With the holder killed, the desktop came back by itself, with no reboot and no service restart (one session end logged since). Two predictions held, each met by a fix merged before the run. The preflight skipped its holder check while `desktop.service` was active (`claude/fix-preflight-holders-active`). seat-prep, a `RemainAfterExit=` oneshot, did not run again at the desktop's next start (`claude/fix-oneshots-every-start` makes it and `desktop-cdi-refresh` `PartOf=desktop.service`). Under `artifacts/S10.5.1/` (artifact `evidence-vm-maint-faults`): the entry, the staging, the three first stops, `fuser -v`, the kill and the remedy's log, preflight and status before and after with their diffs, EV-PIDS, and the EV-VIDEO from the start to the recovery.
 
 **S10.5.2 Input devices on another seat: the documented remedy gives typing and clicking back**
 - Requirement: when the keyboard and mouse are attached to another seat (`loginctl attach`), the README's "No input devices" entry (its `udevadm info … | grep -i seat` check and `systemctl restart desktop-seat-prep.service`) identifies the cause and restores typing and clicking at the screen, with no step the entry does not list.
 - Acceptance: S3.8.6's staging, applied to the session's keyboard and pointer; the symptom captured (typed text does not land); the entry's check, run as written and against the attached nodes, shows the foreign `ID_SEAT`; the remedy run verbatim; typed text and a click land afterwards. Whether Xorg or the desktop restarted is recorded (EV-PIDS); the requirement is that neither had to.
 - Evidence: common set; `udevadm info` before and after (EV-DIFF); EV-LOG-XORG device removal and addition lines; EV-SHOT of typed text.
-- Tier: T3 · Coverage: ❌ (S3.8.6 restarts the desktop as part of its own procedure, so it cannot show whether the documented remedy alone recovers a running session).
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-faults`: every input device with an event node attached to `seat1` (S3.8.6's staging applied to all eight, each followed by a udev change event); a click and a word typed through QEMU's devices do not land. The entry's check, run as written against each staged node, shows `ID_SEAT=seat1`. Its remedy, `systemctl restart desktop-seat-prep.service`, exits 0; no staged node is tagged for `seat1` any more; a word typed lands again. Nothing restarted: every desktop process and the container are the ones from before the fault. Under `artifacts/S10.5.2/` (artifact `evidence-vm-maint-faults`): the entry, the devices and rules, the first stops, the check per node, `udevadm info` before and after with the diff, Xorg's device lines, EV-PIDS, preflight and status with their diffs, and both typing attempts.
 
 **S10.5.3 A confined client denied by SELinux: the documented checks name the label, the documented restart fixes it, nothing else restarts**
 - Requirement: when a client-facing directory loses its `container_file_t` label on an enforcing host, a confined client fails; the README's checks (`systemctl status desktop-selinux`, `ls -Zd …`, `ausearch -m avc -ts recent | audit2why`) show the wrong label and the denial; `systemctl restart desktop-selinux` restores access for a client pod that is already running, without restarting the desktop or the pod.
 - Acceptance: a running pod opens the display in a loop (`xdpyinfo` every 2 s, logging each result); the directory and its socket are relabelled to a host type the policy denies to `container_t` (`chcon -R -t tmp_t /tmp/.X11-unix` is the obvious candidate); the loop fails and an AVC is logged; the documented checks run; `systemctl restart desktop-selinux`; the loop succeeds again; the pod's `restartCount` is 0 and the Xorg pid is unchanged.
 - Evidence: common set; `ls -Zd /tmp/.X11-unix` and `ls -Z /tmp/.X11-unix/X0` before, during and after (EV-STATE); the `ausearch | audit2why` output; EV-LOG-CLIENT of the loop, with the failure and recovery timestamps.
-- Tier: T3 · Coverage: ❌. `guest:phase_deploy` asserts the labels once, after the tree is applied (F5.6); no test loses one and recovers a running client.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-faults`: a confined podman client (`container_t`), standing in for the requirement's pod (this journey runs no cluster), opens the display every 2 s, logging each try. `/tmp/.X11-unix` is relabelled `tmp_t` (`chcon -R`): the loop fails and an AVC denial is logged. The README's checks, as written: `systemctl status desktop-selinux`; `ls -Zd` shows the wrong label; `ausearch -m avc -ts recent | audit2why`, at a terminal as a maintainer runs it, names the denial. After `systemctl restart desktop-selinux` the loop opens the display again; the client is the same container (restart count 0), the X server the same pid, and no desktop process restarted. The harness's own searches pass `--input-logs`: run 37387054418 found ausearch reading the guest script's standard input (a pipe over ssh) instead of the log. Under `artifacts/S10.5.3/` (artifact `evidence-vm-maint-faults`): the entry, the client and its log, the labels before, during and after, the denial, the script's stdin type, the three checks and the remedy, EV-PIDS, and preflight and status with their diffs.
 
 **S10.5.4 Device permission errors: found from the documented log lines; the escape hatch works as the README describes it**
 - Requirement: when the session user cannot open a device node (its gid out of step with the host's), the README's EACCES entry leads the maintainer to the cause through `podman logs desktop` (the `align-device-groups` and `postmortem:` lines); `systemctl restart desktop.service`, which re-runs the alignment, recovers; and the entry's escape hatch (`needs_root_rights = yes` in `/etc/X11/Xwrapper.config`), applied as the entry describes, gives a running session too.
 - Acceptance: with the desktop up, run `groupmod -g <fresh gid> video` inside the container (the misalignment `align-device-groups.sh` exists to prevent), then kill Xorg; the desktop does not come back; the postmortem shows `LIKELY CAUSE: device group permissions`, and the commands it names (`id desktop`, `ls -ln /dev/dri /dev/input`) show the mismatch. Path A: `systemctl restart desktop.service`, and the desktop is visible. Restage. Path B: apply the escape hatch in the running container and kill Xorg; the next session comes up with `ps -o user= -C Xorg` showing `root`. Finally `systemctl restart desktop.service`, asserting that the shipped `Xwrapper.config` and a rootless Xorg are back (S9.2.5).
 - Evidence: common set; `ls -ln /dev/dri` on the host and in the container at each step; `getent group video` in the container; the log slices; EV-PIDS.
-- Tier: T3 · Coverage: ❌. No test stages the gid mismatch or tries the escape hatch, so nothing shows that a root Xorg starts under this unit's capability set.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-faults`: with the desktop up, `groupmod -g 64999 video` in the container, then Xorg killed; 20 s on there is no desktop. The desktop log's postmortem says `LIKELY CAUSE: device group permissions (gid misalignment)`, and the commands it names (`id desktop`, `ls -ln /dev/dri /dev/input`) show the mismatch. Path A, `systemctl restart desktop.service`: the session is back, Xorg rootless. Restaged, path B: the escape hatch (`needs_root_rights = yes` in `/etc/X11/Xwrapper.config`) applied in the running container and Xorg killed; the next session comes up with Xorg as root. A last `systemctl restart desktop.service` brings back the shipped `Xwrapper.config` and a rootless Xorg. Under `artifacts/S10.5.4/` (artifact `evidence-vm-maint-faults`): the entry, the gids on the host and in the container at each step, the staging, the first stops and the align lines, the commands the postmortem names, `Xwrapper.config` before, during and after, Xorg's user on each path, EV-PIDS, and preflight and status with their diffs.
 
 ### F10.6 Bringing client workloads to a host
 
@@ -2051,13 +2056,13 @@ when a node is not ready for them.
 - Requirement: on a node provisioned per S10.1.2 with k3s and CRI-O, the steps in `README.md` "Kubernetes (single-node k3s + CRI-O)" and "Kubernetes: a device plugin per capability" (the CRI-O `cdi_spec_dirs` drop-in, the three `helm install` commands, `kubectl describe node | grep -A1 desktop.local/`, `kubectl apply -f examples/x11-client-pod.yaml`) give 10 allocatable of each resource and put the demo xterm ("CDI demo") on the screen, where the operator can click into it and type.
 - Acceptance: the blocks run verbatim, `<registry>` the only substitution; the three resources at 10; the xterm visible (EV-SHOT); typed text lands in it (S7.5.2).
 - Evidence: common set; the `kubectl describe node` excerpt; `kubectl describe pod x11-client-demo` (its events).
-- Tier: T3 · Coverage: ❌ evidence not saved, and the blocks are not run as written: `guest:phase2` adds `--set image.pullPolicy=Never` to each `helm install` (the chart already defaults to `IfNotPresent`), rewrites the example's image to `localhost/desktop-container:latest` with `sed`, and never types into the demo xterm. Whether CRI-O resolves the unqualified `desktop-container:latest` to the `localhost/` image is unverified.
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-k8s`, on the host provisioned the documented way: CRI-O and k3s installed as phase 2 installs them (the README assumes both and does not say how, nor does it give the drop-in pointing CRI-O at k3s's pod network, `11-k3s-cni.conf`, which phase 2 also writes), with the README's CRI-O drop-in (its `toml` block, at the path its first line names) written before CRI-O first starts; the node is Ready on CRI-O and SELinux is still enforcing. The three `helm install` commands run as written, `<registry>` → `localhost` the only substitution, and each exits 0. The describe line, as written, shows `desktop.local/display`, `audio` and `tools` at 10 under Capacity and Allocatable, and the API agrees. `kubectl apply -f examples/x11-client-pod.yaml` (the repo file, byte for byte) exits 0; the pod runs this host's `localhost/desktop-container:latest`, unpulled (its image ID is podman's digest), and its xterm is on the screen (IsViewable), found as the pod's X client. A click into it, then a line typed through QEMU's devices, runs in the pod's shell (S7.5.2's check). Every desktop process and the container are the ones from before k3s and CRI-O. The journey found the example wrong: it named the image unqualified, `desktop-container:latest`, which CRI-O does not take for podman's `localhost/` image; it pulled the name from its search registries instead (quay.io: 404, `ImagePullBackOff`; run 37394752689). `claude/fix-example-image` names the image in full. The xterm's title is not the example's "CDI demo": the image's stock `/etc/bashrc` retitles an xterm at its shell's first prompt (`@x11-client-demo:/`; `USER` is unset in the pod). Under `artifacts/S10.6.1/` (artifact `evidence-vm-maint-k8s`): the README's blocks and the drop-in, the node, each install, the describe line's output and allocatable, the plugin pods, the manifest, the apply, the pod's events and image against podman's, the pod's windows, the typed line, EV-PIDS before and after, preflight and status with their diffs, and the screens around the apply.
 
 **S10.6.2 A node the desktop has not provisioned is a visible scheduling failure that heals in place**
 - Requirement: as `deploy/README.md` promises, a node without the toolkit turns "this node was never set up" into "a scheduling failure an operator can see" (that document's operator is this one's maintainer). A pod requesting `desktop.local/tools` stays `Pending` with an `Insufficient desktop.local/tools` event instead of starting and failing; once the desktop publishes, the same pod object schedules and runs, with no one deleting or recreating it.
 - Acceptance: a never-provisioned node, staged: desktop stopped, `/var/lib/desktop-container/bin` emptied, `/etc/cdi/desktop-tools.yaml` removed, and `systemctl stop desktop-tools-cdi.service` (which `deploy/README.md` requires of any teardown, or the `.path` unit stays parked); allocatable `desktop.local/tools` falls to 0 (polled); a pod requesting display and tools, running `"$DESKTOP_TOOLS_BIN"/screenshot`, is `Pending` with the event; `systemctl start desktop.service`; the same pod (same uid) schedules and runs, and its capture succeeds.
 - Evidence: common set; the pod's events; allocatable at each step; the pod uid before and after; `ls -l /etc/cdi /var/lib/desktop-container/bin` at each step.
-- Tier: T3 · Coverage: ❌ (S7.2.5 asserts the spec is absent before the first start; nothing asserts what kubernetes shows the maintainer).
+- Tier: T3 · Coverage: ✅ (workflow `maintainer.yml`) `maint-k8s`, on S10.6.1's node with the three plugins registered: the never-provisioned node staged as the Acceptance gives it (the desktop stopped, `/var/lib/desktop-container/bin` emptied, `/etc/cdi/desktop-tools.yaml` removed, `desktop-tools-cdi.service` stopped); allocatable `desktop.local/tools` falls to 0 while display and audio stay at 10. A pod requesting display and tools that captures the display with `"$DESKTOP_TOOLS_BIN"/screenshot` (`ci/vm/unprovisioned-pod.yaml`) stays `Pending` for 20 s: on no node, no container created, `PodScheduled` False `Unschedulable`, and its event says `0/1 nodes are available: 1 Insufficient desktop.local/tools`. After `systemctl start desktop.service` the desktop publishes, the watcher writes the spec, and allocatable `tools` is back at 10. The same pod object (the same uid) schedules and runs, its container never restarted, and its first capture succeeds: a 1280x800 PNG of the whole screen. Every desktop process and the container are new, as a start leaves them, and the host login session moved with them. Under `artifacts/S10.6.2/` (artifact `evidence-vm-maint-k8s`): `ls -l /etc/cdi /var/lib/desktop-container/bin` and allocatable at each step, the staging, the plugin's log, the pod's manifest, the apply, its events, state and describe while Pending and after the start, its log and capture, EV-PIDS, preflight and status with their diffs, the screen while stopped, and the start's EV-VIDEO.
 
 ---
 
@@ -2167,19 +2172,19 @@ them without root or a container. Defaults must remain the production paths.
 | Script | Hard-coded today | Proposed override | Unblocks |
 |---|---|---|---|
 | `image/xorg/xorg-gpu-conf.sh` | `/dev/dri`, `/dev/nvidia*`, `/sys/class/drm`, lib dirs, output path | `GPU_DEV_DIR`, `GPU_SYS_DRM`, `GPU_LIB_DIRS`, `GPU_OUT` | S3.1.1–S3.1.5 |
-| `image/xorg/align-device-groups.sh` | node globs under `/dev` | `DEV_ROOT` prefix | S3.2.2 |
+| `image/xorg/align-device-groups.sh` | node globs under `/dev` | **not needed**: a scratch container of the image per branch, plain files with the wanted group standing in for the nodes (`ci/align-groups-tests.sh`) | S3.2.2 |
 | `image/xorg/ensure-vt-devices.sh` | `/dev` | `DEV_ROOT` | S3.2.3 |
-| `image/xorg/preflight-check.sh` | all of the above plus `/run/udev`, the pid file, `/proc/self/mounts`, `/etc/desktop-container` | one `PREFLIGHT_ROOT` prefix, or `podman run` with mounts omitted | S5.11.2 |
+| `image/xorg/preflight-check.sh` | all of the above plus `/run/udev`, the pid file, `/proc/self/mounts`, `/etc/desktop-container` | **used**: `podman run` with the quadlet's mounts and devices omitted (`ci/preflight-rows.py container`) | S5.11.2 |
 | `image/session/session-postmortem` | Xorg log glob | **built**: `POSTMORTEM_XLOG_GLOB` | S2.3.5 |
 | `image/session/start-audio` | daemons by name | `PATH` (used: fake daemons) | S2.4.4, S2.4.5 |
-| `image/session/host-shell-setup.sh` | `SRC`, `DHOME` | export the existing variables | S5.7.7 |
+| `image/session/host-shell-setup.sh` | `SRC`, `DHOME` | **not needed**: a scratch container of the image per case (`ci/host-shell-setup-tests.sh`) | S5.7.7 |
 | `image/session/host-terminal` | `ssh` by name | `PATH` (used: a fake `ssh`) | S5.7.8 |
 | `image/tools/publish-tools.sh` | `SRC`, `DEST` | export the existing variables | S7.2.2, S7.2.3 |
 | `deploy/host/usr/local/libexec/desktop-host-shell-setup` | `/etc/desktop-container`, `/etc/ssh/authorized_keys.d` | **built**: `DESKTOP_CONTAINER_DIR`, `HOST_SHELL_AK_DIR` | S5.7.5 |
 | `deploy/host/usr/local/bin/desktop-monitors-capture` | `podman exec … xrandr --query` | **built**: `DESKTOP_XRANDR_CMD` | S3.4.12 |
 | `deploy/host/usr/local/libexec/desktop-selinux` | takes paths as args already | — | S5.6.4–S5.6.6 |
 | `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | also honour an env override | S5.5.4 |
-| `deploy/host/usr/local/libexec/desktop-cdi-refresh` | `/proc/modules` (the loaded-`nvidia` trigger of the no-downgrade rule) | `CDI_PROC_MODULES` | S5.4.2 (module half) |
+| `deploy/host/usr/local/libexec/desktop-cdi-refresh` | `/proc/modules` (the loaded-`nvidia` trigger of the no-downgrade rule) | **built**: `CDI_PROC_MODULES` | S5.4.2 (module half) |
 
 Probe tooling the client-side and hotplug stories need, and where it stands:
 
@@ -2197,39 +2202,45 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 
 The `script-unit` step of `ci.yml` `static` covers S1.1.3, S2.3.5, S2.4.4,
 S2.4.5, S3.4.12, S5.7.5 and S5.7.8 so far. S3.1.x need the `xorg-gpu-conf.sh`
-overrides above; S5.7.7, S3.2.2 and S3.2.3 need root or a scratch container of
-the image, since they install files as the session user or create groups and
-device nodes.
+overrides above. S5.7.7's and S3.2.2's T1 halves run in scratch containers of
+the image in `build-smoke`, since they install files as the session user or
+create groups; S3.2.3, which creates device nodes, needs the same.
 
-## Appendix B — Suggested new VM e2e phases
+## Appendix B — VM e2e phases, as suggested and as built
 
-| New phase | Stories |
-|---|---|
-| `verify-session-tree` | S2.3.1, S2.3.3 (host-process half), S2.3.4, S2.3.6 (mwm killed; Quit session is the operator phase's), S2.4.2 (wireplumber / pipewire-pulse), S2.4.7, S3.2.4, S3.2.5 |
-| `verify-shutdown` | S2.5.1 |
-| `verify-host-audio-clients` | S4.2.1, S4.2.2 |
-| `verify-host-shell-hardening` | S5.7.3, S5.7.4 |
-| `verify-selinux-policy` | S5.6.2 (full context), S5.6.3, S5.6.4, S5.6.5, S5.6.6 |
-| `verify-seat-gate` | S5.3.3, S3.8.6 |
-| `verify-isolation-negatives` | S6.1.3, S6.1.5 (submounts), S6.2.1, S6.2.3 |
-| `verify-fixed-layout` (extend) | S3.4.10 (window tree + video), S3.4.11, S3.4.12 |
-| `verify-hotplug-input` (new; pointers, per-device proof, Xorg plug-out) | S3.9.2, S3.9.4, S3.9.5, S3.9.7–S3.9.12 |
-| `verify-hotplug-monitor` (new; DRM force on + firmware EDID) | S3.10.3–S3.10.7 |
-| `verify-hotplug-audio` (extend) | S4.7.3, S4.7.5 (default sink), S4.7.7, S4.7.8, S4.7.9, S4.7.11 |
-| `verify-kvm-composite` (new) | S3.11.1, S3.11.2 |
-| `verify-client-journeys` (new; display + audio journeys) | S7.5.1–S7.5.5, S7.6.3–S7.6.5, S7.6.6 (record) |
-| `verify-client-hotplug-continuity` (new; the "no restart" proofs) | S7.7.1–S7.7.8 |
-| `verify-client-lifecycle` (new) | S7.8.1–S7.8.3, S7.3.6 (running client through uninstall) |
-| reboot sub-phase after `phase-deploy` | S5.1.3, S5.5.5 (reboot half) |
-| second VM profile booted without `intel-hda` | S2.4.6 / S4.7.10 / S7.7.9 |
-| `verify-maintainer-provisioning` (new; a fresh overlay per variant, procedures from the documents, reboots) | S10.1.1–S10.1.4 |
-| VM profile with `gdm`, booted to `graphical.target` | S10.1.5 |
-| `verify-maintainer-checklists` (new) | S10.2.1, S10.2.2 |
-| `verify-maintainer-day2` (new) | S10.3.1–S10.3.7 |
-| `verify-maintainer-routine` (new) | S10.4.1, S10.4.2 |
-| `verify-maintainer-troubleshooting` (new; one documented fault per story, staged and restored) | S10.5.1–S10.5.4 |
-| `verify-maintainer-onboarding` (extend phase 2; the README's steps verbatim) | S10.6.1, S10.6.2 |
-| operator phase (**exists**: `ci/vm/operator-e2e.py`, between the hotplug checks and phase 2; QMP pointer and key events only) | S3.3.2, S3.3.3, S3.5.2, S3.5.3, S11.1.1–S11.1.3, S11.2.1, S11.3.1; with them S2.3.6 (Quit session), S3.6.1 (menu), S3.6.3, S5.7.2 (menu-launched shell) |
+Every phase this appendix suggested is built. The table keeps each
+suggestion and names the steps that were built for its stories, as their
+Coverage lines give them: `guest:` steps of `ci/vm/vm-guest.sh`, `operator-e2e:`
+stories of `ci/vm/operator-e2e.py`, the host-side checks of `ci/vm/vm-e2e.sh`, and
+`maintainer.yml`'s shards.
+
+| Suggested phase | Stories | Built as |
+|---|---|---|
+| `verify-session-tree` | S2.3.1, S2.3.3 (host-process half), S2.3.4, S2.3.6 (mwm killed; Quit session is the operator phase's), S2.4.2 (wireplumber / pipewire-pulse), S2.4.7, S3.2.4, S3.2.5 | `guest:verify_runtime`, `guest:verify_session_restart`, `guest:verify_mwm_exit`, `guest:verify_audio_restarts`, `guest:play_as_rocky`, the e2e's host-side checks and `smoke`; Quit session in `operator-e2e:menu_quit_session` |
+| `verify-shutdown` | S2.5.1 | `smoke` |
+| `verify-host-audio-clients` | S4.2.1, S4.2.2 | `guest:host_audio` |
+| `verify-host-shell-hardening` | S5.7.3, S5.7.4 | `guest:deploy_checks`, `smoke` |
+| `verify-selinux-policy` | S5.6.2 (full context), S5.6.3, S5.6.4, S5.6.5, S5.6.6 | `guest:deploy_checks`, `guest:deploy_tail` |
+| `verify-seat-gate` | S5.3.3, S3.8.6 | `guest:deploy_tail`, `guest:seat_tags` |
+| `verify-isolation-negatives` | S6.1.3, S6.1.5 (submounts), S6.2.1, S6.2.3 | `guest:verify_privileges`, `smoke` |
+| `verify-fixed-layout` (extend) | S3.4.10 (window tree + video), S3.4.11, S3.4.12 | `guest:layout_declare`, `guest:layout_unplug`, `guest:layout_roundtrip`, `guest:layout_restore`, `smoke`, `script-unit` |
+| `verify-hotplug-input` (new; pointers, per-device proof, Xorg plug-out) | S3.9.2, S3.9.4, S3.9.5, S3.9.7–S3.9.12 | the e2e's host-side QMP checks; `operator-e2e:s3_9_11`, `operator-e2e:s3_9_12` |
+| `verify-hotplug-monitor` (new; the DRM force for plug-outs, QEMU plugging a monitor in through a VNC server on the head, an EDID through debugfs: F3.10's introduction) | S3.10.3–S3.10.7 | `guest:layout_unplug`, `guest:ad_plugin`, `guest:ad_unplug`, `guest:ad_edid`, with the host's `vnc-head.py` |
+| `verify-hotplug-audio` (extend) | S4.7.3, S4.7.5 (default sink), S4.7.7, S4.7.8, S4.7.9, S4.7.11 | the e2e's host-side checks |
+| `verify-kvm-composite` (new) | S3.11.1, S3.11.2 | `operator-e2e:s3_11_1`, `operator-e2e:s3_11_2` |
+| `verify-client-journeys` (new; display + audio journeys) | S7.5.1–S7.5.5, S7.6.3–S7.6.5, S7.6.6 (record) | `operator-e2e:s7_5_1`, `operator-e2e:s7_5_3`, `guest:pod_windows` and the e2e's host-side checks |
+| `verify-client-hotplug-continuity` (new; the "no restart" proofs) | S7.7.1–S7.7.8 | `operator-e2e:s7_7_1`, `operator-e2e:s7_7_2`, `operator-e2e:s7_7_8`, `operator-e2e:s11_3_1`, `guest:layout_unplug` and the e2e's host-side checks |
+| `verify-client-lifecycle` (new) | S7.8.1–S7.8.3, S7.3.6 (running client through uninstall) | the e2e's host-side checks, `guest:verify_teardown` |
+| reboot sub-phase after `phase-deploy` | S5.1.3, S5.5.5 (reboot half) | `guest:deploy_tail`, `guest:deploy_reboot`, last in the core shard |
+| second VM profile booted without `intel-hda` | S2.4.6 / S4.7.10 / S7.7.9 | the `soundless` shard, `guest:soundless` |
+| `verify-maintainer-provisioning` (new; a fresh overlay per variant, procedures from the documents, reboots) | S10.1.1–S10.1.4 | `maintainer.yml`: `maint-docpath`, `maint-live` |
+| VM profile with `gdm`, booted to `graphical.target` | S10.1.5 | `maintainer.yml`: `maint-gdm` |
+| `verify-maintainer-checklists` (new) | S10.2.1, S10.2.2 | `maintainer.yml`: `maint-docpath` |
+| `verify-maintainer-day2` (new) | S10.3.1–S10.3.7 | `maintainer.yml`: `maint-config`, `maint-session` |
+| `verify-maintainer-routine` (new) | S10.4.1, S10.4.2 | `maintainer.yml`: `maint-docpath` |
+| `verify-maintainer-troubleshooting` (new; one documented fault per story, staged and restored) | S10.5.1–S10.5.4 | `maintainer.yml`: `maint-faults` |
+| `verify-maintainer-onboarding` (extend phase 2; the README's steps verbatim) | S10.6.1, S10.6.2 | `maintainer.yml`: `maint-k8s` |
+| operator phase | S3.3.2, S3.3.3, S3.5.2, S3.5.3, S11.1.1–S11.1.3, S11.2.1, S11.3.1; with them S2.3.6 (Quit session), S3.6.1 (menu), S3.6.3, S5.7.2 (menu-launched shell) | `ci/vm/operator-e2e.py`, the `operator` shard (QMP pointer and key events only) |
 
 ## Appendix C — Hardware acceptance checklist (T4)
 
@@ -2298,16 +2309,16 @@ moves to ✅ only when a CI run has saved its evidence, which the
 
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
-| E1 Image build | 14 | 12 | 0 | 2 | 0 |
-| E2 Boot & supervision | 25 | 22 | 1 | 2 | 0 |
-| E3 Display & session | 62 | 47 | 1 | 11 | 3 |
-| E4 Audio | 23 | 16 | 0 | 6 | 1 |
-| E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
+| E1 Image build | 14 | 14 | 0 | 0 | 0 |
+| E2 Boot & supervision | 25 | 25 | 0 | 0 | 0 |
+| E3 Display & session | 62 | 59 | 0 | 0 | 3 |
+| E4 Audio | 23 | 22 | 0 | 0 | 1 |
+| E5 Deploy tree | 50 | 49 | 0 | 0 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
-| E7 Client contract & journeys | 40 | 31 | 1 | 8 | 0 |
-| E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
+| E7 Client contract & journeys | 40 | 40 | 0 | 0 | 0 |
+| E10 Maintainer experience | 23 | 22 | 0 | 0 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **167** | **4** | **74** | **6** |
+| **Total** | **251** | **245** | **0** | **0** | **6** |
 
 Regenerate after editing with:
 

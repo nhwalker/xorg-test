@@ -110,7 +110,7 @@ diagnostics() {
     ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin 2>/dev/null || true
     systemctl status desktop-selinux.service --no-pager -l  2>/dev/null | head -20 || true
     echo "---- diagnostics: recent SELinux denials ----"
-    ausearch -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
+    ausearch --input-logs -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
     if command -v k3s >/dev/null; then
         echo "---- diagnostics: k3s state ----"
         k3s kubectl get nodes,pods -A -o wide 2>/dev/null || true
@@ -474,8 +474,8 @@ phase_deploy() {
         env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
         || fail "the host cannot connect to the relabeled pulse socket"
     ev_pass "an unconfined host process connects to the relabeled pulse socket"
-    avc=$(ev_save avc-since-host-checks "EV-STATE: ausearch -m avc -ts $ev_t0 - every SELinux denial since the host checks began; none" \
-        sh -c "ausearch -m avc -ts $ev_t0 2>&1 || true") || true
+    avc_control
+    avc=$(avc_search avc-since-host-checks "$ev_t0" "every SELinux denial since the host checks began; none") || true
     if grep -q 'type=AVC' <<<"$avc"; then
         fail "SELinux denied something while the host used the relabeled sockets and toolkit (see the ausearch output)"
     fi
@@ -607,8 +607,8 @@ phase_deploy() {
     grep -q ':container_t:' <<<"$lbl" || fail "the probe did not run as container_t: $(echo $lbl)"
     grep -q XDPYINFO_OK <<<"$lbl" || fail "the confined probe could not open :0"
     ev_pass "a client runs confined, as $(grep -o '[a-z_]*:[a-z_]*:container_t:[^[:space:]]*' <<<"$lbl" | sed -n 1p), and opens :0"
-    avc=$(ev_save avc "EV-STATE: ausearch -m avc -ts $s712_t0: SELinux's denials since the probes began" \
-        sh -c "ausearch -m avc -ts $s712_t0 2>&1 || true") || true
+    avc_control
+    avc=$(avc_search avc "$s712_t0" "SELinux's denials since the probes began") || true
     ! grep -q 'scontext=[^ ]*:container_t:' <<<"$avc" \
         || fail "SELinux denied a confined client: $(grep -m1 'scontext=[^ ]*:container_t:' <<<"$avc")"
     ev_pass "no AVC denial since the probes began has a container_t subject"
@@ -691,6 +691,29 @@ deploy_proof() {
 # Restores the shipped (empty) monitors.conf and the connector's forced status
 # before returning, so nothing downstream - the screendumps, the testpattern
 # comparison, phase2's client pods - sees a display this function set up.
+# A search for SELinux denials, and its control. ausearch reads its standard
+# input instead of the audit log when that is a pipe (audit-userspace
+# src/ausearch.c: is_pipe(0), unless --input-logs), and this script runs over
+# ssh with no terminal, its stdin one: without --input-logs every search here
+# read an empty pipe and found no denial, whatever the log held (the
+# maintainer journey's S10.5.3 showed it: 31 AVC records in audit.log,
+# "<no matches>"). The control finds auditd's own start record, which every
+# audit log has, so a search that cannot read the log fails the story rather
+# than passing it.
+avc_search() { # <moment> <since HH:MM:SS> <what>: the denials since then, kept and printed
+    ev_save "$1" "EV-STATE: ausearch --input-logs -m avc -ts $2: $3" \
+        sh -c "ausearch --input-logs -m avc -ts $2 2>&1 || true"
+}
+avc_control() {
+    local out
+    ev_note "this script's standard input is a $(stat -L -c %F /proc/self/fd/0): ausearch without --input-logs would read it instead of the audit log"
+    out=$(ev_save avc-control "EV-STATE: the control: ausearch --input-logs -m DAEMON_START, auditd's own start records: the search reads the audit log" \
+        sh -c 'ausearch --input-logs -m DAEMON_START 2>&1 || true') || true
+    grep -q 'type=DAEMON_START' <<<"$out" \
+        || fail "ausearch --input-logs found no DAEMON_START record: the denial search cannot read the audit log"
+    ev_pass "the denial search reads the audit log: it finds auditd's own start record"
+}
+
 dpy_dims() {
     podman exec -u desktop -e DISPLAY=:0 desktop \
         sh -c "xdpyinfo | awk '/dimensions:/{print \$2; exit}'"
@@ -2297,23 +2320,30 @@ seat_tags() { # attach|fix
             ev_save tagged-attached "EV-STATE: every udev database entry tagged for a seat other than seat0, after loginctl attach seat1: the keyboard's input device and the devices under it" \
                 foreign_entries >/dev/null || true
             ev_pass "loginctl attach seat1 tagged the keyboard: $ev reads ID_SEAT=seat1 ($(foreign_tags | paste -sd' ' -) in the udev database)"
-            systemctl restart desktop.service
-            desk_back
-            pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
-            ev_text preflight "EV-LOG-DESKTOP: the container preflight's seat line, the desktop restarted with the keyboard on seat1" "${pf:-(none)}"
+            # Both preflights while the desktop runs. seat-prep runs before
+            # every desktop start, so a restart undoes the tag before the
+            # container's preflight, one of desktop-init's start oneshots,
+            # could see it: the container's is run in the running desktop.
+            pf=$(ev_save host-preflight "EV-STATE: desktop-preflight with the keyboard on seat1, the desktop running" desktop-preflight) || true
+            grep -q 'FAIL: custom seat attachment rules present (/etc/udev/rules.d/72-seat-' <<<"$pf" \
+                || fail "desktop-preflight does not name the seat rule: $(grep -i 'seat' <<<"$pf" | tr '\n' ' ')"
+            ev_pass "desktop-preflight names the rule: $(grep -m1 -o 'FAIL: custom seat attachment rules present ([^)]*)' <<<"$pf")"
+            pf=$(ev_save preflight "EV-LOG-DESKTOP: the container preflight run in the running desktop (podman exec desktop /usr/local/bin/preflight-check.sh), its seat line" \
+                sh -c 'podman exec desktop /usr/local/bin/preflight-check.sh 2>&1 | tr -d "\r" | grep "^preflight: .*seat" || true') || true
             grep -q '^preflight: WARN: devices tagged for a non-default seat (E:ID_SEAT=seat1' <<<"$pf" \
                 || fail "the preflight did not warn about the seat1 tag: ${pf:-no seat line}"
-            ev_pass "the preflight warns: $pf"
+            ev_pass "the preflight warns: $(grep -m1 '^preflight: WARN: devices tagged' <<<"$pf")"
             ;;
         fix)
-            desk_down
+            # The desktop restarted: seat-prep (PartOf=desktop.service) runs
+            # again before the start and undoes the attachment.
             j0=$(ev_since)
-            systemctl restart desktop-seat-prep.service \
-                || fail "desktop-seat-prep failed: $(journalctl --no-pager -o cat -u desktop-seat-prep.service --since "$j0" | tail -5)"
-            j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -u desktop-seat-prep from its restart, the desktop stopped" \
+            systemctl restart desktop.service
+            desk_back
+            j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -u desktop-seat-prep from the desktop's restart: seat-prep runs before every desktop start" \
                 journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$j0") || true
             grep -q 'seat-prep: removing custom seat attachment rule /etc/udev/rules.d/72-seat-' <<<"$j" \
-                || fail "seat-prep did not log removing the 72-seat-* rule"
+                || fail "seat-prep did not log removing the 72-seat-* rule at the desktop's restart"
             ev_pass "seat-prep logged: $(grep -o 'seat-prep: removing custom seat attachment rule [^ ]*' <<<"$j" | head -n1)"
             ev_save rules-after "EV-STATE: ls -l /etc/udev/rules.d after seat-prep: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is still there after seat-prep"
@@ -2323,10 +2353,8 @@ seat_tags() { # attach|fix
             ! udevadm info -q property -n "$ev" | grep -q '^ID_SEAT=' || fail "$ev still carries $(udevadm info -q property -n "$ev" | grep '^ID_SEAT=')"
             [ -z "$(foreign_tags)" ] || fail "the udev database still has a foreign seat tag: $(foreign_entries | paste -sd' ' -)"
             ev_pass "the rule is gone and udev re-read the keyboard: $ev has no ID_SEAT, and no device in the udev database is tagged for another seat"
-            systemctl start desktop.service
-            desk_back
             pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
-            ev_text preflight-after "EV-LOG-DESKTOP: the container preflight's seat line after seat-prep, the desktop started again" "${pf:-(none)}"
+            ev_text preflight-after "EV-LOG-DESKTOP: the container preflight's seat line at that start, after seat-prep" "${pf:-(none)}"
             grep -qx 'preflight: PASS: no foreign seat tags in the udev database' <<<"$pf" \
                 || fail "the preflight does not pass the seat check after seat-prep: ${pf:-no seat line}"
             ev_pass "the preflight passes: $pf"
@@ -2477,6 +2505,86 @@ host_audio() { # pulse-play|autospawn|alsa-setup|alsa-play|alsa-control|null-on|
     esac
 }
 
+# --- k3s on CRI-O: phase2's node, and the maintainer's (maint-guest.sh) ---------
+# Client pods reach the display through CDI, which only the CRI resolves - so
+# k3s runs on an EXTERNAL CRI-O instead of the bundled containerd. CRI-O scans
+# /etc/cdi, which is where the specs live. In three steps, so that a caller
+# loads images into the storage CRI-O shares with podman, and writes its own
+# crio.conf.d drop-ins (the cdi_spec_dirs one: phase2's, or README.md's
+# block), after the package and before CRI-O first starts.
+k8s_crio_pkg() { # <log tag>
+    log "$1" "install CRI-O ${CRIO_VERSION} (the documented runtime for CDI clients)"
+    cat > /etc/yum.repos.d/cri-o.repo <<EOF
+[cri-o]
+name=CRI-O ${CRIO_VERSION}
+baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/repodata/repomd.xml.key
+EOF
+    dnf -y -q install cri-o >/dev/null
+}
+k8s_crio_start() {
+    # k3s writes its flannel CNI config + plugin binaries under its own tree,
+    # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
+    # dirs so the pod network comes up (else kubelet stays NetworkNotReady).
+    mkdir -p /etc/crio/crio.conf.d
+    cat > /etc/crio/crio.conf.d/11-k3s-cni.conf <<'EOF'
+[crio.network]
+network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
+EOF
+    systemctl enable --now crio >/dev/null 2>&1 \
+        || { journalctl -u crio --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
+             fail "crio failed to start (bad crio.conf.d drop-in?)"; }
+    wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
+}
+k8s_k3s() { # <log tag>
+    log "$1" "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
+    # On an enforcing EL host k3s needs its own policy module: its tree under
+    # /var/lib/rancher and its agent processes are not covered by stock
+    # container-selinux (which is what CRI-O and the client pods rely on).
+    # The installer is supposed to detect enforcing SELinux and pull
+    # k3s-selinux from rpm.rancher.io itself, so INSTALL_K3S_SKIP_SELINUX_RPM
+    # is deliberately NOT set - but that is the INSTALLER's behaviour, not
+    # ours, and it is exactly the kind of thing that changes upstream without
+    # us noticing. Assert the result below rather than trusting it.
+    #
+    # Output goes to a file rather than /dev/null: a policy install that failed
+    # or was skipped explains itself there, and discarding it is why this was
+    # unverifiable in the first place.
+    if ! curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
+        --container-runtime-endpoint=unix:///run/crio/crio.sock \
+        --kubelet-arg=cgroup-driver=systemd \
+        --disable traefik --disable metrics-server" sh - >/tmp/k3s-install.log 2>&1
+    then
+        tail -40 /tmp/k3s-install.log >&2 || true
+        fail "k3s install failed (see output above)"
+    fi
+
+    log "$1" "k3s brought its own SELinux policy module (required on an enforcing EL host)"
+    if semodule -l 2>/dev/null | grep -qi '^k3s'; then
+        log "$1" "  policy module loaded: $(semodule -l | grep -i '^k3s' | tr '\n' ' ')"
+        rpm -q k3s-selinux >/dev/null 2>&1 && log "$1" "  from $(rpm -q k3s-selinux)"
+    else
+        echo "---- selinux lines from the k3s installer ----" >&2
+        grep -i selinux /tmp/k3s-install.log >&2 || echo "(none)" >&2
+        echo "---- loaded policy modules ----" >&2
+        semodule -l 2>/dev/null | tail -20 >&2 || true
+        fail "no k3s SELinux policy module loaded - the installer skipped it, and k3s is unconfined-by-omission on an enforcing host"
+    fi
+    wait_for 60 5 "k3s node ready" \
+        sh -c "k3s kubectl get nodes | grep -q ' Ready'"
+    # Prove the node really runs CRI-O, not the bundled containerd.
+    k3s kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' \
+        | grep -q cri-o || fail "node runtime is not cri-o"
+
+    curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
+        | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+}
+
 phase2() {
     # The quadlet desktop stays UP for the whole of this phase, and that is
     # the point: kubernetes here carries application containers, never the
@@ -2511,18 +2619,8 @@ phase2() {
     ev_pass "before the install: desktop-init, Xorg, mwm and pipewire are running"
 
     # Client pods reach the display through CDI, which only the CRI
-    # resolves - so this phase runs k3s on an EXTERNAL CRI-O instead of the
-    # bundled containerd. CRI-O scans /etc/cdi, which is where the specs live.
-    log p2 "install CRI-O ${CRIO_VERSION} (the documented runtime for CDI clients)"
-    cat > /etc/yum.repos.d/cri-o.repo <<EOF
-[cri-o]
-name=CRI-O ${CRIO_VERSION}
-baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/
-enabled=1
-gpgcheck=1
-gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/repodata/repomd.xml.key
-EOF
-    dnf -y -q install cri-o >/dev/null
+    # resolves - so this phase runs k3s on an EXTERNAL CRI-O (k8s_crio_pkg).
+    k8s_crio_pkg p2
 
     # podman and CRI-O share /var/lib/containers/storage by default, so a root
     # `podman load` is visible to CRI-O - no ctr import or skopeo needed. Load
@@ -2553,75 +2651,22 @@ EOF
     grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "/etc/cdi/desktop-audio.yaml missing or malformed before k3s install"
 
-    # k3s writes its flannel CNI config + plugin binaries under its own tree,
-    # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
-    # dirs so the pod network comes up (else kubelet stays NetworkNotReady).
-    mkdir -p /etc/crio/crio.conf.d
-    cat > /etc/crio/crio.conf.d/11-k3s-cni.conf <<'EOF'
-[crio.network]
-network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
-plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
-EOF
     # Everything downstream rests on CRI-O scanning /etc/cdi. That IS the
     # default, but state it explicitly rather than depend on it: the default
     # does not appear in `crio config` output (the man page documents the
     # option as cdi_spec_dirs=[], with the real list applied internally), so
     # relying on it is both invisible and unverifiable from outside.
-    # An unknown key here would stop crio starting, which the next line
+    # An unknown key here would stop crio starting, which k8s_crio_start
     # catches - a loud, immediate failure rather than a puzzling one later.
+    mkdir -p /etc/crio/crio.conf.d
     cat > /etc/crio/crio.conf.d/12-cdi.conf <<'EOF'
 [crio.runtime]
 cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
 EOF
-    systemctl enable --now crio >/dev/null 2>&1 \
-        || { journalctl -u crio --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
-             fail "crio failed to start (bad crio.conf.d drop-in?)"; }
-    wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
+    k8s_crio_start
     log p2 "crio configured to scan /etc/cdi for device specs"
 
-    log p2 "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
-    # On an enforcing EL host k3s needs its own policy module: its tree under
-    # /var/lib/rancher and its agent processes are not covered by stock
-    # container-selinux (which is what CRI-O and the client pods rely on).
-    # The installer is supposed to detect enforcing SELinux and pull
-    # k3s-selinux from rpm.rancher.io itself, so INSTALL_K3S_SKIP_SELINUX_RPM
-    # is deliberately NOT set - but that is the INSTALLER's behaviour, not
-    # ours, and it is exactly the kind of thing that changes upstream without
-    # us noticing. Assert the result below rather than trusting it.
-    #
-    # Output goes to a file rather than /dev/null: a policy install that failed
-    # or was skipped explains itself there, and discarding it is why this was
-    # unverifiable in the first place.
-    if ! curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
-        --container-runtime-endpoint=unix:///run/crio/crio.sock \
-        --kubelet-arg=cgroup-driver=systemd \
-        --disable traefik --disable metrics-server" sh - >/tmp/k3s-install.log 2>&1
-    then
-        tail -40 /tmp/k3s-install.log >&2 || true
-        fail "k3s install failed (see output above)"
-    fi
-
-    log p2 "k3s brought its own SELinux policy module (required on an enforcing EL host)"
-    if semodule -l 2>/dev/null | grep -qi '^k3s'; then
-        log p2 "  policy module loaded: $(semodule -l | grep -i '^k3s' | tr '\n' ' ')"
-        rpm -q k3s-selinux >/dev/null 2>&1 && log p2 "  from $(rpm -q k3s-selinux)"
-    else
-        echo "---- selinux lines from the k3s installer ----" >&2
-        grep -i selinux /tmp/k3s-install.log >&2 || echo "(none)" >&2
-        echo "---- loaded policy modules ----" >&2
-        semodule -l 2>/dev/null | tail -20 >&2 || true
-        fail "no k3s SELinux policy module loaded - the installer skipped it, and k3s is unconfined-by-omission on an enforcing host"
-    fi
-    wait_for 60 5 "k3s node ready" \
-        sh -c "k3s kubectl get nodes | grep -q ' Ready'"
-    # Prove the node really runs CRI-O, not the bundled containerd.
-    k3s kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' \
-        | grep -q cri-o || fail "node runtime is not cri-o"
-
-    curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
-        | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
-
-    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    k8s_k3s p2
 
     # The desktop must have survived the CRI-O + k3s install unscathed: a
     # container runtime arriving on the node is exactly the kind of thing
@@ -2673,9 +2718,9 @@ EOF
     log p2 "client pod schedules and opens xterm on the desktop"
     # The example pod declares only the resource request - no volumes, no
     # env - so it running an X client at all means the plugin named the CDI
-    # device and CRI-O applied the spec.
-    sed 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
-        examples/x11-client-pod.yaml | k3s kubectl apply -f -
+    # device and CRI-O applied the spec. It is applied as it stands: its image
+    # is the desktop's own, localhost/desktop-container:latest.
+    k3s kubectl apply -f examples/x11-client-pod.yaml
     wait_for 30 4 "client pod running" \
         sh -c "k3s kubectl get pod x11-client-demo -o jsonpath='{.status.phase}' | grep -q Running"
     sleep 5
@@ -2686,7 +2731,7 @@ EOF
     # proving nothing. Read the type the kernel actually gave it.
     log p2 "the client pod runs confined, and reached the display anyway"
     ev_begin S7.3.3 "Pods are confined and declare no securityContext" T3
-    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, which phase2 applies with only its image pointed at the locally loaded one: a resource request and nothing else - no securityContext, volumes, env or CDI annotation"
+    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, which phase2 applies as it stands: its image (the desktop's own, localhost/desktop-container:latest) and a resource request, nothing else - no securityContext, volumes, env or CDI annotation"
     ev_save demo-spec "EV-STATE: the demo pod as the API server holds it: the pod's securityContext ({} is the API server's empty default), the container's (empty), the volumes (the service-account token's, which the API server adds) and the container's env (empty)" \
         k3s kubectl get pod x11-client-demo -o jsonpath='pod securityContext: {.spec.securityContext}{"\n"}container securityContext: {.spec.containers[0].securityContext}{"\n"}volumes: {.spec.volumes[*].name}{"\n"}container env: {.spec.containers[0].env}{"\n"}' >/dev/null || true
     pctx=$(k3s kubectl exec x11-client-demo -- sh -c 'tr -d "\000" < /proc/self/attr/current' 2>/dev/null || true)
@@ -4701,11 +4746,10 @@ operator_teardown() {
 
 apply_client() { # $1: pod name; $2: xterm geometry (default: the example's)
     # Reuse the example client (a long-running xterm), renamed, titled after
-    # the pod, placed where asked and pointed at the locally-imported image.
+    # the pod and placed where asked.
     sed -e "s/name: x11-client-demo/name: $1/" \
         -e "s/\"CDI demo\"/\"$1\"/" \
         -e "s/80x24+200+200/${2:-80x24+200+200}/" \
-        -e 's|image: desktop-container:latest|image: localhost/desktop-container:latest|' \
         examples/x11-client-pod.yaml | k3s kubectl apply -f -
 }
 
@@ -5228,7 +5272,10 @@ sl_cards() { # alsa_card Devices in PipeWire, as snd_probe counts them
     echo "${n:-0}"
 }
 sl_card_up() { [ "$(sl_cards)" -ge 1 ]; }
-sl_played() { podman logs "$SL_CLIENT" 2>&1 | grep -q '^played at '; }
+# The client's log is read whole, then searched: `podman logs | grep -q` under
+# pipefail fails on podman's SIGPIPE once grep has its match.
+sl_clog() { podman logs "$SL_CLIENT" 2>&1 || true; }
+sl_played() { local l; l=$(sl_clog); grep -q '^played at ' <<<"$l"; }
 sl_inspect() { podman inspect "$SL_CLIENT" --format '{{.Id}} pid={{.State.Pid}} started={{.State.StartedAt}} restarts={{.RestartCount}} status={{.State.Status}}'; }
 sl_wpctl() { podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop wpctl status; }
 # The align-device-groups rows of every narrow (audio-only) pass in the log:
@@ -5241,7 +5288,7 @@ sl_narrow_rows() {
 
 soundless() { # before|plugged|realign|played|after
     [ "${EV_PROFILE:-}" = soundless ] || fail "the soundless steps need the VM booted without a sound card (EV_PROFILE=soundless)"
-    local log since rows node ngid cgid c0 c1 n_lines old
+    local log since rows node ngid cgid c0 c1 n_lines old d0 p0 p1 cm
     case "${1:-}" in
         before)
             log sl "a soundless host: no card, the host's audio group on $SL_GID, the image's in the container"
@@ -5282,8 +5329,13 @@ soundless() { # before|plugged|realign|played|after
             sleep 4
             ev_save client-before "EV-PIDS: the client as it started: id, pid, start, restarts, status" sl_inspect >/dev/null || fail "no client to inspect"
             sl_inspect > /run/ev-sl-client
+            # F7.7's common set: Xorg, mwm and the audio daemons, before and after.
+            ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the card arrives" \
+                ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+            echo "$EV_LAST" > /run/ev-sl-daemons
             ev_save client-log-early "EV-LOG-CLIENT: the client's first tries, with no card's sink to play to" podman logs "$SL_CLIENT" >/dev/null || true
-            podman logs "$SL_CLIENT" 2>&1 | grep -q '^try 1 at ' || fail "the client logged no failed try with no card"
+            clog=$(sl_clog)
+            grep -q '^try 1 at ' <<<"$clog" || fail "the client logged no failed try with no card"
             ! sl_played || fail "the client played with no card"
             ev_pass "the client runs and keeps trying: no card's sink yet"
             ev_end
@@ -5360,8 +5412,18 @@ soundless() { # before|plugged|realign|played|after
             [ -n "$c0" ] && [ "$c1" = "$c0" ] || fail "the client is not the same container and process: $c0 -> $c1"
             grep -q ' restarts=0 status=running$' <<<"$c1" || fail "the client restarted or stopped: $c1"
             ev_pass "the same container and process throughout, never restarted, still running: $c1"
+            ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the client played" \
+                ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+            d0=$(cat /run/ev-sl-daemons 2>/dev/null || true)
+            [ -n "$d0" ] || fail "the daemons' table from before the card is missing"
+            ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons before the card arrived (-) and after the client played (+): the audio daemons are new, the stack having restarted to align to the card; Xorg and mwm are not" "$d0" "$EV_LAST"
+            for cm in Xorg mwm; do
+                p0=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$d0") p1=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$EV_LAST")
+                [ -n "$p0" ] && [ "$p0" = "$p1" ] || fail "$cm is not the same process across the card's arrival: ${p0:-none} -> ${p1:-none}"
+            done
+            ev_pass "Xorg and mwm are the same processes across the card's arrival and the audio stack's restart"
             podman rm -f -t 2 "$SL_CLIENT" >/dev/null 2>&1 || true
-            rm -f /run/ev-sl-client
+            rm -f /run/ev-sl-client /run/ev-sl-daemons
             ev_end
             ;;
         *) fail "soundless: before, plugged, realign, played or after" ;;

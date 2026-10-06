@@ -1345,7 +1345,7 @@ mt_drm_diagnose() {
     fi
     out=$(mt_saved "$(mt_get S10.5.1-log-held)")
     if grep -q 'postmortem: LIKELY CAUSE: another process holds DRM master' <<<"$out"; then
-        ev_pass "the postmortem names the cause: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+        ev_pass "the postmortem names the cause: $(grep -m1 'postmortem: LIKELY CAUSE: another process holds DRM master' <<<"$out" | sed 's/.*postmortem: //')"
     else
         ev_fail "the desktop's log has no postmortem naming another DRM master"
     fi
@@ -1625,10 +1625,13 @@ mt_gid_diagnose() {
     out=$(ev_save align-lines "EV-PROCEDURE: the entry's check, as it writes it: \`podman logs desktop\` for \`align-device-groups\` lines" \
         sh -c 'podman logs desktop 2>&1 | grep align-device-groups') || true
     out=$(mt_saved "$(mt_get S10.5.4-log-staged)")
+    # The line itself, not the log's first LIKELY CAUSE: the container can
+    # hold an earlier fault's postmortems (S10.5.1's DRM holder, staged in it
+    # before this one).
     if grep -q 'postmortem: LIKELY CAUSE: device group permissions' <<<"$out"; then
-        ev_pass "the postmortem names the cause: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+        ev_pass "the postmortem names the cause: $(grep -m1 'postmortem: LIKELY CAUSE: device group permissions' <<<"$out" | sed 's/.*postmortem: //')"
     else
-        ev_fail "the desktop's log has no postmortem naming device group permissions: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+        ev_fail "the desktop's log has no postmortem naming device group permissions; its last: $(grep 'LIKELY CAUSE' <<<"$out" | tail -n 1 | sed 's/.*postmortem: //')"
     fi
     out=$(ev_save named "EV-PROCEDURE: the commands the postmortem names, in the container: id desktop; ls -ln /dev/dri /dev/input" \
         sh -c 'podman exec desktop id desktop; podman exec desktop ls -ln /dev/dri /dev/input') || true
@@ -2087,6 +2090,356 @@ mt_gdm_after() {
     ev_end
 }
 
+# --- F10.6: client workloads on a provisioned host (README.md's Kubernetes steps) --
+# The node: the documented host (provisioned by the journey the S10.1.2 way,
+# its evidence kept by the docpath journey) with k3s and CRI-O, which README.md
+# takes as given and does not install. They go in the way ci.yml's k8s shard
+# installs them (vm-guest.sh's k8s_* functions). The one CRI-O setting README.md
+# does give, its cdi_spec_dirs drop-in, is README.md's own block, written to the
+# path its first line names, before CRI-O first starts. README.md's <registry>
+# is this host's own image storage, which CRI-O shares with podman: the plugin
+# image is loaded there under the name podman load gives it,
+# localhost/cdi-device-plugin, which the chart's IfNotPresent finds unpulled.
+MT_K8S_SECTION="Kubernetes (single-node k3s + CRI-O)"
+MT_K8S_PLUGINS="Kubernetes: a device plugin per capability"
+MT_REGISTRY=localhost
+MT_DEMO=x11-client-demo
+MT_UNPROV=unprovisioned
+MT_UNPROV_POD=ci/vm/unprovisioned-pod.yaml
+
+# The node's allocatable desktop.local resources, saved into the open story;
+# MT_ALLOC holds them as "display=N audio=N tools=N", mt_alloc_of one of them.
+MT_ALLOC=""
+mt_k8s_alloc() { # <moment> <when>
+    ev_save "allocatable-$1" "EV-STATE: the node's allocatable desktop.local resources $2 (kubectl get node -o jsonpath, .status.allocatable)" \
+        kubectl get node -o jsonpath='display={.items[0].status.allocatable.desktop\.local/display} audio={.items[0].status.allocatable.desktop\.local/audio} tools={.items[0].status.allocatable.desktop\.local/tools}' >/dev/null || true
+    MT_ALLOC=$(mt_saved "$EV_LAST")
+}
+mt_alloc_of() { tr ' ' '\n' <<<"$MT_ALLOC" | sed -n "s/^$1=//p"; }
+# A step's story opened, with k3s's kubeconfig named for helm (k3s's own
+# kubectl finds it unnamed): each step is a vm-guest.sh run of its own.
+mt_k8s_begin() { mt_begin "$1"; export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; }
+mt_k8s_ls() { # <moment> <when>
+    ev_save "ls-$1" "EV-STATE: ls -l /etc/cdi /var/lib/desktop-container/bin $2" \
+        ls -l /etc/cdi /var/lib/desktop-container/bin >/dev/null || true
+}
+# The same desktop processes and container at two mt_pids moments: nothing
+# restarted between them (EV-PIDS, said either way).
+mt_pids_kept() { # <moment before> <moment after> <between what>
+    local c a b moved=""
+    for c in ${S737_COMMS//,/ } container; do
+        a=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$EV_STORY-$1")
+        b=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$EV_STORY-$2")
+        [ -n "$a" ] && [ "$a" = "$b" ] || moved="$moved $c (${a:-none} -> ${b:-none})"
+    done
+    if [ -z "$moved" ]; then
+        ev_pass "nothing restarted $3: every desktop process ($S737_COMMS) and the container are the ones from before"
+    else
+        ev_fail "restarted $3:$moved"
+    fi
+}
+
+# S10.6.1, the node: k3s and CRI-O on the provisioned host, README.md's CRI-O
+# drop-in among CRI-O's settings.
+mt_k8s_node() {
+    local toml path
+    mt_k8s_begin S10.6.1
+    mt_put since-k8s "$(date +%s)"
+    ev_note "the host: provisioned the documented way (deploy/HOST-REQUIRES.md's line, the image, deploy/README.md's Apply block and its reboot; the docpath journey keeps that evidence), the desktop on the screen"
+    mt_state before "on the provisioned host, before k3s, CRI-O and README.md's steps"
+    mt_pids before "on the provisioned host, before k3s, CRI-O and README.md's steps"
+    k8s_crio_pkg k8s
+    ev_save crio-version "EV-STATE: CRI-O, installed from its stable stream as ci.yml's k8s shard installs it (README.md assumes CRI-O and does not say how): crio --version" \
+        crio --version >/dev/null || true
+    ev_save plugin-image "EV-PROCEDURE: README.md's <registry>, here this host's own image storage, which CRI-O shares with podman: podman load of the plugin image CI built, before CRI-O starts" \
+        podman load -i /tmp/images-plugin.tar >/dev/null || fail "podman load of the plugin image failed"
+    podman image exists localhost/cdi-device-plugin:latest \
+        || fail "localhost/cdi-device-plugin:latest is not in the image storage after the load"
+    toml=$(python3 ci/doc-blocks.py README.md "$MT_K8S_SECTION" --lang toml) \
+        || fail "README.md's \"$MT_K8S_SECTION\" has no toml block: $toml"
+    ev_text crio-block "EV-PROCEDURE: README.md's CRI-O drop-in, the toml block under \"$MT_K8S_SECTION\", as this run read it" "$toml"
+    path=$(sed -n '1s/^# *\(\/[^ ]*\)$/\1/p' <<<"$toml")
+    case "$path" in
+        /etc/crio/crio.conf.d/*.conf) ;;
+        *) fail "README.md's CRI-O block no longer opens with its drop-in's path: $(sed -n 1p <<<"$toml")" ;;
+    esac
+    mkdir -p "${path%/*}"
+    printf '%s\n' "$toml" > "$path"
+    ev_save crio-dropin "EV-STATE: $path, written from the block as it stands, before CRI-O first starts" cat "$path" >/dev/null || true
+    ev_pass "README.md's CRI-O drop-in is at $path, the path its first line names, before CRI-O first starts"
+    k8s_crio_start
+    k8s_k3s k8s
+    ev_save crio-confd "EV-STATE: CRI-O's drop-ins: README.md's, and 11-k3s-cni.conf, which points CRI-O at k3s's pod network as ci.yml's k8s shard does (README.md does not cover it)" \
+        sh -c 'ls -l /etc/crio/crio.conf.d; for f in /etc/crio/crio.conf.d/*.conf; do echo "== $f"; cat "$f"; done' >/dev/null || true
+    ev_save node "EV-STATE: the node: kubectl get node -o wide (its runtime, cri-o), k3s --version and helm version" \
+        sh -c 'kubectl get node -o wide; k3s --version; helm version' >/dev/null || true
+    [ "$(getenforce)" = Enforcing ] || fail "SELinux is $(getenforce) after the k3s install"
+    ev_pass "the node is Ready on CRI-O, and SELinux is still enforcing"
+    ev_end
+}
+
+# S10.6.1: README.md's helm block as written, <registry> its one substitution,
+# then its describe line, again until its comment holds.
+mt_k8s_plugins() {
+    local raw line n=0 rc out tries=0 cap ok
+    local -a cmds
+    mt_k8s_begin S10.6.1
+    mt_put since-steps "$(date +%s)"
+    raw=$(python3 ci/doc-blocks.py README.md "$MT_K8S_PLUGINS" 1) \
+        || fail "README.md's \"$MT_K8S_PLUGINS\" has no command block: $raw"
+    ev_text helm-block "EV-PROCEDURE: README.md's helm block (\"$MT_K8S_PLUGINS\", its first block), as this run read it. Each command follows, <registry> replaced by $MT_REGISTRY and nothing else, run as root in the repository with KUBECONFIG=$KUBECONFIG (k3s's kubeconfig, which helm has to be told)" "$raw"
+    mapfile -t cmds < <(python3 ci/doc-blocks.py README.md "$MT_K8S_PLUGINS" 1 --commands | cut -f1)
+    [ "${#cmds[@]}" = 3 ] || fail "README.md's helm block is no longer three commands: ${cmds[*]}"
+    for line in "${cmds[@]}"; do
+        n=$((n + 1)) rc=0
+        case "$line" in
+            "helm install "*"<registry>"*) ;;
+            *) fail "README.md's helm block, command $n, is not a helm install naming <registry>: $line" ;;
+        esac
+        line=${line//<registry>/$MT_REGISTRY}
+        case "$line" in *"<"*">"*) fail "a placeholder other than <registry> is left in: $line" ;; esac
+        ev_save "helm-$n" "EV-PROCEDURE: \`$line\`, as written but for <registry>: its output and exit status" sh -c "$line" >/dev/null || rc=$?
+        [ "$rc" = 0 ] || fail "\`$line\` exited $rc"
+        ev_pass "\`$line\` exited 0"
+    done
+    raw=$(python3 ci/doc-blocks.py README.md "$MT_K8S_PLUGINS" 2) \
+        || fail "README.md's \"$MT_K8S_PLUGINS\" has no second command block: $raw"
+    ev_text use-block "EV-PROCEDURE: README.md's second block there, as this run read it: the describe line, then the apply line (the next step runs it)" "$raw"
+    mapfile -t cmds < <(python3 ci/doc-blocks.py README.md "$MT_K8S_PLUGINS" 2 --commands | cut -f1)
+    [ "${#cmds[@]}" = 2 ] && [ "${cmds[0]#kubectl describe node}" != "${cmds[0]}" ] && [ "${cmds[1]#kubectl apply -f }" != "${cmds[1]}" ] \
+        || fail "README.md's second block is no longer a describe line and an apply line: ${cmds[*]}"
+    mt_put k8s-apply "${cmds[1]}"
+    # The releases register with kubelet some seconds after their pods start;
+    # each resource's Capacity and Allocatable lines both read 10 once they have.
+    for tries in $(seq 30); do
+        out=$(sh -c "${cmds[0]}" 2>&1) || true
+        ok=1
+        for cap in display audio tools; do
+            [ "$(grep -cE "^[[:space:]]+desktop\.local/$cap:[[:space:]]+10[[:space:]]*\$" <<<"$out")" -ge 2 ] || ok=0
+        done
+        [ "$ok" = 0 ] || break
+        sleep 4
+    done
+    ev_save describe "EV-STATE: \`${cmds[0]}\`, as written, once its comment held (\"10 of each allocatable\"; try $tries, 4 s apart): each resource's Capacity and Allocatable lines" \
+        sh -c "${cmds[0]}" >/dev/null || true
+    out=$(mt_saved "$EV_LAST")
+    for cap in display audio tools; do
+        [ "$(grep -cE "^[[:space:]]+desktop\.local/$cap:[[:space:]]+10[[:space:]]*\$" <<<"$out")" -ge 2 ] \
+            || fail "\`${cmds[0]}\` does not show desktop.local/$cap at 10, Capacity and Allocatable, after $tries tries"
+    done
+    ev_pass "the describe line, as written, shows desktop.local/display, audio and tools at 10, Capacity and Allocatable"
+    mt_k8s_alloc plugins "after README.md's helm installs"
+    for cap in display audio tools; do
+        [ "$(mt_alloc_of "$cap")" = 10 ] || fail "desktop.local/$cap is allocatable at '$(mt_alloc_of "$cap")', not 10"
+    done
+    ev_pass "the API agrees: 10 of each allocatable ($MT_ALLOC)"
+    ev_save plugin-pods "EV-STATE: the three releases' pods, each with its image and the image ID CRI-O reports" \
+        kubectl get pods -o 'custom-columns=NAME:.metadata.name,STATUS:.status.phase,IMAGE:.spec.containers[0].image,IMAGEID:.status.containerStatuses[0].imageID' >/dev/null || true
+    ev_end
+}
+
+# S10.6.1: README.md's apply line as written; the example pod running on the
+# desktop's own image, unpulled, and its xterm on the screen.
+mt_k8s_apply() {
+    local line rc=0 phase="" img imgid id dg same=no title
+    mt_k8s_begin S10.6.1
+    line=$(mt_get k8s-apply)
+    [ -n "$line" ] || fail "no apply line kept from README.md's block"
+    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, applied as it stands: its image, the desktop's own localhost/desktop-container:latest, with imagePullPolicy IfNotPresent, and the display and audio resource requests"
+    ev_save apply "EV-PROCEDURE: \`$line\`, as written: its output and exit status" sh -c "$line" >/dev/null || rc=$?
+    [ "$rc" = 0 ] || fail "\`$line\` exited $rc"
+    ev_pass "\`$line\` exited 0"
+    for _ in $(seq 45); do
+        phase=$(kubectl get pod "$MT_DEMO" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        [ "$phase" != Running ] || break
+        sleep 2
+    done
+    ev_save demo-describe "EV-STATE: kubectl describe pod $MT_DEMO: its events, scheduled to started" kubectl describe pod "$MT_DEMO" >/dev/null || true
+    [ "$phase" = Running ] || fail "the demo pod is '${phase:-absent}', not Running, 90 s after the apply line (its events are in the evidence)"
+    ev_pass "the demo pod is Running"
+    ev_save demo-image "EV-STATE: the demo pod's image: the name its spec gives (the example's), and the name and image ID kubelet reports from CRI-O" \
+        kubectl get pod "$MT_DEMO" -o jsonpath='spec: {.spec.containers[0].image}{"\n"}status: {.status.containerStatuses[0].image}{"\n"}imageID: {.status.containerStatuses[0].imageID}{"\n"}' >/dev/null || true
+    img=$(mt_saved "$EV_LAST")
+    ev_save local-image "EV-STATE: the desktop image in the storage CRI-O shares with podman: podman image inspect localhost/desktop-container:latest, its id and digests" \
+        podman image inspect localhost/desktop-container:latest --format 'id: {{.Id}}{{"\n"}}digest: {{.Digest}}{{"\n"}}repo digests: {{.RepoDigests}}' >/dev/null || true
+    id=$(podman image inspect localhost/desktop-container:latest --format '{{.Id}}')
+    dg=$(podman image inspect localhost/desktop-container:latest --format '{{.Digest}}')
+    imgid=$(sed -n 's/^imageID: //p' <<<"$img")
+    [ -z "$id" ] || case "$imgid" in *"$id"*) same=yes ;; esac
+    [ -z "$dg" ] || case "$imgid" in *"$dg"*) same=yes ;; esac
+    [ -n "$imgid" ] && [ "$same" = yes ] \
+        || fail "the demo pod runs image '${imgid:-unknown}', not this host's localhost/desktop-container:latest (id $id, digest $dg)"
+    ev_pass "the demo pod runs this host's localhost/desktop-container:latest, unpulled, the image the desktop runs: $imgid"
+    for _ in $(seq 20); do
+        pod_window_up "$MT_DEMO" && break
+        sleep 1
+    done
+    ev_save demo-windows "EV-STATE: the demo pod's main process (its xterm), the X client it holds and the windows X allocated to it (xwininfo), each with its title and map state" \
+        pod_windows "$MT_DEMO" >/dev/null || fail "the demo pod's xterm holds no X connection"
+    grep -q ' map=IsViewable$' <<<"$(mt_saved "$EV_LAST")" || fail "the demo pod's xterm has no window on the screen"
+    title=$(sed -nE 's/^0x[0-9a-f]+ "([^"]*)".* map=IsViewable$/\1/p' <<<"$(mt_saved "$EV_LAST")" | sed -n 1p)
+    ev_pass "the demo pod's xterm has a window on the screen (IsViewable), found as its pod's X client"
+    ev_note "its title now: \"${title:-none}\" (the example passes -title \"CDI demo\"; the image's /etc/bashrc retitles an xterm at its shell's first prompt)"
+    ev_end
+}
+
+# S10.6.1, after the typing: nothing restarted, and the common set's after.
+mt_k8s_after() {
+    mt_k8s_begin S10.6.1
+    mt_pids after "after README.md's steps and the typing"
+    mt_pids_kept before after "from before k3s and CRI-O to the demo pod in use"
+    ev_save demo-final "EV-STATE: kubectl describe pod $MT_DEMO after it was used" kubectl describe pod "$MT_DEMO" >/dev/null || true
+    mt_state after "after README.md's steps"
+    mt_state_diff before after "k3s and CRI-O arriving, and README.md's steps"
+    mt_logs "$(mt_get since-steps)" "from README.md's helm installs to the demo pod in use"
+    ev_save demo-delete "EV-STATE: the demo pod removed, for S10.6.2: kubectl delete pod $MT_DEMO" \
+        kubectl delete pod "$MT_DEMO" --wait=true >/dev/null || true
+    ev_end
+}
+
+# S10.6.2: this node staged as one the desktop has never provisioned, as the
+# requirement lists it: the desktop stopped, its toolkit directory emptied, the
+# tools spec removed, and its generator stopped, which deploy/README.md asks
+# of anything that removes the spec.
+mt_unprov_stage() {
+    local t=0
+    mt_k8s_begin S10.6.2
+    mt_put since-unprov "$(date +%s)"
+    mt_state before "before the node is staged as never provisioned"
+    mt_pids before "before the desktop is stopped"
+    mt_k8s_ls before "before the staging: the tools spec and the published toolkit"
+    mt_k8s_alloc before "before the staging"
+    [ "$(mt_alloc_of tools)" = 10 ] || fail "desktop.local/tools is allocatable at '$(mt_alloc_of tools)' before the staging, not 10"
+    ev_save stop "EV-PROCEDURE: staging a never-provisioned node, 1: systemctl stop desktop.service" \
+        systemctl stop desktop.service >/dev/null || fail "could not stop the desktop"
+    ev_save empty "EV-PROCEDURE: staging, 2: the toolkit directory emptied (find /var/lib/desktop-container/bin -mindepth 1 -delete)" \
+        find /var/lib/desktop-container/bin -mindepth 1 -delete >/dev/null || fail "could not empty the toolkit directory"
+    ev_save rm-spec "EV-PROCEDURE: staging, 3: rm /etc/cdi/desktop-tools.yaml" \
+        rm /etc/cdi/desktop-tools.yaml >/dev/null || fail "could not remove the tools spec"
+    ev_save stop-generator "EV-PROCEDURE: staging, 4: systemctl stop desktop-tools-cdi.service, which deploy/README.md requires of anything that removes the spec (\"or the host cannot advertise the device again until it reboots\")" \
+        systemctl stop desktop-tools-cdi.service >/dev/null || fail "could not stop desktop-tools-cdi.service"
+    ev_save units "EV-STATE: the watcher and its generator after the staging: systemctl status desktop-tools-cdi.path desktop-tools-cdi.service" \
+        systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service >/dev/null || true
+    mt_k8s_ls staged "after the staging: no tools spec, an empty toolkit directory"
+    [ ! -e /etc/cdi/desktop-tools.yaml ] && [ -z "$(ls -A /var/lib/desktop-container/bin)" ] \
+        || fail "the staging did not leave the node without the tools spec and the toolkit"
+    # The tools plugin rescans the spec dirs every 5 s (the chart's
+    # healthInterval) and reports its devices Unhealthy; kubelet then
+    # publishes 0 allocatable.
+    for t in $(seq 30); do
+        [ "$(kubectl get node -o jsonpath='{.items[0].status.allocatable.desktop\.local/tools}' 2>/dev/null)" != 0 ] || break
+        sleep 2
+    done
+    mt_k8s_alloc staged "after the staging, polled every 2 s (try $t)"
+    [ "$(mt_alloc_of tools)" = 0 ] || fail "desktop.local/tools is allocatable at '$(mt_alloc_of tools)' 60 s after the staging, not 0"
+    ev_pass "allocatable desktop.local/tools fell to 0 ($MT_ALLOC)"
+    ev_save plugin-log "EV-LOG-CLIENT: the tools release's plugin log (kubectl logs -l app.kubernetes.io/instance=tools): the device turning unresolvable" \
+        kubectl logs -l app.kubernetes.io/instance=tools --tail=30 >/dev/null || true
+    ev_end
+}
+
+# S10.6.2: a client that needs the toolkit, applied to the staged node: a
+# scheduling failure kubernetes shows, and nothing started.
+mt_unprov_pod() {
+    local ev="" out uid
+    mt_k8s_begin S10.6.2
+    ev_copy "$MT_UNPROV_POD" manifest "EV-CONFIG: the pod (test-only): it requests desktop.local/display and desktop.local/tools, and captures the display with \"\$DESKTOP_TOOLS_BIN\"/screenshot"
+    ev_save apply "EV-PROCEDURE: kubectl apply -f $MT_UNPROV_POD, on the node staged as never provisioned" \
+        kubectl apply -f "$MT_UNPROV_POD" >/dev/null || fail "kubectl apply of the pod failed"
+    for _ in $(seq 30); do
+        ev=$(kubectl get events --field-selector "involvedObject.name=$MT_UNPROV,reason=FailedScheduling" -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null || true)
+        ! grep -q 'Insufficient desktop.local/tools' <<<"$ev" || break
+        sleep 2
+    done
+    ev_save events "EV-STATE: the pod's events: kubectl get events --field-selector involvedObject.name=$MT_UNPROV" \
+        kubectl get events --field-selector "involvedObject.name=$MT_UNPROV" -o wide >/dev/null || true
+    grep -q 'Insufficient desktop.local/tools' <<<"$ev" \
+        || fail "no FailedScheduling event names Insufficient desktop.local/tools within 60 s: '${ev:-no event}'"
+    ev_pass "kubernetes says why, in the pod's events: $(grep -m1 'Insufficient desktop.local/tools' <<<"$ev")"
+    # And it stays that way: Pending on no node, no container ever created.
+    sleep 20
+    ev_save pending "EV-STATE: the pod 20 s later: its uid, phase, node, PodScheduled condition and container statuses" \
+        kubectl get pod "$MT_UNPROV" -o jsonpath='uid={.metadata.uid}{"\n"}phase={.status.phase}{"\n"}node={.spec.nodeName}{"\n"}scheduled={.status.conditions[?(@.type=="PodScheduled")].status} {.status.conditions[?(@.type=="PodScheduled")].reason}{"\n"}containers={.status.containerStatuses}{"\n"}' >/dev/null || true
+    out=$(mt_saved "$EV_LAST")
+    uid=$(sed -n 's/^uid=//p' <<<"$out")
+    [ -n "$uid" ] || fail "could not read the pod's uid"
+    mt_put unprov-uid "$uid"
+    grep -qx 'phase=Pending' <<<"$out" && grep -qx 'node=' <<<"$out" && grep -qx 'containers=' <<<"$out" \
+        || fail "the pod did not stay Pending, on no node, with no container: $(tr '\n' ' ' <<<"$out")"
+    ev_pass "it stays Pending 20 s on: on no node, no container created, PodScheduled $(sed -n 's/^scheduled=//p' <<<"$out") (pod uid $uid)"
+    ev_save describe "EV-STATE: kubectl describe pod $MT_UNPROV while it is Pending" kubectl describe pod "$MT_UNPROV" >/dev/null || true
+    ev_end
+}
+
+# S10.6.2: the desktop's start publishes; the same pod object schedules, runs
+# and captures, with nobody deleting or recreating it.
+mt_unprov_start() {
+    local phase="" log="" out uid name dims scr t=0
+    mt_k8s_begin S10.6.2
+    ev_save start "EV-PROCEDURE: systemctl start desktop.service: the desktop's first start on this node, which publishes the toolkit" \
+        systemctl start desktop.service >/dev/null || fail "systemctl start desktop.service failed"
+    for t in $(seq 60); do
+        phase=$(kubectl get pod "$MT_UNPROV" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        log=$(kubectl logs "$MT_UNPROV" 2>/dev/null || true)
+        { [ "$phase" = Running ] && grep -q 'capture ok' <<<"$log"; } && break
+        [ "$phase" != Failed ] || break
+        sleep 2
+    done
+    ev_note "polled the pod every 2 s after the start; try $t: phase ${phase:-unknown}"
+    mt_k8s_ls started "after the start: the spec written again, the toolkit published"
+    ev_save units "EV-STATE: the watcher and its generator after the start: systemctl status desktop-tools-cdi.path desktop-tools-cdi.service" \
+        systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service >/dev/null || true
+    mt_k8s_alloc started "after the start"
+    ev_save plugin-log "EV-LOG-CLIENT: the tools release's plugin log (kubectl logs -l app.kubernetes.io/instance=tools): the device resolvable again" \
+        kubectl logs -l app.kubernetes.io/instance=tools --tail=30 >/dev/null || true
+    ev_save events "EV-STATE: the pod's events after the start: kubectl get events --field-selector involvedObject.name=$MT_UNPROV" \
+        kubectl get events --field-selector "involvedObject.name=$MT_UNPROV" -o wide >/dev/null || true
+    ev_save state "EV-STATE: the pod after the start: its uid, phase, node, and its container's restart count and start" \
+        kubectl get pod "$MT_UNPROV" -o jsonpath='uid={.metadata.uid}{"\n"}phase={.status.phase}{"\n"}node={.spec.nodeName}{"\n"}restarts={.status.containerStatuses[0].restartCount}{"\n"}started={.status.containerStatuses[0].state.running.startedAt}{"\n"}' >/dev/null || true
+    out=$(mt_saved "$EV_LAST")
+    ev_save log "EV-LOG-CLIENT: kubectl logs $MT_UNPROV: each capture try with its time, and the capture" \
+        kubectl logs "$MT_UNPROV" >/dev/null || true
+    log=$(mt_saved "$EV_LAST")
+    [ -e /etc/cdi/desktop-tools.yaml ] && [ -n "$(ls -A /var/lib/desktop-container/bin)" ] \
+        || fail "after the start the node has no tools spec or no published toolkit"
+    [ "$(mt_alloc_of tools)" = 10 ] || fail "desktop.local/tools is allocatable at '$(mt_alloc_of tools)' after the start, not 10"
+    ev_pass "the desktop published, the watcher wrote the spec, and desktop.local/tools is allocatable at 10 again ($MT_ALLOC)"
+    uid=$(sed -n 's/^uid=//p' <<<"$out")
+    [ "$uid" = "$(mt_get unprov-uid)" ] || fail "the pod's uid is '$uid', not '$(mt_get unprov-uid)': it is not the same pod object"
+    grep -qx 'phase=Running' <<<"$out" && grep -qx 'restarts=0' <<<"$out" \
+        || fail "the pod is not Running with its container never restarted: $(tr '\n' ' ' <<<"$out")"
+    ev_pass "the same pod object (uid $uid) scheduled on $(sed -n 's/^node=//p' <<<"$out") and runs, its container never restarted: nobody deleted or recreated it"
+    grep -q 'capture ok' <<<"$log" || fail "the pod's capture did not succeed: $(tail -n 3 <<<"$log" | tr '\n' ' ')"
+    ev_pass "its capture succeeded: $(grep -m1 'capture ok' <<<"$log")"
+    name=$(ev_name capture png)
+    kubectl exec "$MT_UNPROV" -- cat /tmp/shot.png > "$EV_DIR/$name" 2>/dev/null || true
+    [ -s "$EV_DIR/$name" ] || { rm -f "${EV_DIR:?}/${name:?}"; fail "the pod's capture could not be read out of it"; }
+    ev_attach "$name" "EV-SHOT-CLIENT: the capture the pod took with \"\$DESKTOP_TOOLS_BIN\"/screenshot once it ran"
+    dims=$(python3 -c 'import struct, sys
+d = open(sys.argv[1], "rb").read(24)
+assert d[:8] == b"\x89PNG\r\n\x1a\n"
+print("%dx%d" % struct.unpack(">II", d[16:24]))' "$EV_DIR/$name" 2>/dev/null || true)
+    scr=$(desk xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}' || true)
+    [ -n "$dims" ] && [ "$dims" = "$scr" ] || fail "the pod's capture is not a PNG of the screen: ${dims:-not a PNG}, the screen ${scr:-unknown}"
+    ev_pass "the capture is a PNG of the whole screen, $dims"
+    ev_end
+}
+
+# S10.6.2's after: the desktop restarted whole, the common set's after, and
+# the pod removed.
+mt_unprov_after() {
+    mt_k8s_begin S10.6.2
+    desk_back
+    mt_pids after "after the start"
+    mt_pids_moved before after
+    mt_state after "after the start"
+    mt_state_diff before after "the node staged as never provisioned, the pod Pending, the desktop started"
+    mt_logs "$(mt_get since-unprov)" "from the staging to the pod running"
+    ev_save delete "EV-STATE: the pod removed: kubectl delete pod $MT_UNPROV" \
+        kubectl delete pod "$MT_UNPROV" --wait=true >/dev/null || true
+    ev_end
+}
+
 maint() { # <step> [args]
     case "${1:-}" in
         packages) mt_packages ;;
@@ -2152,6 +2505,14 @@ maint() { # <step> [args]
         stop) mt_stop ;;
         held) mt_held ;;
         start) mt_start ;;
+        k8s-node) mt_k8s_node ;;
+        k8s-plugins) mt_k8s_plugins ;;
+        k8s-apply) mt_k8s_apply ;;
+        k8s-after) mt_k8s_after ;;
+        unprov-stage) mt_unprov_stage ;;
+        unprov-pod) mt_unprov_pod ;;
+        unprov-start) mt_unprov_start ;;
+        unprov-after) mt_unprov_after ;;
         *) fail "maint: no step named '${1:-}' (see the case above)" ;;
     esac
 }

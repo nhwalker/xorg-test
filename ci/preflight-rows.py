@@ -213,6 +213,9 @@ def host_cases(w):
         no_shell_user = "".join(l for l in f if not l.startswith("desktop-shell:"))
     cdi = {n: open(os.path.join("/etc/cdi", n)).read() for n in os.listdir("/etc/cdi")
            if os.path.isfile(os.path.join("/etc/cdi", n))}
+    cards = sorted((n for n in os.listdir("/dev/dri") if re.fullmatch(r"card\d+", n)), key=lambda n: int(n[4:])) \
+        if os.path.isdir("/dev/dri") else []
+    card = "/dev/dri/" + cards[0] if cards else "/dev/dri/card0"    # the runner's is card1
     return [
         dict(id="podman-old", what="podman reports 4.3.1 (the fake)",
              podman={"--version": (0, "podman version 4.3.1")},
@@ -259,9 +262,12 @@ def host_cases(w):
         dict(id="no-logind-dropin", what="the logind drop-in hidden under /dev/null",
              hide=["/etc/systemd/logind.conf.d/50-desktop-container.conf"],
              rows=["logind drop-in missing: host logind may spawn gettys on VT switches"]),
-        dict(id="holder", what="desktop.service inactive (the fake) while a sleep holds /dev/dri/card0",
-             sc=inactive, holder="/dev/dri/card0",
-             rows=["processes hold$holders while desktop.service is inactive - Xorg would fail drmSetMaster (fuser -v shows who)"]),
+        # The row fires whether desktop.service is active or not (a desktop
+        # crash-looping on drmSetMaster is active); the fake keeps the case
+        # apart from the runner's own desktop.
+        dict(id="holder", what=f"a sleep holds {card}, the host's first DRM card (desktop.service inactive, the fake)",
+             sc=inactive, holder=card,
+             rows=["processes other than the desktop hold$holders - Xorg would fail drmSetMaster (fuser -v shows who)"]),
         dict(id="no-fuser", what="desktop.service inactive (the fake), no fuser on PATH",
              sc=inactive, hide_cmd=["fuser"],
              rows=["fuser not available (install psmisc); cannot check DRM/VT holders"]),
@@ -445,7 +451,9 @@ def cmd_host():
                 made = [p for p in case.get("host_files", []) if not os.path.exists(p)]
                 for p in made:
                     open(p, "w").close()
-                if case.get("holder") and os.path.exists(case["holder"]):
+                if case.get("holder"):          # no card to hold: the case cannot be staged
+                    if not os.path.exists(case["holder"]):
+                        raise RuntimeError(f"{case['id']}: {case['holder']} does not exist; nothing to hold")
                     holder = subprocess.Popen(["sleep", "60"], stdin=open(case["holder"]))
                 r = run(["unshare", "-m", "--propagation", "private", "bash", "-c", script])
             finally:
