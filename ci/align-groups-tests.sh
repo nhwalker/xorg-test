@@ -39,7 +39,7 @@ check() { ev_check "$@" || f=1; }
 # A branch: run it, keep the transcript, the groups before and after, and
 # their diff; the caller then checks the script's log and the after state.
 OUT="" LOG="" BEFORE="" AFTER="" ID=""
-branch() { # <moment> <what> <setup> <args>
+branch() { # <moment> <what> <setup> <args> <the lines expected to differ>
     ev_text "$1-setup" "EV-STATE: the scratch container's setup, as root, before align-device-groups.sh ${4:-(no arguments)}" "$3"
     OUT=$(in_scratch "$3" "$4") || { ev_text "$1-run" "EV-LOG: the scratch container's transcript (it failed)" "$OUT"; ev_fail "$2: the scratch container failed"; f=1; return 1; }
     ev_text "$1-run" "EV-LOG: the scratch container's transcript: the groups, align-device-groups.sh ${4:-(no arguments)} and its log, the groups again, id desktop" "$OUT"
@@ -50,13 +50,14 @@ branch() { # <moment> <what> <setup> <args>
     ev_text "$1-before" "EV-STATE: getent group before ($GROUPS_SHOWN; absent ones are not listed)" "$BEFORE"
     local b=$EV_LAST
     ev_text "$1-after" "EV-STATE: getent group after" "$AFTER"
-    ev_diff "$1-groups" "EV-DIFF: getent group before against after: $2" "$b" "$EV_LAST"
+    ev_diff "$1-groups" "EV-DIFF: getent group before against after: $2" "$b" "$EV_LAST" "$5"
 }
 
 ev_begin S3.2.2 "Group gids are aligned to the host's device nodes" T1
 
 # 1. A node whose gid no group has: the group is renumbered to it.
-branch renumber "renumber" 'mkdir -p /dev/dri; : > /dev/dri/card0; chgrp 2001 /dev/dri/card0' video
+branch renumber "renumber" 'mkdir -p /dev/dri; : > /dev/dri/card0; chgrp 2001 /dev/dri/card0' video \
+    "video's line alone: its gid, now 2001"
 v0=$(gid_of "$BEFORE" video)
 check "renumber: the log says video moved to the node's gid ($(grep -m1 'video: gid' <<<"$LOG" || echo none))" \
     grep -qx "align-device-groups: video: gid $v0 -> 2001 (from /dev/dri/card0)" <<<"$LOG"
@@ -65,7 +66,8 @@ check "renumber: and the desktop user is in it: $ID" grep -q '2001(video)' <<<"$
 
 # 2. A node whose gid another group holds, with 60000 also taken: the other
 #    group moves to the first free gid from 60000, here 60001.
-branch collision "collision" 'groupadd -g 2002 squatter; groupadd -g 60000 g60000; mkdir -p /dev/dri; : > /dev/dri/renderD128; chgrp 2002 /dev/dri/renderD128' render
+branch collision "collision" 'groupadd -g 2002 squatter; groupadd -g 60000 g60000; mkdir -p /dev/dri; : > /dev/dri/renderD128; chgrp 2002 /dev/dri/renderD128' render \
+    "render's line (its gid, now 2002) and squatter's (moved to 60001); g60000's stays"
 r0=$(gid_of "$BEFORE" render)
 check "collision: the log says squatter moves to 60001, the first free gid from 60000 (60000 being taken)" \
     grep -qx "align-device-groups: gid 2002 is taken by group 'squatter'; moving 'squatter' to 60001" <<<"$LOG"
@@ -76,7 +78,8 @@ check "collision: and the log says so" grep -qx "align-device-groups: render: gi
 
 # 3. A group the image does not have: created with the node's gid, and the
 #    desktop user added to it.
-branch missing "missing group" 'groupdel input; mkdir -p /dev/input; : > /dev/input/event0; chgrp 2003 /dev/input/event0' input
+branch missing "missing group" 'groupdel input; mkdir -p /dev/input; : > /dev/input/event0; chgrp 2003 /dev/input/event0' input \
+    "one new line: input, gid 2003, with the desktop user in it"
 check "missing group: input is absent before" test -z "$(gid_of "$BEFORE" input)"
 check "missing group: the log says it is created with the node's gid" \
     grep -qx "align-device-groups: input: creating with gid 2003 (from /dev/input/event0)" <<<"$LOG"
@@ -84,14 +87,15 @@ check "missing group: input is gid 2003 after, and the desktop user is in it: $I
     sh -c '[ "$1" = 2003 ] && printf "%s\n" "$2" | grep -q "2003(input)"' _ "$(gid_of "$AFTER" input)" "$ID"
 
 # 4. A root-group node (as /dev/nvidia* are): skipped, with a log line.
-branch rootgroup "root-group node" 'mkdir -p /dev/dri; : > /dev/dri/card0; chgrp 0 /dev/dri/card0' video
+branch rootgroup "root-group node" 'mkdir -p /dev/dri; : > /dev/dri/card0; chgrp 0 /dev/dri/card0' video \
+    "nothing: a root-group node is skipped"
 check "root-group node: the log says it is skipped" \
     grep -qx "align-device-groups: video: /dev/dri/card0 has group root, skipping" <<<"$LOG"
 check "root-group node: video's gid is unchanged ($(gid_of "$BEFORE" video))" \
     test "$(gid_of "$AFTER" video)" = "$(gid_of "$BEFORE" video)"
 
 # 5. No node at all: skipped, with a log line.
-branch absent "absent node" 'rm -rf /dev/snd' audio
+branch absent "absent node" 'rm -rf /dev/snd' audio "nothing: there is no node to align to"
 check "absent node: the log says there is nothing to align" \
     grep -qx "align-device-groups: audio: no device nodes present, skipping" <<<"$LOG"
 check "absent node: audio's gid is unchanged ($(gid_of "$BEFORE" audio))" \
@@ -102,7 +106,7 @@ check "absent node: audio's gid is unchanged ($(gid_of "$BEFORE" audio))" \
 branch aligned "already aligned" 'mkdir -p /dev/dri /dev/input /dev/snd
 for p in video:/dev/dri/card0 render:/dev/dri/renderD128 input:/dev/input/event0 audio:/dev/snd/controlC0; do
     : > "${p#*:}"; chgrp "$(getent group "${p%%:*}" | cut -d: -f3)" "${p#*:}"
-done' ""
+done' "" "nothing: every node is already on its group's gid"
 check "already aligned: no group changes (getent group is the same before and after)" test "$BEFORE" = "$AFTER"
 check "already aligned: the log moves nothing" sh -c '! printf "%s\n" "$1" | grep -qE " -> |creating|moving"' _ "$LOG"
 check "already aligned: the final table names all four groups, each with its device's gid" \
@@ -115,7 +119,7 @@ branch narrow "narrow form" 'mkdir -p /dev/dri /dev/input /dev/snd
 : > /dev/dri/card0; chgrp 2011 /dev/dri/card0
 : > /dev/dri/renderD128; chgrp 2012 /dev/dri/renderD128
 : > /dev/input/event0; chgrp 2013 /dev/input/event0
-: > /dev/snd/controlC0; chgrp 2014 /dev/snd/controlC0' audio
+: > /dev/snd/controlC0; chgrp 2014 /dev/snd/controlC0' audio "audio's line alone: its gid, now 2014"
 check "narrow form: audio is renumbered to 2014" test "$(gid_of "$AFTER" audio)" = 2014
 for g in video render input; do
     check "narrow form: $g is untouched ($(gid_of "$BEFORE" $g))" test "$(gid_of "$AFTER" $g)" = "$(gid_of "$BEFORE" $g)"
@@ -124,7 +128,7 @@ check "narrow form: the final table has the audio row alone" \
     sh -c 'printf "%s\n" "$1" | grep -E "^align-device-groups:   [a-z]+:" | grep -vq "^align-device-groups:   audio:" && exit 1; printf "%s\n" "$1" | grep -q "^align-device-groups:   audio: container gid 2014, device /dev/snd/controlC0 has gid 2014"' _ "$LOG"
 
 # 8. A name the script does not know: logged, nothing done.
-branch unknown "unknown group" ':' bogus
+branch unknown "unknown group" ':' bogus "nothing: an unknown name is logged and nothing is done"
 check "unknown group: the log names it and the known ones" \
     grep -qx "align-device-groups: unknown group 'bogus'; known: video render input audio" <<<"$LOG"
 check "unknown group: no group changes" test "$BEFORE" = "$AFTER"

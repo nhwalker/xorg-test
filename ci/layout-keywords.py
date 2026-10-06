@@ -133,7 +133,8 @@ def main():
             import difflib
             diff = "".join(difflib.unified_diff(open(st.path(names[a])).readlines(), open(st.path(names[b])).readlines(), a, b))
             st.write(f"diff-{b.split('.')[0].replace('-', '')}", diff or f"(no differences between {a} and {b})\n",
-                     f"EV-DIFF: the keywords {a} documents (-) against those {b} {'accepts' if 'conf' in b else 'skips'} (+): empty", ext="diff")
+                     f"EV-DIFF: the keywords {a} documents (-) against those {b} {'accepts' if 'conf' in b else 'skips'} (+); "
+                     "expected to differ: nothing: the three agree", ext="diff")
         st.check(lists["monitors.conf"] == lists["xorg-monitor-conf.sh"],
                  "the generator accepts exactly the global keywords monitors.conf documents: " + " ".join(lists["monitors.conf"]))
         st.check(lists["monitors.conf"] == lists["preflight-check.sh"],

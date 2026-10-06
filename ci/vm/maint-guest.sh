@@ -23,7 +23,8 @@ mt_saved_rc() { sed -n '$s/^\[exit \([0-9]*\)\]$/\1/p' "$EV_DIR/$1"; }
 
 # The common set's before-and-after pair (Requirements.md E10):
 # desktop-preflight's report and systemctl status 'desktop*', saved into the
-# open story; mt_state_diff compares two moments of the same story.
+# open story; mt_state_diff compares two moments of the same story, saying
+# for each diff which lines are expected to differ (S9.3.2).
 mt_state() { # <moment> <when>
     if command -v desktop-preflight >/dev/null; then
         ev_save "preflight-$1" "EV-STATE: desktop-preflight $2" desktop-preflight >/dev/null || true
@@ -35,14 +36,33 @@ mt_state() { # <moment> <when>
     ev_save "status-$1" "EV-STATE: systemctl status 'desktop*' $2" systemctl --no-pager status 'desktop*' >/dev/null || true
     mt_put "$EV_STORY-$1-status" "$EV_LAST"
 }
-mt_state_diff() { # <moment before> <moment after> <what happened between them>
-    local k a b
+mt_state_diff() { # <moment before> <moment after> <what happened between them> <preflight: expected to differ> <status: expected to differ>
+    local k a b e
     for k in preflight status; do
         a=$(mt_get "$EV_STORY-$1-$k") b=$(mt_get "$EV_STORY-$2-$k")
+        if [ "$k" = preflight ]; then e=${4:?preflight: expected to differ}; else e=${5:?status: expected to differ}; fi
         if [ -n "$a" ] && [ -n "$b" ]; then
-            ev_diff "$k-$1-$2" "EV-DIFF: $k, $1 (-) against $2 (+): $3" "$a" "$b"
+            ev_diff "$k-$1-$2" "EV-DIFF: $k, $1 (-) against $2 (+): $3" "$a" "$b" "$e"
         fi
     done
+}
+# What any two looks at systemctl status 'desktop*' differ in, whatever
+# happened between them: each unit's "... ago", its memory, CPU and tasks,
+# and the order systemctl lists the units in.
+MT_ST_AGO="every unit's 'ago', memory, CPU and tasks, and the order the units are listed in"
+# ...and across a step that stopped and started the desktop.
+MT_ST_RESTART="$MT_ST_AGO; desktop.service and the units that start with it (desktop-session, desktop-seat-prep, desktop-cdi-refresh and the like): their pids, start times, cgroup trees and log lines"
+# Preflight's report across a step that restarts the desktop, by what the
+# step changed (mt_after's <preflight> key): the checks are those of the same
+# host, but PipeWire may not have exported its sockets yet when it looked.
+mt_pf_expected() { # [<key>]
+    local audio="at most the audio-socket line, if PipeWire had not exported its sockets yet when preflight looked"
+    case "${1:-}" in
+        pin-forward) echo "the image line, which now names the digest the drop-in pins, and a new 'quadlet drop-ins present' line; $audio" ;;
+        pin-back) echo "the image line, which names :latest again, and the 'quadlet drop-ins present' line, gone; $audio" ;;
+        host-shell-off) echo "the host-shell key and trust-entry lines (two PASSes), now one 'no host-shell key yet' WARN: desktop-host-shell.service no longer runs; $audio" ;;
+        *) echo "$audio; every other check the same" ;;
+    esac
 }
 
 # EV-LOG-JOURNAL and EV-LOG-DESKTOP for a step's window, since <epoch>.
@@ -78,7 +98,7 @@ mt_pids() { # <moment> <when>
     } > "$MT/pids-$EV_STORY-$1"
     ev_save "pids-$1" "EV-PIDS: $2: the desktop's processes in the container (ps), the container (podman inspect), the host login session (systemctl show, loginctl) and every uid-61000 process on the host (ps -u 61000)" \
         sh -c 'echo "== in the container"; podman exec desktop ps -o pid,ppid,lstart,comm -C '"$S737_COMMS"' 2>&1 || echo "(no desktop container running)"
-               echo "== the container"; podman inspect --format "{{.Id}} pid={{.State.Pid}} started={{.State.StartedAt}}" desktop 2>&1 || true
+               echo "== the container"; podman inspect --format "id={{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}}" desktop 2>&1 || true
                echo "== the host login session"; systemctl show -p MainPID -p ActiveEnterTimestamp desktop.service desktop-session.service; loginctl list-sessions --no-pager --no-legend
                echo "== every uid-61000 process on the host"; ps -u 61000 -o pid,ppid,lstart,comm,args 2>&1 || echo "(none)"' >/dev/null || true
 }
@@ -92,6 +112,8 @@ mt_pids_moved() { # <moment before> <moment after>
         grep -q "^$c " "$b" || fail "there is no $c in the desktop $2"
     done
     same=$(awk 'NR == FNR {if ($1 != "desktop-session") seen[$1 " " $2] = 1; next} ($1 " " $2) in seen' "$a" "$b")
+    ev_diff pids "EV-DIFF: the EV-PIDS listings $1 (-) and $2 (+)" "$(ev_named "pids-$1")" "$(ev_named "pids-$2")" \
+        "the desktop's processes, the container (id, pid, start), desktop.service's and desktop-session's MainPID and start, the session's number and every uid-61000 process the session started: all new; the user's systemd manager may stay, and the harness's own ssh sessions come and go"
     [ -z "$same" ] || fail "the same process or container $1 and $2: $(echo $same)"
     ev_pass "every desktop process ($S737_COMMS) and the container itself are new: no pid and no container id is the same $1 and $2"
     s0=$(awk '$1 == "desktop-session" {print $2, $3}' "$a")
@@ -153,7 +175,8 @@ mt_packages() {
     ev_pass "every package it names is installed: $pkgs"
     ev_save rpm-documented "EV-STATE: rpm -qa | sort after the documented line" sh -c 'rpm -qa | sort' >/dev/null || true
     doc=$EV_LAST
-    ev_diff rpm-documented "EV-DIFF: what the documented line installed: rpm -qa on the stock host (-) against after it (+)" "$stock" "$doc"
+    ev_diff rpm-documented "EV-DIFF: what the documented line installed: rpm -qa on the stock host (-) against after it (+)" "$stock" "$doc" \
+        "the packages the line installs and those they pull in, added; any it upgrades on the way, old version (-) and new (+)"
     # The journey's own tools, which are not host requirements: rsync applies
     # the tree (deploy/README.md's provisioning tool), and paplay and aplay
     # are the host clients whose tones the VM host listens for.
@@ -162,7 +185,8 @@ mt_packages() {
     ev_save dnf-probes "EV-PROCEDURE: harness-only: this journey's own tools, installed after the documented line and not host requirements: rsync (the provisioning tool deploy/README.md uses), pulseaudio-utils (paplay) and alsa-utils (aplay)" \
         dnf -y install $probes >/dev/null || fail "could not install the journey's own tools: $probes"
     ev_save rpm-probes "EV-STATE: rpm -qa | sort after the journey's own tools" sh -c 'rpm -qa | sort' >/dev/null || true
-    ev_diff rpm-probes "EV-DIFF: what the journey's own tools added after the documented line" "$doc" "$EV_LAST"
+    ev_diff rpm-probes "EV-DIFF: what the journey's own tools added after the documented line" "$doc" "$EV_LAST" \
+        "the journey's tools not already installed (rsync, pulseaudio-utils, alsa-utils) and what they pull in, added; any upgraded on the way, old version (-) and new (+)"
     ev_end
 }
 
@@ -243,11 +267,14 @@ mt_apply() { # took|skipped: whether this host takes S10.1.3's restorecon line
     done
     ev_save stamps-after "EV-STATE: the same stat after the commands" \
         stat -c '%y %a %U:%G %n' / /etc /usr /etc/.updated /var/.updated >/dev/null || true
-    ev_diff stamps "EV-DIFF: what the rsync did to /, /etc and /usr themselves: rsync -a gives each the time and mode of its deploy/host counterpart" "$stamps" "$EV_LAST"
+    ev_diff stamps "EV-DIFF: what the rsync did to /, /etc and /usr themselves: rsync -a gives each the time and mode of its deploy/host counterpart" "$stamps" "$EV_LAST" \
+        "the times of /, /etc and /usr, each now its deploy/host counterpart's; a mode or owner only where the counterpart's differs"
     ev_save accounts "EV-STATE: id desktop and id desktop-shell before the reboot: neither exists yet, the first boot makes them" \
         sh -c 'id desktop; id desktop-shell' >/dev/null || true
     mt_state applied "after the block's commands, before its reboot"
-    mt_state_diff stock applied "what the commands before the reboot changed"
+    mt_state_diff stock applied "what the commands before the reboot changed" \
+        "every line: on the stock host there is no desktop-preflight; after the commands it runs, with the FAILs and WARNs of a host not yet rebooted" \
+        "nothing: no desktop unit is loaded before the reboot"
     mt_logs "$(mt_get since-apply)" "from the stock host to the reboot"
     mt_put boot-before "$(cat /proc/sys/kernel/random/boot_id)"
     mt_put reboot-at "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
@@ -343,7 +370,9 @@ first login: ${first:-(none this boot)}"
     [ "$(mt_saved_rc "$pf")" = 0 ] && grep -q 'done: 0 FAIL' <<<"$out" \
         || fail "desktop-preflight reported FAILs on the first boot: $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     ev_pass "desktop-preflight exits 0 on the first boot: 0 FAILs"
-    mt_state_diff applied booted "what the first boot did"
+    mt_state_diff applied booted "what the first boot did" \
+        "the checks the first boot settles (the getty and the VT's holders, the CDI specs, /run/desktop-audio, the desktop-shell account, the host-shell key and trust entry, desktop.service and its audio sockets), from FAIL or WARN to PASS, and the count of FAILs" \
+        "every line: no desktop unit is loaded before the reboot, and the first boot starts them all"
     who=$(ev_save ssh-host "EV-STATE: ssh host whoami, run in the desktop container as the session user (S5.7.2): desktop-shell" \
         podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) || true
     [ "$(tail -n1 <<<"$who")" = desktop-shell ] || fail "ssh host from the container answered '$(tail -n1 <<<"$who")', want desktop-shell"
@@ -562,7 +591,8 @@ mt_checklist_tools() {
     ev_save dnf-probes "EV-PROCEDURE: pipewire-utils (pw-play), which the README checklist's first audio line uses, installed as a declared probe: not a host requirement" \
         dnf -y install pipewire-utils >/dev/null || fail "could not install pipewire-utils"
     ev_save rpm-after "EV-STATE: rpm -qa | sort after it" sh -c 'rpm -qa | sort' >/dev/null || true
-    ev_diff rpm-probe "EV-DIFF: what installing pipewire-utils added: whether it brought PipeWire's daemon (HOST-REQUIRES.md: no PipeWire daemon on the host)" "$before" "$EV_LAST"
+    ev_diff rpm-probe "EV-DIFF: what installing pipewire-utils added: whether it brought PipeWire's daemon (HOST-REQUIRES.md: no PipeWire daemon on the host)" "$before" "$EV_LAST" \
+        "pipewire-utils and what it pulls in, added; the pipewire package among them would be PipeWire's daemon"
     if rpm -q pipewire >/dev/null 2>&1; then
         ev_note "pipewire-utils brought the pipewire package (PipeWire's daemon) onto the host, which deploy/HOST-REQUIRES.md says the host does not have"
     else
@@ -698,7 +728,8 @@ mt_quiet() { # start <seconds>|state <moment>|ended|remove
             mt_put "quiet-$2-files" "$EV_LAST"
             if [ "$2" = after ]; then
                 for i in pids xrandr tree files; do
-                    ev_diff "$i" "EV-DIFF: $i before (-) and after (+) the checklists: empty" "$(mt_get "quiet-before-$i")" "$(mt_get "quiet-after-$i")"
+                    ev_diff "$i" "EV-DIFF: $i before (-) and after (+) the checklists: empty" "$(mt_get "quiet-before-$i")" "$(mt_get "quiet-after-$i")" \
+                        "nothing: the checklists only read"
                     if diff -q "$EV_DIR/$(mt_get "quiet-before-$i")" "$EV_DIR/$(mt_get "quiet-after-$i")" >/dev/null 2>&1; then
                         ev_pass "the checklists changed nothing in the $i"
                     else
@@ -792,7 +823,10 @@ mt_layout_pinned() {
     done < "$MT/captured-outputs"
     ev_save xrandr-after "EV-STATE: xrandr --query --verbose with the layout pinned" xrv >/dev/null || true
     ev_diff xrandr "EV-DIFF: xrandr --query --verbose autodetected (-) and pinned (+): the mode names may change to cvt(1)'s, as monitors.conf's comments say" \
-        "$(mt_get S10.3.1-xrv-before)" "$EV_LAST"
+        "$(mt_get S10.3.1-xrv-before)" "$EV_LAST" \
+        "the current mode, which may now be cvt(1)'s (its name, timings and refresh) beside the EDID's own; the mode ids X numbered again; the timestamps"
+    ev_diff geometry "EV-DIFF: xrandr --query autodetected (-) and pinned (+)" "$(ev_named geometry-before)" "$(ev_named geometry-after)" \
+        "at most the current mode's line, which may now be cvt(1)'s name and refresh, with the EDID's mode listed beside it; each output's size and position: the same"
     m0=$(grep -m1 '\*' "$EV_DIR/$(mt_get S10.3.1-xrv-before)" | awk '{print $1}')
     m1=$(grep -m1 '\*' "$EV_DIR/$EV_LAST" | awk '{print $1}')
     ev_note "the current mode's name: $m0 autodetected, $m1 pinned (the expected change, when there is one, is to the cvt(1) name)"
@@ -922,7 +956,9 @@ mt_image_gone() {
     grep -q 'FAIL: image NOT in podman storage: localhost/desktop-container:latest' <<<"$out" || fail "desktop-preflight does not name the missing image"
     ev_pass "desktop-preflight exits 1, naming it: $(grep -m1 'image NOT in podman storage' <<<"$out" | sed 's/^host-preflight: //')"
     mt_state gone "with the image gone"
-    mt_state_diff running gone "the image removed"
+    mt_state_diff running gone "the image removed" \
+        "the image line (PASS, then FAIL), desktop.service and its audio sockets (active, then not started), the count of FAILs and the exit status" \
+        "$MT_ST_AGO; desktop.service and the units that start with it, stopped"
     ev_end
 }
 mt_image_load() {
@@ -938,7 +974,9 @@ mt_image_back() {
     out=$(ev_save preflight-back "EV-STATE: desktop-preflight with the image loaded and the desktop restarted" desktop-preflight) || rc=$?
     [ "$rc" = 0 ] || fail "desktop-preflight still FAILs: $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     ev_pass "loading the image and restarting was the whole fix: the desktop is back and desktop-preflight reports 0 FAILs"
-    mt_state_diff gone back "the image loaded, the desktop restarted"
+    mt_state_diff gone back "the image loaded, the desktop restarted" \
+        "the image line (FAIL, then PASS), desktop.service and its audio sockets (not started, then active), the count of FAILs and the exit status" \
+        "$MT_ST_RESTART"
     ev_end
 }
 
@@ -1110,7 +1148,8 @@ mt_hostterm_switch() {
     ev_save switch "EV-PROCEDURE: the two lines commented out (sed -i -E 's/^(Wants|After)=desktop-host-shell\\.service\$/#&/' $MT_QUADLET)" \
         sed -i -E 's/^(Wants|After)=desktop-host-shell\.service$/#&/' "$MT_QUADLET" >/dev/null || fail "could not edit the quadlet"
     ev_copy "$MT_QUADLET" quadlet-after "EV-CONFIG: the quadlet after the switch"
-    ev_diff quadlet "EV-DIFF: the quadlet before (-) and after (+) the switch: the two lines commented out, nothing else" "$before" "$EV_LAST"
+    ev_diff quadlet "EV-DIFF: the quadlet before (-) and after (+) the switch: the two lines commented out, nothing else" "$before" "$EV_LAST" \
+        "the two desktop-host-shell lines, Wants= and After=, commented out; nothing else"
     [ "$(grep -cE '^#(Wants|After)=desktop-host-shell\.service$' "$MT_QUADLET")" = 2 ] \
         && ! grep -qE '^(Wants|After)=.*desktop-host-shell' "$MT_QUADLET" \
         || fail "the quadlet's two desktop-host-shell lines are not both commented out"
@@ -1175,7 +1214,8 @@ mt_hostterm_after() {
     fi
     mt_material off "after the switch and the reboot"
     ev_diff material "EV-DIFF: the host-shell material before (-) the switch and after (+) it and the reboot" \
-        "$(mt_get S10.3.5-material-before)" "$(mt_get S10.3.5-material-off)"
+        "$(mt_get S10.3.5-material-before)" "$(mt_get S10.3.5-material-off)" \
+        "the host-shell key in /etc/desktop-container and the trust entry in /etc/ssh/authorized_keys.d, gone, and each listing's total"
     ev_save sshd-journal "EV-LOG-JOURNAL: journalctl -b -u sshd, this boot: every login tried since" \
         journalctl -b --no-pager -o short-precise -u sshd >/dev/null || true
     ev_end
@@ -1224,7 +1264,8 @@ mt_hostterm_enable() { # <command, base64>
     mt_material enabled "after the command"
     ev_save dotssh-after "EV-STATE: ls -la /home/desktop/.ssh in the container, after the command" \
         podman exec desktop ls -la /home/desktop/.ssh >/dev/null || true
-    ev_diff dotssh "EV-DIFF: the container's ~/.ssh before (-) and after (+) the command" "$(mt_get S10.3.6-dotssh-before)" "$EV_LAST"
+    ev_diff dotssh "EV-DIFF: the container's ~/.ssh before (-) and after (+) the command" "$(mt_get S10.3.6-dotssh-before)" "$EV_LAST" \
+        "every line: no ~/.ssh before the command (ls fails), the host-shell material in it after"
     ev_end
 }
 mt_hostterm_journal() {
@@ -1249,7 +1290,8 @@ mt_lf_mwmrc() {
         podman exec -u desktop desktop sed -i "s/^\\( *\\)\"Refresh\"\\( *f\\.refresh\\)/\\1\"$MT_LF_LABEL\"\\2/" /home/desktop/.mwmrc >/dev/null \
         || fail "the edit failed"
     ev_save mwmrc-after "EV-CONFIG: ~/.mwmrc after the edit" podman exec desktop cat /home/desktop/.mwmrc >/dev/null || true
-    ev_diff mwmrc "EV-DIFF: ~/.mwmrc before (-) and after (+) the edit: one label" "$before" "$EV_LAST"
+    ev_diff mwmrc "EV-DIFF: ~/.mwmrc before (-) and after (+) the edit: one label" "$before" "$EV_LAST" \
+        "the root menu's f.refresh line: its label, \"Refresh\" (-) and \"$MT_LF_LABEL\" (+); nothing else"
     grep -q "\"$MT_LF_LABEL\" *f\\.refresh" "$EV_DIR/$EV_LAST" || fail "the label was not edited"
     ev_pass "the root menu in /home/desktop/.mwmrc now labels f.refresh \"$MT_LF_LABEL\""
     ev_end
@@ -1264,7 +1306,8 @@ mt_lf_xdefaults() { # <XTerm*background> <Mwm*menu*background>, hex without '#'
         podman exec -u desktop desktop sed -i -e "s/^\\(XTerm\\*background: *\\)#[0-9a-fA-F]*/\\1$term/" \
         -e "s/^\\(Mwm\\*menu\\*background: *\\)#[0-9a-fA-F]*/\\1$menu/" /home/desktop/.Xdefaults >/dev/null || fail "the edit failed"
     ev_save xdefaults-after "EV-CONFIG: ~/.Xdefaults after the edit" podman exec desktop cat /home/desktop/.Xdefaults >/dev/null || true
-    ev_diff xdefaults "EV-DIFF: ~/.Xdefaults before (-) and after (+) the edit: two colours" "$before" "$EV_LAST"
+    ev_diff xdefaults "EV-DIFF: ~/.Xdefaults before (-) and after (+) the edit: two colours" "$before" "$EV_LAST" \
+        "the XTerm*background and Mwm*menu*background lines: their colours; nothing else"
     grep -q "^XTerm\\*background: *$term" "$EV_DIR/$EV_LAST" && grep -q "^Mwm\\*menu\\*background: *$menu" "$EV_DIR/$EV_LAST" \
         || fail "the two colours were not both edited"
     ev_note "README.md \"Look and feel\": a client reads ~/.Xdefaults as it starts, so the next xterm has the change, and Restart mwm makes mwm read its resources afresh, in the same X session; the VM host opens the xterm and picks Restart mwm"
@@ -1318,13 +1361,15 @@ mt_first_stops() { # <moment>
     mt_put "$EV_STORY-log-$1" "$EV_LAST"
 }
 # The common set's "after" for a remedy that must not restart anything: the
-# same pids as before, said either way (EV-PIDS).
+# same pids as before, said either way (EV-PIDS), the two listings diffed.
+MT_PIDS_KEPT="at most the login sessions of the harness's own ssh calls and uid-61000 processes the harness started or ended meanwhile (S10.5.2's input-test xterms); the desktop's processes, the container and its session: the same"
 mt_after_kept() { # <story> <moment before> <moment after>
     local since c a b moved=""
     mt_begin "$1"
     since=$(mt_get "since-$1")
     desk_back
     mt_pids "$3" "after the remedy"
+    ev_diff pids "EV-DIFF: the EV-PIDS listings $2 (-) and $3 (+)" "$(ev_named "pids-$2")" "$EV_LAST" "$MT_PIDS_KEPT"
     for c in ${S737_COMMS//,/ } container; do
         a=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$1-$2")
         b=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$1-$3")
@@ -1337,7 +1382,9 @@ mt_after_kept() { # <story> <moment before> <moment after>
     fi
     mt_no_getty "$since" "between the fault and now"
     mt_state "$3" "after the remedy"
-    mt_state_diff "$2" "$3" "the fault and its remedy"
+    mt_state_diff "$2" "$3" "the fault and its remedy" \
+        "nothing: the remedy put back what the fault changed, and nothing restarted" \
+        "$MT_ST_AGO; the unit the remedy ran again (its pid, times and log lines); processes the harness started in the desktop meanwhile"
     mt_logs "$since" "from the fault to its remedy"
     ev_end
 }
@@ -1499,7 +1546,8 @@ mt_seat_diagnose() {
     sleep 3
     ev_save udev-after "EV-STATE: udevadm info -q property of each staged event node, after the remedy" \
         sh -c 'for e in $(cat '"$MT"'/seat-events); do echo "== $e"; udevadm info -q property -n "$e"; done' >/dev/null || true
-    ev_diff udev "EV-DIFF: udevadm info of the staged nodes, staged (-) and after the remedy (+)" "$(mt_get S10.5.2-udev-before)" "$EV_LAST"
+    ev_diff udev "EV-DIFF: udevadm info of the staged nodes, staged (-) and after the remedy (+)" "$(mt_get S10.5.2-udev-before)" "$EV_LAST" \
+        "the seat1 tag on each staged node: TAGS, every tag udev has given the node, keeps it; CURRENT_TAGS and ID_SEAT lose it where the staging had taken effect when the staged listing was read; the order of a node's DEVLINKS"
     if grep -q 'ID_SEAT=seat1' "$EV_DIR/$EV_LAST"; then ev_fail "a staged node is still tagged ID_SEAT=seat1"; else ev_pass "no staged node is tagged for seat1 any more"; fi
     ev_save xorg-lines "EV-LOG-XORG: the Xorg log's device removal and addition lines" \
         podman exec desktop grep -E 'config/udev: (Adding|removing) input device|Device removed|Adding input device' "$XORG_LOG" >/dev/null || true
@@ -1529,8 +1577,8 @@ mt_sel_client() {
         || fail "the client did not start"
     for i in $(seq 15); do mt_selc_has ' ok$' && break; sleep 1; done
     mt_selc_has ' ok$' || fail "the client's loop never opened the display"
-    ev_save client-id "EV-PIDS: the client: id, pid, restart count, started" \
-        podman inspect --format '{{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}} label={{.ProcessLabel}}' "$MT_SELC" >/dev/null || true
+    ev_save client-id-before "EV-PIDS: the client before the fault: id, pid, restart count, started" \
+        podman inspect --format 'id={{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}} label={{.ProcessLabel}}' "$MT_SELC" >/dev/null || true
     mt_put selc "$(podman inspect --format '{{.Id}}' "$MT_SELC")"
     ev_pass "the client's loop opens the display"
     ev_end
@@ -1548,6 +1596,8 @@ mt_sel_break() {
         chcon -R -t tmp_t /tmp/.X11-unix >/dev/null || fail "chcon failed"
     for i in $(seq 15); do mt_selc_has ' FAIL$' "$(mt_get since-break)" && break; sleep 1; done
     mt_sel_labels during "relabelled"
+    ev_diff labels-staged "EV-DIFF: the labels before the relabel (-) and relabelled (+)" "$(ev_named labels-before)" "$EV_LAST" \
+        "the two labels' type: container_file_t, then tmp_t"
     if mt_selc_has ' FAIL$' "$(mt_get since-break)"; then
         ev_pass "the client's loop fails with the directory relabelled"
     else
@@ -1612,11 +1662,17 @@ mt_sel_diagnose() {
     [ "$rc" = 0 ] && ev_pass "\`$line\` exited 0" || ev_fail "\`$line\` exited $rc"
     for i in $(seq 15); do mt_selc_has ' ok$' "$(mt_get since-remedy)" && break; sleep 1; done
     mt_sel_labels after "after the remedy"
+    ev_diff labels "EV-DIFF: the labels before the relabel (-) and after the remedy (+)" "$(ev_named labels-before)" "$EV_LAST" \
+        "nothing: the remedy puts back the labels the relabel took"
     if mt_selc_has ' ok$' "$(mt_get since-remedy)"; then
         ev_pass "the client's loop opens the display again, the client never restarted"
     else
         ev_fail "the client's loop still fails after \`$line\`"
     fi
+    ev_save client-id-after "EV-PIDS: the client after the remedy: id, pid, restart count, started" \
+        podman inspect --format 'id={{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}} label={{.ProcessLabel}}' "$MT_SELC" >/dev/null || true
+    ev_diff client-id "EV-DIFF: the client before the fault (-) and after the remedy (+)" "$(ev_named client-id-before)" "$EV_LAST" \
+        "nothing: the same container and process, never restarted"
     out=$(podman inspect --format '{{.Id}} {{.RestartCount}}' "$MT_SELC" 2>/dev/null || true)
     [ "$out" = "$(mt_get selc) 0" ] && ev_pass "the client is the same container, restart count 0" || ev_fail "the client is not the same container, or it restarted: $out"
     xorg1=$(podman exec desktop pgrep -u desktop -x Xorg || true)
@@ -1708,6 +1764,8 @@ mt_gid_hatch() {
         podman exec desktop sh -c "if grep -q '^needs_root_rights' /etc/X11/Xwrapper.config; then sed -i 's/^needs_root_rights.*/$line/' /etc/X11/Xwrapper.config; else echo '$line' >> /etc/X11/Xwrapper.config; fi" >/dev/null \
         || fail "the escape hatch could not be applied"
     ev_save xwrapper-after "EV-CONFIG: /etc/X11/Xwrapper.config with the escape hatch" podman exec desktop cat /etc/X11/Xwrapper.config >/dev/null || true
+    ev_diff xwrapper "EV-DIFF: /etc/X11/Xwrapper.config before (-) and with (+) the escape hatch" "$(ev_named xwrapper-before)" "$EV_LAST" \
+        "the needs_root_rights line: no, then the entry's value; nothing else"
     x=$(podman exec desktop pgrep -x Xorg || true)
     ev_save kill-x "EV-PROCEDURE: harness-only: Xorg (pid ${x:-none, the session is between attempts}) killed, so the next session starts under the escape hatch (the entry does not say how the change takes effect)" \
         podman exec -u desktop desktop pkill -x Xorg >/dev/null || ev_note "no Xorg was running to kill"
@@ -1726,7 +1784,7 @@ mt_before() { # <story> <moment>
 }
 # After the desktop came back: everything new, the session moved, no getty
 # was started on the way, and the common set's second half.
-mt_after() { # <story> <moment before> <moment after>
+mt_after() { # <story> <moment before> <moment after> [<preflight key>, mt_pf_expected]
     local since
     mt_begin "$1"
     since=$(mt_get "since-$1")
@@ -1735,7 +1793,7 @@ mt_after() { # <story> <moment before> <moment after>
     mt_pids_moved "$2" "$3"
     mt_no_getty "$since" "between the command and now"
     mt_state "$3" "with the desktop back"
-    mt_state_diff "$2" "$3" "the desktop went and came back"
+    mt_state_diff "$2" "$3" "the desktop went and came back" "$(mt_pf_expected "${4:-}")" "$MT_ST_RESTART"
     mt_logs "$since" "from the command until the desktop was back"
     ev_end
 }
@@ -1796,7 +1854,9 @@ mt_stop() {
         || fail "a client's connect attempt did not fail cleanly: $(echo $out)"
     ev_pass "a client's connect attempt fails cleanly: xdpyinfo says it is unable to open the display and exits nonzero ($(grep '^xdpyinfo exited' <<<"$out")); the whole podman run took $t1 s"
     mt_state stopped "with the desktop stopped"
-    mt_state_diff running stopped "the maintenance stop"
+    mt_state_diff running stopped "the maintenance stop" \
+        "desktop.service and its audio sockets: active, then 'not started'" \
+        "$MT_ST_AGO; desktop.service and the units that start with it: listed while they run, gone once stopped"
     ev_end
 }
 
@@ -1922,7 +1982,9 @@ mt_live() { # readme|deploy
     mt_put since-live "$(date +%s)"
     mt_live_run "$1"
     mt_state applied "after the $1 path's commands, no reboot"
-    mt_state_diff stock applied "what the $1 path did"
+    mt_state_diff stock applied "what the $1 path did" \
+        "every line: on the stock host there is no desktop-preflight; after the path's commands it runs, the desktop up" \
+        "every line: no desktop unit on the stock host, every one after the path's commands"
     ev_end
 }
 
@@ -1980,7 +2042,9 @@ mt_live_state() { # readme|deploy
     else
         ev_fail "desktop-preflight reported FAILs: $(grep -m3 'FAIL:' <<<"$out" | tr '\n' ' ')"
     fi
-    mt_state_diff applied live "what came up after the path's commands"
+    mt_state_diff applied live "what came up after the path's commands" \
+        "at most the audio-socket line: not yet exported at the first look, exported by the second" \
+        "$MT_ST_AGO; the units that ran or finished since the first look (desktop.service's tree, the CDI and host-shell units)"
     since=$(date +%s)
     who=$(ev_save ssh-host "EV-STATE: ssh host whoami, run in the desktop container as the session user (S5.7.2): Host Terminal's path" \
         podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) || true
@@ -2102,6 +2166,10 @@ mt_gdm_after() {
     out=$(systemctl is-active gdm 2>&1 || true)
     [ "$out" != active ] && ev_pass "gdm is not running ($out)" || ev_fail "gdm is running again"
     mt_holders_state after "the end state"
+    ev_diff fuser "EV-DIFF: fuser -v on the greeter's host (-) and at the end state (+)" "$(ev_named fuser-before)" "$(ev_named fuser-after)" \
+        "every line: the greeter's holders (systemd, logind, gdm's session and gnome-shell) before; none after, where the host's fuser cannot see the container's own device nodes"
+    ev_diff holders "EV-DIFF: the DRM card's and tty1's holders, from /proc/<pid>/fd, on the greeter's host (-) and at the end state (+)" "$(ev_named holders-before)" "$(ev_named holders-after)" \
+        "every line: the greeter's holders (systemd, logind, gdm's session and gnome-shell) before; the desktop's startx, xinit and Xorg after"
     x=$(podman exec desktop pgrep -u desktop -x Xorg 2>/dev/null || true)
     x=${x%%$'\n'*}
     holders=$(mt_drm_holders | awk '$4 ~ /^\/dev\/dri\/card/ {print $1}' | sort -u | paste -sd' ')
@@ -2118,7 +2186,9 @@ mt_gdm_after() {
             journalctl --no-pager -o short-precise -b -1 -u desktop-seat-prep -u systemd-logind -u gdm >/dev/null || true
     fi
     mt_state after "the end state"
-    mt_state_diff greeter after "the greeter's host against the end state"
+    mt_state_diff greeter after "the greeter's host against the end state" \
+        "every line: on the greeter's host there is no desktop-preflight; at the end state it runs, every check PASS" \
+        "every line: no desktop unit on the greeter's host, every one at the end state"
     ev_end
 }
 
@@ -2159,6 +2229,7 @@ mt_k8s_ls() { # <moment> <when>
 # restarted between them (EV-PIDS, said either way).
 mt_pids_kept() { # <moment before> <moment after> <between what>
     local c a b moved=""
+    ev_diff pids "EV-DIFF: the EV-PIDS listings $1 (-) and $2 (+)" "$(ev_named "pids-$1")" "$(ev_named "pids-$2")" "$MT_PIDS_KEPT"
     for c in ${S737_COMMS//,/ } container; do
         a=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$EV_STORY-$1")
         b=$(awk -v c="$c" '$1 == c {print $2; exit}' "$MT/pids-$EV_STORY-$2")
@@ -2322,7 +2393,9 @@ mt_k8s_after() {
     mt_pids_kept before after "from before k3s and CRI-O to the demo pod in use"
     ev_save demo-final "EV-STATE: kubectl describe pod $MT_DEMO after it was used" kubectl describe pod "$MT_DEMO" >/dev/null || true
     mt_state after "after README.md's steps"
-    mt_state_diff before after "k3s and CRI-O arriving, and README.md's steps"
+    mt_state_diff before after "k3s and CRI-O arriving, and README.md's steps" \
+        "nothing: k3s, CRI-O and README.md's steps change no check desktop-preflight makes" \
+        "$MT_ST_AGO"
     mt_logs "$(mt_get since-steps)" "from README.md's helm installs to the demo pod in use"
     ev_save demo-delete "EV-STATE: the demo pod removed, for S10.6.2: kubectl delete pod $MT_DEMO" \
         kubectl delete pod "$MT_DEMO" --wait=true >/dev/null || true
@@ -2466,7 +2539,9 @@ mt_unprov_after() {
     mt_pids after "after the start"
     mt_pids_moved before after
     mt_state after "after the start"
-    mt_state_diff before after "the node staged as never provisioned, the pod Pending, the desktop started"
+    mt_state_diff before after "the node staged as never provisioned, the pod Pending, the desktop started" \
+        "nothing: the desktop runs at both looks, on the same host" \
+        "$MT_ST_RESTART"
     mt_logs "$(mt_get since-unprov)" "from the staging to the pod running"
     ev_save delete "EV-STATE: the pod removed: kubectl delete pod $MT_UNPROV" \
         kubectl delete pod "$MT_UNPROV" --wait=true >/dev/null || true
@@ -2533,7 +2608,7 @@ maint() { # <step> [args]
         gid-check) mt_gid_check "${2:?a, b or final}" ;;
         after-kept) mt_after_kept "${2:?story}" "${3:?moment before}" "${4:?moment after}" ;;
         before) mt_before "${2:?story}" "${3:?moment}" ;;
-        after) mt_after "${2:?story}" "${3:?moment before}" "${4:?moment after}" ;;
+        after) mt_after "${2:?story}" "${3:?moment before}" "${4:?moment after}" "${5:-}" ;;
         restart) mt_restart ;;
         stop) mt_stop ;;
         held) mt_held ;;

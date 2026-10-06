@@ -110,7 +110,7 @@ fresh=$EV_LAST
 ev_pass "the fresh base lists $(grep -c . <<<"$after") packages"
 if [ -n "$before" ]; then
     ev_diff rpm-drift "EV-DIFF: the week's package drift: rpm -qa of the previous base (-) against the fresh one (+)" \
-        "$prevfile" "$fresh"
+        "$prevfile" "$fresh" "the lines of the packages the week's updates changed, whichever they are: this diff is the drift"
     gone=$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep -c . || true)
     new=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep -c . || true)
     ev_note "the week's drift in the desktop base: $new package versions new, $gone gone"

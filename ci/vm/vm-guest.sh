@@ -280,8 +280,8 @@ phase_deploy() {
     ev_pass "no tools spec before the desktop's first start"
     ev_save cdi-after-publish "EV-STATE: ls -l --full-time /etc/cdi once the desktop has published its toolkit: desktop-tools.yaml is there" \
         ls -l --full-time /etc/cdi >/dev/null || true
-    ev_diff cdi "EV-DIFF: /etc/cdi before the first start and after the desktop published; the tools spec is the line that appears" \
-        "$cdi_before" "$EV_LAST"
+    ev_diff cdi "EV-DIFF: /etc/cdi before the first start and after the desktop published" "$cdi_before" "$EV_LAST" \
+        "every line: before the first start there is no /etc/cdi (ls: No such file or directory); after the publish ls lists the four specs, desktop-tools.yaml among them"
     ev_pass "the tools spec is present (kind desktop.local/tools) once the desktop has published"
     ev_end
 
@@ -826,14 +826,15 @@ layout_copy() { # <moment> <when>
     ev_copy "$LAYOUT_TMP/$1-xrandr.txt" "$1-xrandr" "EV-STATE: xrandr --query --verbose, $2"
     ev_copy "$LAYOUT_TMP/$1-tree.txt" "$1-tree" "EV-STATE: xwininfo -root -tree, $2"
 }
-# EV-DIFF of two files anywhere (ev_diff takes names inside the story).
-ev_diff_paths() { # <moment> <what> <path a> <path b>
+# EV-DIFF of two files anywhere (ev_diff takes names inside the story), with
+# the lines expected to differ, as ev_diff's.
+ev_diff_paths() { # <moment> <what> <path a> <path b> <expected>
     [ -n "$EV_DIR" ] || return 0
     local name
     name=$(ev_name "$1" diff)
     diff -u "$3" "$4" > "$EV_DIR/$name" || true
     [ -s "$EV_DIR/$name" ] || echo "(no differences between $3 and $4)" > "$EV_DIR/$name"
-    ev_attach "$name" "$2"
+    ev_attach "$name" "$2${5:+; expected to differ: $5}"
 }
 # The client windows in a saved xwininfo -root -tree (the ones with a
 # WM_CLASS), each with its id, size and absolute position: what "no window
@@ -905,15 +906,17 @@ s773_after() {
     s773_open
     ev_save client-after "EV-PIDS: the client container after the re-plug" \
         podman inspect --format '{{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}}' "$S773" >/dev/null || true
-    ev_diff client "EV-DIFF: the client container before and after (no differences: the same container and process, never restarted)" "$S773_CB" "$EV_LAST"
+    ev_diff client "EV-DIFF: the client container before and after" "$S773_CB" "$EV_LAST" "nothing: the same container and process, never restarted"
     cb=$(sed '1d;$d' "$EV_DIR/$S773_CB") ca=$(sed '1d;$d' "$EV_DIR/$EV_LAST")
     ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the re-plug" \
         ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
-    ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the unplug and re-plug (no differences)" "$S773_DB" "$EV_LAST"
+    ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the unplug and re-plug" "$S773_DB" "$EV_LAST" "nothing: none restarted"
     db=$(sed '1d;$d' "$EV_DIR/$S773_DB") da=$(sed '1d;$d' "$EV_DIR/$EV_LAST")
     ev_save client-log "EV-LOG-CLIENT: the client container's own output (podman logs)" podman logs "$S773" >/dev/null || true
-    ev_diff geometry-during "EV-DIFF: xwininfo of the client's window before the force and while Virtual-1 was off (no differences: it did not move or resize)" "$S773_INFO_before" "$S773_INFO_during"
-    ev_diff geometry-after "EV-DIFF: xwininfo of the client's window before the force and after the re-plug (no differences)" "$S773_INFO_before" "$S773_INFO_after"
+    ev_diff geometry-during "EV-DIFF: xwininfo of the client's window before the force and while Virtual-1 was off" "$S773_INFO_before" "$S773_INFO_during" \
+        "nothing: the window did not move or resize"
+    ev_diff geometry-after "EV-DIFF: xwininfo of the client's window before the force and after the re-plug" "$S773_INFO_before" "$S773_INFO_after" \
+        "nothing: the window did not move or resize"
     [ "$(sed '1d;$d' "$EV_DIR/$S773_INFO_before")" = "$(sed '1d;$d' "$EV_DIR/$S773_INFO_during")" ] \
         || fail "the client's window changed while Virtual-1 was forced off (see the geometry-during diff)"
     [ "$(sed '1d;$d' "$EV_DIR/$S773_INFO_before")" = "$(sed '1d;$d' "$EV_DIR/$S773_INFO_after")" ] \
@@ -1061,8 +1064,8 @@ layout_roundtrip() {
         || fail "the captured block generated no 30-monitors.conf"
     ev_save xrandr-roundtrip "EV-STATE: xrandr --query after applying the captured block" \
         xr >/dev/null || true
-    ev_diff roundtrip "EV-DIFF: xrandr with the declared layout and with the captured block applied" \
-        "$xr_declared" "$EV_LAST"
+    ev_diff roundtrip "EV-DIFF: xrandr with the declared layout and with the captured block applied" "$xr_declared" "$EV_LAST" \
+        "only the current modes' names and refresh rates (the captured block names cvt's modes, which X names and times its own way); the outputs, their sizes and positions must not"
     dims=$(dpy_dims)
     [ "$dims" = 2048x768 ] || fail "the captured block gives a $dims screen, not the declared 2048x768"
     xr_is Virtual-1 connected 1024x768+0+0 || fail "round trip: Virtual-1 is not at 1024x768+0+0: $(xr_line Virtual-1)"
@@ -1103,8 +1106,9 @@ layout_unplug() {
     layout_set forced-off "after Virtual-1 was forced off under the running server"
     xorg_slice "$xl0" "$T/forced-off-xorg-log.txt"
     ev_copy "$T/forced-off-xorg-log.txt" xorg-log-off "EV-LOG-XORG: the Xorg log's lines since just before the force"
-    ev_diff_paths xrandr-off "EV-DIFF: xrandr --verbose across the force" "$T/before-xrandr.txt" "$T/forced-off-xrandr.txt"
-    ev_diff_paths tree-off "EV-DIFF: the window tree across the force (empty: no window changed)" "$T/before-tree.txt" "$T/forced-off-tree.txt"
+    ev_diff_paths xrandr-off "EV-DIFF: xrandr --verbose across the force" "$T/before-xrandr.txt" "$T/forced-off-xrandr.txt" \
+        "Virtual-1's block only: disconnected, its EDID and physical size gone and its mode list changed; its position and current mode stay, and Virtual-2's block must not differ"
+    ev_diff_paths tree-off "EV-DIFF: the window tree across the force" "$T/before-tree.txt" "$T/forced-off-tree.txt" "nothing: no window changed"
     dims=$(dpy_dims)
     [ "$dims" = 2048x768 ] \
         || fail "screen collapsed to $dims when Virtual-1 went down - the layout did not hold"
@@ -1126,7 +1130,7 @@ layout_unplug() {
     layout_copy before "before the force (taken in S3.4.10)"
     layout_copy forced-off "after Virtual-1 was forced off (taken in S3.4.10)"
     ev_copy "$T/forced-off-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the force (taken in S3.4.10)"
-    ev_diff_paths tree "EV-DIFF: the window tree across the force (empty: no window changed)" "$T/before-tree.txt" "$T/forced-off-tree.txt"
+    ev_diff_paths tree "EV-DIFF: the window tree across the force" "$T/before-tree.txt" "$T/forced-off-tree.txt" "nothing: no window changed"
     ev_pass "the screen size held: 2048x768 before and after (asserted in S3.4.10)"
     ev_pass "every output's position held: Virtual-1 1024x768+0+0, Virtual-2 1024x768+1024+0 (asserted in S3.4.10)"
     ev_pass "every client window's id, size and position held (asserted in S3.4.10 on these two trees)"
@@ -1155,8 +1159,9 @@ layout_unplug() {
     layout_set replugged "after Virtual-1 was set back to detect"
     xorg_slice "$xl0" "$T/replugged-xorg-log.txt"
     ev_copy "$T/replugged-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the re-plug"
-    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose before the force and after the re-plug" "$T/before-xrandr.txt" "$T/replugged-xrandr.txt"
-    ev_diff_paths tree "EV-DIFF: the window tree before the force and after the re-plug (empty: no window changed)" "$T/before-tree.txt" "$T/replugged-tree.txt"
+    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose before the force and after the re-plug" "$T/before-xrandr.txt" "$T/replugged-xrandr.txt" \
+        "Virtual-1's block only: connected again, without the EDID and physical size it had before the force, its modes those it now lists; its position and current mode stay, and Virtual-2's block must not differ"
+    ev_diff_paths tree "EV-DIFF: the window tree before the force and after the re-plug" "$T/before-tree.txt" "$T/replugged-tree.txt" "nothing: no window changed"
     grep -q 'card[0-9]*-Virtual-1/status:connected' "$T/replugged-sysfs.txt" \
         || fail "sysfs does not read Virtual-1 connected after the re-plug"
     ev_pass "RandR reports Virtual-1 connected at 1024x768+0+0 again: $(xr_line Virtual-1)"
@@ -1186,8 +1191,9 @@ layout_unplug() {
     layout_set v2-on "after Virtual-2 was forced on"
     xorg_slice "$xl0" "$T/v2-on-xorg-log.txt"
     ev_copy "$T/v2-on-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before Virtual-2 was forced on"
-    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across Virtual-2's plug-in" "$T/replugged-xrandr.txt" "$T/v2-on-xrandr.txt"
-    ev_diff_paths tree "EV-DIFF: the window tree across Virtual-2's plug-in (empty: no window changed)" "$T/replugged-tree.txt" "$T/v2-on-tree.txt"
+    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across Virtual-2's plug-in" "$T/replugged-xrandr.txt" "$T/v2-on-xrandr.txt" \
+        "Virtual-2's block only: connected, with the modes it now lists; Virtual-1's block must not differ"
+    ev_diff_paths tree "EV-DIFF: the window tree across Virtual-2's plug-in" "$T/replugged-tree.txt" "$T/v2-on-tree.txt" "nothing: no window changed"
     ev_pass "RandR reports Virtual-2 connected where the layout put it: $(xr_line Virtual-2)"
     dims=$(dpy_dims)
     [ "$dims" = 2048x768 ] || fail "the screen is $dims after Virtual-2 was forced on, want 2048x768"
@@ -1306,8 +1312,9 @@ ad_plugin() { # before|on|off: S3.10.5, around the host's plug and unplug
             layout_set ad5-on "with the monitor QEMU plugged into Virtual-2"
             xorg_slice "${xl0:-0}" "$T/ad5-xorg-log.txt"
             ev_copy "$T/ad5-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the plug-in"
-            ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across the plug-in" "$T/ad5-before-xrandr.txt" "$T/ad5-on-xrandr.txt"
-            ev_diff_paths tree "EV-DIFF: the window tree across the plug-in (empty: no window changed)" "$T/ad5-before-tree.txt" "$T/ad5-on-tree.txt"
+            ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across the plug-in" "$T/ad5-before-xrandr.txt" "$T/ad5-on-xrandr.txt" \
+                "Virtual-2's block (connected, with its EDID and modes), and Virtual-1's EDID, physical size and the modes its EDID gives (it lists its EDID again after the plug-in); Virtual-1's position and current mode stay"
+            ev_diff_paths tree "EV-DIFF: the window tree across the plug-in" "$T/ad5-before-tree.txt" "$T/ad5-on-tree.txt" "nothing: no window changed"
             ev_pass "sysfs reads Virtual-2 connected, and RandR lists it connected and not enabled: $(xr_line Virtual-2)"
             [ "$(dpy_dims)" = "$dims0" ] || fail "the screen changed from $dims0 to $(dpy_dims) when the monitor arrived"
             [ "$(xr_head Virtual-1)" = "$v1" ] || fail "Virtual-1 changed when the monitor arrived: '$v1' -> '$(xr_head Virtual-1)'"
@@ -1348,8 +1355,9 @@ ad_unplug() { # S3.10.6: the only enabled output forced off, then back
     sleep 3
     xr >/dev/null || true          # a query makes X probe, as any client's would
     layout_set ad6-off "with Virtual-1, the only enabled output, forced off"
-    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across the only output's plug-out" "$T/ad6-before-xrandr.txt" "$T/ad6-off-xrandr.txt"
-    ev_diff_paths tree "EV-DIFF: the window tree across the only output's plug-out" "$T/ad6-before-tree.txt" "$T/ad6-off-tree.txt"
+    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across the only output's plug-out" "$T/ad6-before-xrandr.txt" "$T/ad6-off-xrandr.txt" \
+        "Virtual-1's block only: disconnected, its EDID and physical size gone and its mode list changed; its position and current mode stay"
+    ev_diff_paths tree "EV-DIFF: the window tree across the only output's plug-out" "$T/ad6-before-tree.txt" "$T/ad6-off-tree.txt" "nothing: no window changed"
     x1=$(podman exec desktop pgrep -x Xorg 2>/dev/null | sed -n 1p || true)
     [ -n "$x0" ] && [ "$x1" = "$x0" ] || fail "Xorg did not live through the only output's plug-out: $x0 -> ${x1:-none}"
     ev_pass "Xorg kept running through the only output's plug-out: the same pid ($x0)"
@@ -1366,7 +1374,7 @@ ad_unplug() { # S3.10.6: the only enabled output forced off, then back
     ev_copy "$T/ad6-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines from just before the force to after the re-detect"
     ev_save pids-after "EV-PIDS: desktop-init, Xorg and mwm after Virtual-1 came back" \
         ctr_pids desktop-init,Xorg,mwm >/dev/null || true
-    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across the plug-out and back (no differences: none restarted)" "$pb" "$EV_LAST"
+    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across the plug-out and back" "$pb" "$EV_LAST" "nothing: none restarted"
     [ "$(sed '1d;$d' "$EV_DIR/$pb")" = "$(sed '1d;$d' "$EV_DIR/$EV_LAST")" ] \
         || fail "desktop-init, Xorg or mwm changed across the plug-out and back (see the pids diff)"
     ev_pass "desktop-init, Xorg and mwm kept their pids and start times across the plug-out and back"
@@ -1482,8 +1490,9 @@ $(grep -h 'CONFIG_DRM_LOAD_EDID_FIRMWARE' "/boot/config-$(uname -r)" 2>/dev/null
             layout_set ad7-enabled "after xrandr --output Virtual-2 --auto"
             xorg_slice "${xl0:-0}" "$T/ad7-xorg-log.txt"
             ev_copy "$T/ad7-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the plug-in"
-            ev_diff_paths xrandr "EV-DIFF: xrandr --verbose from before the plug-in to Virtual-2 enabled" "$T/ad7-before-xrandr.txt" "$T/ad7-enabled-xrandr.txt"
-            ev_diff_paths tree "EV-DIFF: the window tree from before the plug-in to Virtual-2 enabled (empty: no window changed)" "$T/ad7-before-tree.txt" "$T/ad7-enabled-tree.txt"
+            ev_diff_paths xrandr "EV-DIFF: xrandr --verbose from before the plug-in to Virtual-2 enabled" "$T/ad7-before-xrandr.txt" "$T/ad7-enabled-xrandr.txt" \
+                "Virtual-2's block (connected with the injected EDID and enabled by xrandr --auto), Virtual-1's EDID, physical size and the modes its EDID gives (it lists its EDID again), and both outputs' Timestamp lines; the screen's line must not"
+            ev_diff_paths tree "EV-DIFF: the window tree from before the plug-in to Virtual-2 enabled" "$T/ad7-before-tree.txt" "$T/ad7-enabled-tree.txt" "nothing: no window changed"
             ev_pass "xrandr --auto enabled Virtual-2 at the EDID's preferred mode: $(xr_line Virtual-2)"
             [ "$(xr_head Virtual-1)" = "$v1" ] || fail "Virtual-1 changed when Virtual-2 was enabled: '$v1' -> '$(xr_head Virtual-1)'"
             ev_pass "Virtual-1 is where it was: $v1 (the screen was $dims0 and is $(dpy_dims))"
@@ -1502,6 +1511,11 @@ $(grep -h 'CONFIG_DRM_LOAD_EDID_FIRMWARE' "/boot/config-$(uname -r)" 2>/dev/null
             printf reset > "$dbg/edid_override" || fail "the kernel did not reset Virtual-2's EDID override"
             ev_note "Virtual-2's EDID override reset at $(ad_now)"
             layout_set ad7-after "after QEMU took the monitor away and the override was reset"
+            ev_diff_paths sysfs "EV-DIFF: every connector's status, from before the plug-in to after the monitor left" "$T/ad7-before-sysfs.txt" "$T/ad7-after-sysfs.txt" \
+                "nothing: each connector reads as it did before the monitor came"
+            ev_diff_paths xrandr-after "EV-DIFF: xrandr --verbose from before the plug-in to after the monitor left" "$T/ad7-before-xrandr.txt" "$T/ad7-after-xrandr.txt" \
+                "Virtual-1's EDID, physical size and the modes its EDID gives (it lists its EDID again), and both outputs' Timestamp lines; Virtual-2 is disconnected again, as before"
+            ev_diff_paths tree-after "EV-DIFF: the window tree from before the plug-in to after the monitor left" "$T/ad7-before-tree.txt" "$T/ad7-after-tree.txt" "nothing: no window changed"
             [ "$(dpy_dims)" = "$dims0" ] || fail "the screen is $(dpy_dims) after the monitor left, not $dims0"
             [ "$(xr_head Virtual-1)" = "$v1" ] || fail "Virtual-1 changed: '$v1' -> '$(xr_head Virtual-1)'"
             ev_pass "with the monitor gone Virtual-2 reads disconnected and unused, the screen is $dims0 and Virtual-1 where it was"
@@ -1605,7 +1619,8 @@ seat_prep_dirty() {
     lp1=$(systemctl show -p MainPID --value systemd-logind.service)
     ev_save status-after "EV-STATE: systemctl status getty@tty1 display-manager after desktop-seat-prep ran on its own" \
         systemctl --no-pager status getty@tty1.service display-manager.service >/dev/null || true
-    ev_diff status "EV-DIFF: getty@tty1 and display-manager before and after seat-prep ran on its own" "$sb" "$EV_LAST"
+    ev_diff status "EV-DIFF: getty@tty1 and display-manager before and after seat-prep ran on its own" "$sb" "$EV_LAST" \
+        "getty@tty1's state, from active (running) to inactive (dead), stopped by seat-prep, with its journal lines and systemctl's exit status; display-manager.service stays absent"
     ev_save default "EV-STATE: systemctl get-default, then systemctl is-enabled getty@tty1" \
         sh -c 'systemctl get-default; systemctl is-enabled getty@tty1.service' >/dev/null || true
     ! systemctl is-active --quiet getty@tty1.service || fail "getty@tty1 still runs after desktop-seat-prep ran on its own"
@@ -1792,7 +1807,8 @@ deploy_tail() {
     systemctl restart desktop-client-cdi.service || fail "desktop-client-cdi.service failed with the desktop down"
     ev_save cdi-after "EV-STATE: ls -l --full-time /etc/cdi after systemctl restart desktop-client-cdi, the desktop still stopped" \
         ls -l --full-time /etc/cdi >/dev/null || true
-    ev_diff cdi "EV-DIFF: /etc/cdi before the removal and after desktop-client-cdi ran again: the two specs are back, rewritten" "$b" "$EV_LAST"
+    ev_diff cdi "EV-DIFF: /etc/cdi before the removal and after desktop-client-cdi ran again" "$b" "$EV_LAST" \
+        "the two specs' lines: written again (new times); their sizes must not"
     for f in desktop-display.yaml desktop-audio.yaml; do
         [ -s "/etc/cdi/$f" ] || fail "desktop-client-cdi did not write $f with the desktop down"
         cmp -s "/run/ev-s556/$f" "/etc/cdi/$f" || fail "$f came back different"
@@ -1865,6 +1881,7 @@ deploy_tail() {
     wait_for 30 1 "the tools spec, after the desktop's restart" test -s "$spec"
     ev_save state-before "EV-STATE: desktop-tools-cdi.path and .service, and the tools spec" \
         sh -c 'systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service; ls -l --full-time /etc/cdi/desktop-tools.yaml' >/dev/null || true
+    st_b=$EV_LAST
     t0=$(ev_since)
     rm -f "$spec"
     sleep 5
@@ -1877,6 +1894,8 @@ deploy_tail() {
     wait_for 15 1 "the tools spec to come back" test -s "$spec"
     ev_save state-after "EV-STATE: the same after systemctl stop desktop-tools-cdi.service" \
         sh -c 'systemctl --no-pager status desktop-tools-cdi.path desktop-tools-cdi.service; ls -l --full-time /etc/cdi/desktop-tools.yaml' >/dev/null || true
+    ev_diff state "EV-DIFF: the path unit, the service and the spec, before the removal and after the .path unit fired again" "$st_b" "$EV_LAST" \
+        "the service's run (its start time, process, Main PID, CPU time, and the journal lines of a new run that wrote the spec again) and the spec's line, a new time; its size and the path unit must not"
     ! systemctl is-failed --quiet desktop-tools-cdi.path || fail "desktop-tools-cdi.path failed"
     [ "$(systemctl show -p ActiveState --value desktop-tools-cdi.path)" = active ] || fail "desktop-tools-cdi.path is not active"
     ev_pass "stopping desktop-tools-cdi.service let the .path unit fire again: the spec is back, and the .path unit is active, not failed"
@@ -1936,6 +1955,7 @@ deploy_tail() {
     d=/var/tmp/ev-s564
     mkdir -p "$d"
     ev_save before "EV-STATE: ls -Zd of the probe directory before" ls -Zd "$d" >/dev/null || true
+    s564_b=$EV_LAST
     rc=0
     out=$(ev_save run "EV-STATE: PATH=/usr/bin:/bin desktop-selinux $d (no semanage, restorecon or selinuxenabled on PATH): its output and exit status" \
         env PATH=/usr/bin:/bin /usr/local/libexec/desktop-selinux "$d") || rc=$?
@@ -1944,6 +1964,8 @@ deploy_tail() {
     grep -qF "labeled container_file_t: $d" <<<"$out" || fail "desktop-selinux did not report the probe labelled"
     [ "$(ctx_of "$d" | cut -d: -f3)" = container_file_t ] || fail "the probe directory is $(ctx_of "$d")"
     ev_save after "EV-STATE: ls -Zd of the probe directory after" ls -Zd "$d" >/dev/null || true
+    ev_diff label "EV-DIFF: the probe directory's label before and after desktop-selinux" "$s564_b" "$EV_LAST" \
+        "only its type: user_tmp_t before, container_file_t after (chcon labelled it)"
     ! grep -qF "$d" <<<"$(semanage fcontext -l -C)" || fail "a policy rule for the probe directory appeared"
     ev_pass "without semanage on PATH, desktop-selinux printed the policy note, labelled the probe directory container_file_t with chcon and exited 0, and added no policy rule"
     ev_end
@@ -2090,7 +2112,18 @@ deploy_reboot() {
     n=$(log_wait 30 1 '^Started ' journalctl -b --no-pager -o cat -u systemd-logind.service) || true
     n=$(grep -c '^Started ' <<<"$n" || true)
     [ "$n" = 1 ] || fail "systemd-logind started $n times this boot, want once"
-    ev_pass "on the steady-state boot seat-prep logged nothing, and logind started once, at boot: no restart"
+    # And its pid: the one logind's own first line this boot carries, and its
+    # MainPID now (S9.3.3). A restart would have given it a new one.
+    j=$(journalctl -b --no-pager -o verbose _SYSTEMD_UNIT=systemd-logind.service) || true
+    p0=$(sed -n '/^ *_PID=/{s/^ *_PID=//p;q}' <<<"$j")
+    ev_text logind-pid-before "EV-PIDS: systemd-logind's pid at boot: the _PID of its own first journal line this boot (journalctl -b -o verbose _SYSTEMD_UNIT=systemd-logind.service)" \
+        "systemd-logind pid ${p0:-none}"
+    lp0=$EV_LAST
+    p1=$(systemctl show -p MainPID --value systemd-logind.service)
+    ev_text logind-pid-after "EV-PIDS: systemd-logind's pid now: systemctl show -p MainPID systemd-logind.service" "systemd-logind pid ${p1:-none}"
+    ev_diff logind-pid "EV-DIFF: systemd-logind's pid at boot (-) and now (+)" "$lp0" "$EV_LAST" "nothing: one logind process all boot"
+    [ -n "$p0" ] && [ "$p0" = "$p1" ] || fail "systemd-logind's pid now (${p1:-none}) is not the one its first line this boot carries (${p0:-none})"
+    ev_pass "on the steady-state boot seat-prep logged nothing, and logind started once, at boot: no restart (one 'Started' line; pid $p1 at its first line and now)"
     ev_end
 
     # S5.5.5's reboot half
@@ -2187,7 +2220,8 @@ verify_mwm_exit() {
     mwm2=$(podman exec desktop pgrep -u desktop -x mwm | sed -n 1p || true)
     ev_save pids-after "EV-PIDS: desktop-init, Xorg and mwm after the new session came up" \
         ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg2,$mwm2" >/dev/null || true
-    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across mwm's exit (Xorg and mwm new, desktop-init the same)" "$p_before" "$EV_LAST"
+    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across mwm's exit" "$p_before" "$EV_LAST" \
+        "the Xorg and mwm rows (a new session: new pids and start times) and the ps line's pid list; desktop-init's row must not"
     ev_save log "EV-LOG-DESKTOP: podman logs desktop from mwm's SIGTERM on" \
         sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
     # The session's exit line is the last of its end: a postmortem would
@@ -2362,14 +2396,16 @@ seat_tags() { # attach|fix
         attach)
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is already there"
             ev_save rules-before "EV-STATE: ls -l /etc/udev/rules.d before: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
+            s386_rb=$EV_LAST
             ev_save udev-before "EV-STATE: udevadm info of the USB keyboard ($sys) and its event node ($ev) before" kbd_udev "$sys" >/dev/null || true
-            b=$EV_LAST
+            b=$EV_LAST s386_ub=$EV_LAST
             loginctl attach seat1 "$sys" || fail "loginctl attach seat1 $sys failed"
             udevadm settle --timeout=15 || true
             ev_save rule "EV-CONFIG: the rule loginctl attach wrote" \
                 sh -c 'for f in /etc/udev/rules.d/72-seat-*.rules; do echo "== $f"; cat "$f"; done' >/dev/null || true
             ev_save udev-attached "EV-STATE: udevadm info of the keyboard after loginctl attach seat1" kbd_udev "$sys" >/dev/null || true
-            ev_diff udev-attach "EV-DIFF: udevadm info across loginctl attach seat1 (ID_SEAT=seat1 appears)" "$b" "$EV_LAST"
+            ev_diff udev-attach "EV-DIFF: udevadm info across loginctl attach seat1" "$b" "$EV_LAST" \
+                "ID_SEAT=seat1, new, and the TAGS and CURRENT_TAGS lines, which gain seat1, for the keyboard and the devices under it"
             props=$(udevadm info -q property -n "$ev") || fail "udevadm info could not read $ev"
             grep -qx 'ID_SEAT=seat1' <<<"$props" || fail "$ev is not tagged ID_SEAT=seat1 after loginctl attach"
             ev_save tagged-attached "EV-STATE: every udev database entry tagged for a seat other than seat0, after loginctl attach seat1: the keyboard's input device and the devices under it" \
@@ -2403,8 +2439,12 @@ seat_tags() { # attach|fix
                 || fail "seat-prep did not log removing the 72-seat-* rule at the desktop's restart"
             ev_pass "seat-prep logged: $(grep -m1 -o 'seat-prep: removing custom seat attachment rule [^ ]*' <<<"$j")"
             ev_save rules-after "EV-STATE: ls -l /etc/udev/rules.d after seat-prep: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
+            ev_diff rules "EV-DIFF: /etc/udev/rules.d before the attach and after seat-prep" "$s386_rb" "$EV_LAST" \
+                "nothing: no 72-seat-* rule before the attach, and none once seat-prep removed the one it wrote"
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is still there after seat-prep"
             ev_save udev-after "EV-STATE: udevadm info of the keyboard after seat-prep" kbd_udev "$sys" >/dev/null || true
+            ev_diff udev "EV-DIFF: udevadm info of the keyboard before the attach and after seat-prep" "$s386_ub" "$EV_LAST" \
+                "only the TAGS lines, which keep seat1 (udev's TAGS keep every tag a device has had; CURRENT_TAGS, its present ones, are as before); ID_SEAT must not"
             ev_save tagged-after "EV-STATE: every udev database entry tagged for a seat other than seat0, after seat-prep: none" \
                 foreign_entries >/dev/null || true
             props=$(udevadm info -q property -n "$ev") || fail "udevadm info could not read $ev"
@@ -2748,7 +2788,7 @@ phase2() {
     ev_pass "after the install desktop.service is active and the X socket is there"
     s737_after=$(ctr_pids "$S737_COMMS") || fail "could not list the desktop's processes after the install"
     ev_text pids-after "EV-PIDS: the desktop's processes after CRI-O and k3s were installed (the same ps)" "$s737_after"
-    ev_diff pids "EV-DIFF: the desktop's processes before and after the install (no differences: the same processes, none restarted)" "$s737_before_f" "$EV_LAST"
+    ev_diff pids "EV-DIFF: the desktop's processes before and after the install" "$s737_before_f" "$EV_LAST" "nothing: the same processes, none restarted"
     [ "$s737_after" = "$s737_before" ] \
         || fail "the desktop's processes changed while CRI-O and k3s were installed (see the diff)"
     ev_pass "the same desktop-init, Xorg, mwm and audio daemons before and after: pids and start times unchanged"
@@ -2961,11 +3001,13 @@ verify_cdi() {
         sh -c "k3s kubectl get pod cdi-control -o jsonpath='{.status.phase}' | grep -q Running"
     cenv=$(k3s kubectl exec cdi-control -- env | sort) || fail "could not read the control pod's environment"
     ev_text control-env "EV-STATE: the control pod's environment - the same image and manifest without the resource request (env, sorted)" "$cenv"
-    ev_diff env "EV-DIFF: the control pod's environment against the verifier's: what the request injected (and HOSTNAME, each pod's own name)" "$EV_LAST" "$venv_f"
+    ev_diff env "EV-DIFF: the control pod's environment against the verifier's" "$EV_LAST" "$venv_f" \
+        "what the request injected: DISPLAY, PIPEWIRE_REMOTE and PULSE_SERVER, new; and HOSTNAME, each pod's own name"
     cmnt=$(k3s kubectl exec cdi-control -- cat /proc/self/mountinfo | mount_points) \
         || fail "could not read the control pod's mounts"
     ev_text control-mounts "EV-STATE: the control pod's mounts (mount point and filesystem type, sorted)" "$cmnt"
-    ev_diff mounts "EV-DIFF: the control pod's mounts against the verifier's: what the request mounted" "$EV_LAST" "$vmnt_f"
+    ev_diff mounts "EV-DIFF: the control pod's mounts against the verifier's" "$EV_LAST" "$vmnt_f" \
+        "what the request mounted: /run/desktop-audio and /tmp/.X11-unix, new"
     for var in DISPLAY PULSE_SERVER PIPEWIRE_REMOTE; do
         ! grep -q "^$var=" <<<"$cenv" \
             || fail "control pod has $var without requesting the resource - injection is not what we measured"
@@ -3414,6 +3456,7 @@ verify_audio_x_restart() {
     ev_begin S4.5.1 "Audio survives an X session restart" T3
     ev_save pids-before "EV-PIDS: Xorg, mwm and the three audio daemons before Xorg is killed" \
         ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    xk_pb=$EV_LAST
     x_before=$(first_of podman exec desktop pgrep -x Xorg)
 
     # Kill the X server, not the container: the session dies, desktop-init
@@ -3434,6 +3477,8 @@ verify_audio_x_restart() {
     ev_note "a new Xorg and mwm up at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     ev_save pids-after "EV-PIDS: Xorg, mwm and the three audio daemons after the session came back" \
         ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    ev_diff pids "EV-DIFF: Xorg, mwm and the three audio daemons across the X restart" "$xk_pb" "$EV_LAST" \
+        "the Xorg and mwm rows (a new session: new pids and start times); the audio daemons' rows must not"
     ev_pass "the X session restarted: Xorg $x_before -> $(first_of podman exec desktop pgrep -x Xorg)"
 
     pw_after=$(pipewire_pid)
@@ -3477,6 +3522,7 @@ verify_audio_lifecycle() {
     ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T3
     ev_save pids-before "EV-PIDS: Xorg, mwm and the three audio daemons before pipewire is killed" \
         ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    pk_pb=$EV_LAST
     x_pids_before=$(podman exec desktop sh -c 'pgrep -x Xorg; pgrep -x mwm' 2>/dev/null | paste -sd' ' || true)
     [ "$(wc -w <<<"$x_pids_before")" -ge 2 ] || fail "no Xorg and mwm to compare across the audio crash (found: '$x_pids_before')"
     pw_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -3515,8 +3561,8 @@ verify_audio_lifecycle() {
         audio_reachable
     ev_save export-after "EV-STATE: ls -li /run/desktop-audio after the restart: new socket files (new inodes)" \
         ls -li /run/desktop-audio >/dev/null || true
-    ev_diff export "EV-DIFF: the export dir across the pipewire restart; the socket lines change inode" \
-        "$export_before" "$EV_LAST"
+    ev_diff export "EV-DIFF: the export dir across the pipewire restart" "$export_before" "$EV_LAST" \
+        "the three entries (pipewire-0, its lock, pulse): new inodes and times, made again by the restarted stack"
     ino_after=$(stat -c %i /run/desktop-audio/pulse 2>/dev/null || echo none)
     [ "$ino_after" != none ] && [ "$ino_after" != "$ino_before" ] \
         || fail "the pulse socket's inode did not change across the restart ($ino_before -> $ino_after): the stale file was not replaced"
@@ -3540,6 +3586,8 @@ verify_audio_lifecycle() {
     ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T3
     ev_save pids-after "EV-PIDS: Xorg, mwm and the three audio daemons after pipewire was killed and the stack came back" \
         ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    ev_diff pids "EV-DIFF: Xorg, mwm and the three audio daemons across pipewire's crash" "$pk_pb" "$EV_LAST" \
+        "the three audio daemons' rows (new pids and start times: the stack restarted); Xorg's and mwm's must not"
     ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before pipewire was killed" \
         podman logs --since "$pw_since" desktop >/dev/null || true
     ev_pass "pipewire came back as a new process on its own: $pw_before -> $recovered"
@@ -3744,7 +3792,7 @@ verify_privileges() {
     caps_want=$EV_LAST
     have=$(cap_names "$capeff" | sort)
     ev_text have "EV-STATE: CapEff=$capeff of desktop-init, decoded bit by bit, sorted" "$have"
-    ev_diff caps "EV-DIFF: the quadlet's list against CapEff (no differences: exactly the granted set)" "$caps_want" "$EV_LAST"
+    ev_diff caps "EV-DIFF: the quadlet's list against CapEff" "$caps_want" "$EV_LAST" "nothing: exactly the granted set"
     [ -n "$want" ] && [ "$have" = "$want" ] \
         || fail "CapEff=$capeff decodes to '$(echo $have)', and the quadlet adds back '$(echo $want)'"
     ev_pass "CapEff=$capeff decodes to exactly the $(wc -l <<<"$have") the quadlet adds back: $(echo $have)"
@@ -3952,7 +4000,7 @@ container: $ns_ctr"
     ev_text ifaces-host "EV-STATE: the interface names in the VM host's /proc/net/dev" "$if_h"
     if_host=$EV_LAST
     ev_text ifaces-ctr "EV-STATE: the interface names in the container's /proc/net/dev (the image may not ship ip)" "$if_c"
-    ev_diff ifaces "EV-DIFF: the interface names, host against container (no differences)" "$if_host" "$EV_LAST"
+    ev_diff ifaces "EV-DIFF: the interface names, host against container" "$if_host" "$EV_LAST" "nothing: the container sees the host's interfaces"
     [ -n "$ns_ctr" ] && [ "$ns_ctr" = "$ns_host" ] || fail "the container's network namespace is $ns_ctr, the host's $ns_host"
     ev_pass "the container's network namespace is the host's: $ns_host"
     [ -n "$if_c" ] && [ "$if_c" = "$if_h" ] || fail "the container's interfaces ($(echo $if_c)) differ from the host's ($(echo $if_h))"
@@ -4604,6 +4652,7 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
     ev_end
     ev_begin S3.2.5 "The session activates its VT, so the operator sees it" T3
     ev_text vt-before "EV-STATE: the active VT before (/sys/class/tty/tty0/active)" "$(active_vt)"
+    vt_b=$EV_LAST
     [ "$(active_vt)" = tty1 ] || fail "the active VT is $(active_vt) before the test, not tty1"
     switch_vt 2
     sleep 1
@@ -4637,7 +4686,8 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
     mwm2=$(podman exec desktop pgrep -u desktop -x mwm | sed -n 1p || true)
     ev_save pids-after "EV-PIDS: desktop-init, Xorg and mwm after the restart" \
         ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg2,$mwm2" >/dev/null || true
-    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across the restart (Xorg and mwm new, desktop-init the same)" "$p_before" "$EV_LAST"
+    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across the restart" "$p_before" "$EV_LAST" \
+        "the Xorg and mwm rows (a new session: new pids and start times) and the ps line's pid list; desktop-init's row must not"
     ev_save log "EV-LOG-DESKTOP: podman logs desktop from the kill on" \
         sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
     local since
@@ -4654,7 +4704,8 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
     ev_begin S2.3.3 "Session cleanup is scoped by session id and session tag, never by uid" T3
     ev_save uid61000-after "EV-PIDS: every uid-61000 process on the host after the restart" \
         ps -u 61000 -o pid,ppid,sess,tty,args >/dev/null || true
-    ev_diff uid61000 "EV-DIFF: the host's uid-61000 processes across the kill: the old session and the tagged sleep gone, the rest unchanged" "$u_before" "$EV_LAST"
+    ev_diff uid61000 "EV-DIFF: the host's uid-61000 processes across the kill" "$u_before" "$EV_LAST" \
+        "the old session's rows (startx, xinit, Xorg, mwm, its xterm and bash) and the tagged sleep's, gone, and the new session's, there; the untagged podman-exec sleep, the host's uid-61000 sleep, PipeWire and desktop-session-lead must not"
     [ -n "$t_clean" ] || fail "10 s after the kill, processes of the old session ($sid) or its tag ($tag) were still running"
     local took
     took=$(awk -v a="$t_kill" -v b="$t_clean" 'BEGIN {printf "%.2f", b - a}')
@@ -4674,6 +4725,8 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
 
     ev_begin S3.2.5 "The session activates its VT, so the operator sees it" T3
     ev_text vt-after "EV-STATE: the active VT after the new session came up" "$(active_vt)"
+    ev_diff vt "EV-DIFF: the active VT before the console was moved to tty2 and after the new session came up" "$vt_b" "$EV_LAST" \
+        "nothing: the new session took tty1 back"
     [ "$(active_vt)" = tty1 ] || fail "after the restart the active VT is $(active_vt), not tty1: the new session did not take its VT"
     ev_pass "the new session switched the console back to tty1 by itself"
     ev_end
@@ -4702,7 +4755,8 @@ verify_audio_restarts() {
         after=$(audio_trio)
         ev_save "pids-after-$victim" "EV-PIDS: the three audio daemons after the stack came back" \
             ctr_pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
-        ev_diff "pids-$victim" "EV-DIFF: the audio daemons across $victim's exit (all three new)" "$b" "$EV_LAST"
+        ev_diff "pids-$victim" "EV-DIFF: the audio daemons across $victim's exit" "$b" "$EV_LAST" \
+            "all three daemons' rows (new pids and start times: the whole stack restarted)"
         ev_save "log-$victim" "EV-LOG-DESKTOP: podman logs desktop from $victim's kill on" \
             sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
         since=$(log_wait 30 1 '^desktop-init: audio stack exited \(rc=' sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))") || true
@@ -5171,7 +5225,7 @@ print(" ".join(bad))
     for n in a b c; do
         st=$(pod_state "x11-client-$n") || fail "could not read pod x11-client-$n's state"
         ev_text "pod-$n-after" "EV-PIDS: pod x11-client-$n after the shared-display checks" "$st"
-        ev_diff "pod-$n" "EV-DIFF: pod x11-client-$n before and after (empty: the same container)" "${s757_bf[$n]}" "$EV_LAST"
+        ev_diff "pod-$n" "EV-DIFF: pod x11-client-$n before and after" "${s757_bf[$n]}" "$EV_LAST" "nothing: the same container"
         grep -q 'restartCount=0 ' <<<"$st" && [ "$st" = "${s757_b[$n]}" ] \
             || fail "pod x11-client-$n changed or restarted across the checks: '${s757_b[$n]}' -> '$st'"
     done
@@ -5196,6 +5250,7 @@ verify_teardown() {
     td_bf=$EV_LAST
     ev_save windows-before "EV-STATE: the client pod's main process, its X client and its windows before the uninstall" \
         pod_windows x11-client-td >/dev/null || true
+    td_wb=$EV_LAST
     alloc_b=$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' | tr ',' '\n' | sort)
     ev_text allocatable-before "EV-STATE: the node's allocatable resources before the uninstall, one per line" "$alloc_b"
     alloc_bf=$EV_LAST
@@ -5221,7 +5276,8 @@ verify_teardown() {
         sh -c "! k3s kubectl get ds display-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds audio-cdi-device-plugin >/dev/null 2>&1 && ! k3s kubectl get ds tools-cdi-device-plugin >/dev/null 2>&1"
     alloc_a=$(k3s kubectl get node -o jsonpath='{.items[0].status.allocatable}' | tr ',' '\n' | sort)
     ev_text allocatable-after "EV-STATE: the node's allocatable resources after the uninstall" "$alloc_a"
-    ev_diff allocatable "EV-DIFF: the node's allocatable resources before and after: the three desktop.local resources withdrawn (gone, or 0)" "$alloc_bf" "$EV_LAST"
+    ev_diff allocatable "EV-DIFF: the node's allocatable resources before and after" "$alloc_bf" "$EV_LAST" \
+        "the three desktop.local resources' lines (withdrawn: 0, or gone); every other resource must not"
     ev_pass "helm uninstall withdrew desktop.local/display, audio and tools: none is allocatable, and the three plugin daemonsets are gone"
 
     # The CDI spec is HOST state, not chart state: uninstalling must not
@@ -5229,7 +5285,7 @@ verify_teardown() {
     # spec definition serve podman and kubernetes alike.
     cdi_a=$(ls -l --time-style=full-iso /etc/cdi)
     ev_text cdi-after "EV-STATE: ls -l --time-style=full-iso /etc/cdi after the uninstall" "$cdi_a"
-    ev_diff cdi "EV-DIFF: /etc/cdi before and after the uninstall (no differences: the host's specs untouched)" "$cdi_bf" "$EV_LAST"
+    ev_diff cdi "EV-DIFF: /etc/cdi before and after the uninstall" "$cdi_bf" "$EV_LAST" "nothing: the host's specs untouched"
     gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "helm uninstall removed the host display spec - it is host state"
     gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
@@ -5249,11 +5305,13 @@ verify_teardown() {
     # window still on the screen, and the display opens from it anew.
     td_a=$(pod_state x11-client-td) || fail "could not read pod x11-client-td's state"
     ev_text pod-after "EV-PIDS: the client pod x11-client-td after the uninstall" "$td_a"
-    ev_diff pod "EV-DIFF: the client pod before and after the uninstall (empty: the same container)" "$td_bf" "$EV_LAST"
+    ev_diff pod "EV-DIFF: the client pod before and after the uninstall" "$td_bf" "$EV_LAST" "nothing: the same container"
     grep -q 'restartCount=0 ' <<<"$td_a" && [ "$td_a" = "$td_b" ] \
         || fail "the client pod changed across the uninstall: '$td_b' -> '$td_a'"
-    wins=$(pod_windows x11-client-td) || fail "the client pod's xterm lost its X connection with the uninstall"
-    ev_text windows-after "EV-STATE: the client pod's X client and its windows after the uninstall" "$wins"
+    wins=$(ev_save windows-after "EV-STATE: the client pod's main process, its X client and its windows after the uninstall" \
+        pod_windows x11-client-td) || fail "the client pod's xterm lost its X connection with the uninstall"
+    ev_diff windows "EV-DIFF: the client pod's main process, X client and windows across the uninstall" "$td_wb" "$(ev_last)" \
+        "nothing: the same process, X client and windows"
     grep -q ' map=IsViewable$' <<<"$wins" || fail "the client pod's window left the screen with the uninstall"
     timeout 20 k3s kubectl exec x11-client-td -- sh -c 'xdpyinfo >/dev/null' \
         || fail "the running client pod can no longer open the display after the uninstall"
@@ -5456,6 +5514,8 @@ soundless() { # before|plugged|realign|played|after
             ev_pass "the container's audio group now equals the host node's gid: $cgid"
             wait_for 45 1 "PipeWire to list the card" sl_card_up
             ev_save wpctl-after "EV-STATE: wpctl status after the restart: the card" sl_wpctl >/dev/null || true
+            ev_diff wpctl "EV-DIFF: wpctl status with no card and after the stack's restart with one" "$(ev_named wpctl-before)" "$EV_LAST" \
+                "PipeWire's cookie and the daemons' pids (the stack restarted to align to the card), wpctl's own row, and the card: its device and sink appear, and the sink becomes the default in place of the Dummy Output"
             ev_pass "PipeWire lists the card after the restart ($(sl_cards) alsa_card Device)"
             ev_end
             ev_begin S4.7.10 "A card that arrives after a soundless boot is openable" T3
@@ -5478,6 +5538,8 @@ soundless() { # before|plugged|realign|played|after
         after)
             ev_begin S7.7.9 "A client that started on a soundless host plays once a card arrives, without restarting" T3
             ev_save client-after "EV-PIDS: the client after it played: id, pid, start, restarts, status" sl_inspect >/dev/null || true
+            ev_diff client "EV-DIFF: the client as it started and after it played" "$(ev_named client-before)" "$EV_LAST" \
+                "nothing: the same container and process, never restarted, still running"
             c0=$(cat /run/ev-sl-client 2>/dev/null || true)
             c1=$(sl_inspect)
             [ -n "$c0" ] && [ "$c1" = "$c0" ] || fail "the client is not the same container and process: $c0 -> $c1"
@@ -5487,7 +5549,8 @@ soundless() { # before|plugged|realign|played|after
                 ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
             d0=$(cat /run/ev-sl-daemons 2>/dev/null || true)
             [ -n "$d0" ] || fail "the daemons' table from before the card is missing"
-            ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons before the card arrived (-) and after the client played (+): the audio daemons are new, the stack having restarted to align to the card; Xorg and mwm are not" "$d0" "$EV_LAST"
+            ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons before the card arrived (-) and after the client played (+)" "$d0" "$EV_LAST" \
+                "the three audio daemons' rows (new: the stack restarted to align to the card); Xorg's and mwm's must not"
             for cm in Xorg mwm; do
                 p0=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$d0") p1=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$EV_LAST")
                 [ -n "$p0" ] && [ "$p0" = "$p1" ] || fail "$cm is not the same process across the card's arrival: ${p0:-none} -> ${p1:-none}"
