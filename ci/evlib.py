@@ -872,8 +872,10 @@ def cmd_gate(args):
         if s["mark"] == "✅" and not passed:
             errors.append(f"{sid}: marked ✅ in Requirements.md but this run has "
                           + ("no evidence for it" if not dirs else "no passing evidence for it"))
-        # S9.3.5: a story run in a VM whose event changes the screen holds a video.
-        if s.get("video") and "T3" in s["tier"] and dirs and not any(has_video(d) for d in dirs):
+        # S9.3.5: a story run in a VM whose event changes the screen holds a
+        # video, in the gate of the workflow that records it (a story another
+        # workflow keeps may leave only its T0 half here).
+        if s.get("video") and "T3" in s["tier"] and not other and dirs and not any(has_video(d) for d in dirs):
             errors.append(f"{sid}: S9.3.5: Requirements.md asks it for EV-VIDEO (its event changes the "
                           "screen), but its evidence holds no video")
         if s["mark"] in ("❌", "🟡") and passed:

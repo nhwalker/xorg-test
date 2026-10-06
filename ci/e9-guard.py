@@ -3559,10 +3559,12 @@ def rule_s935(root, rep):
             f.write("## E9 Planted\n\n### F9.8 Screen events\n\n**Common set**: EV-VIDEO of the display across the event.\n\n"
                     "**S9.8.1 An event that changes the screen, recorded**\n- Tier: T3 · Coverage: ✅ planted\n\n"
                     "**S9.8.2 An event that changes the screen, not recorded**\n- Tier: T3 · Coverage: ✅ planted\n\n"
+                    "**S9.8.3 An event another workflow records, its T0 half here**\n"
+                    "- Tier: T0/T3 · Coverage: ✅ (workflow `maintainer.yml`) planted\n\n"
                     "### F9.9 Quiet events\n\n**S9.9.1 An event that changes nothing on the screen**\n"
                     "- Tier: T3 · Coverage: ✅ planted\n")
         ev = os.path.join(d, "gate")
-        for sid, video in (("S9.8.1", True), ("S9.8.2", False), ("S9.9.1", False)):
+        for sid, video in (("S9.8.1", True), ("S9.8.2", False), ("S9.8.3", False), ("S9.9.1", False)):
             st = evlib.StoryWriter(ev, sid, "planted", "T3", "e9-guard.py")
             st.check(True, "the planted story ran")
             if video:
@@ -3580,7 +3582,8 @@ def rule_s935(root, rep):
         flagged = sorted({e.split(":")[0] for e in errors if "S9.3.5" in e})
         if flagged == ["S9.8.2"]:
             rep.ok("S9.3.5", "ci/evlib.py", 0, "the gate fails a story its document asks to record that holds no video "
-                   "(S9.8.2), and passes one that holds its video (S9.8.1) and one asked for none (S9.9.1)")
+                   "(S9.8.2), and passes one that holds its video (S9.8.1), one another workflow records (S9.8.3) "
+                   "and one asked for none (S9.9.1)")
         else:
             rep.flag("S9.3.5", "ci/evlib.py", 0, "gate", f"the gate's video check flagged {flagged or 'nothing'}, "
                      "want only S9.8.2", "the gate must hold each story whose event changes the screen to a video")
