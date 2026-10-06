@@ -642,6 +642,9 @@ type_check() { # <label>
     if [ -n "$HW_REHEARSE" ]; then ev_note "rehearsal: nobody typed ($1)"; podman exec desktop pkill -f 'xterm -title hw-sink' 2>/dev/null; return 0; fi
     if [ "$got" = "$word" ]; then ev_pass "after the $1 the keyboard types: the sink xterm read '$word'"
     else ev_fail "after the $1 the sink xterm read '${got:-nothing}', not '$word'"; podman exec desktop pkill -f 'xterm -title hw-sink' 2>/dev/null; fi
+    # mwm may focus a new window by itself, so the typing does not prove the
+    # mouse: the tester says whether it moved the pointer and clicked.
+    observe "after the $1 the mouse moves the pointer, and its click raised or focused the xterm"
 }
 
 # The Audio section's device lines in wpctl status ("42. Built-in Audio  [alsa]").
