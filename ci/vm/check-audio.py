@@ -219,7 +219,8 @@ def level_plot(samples, sr, freq, out, marks_i=()):
     write_png(out, w, h, img)
     say(f"check-audio: plot {out}: "
         + (f"the level at {freq:.0f} Hz" if freq is not None else "the broadband (RMS) level")
-        + f", one bar per 0.1 s ({len(levels)} bars), -60..0 dBFS, dashed lines at -20 and -40 dB"
+        + f", one bar per 0.1 s ({len(levels)} bars{': the capture holds no 0.1 s window' if not levels else ''}), "
+        + "-60..0 dBFS, dashed lines at -20 and -40 dB"
         + "".join(f", a red line at {m * 0.1:.1f}s" for m in drawn))
 
 
@@ -240,7 +241,9 @@ for mark in marks:
     else:
         say("check-audio: no mark: the tone never reaches -40 dBFS, so there is nothing to time it from")
 
-if plot_path and left:
+# The picture even of an empty capture: an empty scale shows it held nothing
+# (Requirements.md S9.3.4: every recording is seen as well as judged).
+if plot_path:
     level_plot(left, rate, expected_hz, plot_path, marks_i)
 
 if duration < min_sec:
