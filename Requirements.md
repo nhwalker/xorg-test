@@ -1810,16 +1810,17 @@ and E11, which follow, included); the suite's own history (see comments in
 `ci/`) is the reason each exists.
 
 `ci/e9-guard.py`, in the static job, holds the rules that a read of the tree
-can check: S9.1.2, S9.1.3, S9.1.5, S9.2.1, S9.2.2, S9.2.4, S9.2.5, S9.2.6 and
-S9.3.1's static half, each as its own story with its own evidence. Nothing
-checks the others yet; their Coverage lines say what holds them today.
+can check: S9.1.1's static half, S9.1.2, S9.1.3, S9.1.4, S9.1.5, S9.2.1,
+S9.2.2, S9.2.3, S9.2.4, S9.2.5, S9.2.6 and S9.3.1's static half, each as its
+own story with its own evidence. Nothing checks the others yet; their
+Coverage lines say what holds them today.
 
 ### F9.1 Assertion discipline
 
 **S9.1.1 Every assertion has been seen to fail**
 - Requirement: a new assertion is verified against a deliberate mutation before it is merged.
 - Acceptance: the PR description names the mutation.
-- Tier: T0 · Coverage: ❌ no check reads a pull request's description: the repository has no PR template, and no workflow reads the event's body. The static guards hold the rule for themselves: `ci/client-guard.py`, `ci/e9-guard.py`, `ci/script-list.py` and `ci/layout-keywords.py` each run a self-test first that plants what their checks must flag.
+- Tier: T0 · Coverage: 🟡 the static half. `ci/e9-guard.py --rule S9.1.1`, run by the static job, holds that each tree guard the static job runs (`ci/client-guard.py`, `ci/e9-guard.py`, `ci/script-list.py` and `ci/layout-keywords.py`, named in its GUARDS) runs there with its self-test, which plants what its checks must catch and fails the step if one is missed; that the static job runs no checker GUARDS does not name; and that every e9-guard rule, this one included, plants a violation it must flag and a form it must pass, as client-guard's self-test does. Its self-test flags a workflow that runs client-guard without its self-test and one that runs a checker GUARDS does not name, and passes one that runs all four with theirs. The gap: nothing reads a pull request's description, so whether a pull request names the mutation its new assertions were tried against is unchecked; the repository has no PR template, and no workflow reads the event's body. The guard's output is under `artifacts/S9.1.1/` (artifact `evidence-static`).
 
 **S9.1.2 Assert generated output, not source text**
 - Requirement: quadlet/CDI/config assertions read the *generated* artefact, anchored so comments cannot match.
@@ -1831,7 +1832,7 @@ checks the others yet; their Coverage lines say what holds them today.
 
 **S9.1.4 Poll log lines; read live state once**
 - Requirement: a log-line assertion is polled; process/socket state may be read directly.
-- Tier: T0 · Coverage: ❌ no check finds a log line read once where it must be polled. Some reads poll (`vm-guest.sh` polls the journal where it documents the journal's lag), but an audit counted about 43 one-shot reads of `podman logs`, `journalctl` or `kubectl logs` that feed an assertion, 16 of them confirmed by reading the code.
+- Tier: T0 · Coverage: ✅ `ci/e9-guard.py --rule S9.1.4`, run by the static job, finds every read of a container log, the journal or a pod log in the shell scripts under `ci/` (`podman logs`, `journalctl`, `kubectl logs`, and the helpers whose own output is one, such as `desktop_log` or `sl_clog`) whose text an assertion reads, and requires it polled: through `ci/evidence.sh`'s `log_wait`, which runs the read until a line matches and hands back all of what it read; in a polling loop (a `for` over `$(seq …)` or `((…))`, a `while` or an `until`) or a function `wait_for` or `log_wait` runs; or after a poll of the same log earlier in its function (or within the 20 commands before, at a script's top level), the log then current to the line polled for. That last form is how an absence is read: after a line the same stream writes later (the X server's banner after `setsid -c`'s complaint; desktop-init's session-exit line after a postmortem). Where no such line exists the absent line itself is polled for a few seconds, `log_wait`'s failure the pass: the session-leader warning (desktop-init says nothing when its check passes), and a converged seat-prep's silence (systemd's own "Finished" line is no marker for it: journald reads a unit's output and systemd's messages from different sockets). A read kept only as evidence, or not asserted on, is listed and passes; one ALLOW entry excuses the smoke's journal cursor, the journal's position rather than a line. Its self-test flags four planted reads (a container log, a count from the journal, a helper, a pod log in a function) and passes five (through `log_wait`, in a polling loop, kept as evidence, an absence after a poll of the same log, a function `wait_for` runs). It found 47 reads taken once (`vm-guest.sh` 20, `smoke-deploy.sh` 12, `maint-guest.sh` 8, `ci/hw/acceptance.sh` 6, `vm-e2e.sh` 1); each now waits for the line that carries its verdict, then asserts as before. The Python harness and the Xorg log, read as a file, are not judged. The guard's output is under `artifacts/S9.1.4/` (artifact `evidence-static`).
 
 **S9.1.5 No early-exiting reader (`grep -q`, `grep -m`, `head`) on a live pipeline under `pipefail`**
 - Requirement: capture output to a variable first.
@@ -1849,7 +1850,7 @@ checks the others yet; their Coverage lines say what holds them today.
 
 **S9.2.3 Failures are diagnosable from the job log**
 - Requirement: every failure handler tees diagnostics to stdout as well as to an artifact; the failing message is repeated last.
-- Tier: T0 · Coverage: ❌ no check that a failure is diagnosable from the job log. `vm-guest.sh`'s `fail` prints its diagnostics to the log and into the open story's evidence, and repeats the message last; an audit found 23 places where a failing command ends a shell script under `errexit` with no message, about 9 checks in `ci.yml` that fail without one, and three failure handlers missing a part.
+- Tier: T0 · Coverage: ✅ `ci/e9-guard.py --rule S9.2.3`, run by the static job, holds each kind of failure handler to the requirement, judged by its shape. Each `fail()` that ends a script (`vm-guest.sh`, `vm-e2e.sh`, `smoke-deploy.sh`, `base-rebuild.sh`) prints its message, captures diagnostics, prints them, keeps them in the open story (`ev_text`) and prints the message again, last. A script under `errexit` reports a command that fails where nothing handles it: `set -E` and an ERR trap whose handler reports through `fail()`, or a FAIL line where there is no `fail()` (`build-bases.sh`, `helm-assertions.sh`). The rule runs each script's own handler and trap against handled failures (a condition, an `||` list, a substitution that goes on past a failure, a function called as a condition), which stay quiet, and one unhandled failure, reported once with its command, its line and its status. `vm-guest.sh` reports only inside a story: outside one it answers the host, whose probes poll on its status, and the host's own `fail()` prints the guest's diagnostics. A script or workflow step that counts its failures and goes on repeats them before it fails on the count (`ci/evidence.sh`'s `ev_failures`, a `printf` of the array that keeps them, or a `fail()` naming the list), and a check at a workflow step's top level (`test`, `[`, `grep`, `cmp`, `diff`, a `podman run`) says why it failed. The rule also runs `ev_save`, which prints the end of a failed command's output to the log as well as keeping all of it, and `ev_failures`, and requires `operator-e2e.py`'s diagnostics, kept in a failed story, to be printed too. Its self-test flags six planted files and passes five. On the tree before, it found 40: no ERR trap in the six scripts under `errexit`, three `fail()`s with no diagnostics and no repeat, eleven counts of failures not repeated, eighteen checks in `ci.yml` that ended a step saying nothing (three of them also among the counts), and the two that kept diagnostics out of the log (`ev_save`, `operator-e2e.py`); each is fixed. `ci/client-guard.py` and `ci/e9-guard.py` print their violations again, last. The guard's output is under `artifacts/S9.2.3/` (artifact `evidence-static`).
 
 **S9.2.4 Probes yield integers, or fail**
 - Requirement: a count read from the guest is an integer, or a failed read: a poll retries it, a one-shot read fails the story with a message. No number stands in for a failed read: a `0` for one can pass a check that a count dropped, or start a log slice at the top of the log.
@@ -2344,10 +2345,10 @@ counted since its stories got Coverage lines (2026-10-06).
 | E5 Deploy tree | 50 | 49 | 0 | 0 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 40 | 0 | 0 | 0 |
-| E9 Test-suite quality | 17 | 9 | 0 | 8 | 0 |
+| E9 Test-suite quality | 17 | 11 | 1 | 5 | 0 |
 | E10 Maintainer experience | 23 | 22 | 0 | 0 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **268** | **254** | **0** | **8** | **6** |
+| **Total** | **268** | **256** | **1** | **5** | **6** |
 
 Regenerate after editing with:
 
