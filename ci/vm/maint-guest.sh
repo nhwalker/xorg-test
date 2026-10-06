@@ -1345,7 +1345,7 @@ mt_drm_diagnose() {
     fi
     out=$(mt_saved "$(mt_get S10.5.1-log-held)")
     if grep -q 'postmortem: LIKELY CAUSE: another process holds DRM master' <<<"$out"; then
-        ev_pass "the postmortem names the cause: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+        ev_pass "the postmortem names the cause: $(grep -m1 'postmortem: LIKELY CAUSE: another process holds DRM master' <<<"$out" | sed 's/.*postmortem: //')"
     else
         ev_fail "the desktop's log has no postmortem naming another DRM master"
     fi
@@ -1625,10 +1625,13 @@ mt_gid_diagnose() {
     out=$(ev_save align-lines "EV-PROCEDURE: the entry's check, as it writes it: \`podman logs desktop\` for \`align-device-groups\` lines" \
         sh -c 'podman logs desktop 2>&1 | grep align-device-groups') || true
     out=$(mt_saved "$(mt_get S10.5.4-log-staged)")
+    # The line itself, not the log's first LIKELY CAUSE: the container can
+    # hold an earlier fault's postmortems (S10.5.1's DRM holder, staged in it
+    # before this one).
     if grep -q 'postmortem: LIKELY CAUSE: device group permissions' <<<"$out"; then
-        ev_pass "the postmortem names the cause: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+        ev_pass "the postmortem names the cause: $(grep -m1 'postmortem: LIKELY CAUSE: device group permissions' <<<"$out" | sed 's/.*postmortem: //')"
     else
-        ev_fail "the desktop's log has no postmortem naming device group permissions: $(grep -m1 'LIKELY CAUSE' <<<"$out" | sed 's/.*postmortem: //')"
+        ev_fail "the desktop's log has no postmortem naming device group permissions; its last: $(grep 'LIKELY CAUSE' <<<"$out" | tail -n 1 | sed 's/.*postmortem: //')"
     fi
     out=$(ev_save named "EV-PROCEDURE: the commands the postmortem names, in the container: id desktop; ls -ln /dev/dri /dev/input" \
         sh -c 'podman exec desktop id desktop; podman exec desktop ls -ln /dev/dri /dev/input') || true
