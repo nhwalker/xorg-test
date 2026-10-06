@@ -1811,9 +1811,11 @@ and E11, which follow, included); the suite's own history (see comments in
 
 `ci/e9-guard.py`, in the static job, holds the rules that a read of the tree
 can check: S9.1.1's static half, S9.1.2, S9.1.3, S9.1.4, S9.1.5, S9.2.1,
-S9.2.2, S9.2.3, S9.2.4, S9.2.5, S9.2.6 and S9.3.1's static half, each as its
-own story with its own evidence. Nothing checks the others yet; their
-Coverage lines say what holds them today.
+S9.2.2, S9.2.3, S9.2.4, S9.2.5, S9.2.6 and the static halves of S9.3.1, S9.3.2
+and S9.3.3, each as its own story with its own evidence. Their run-time
+halves are `ci/evlib.py`'s `check` and `gate`, which read every story
+directory a run leaves. Nothing checks the others yet; their Coverage lines
+say what holds them today.
 
 ### F9.1 Assertion discipline
 
@@ -1873,11 +1875,11 @@ Coverage lines say what holds them today.
 
 **S9.3.2 Before/after pairs are diffed, not eyeballed**
 - Requirement: every EV-STATE pair ships with its `diff -u`, and the index states which lines are expected to differ.
-- Tier: T0 · Coverage: ❌ no check that each before/after pair has its diff: the harness makes one with `ev_diff` (`ci/evidence.sh`) where it calls it, and the gate does not look for pairs without one.
+- Tier: T0 · Coverage: ✅ at run time, `ci/evlib.py`'s `check` and `gate` (`ci.yml`'s `coverage-gate` job, `maintainer.yml`'s gate, `base-rebuild.yml`'s check) read every story directory. Each before/after pair (two text files whose names differ in one word, `before` against `after`) has a diff comparing them. Each diff names the two files it compares (a `---`/`+++` header, or "no differences between A and B"), and its line in the index says which lines are expected to differ (`; expected to differ: …`, which `ev_diff`, `ev_diff_paths` and `Ctx`'s diffs write from their last argument). A diff expected to differ in nothing (`nothing`, or `nothing: why`) must be empty. At T0, `ci/e9-guard.py --rule S9.3.2` checks that each of the 203 places in the harness that write a diff passes its expectation, and runs the gate's check on five planted story directories: it fails a pair with no diff, a diff that states no expectation, one expected to differ in nothing that differs and one that names neither file, and passes a pair diffed with its expectation. On batch 12b's evidence the check found 340 diffs that did not say what they may differ in (253 in `ci.yml`'s, 87 in `maintainer.yml`'s), 90 pairs with no diff (71 and 19) and 13 Python diffs that named neither file; this batch's runs (`ci.yml` 37445408722, `maintainer.yml` 37445404359) leave none. A pair is found by its files' names: states the harness compares under other names (`pids-running` and `pids-restarted`) are diffed where it compares them, but the gate does not look for them. The guard's output is under `artifacts/S9.3.2/` (artifact `evidence-static`).
 
 **S9.3.3 "No restart" is measured**
 - Requirement: a claim that a container or process survived an event carries its container id / `restartCount` / pid before and after.
-- Tier: T0 · Coverage: ❌ no check: nothing lists the stories that claim a survival, or checks that each carries the container id, restart count and pids from before and after.
+- Tier: T0 · Coverage: ✅ at run time, the same `check` and `gate` read each passing check that says a container or process lived through an event (the same container or process, kept its pid, not restarted, `restartCount 0`, and the other words the harness's checks use for it; a check that something did not survive is not one). Its story must hold two states of the pids, or, for a claim about a container or pod, of the container's id and restart count: a pair named `before` and `after`, or the two files a diff compares. At T0, `ci/e9-guard.py --rule S9.3.3` finds the 66 such claims in the harness (`ev_pass`, `ev_check`, `StoryWriter.check`) and checks that each is made in a story (the shell) or a function (the Python) that diffs two states. It also runs the gate's check on seven planted directories: it fails a container's survival with nothing kept and one with only a process's pid kept, and passes a container's id and restart count, a process's pid, two listings a diff compares, a check that something did not survive and a failing check. On batch 12b's evidence it found five stories whose claims nothing measured. Each now keeps and diffs the two states: S5.3.2's logind MainPID across seat-prep's second run (the smoke); S3.9.12's desktop processes before its first hotplug cycle and after its fifth; S11.1.2's and S11.1.3's, from the story's start to its end; and S10.5.3's client container, recorded after the remedy as well as before. S5.3.1's "logind started once" also compares the pid logind's own first journal line this boot carries with its MainPID now. The check reads the words a claim uses, so a claim worded otherwise is not seen. The guard's output is under `artifacts/S9.3.3/` (artifact `evidence-static`).
 
 **S9.3.4 Audio evidence is audible and visible**
 - Requirement: every EV-AUDIO/EV-AUDIO-REC is a WAV plus a spectrogram (or, where no spectrogram tool is installed, the harness's level plot at the story's pitch with each event marked) plus the analyser verdict; distinct frequencies per source as listed in the evidence standard.
@@ -2166,7 +2168,7 @@ EV-PIDS for Xorg, mwm and any client application involved; EV-TIMELINE.
 - Requirement: an operator whose pointer is gone (a KVM that dropped the mouse) can still manage windows through the `.mwmrc` bindings: `Alt+Tab` and `Alt+Shift+Tab` move keyboard focus between windows, `Shift+Escape` and `Alt+Space` post the window menu, and the window menu's accelerators act on the focused window (`Alt+F9` minimize, `Alt+F4` close). `Alt+Tab` cycles icons as well as windows. A window menu posted from the keyboard appears at the top-left corner of the focused window's client area, or just above a focused icon, and its entries can also be chosen by mnemonic (R for Restore).
 - Acceptance: two xterms on screen, one of them from a client pod, and no pointer events after setup; `Alt+Tab` moves focus (the frame colours swap, by S3.5.3's samples, and typed text lands in the newly focused window); `Shift+Escape` shows the window menu (EV-SHOT); `Alt+F9` iconifies the focused window and the window menu's Restore brings it back (`Alt+Tab` to the icon, `Shift+Escape`, R); `Alt+F4` closes the local xterm (its pid exits), and focus can then be moved to the remaining window by keyboard. The local xterm is the session's own: nothing starts another, and the session carries on without a terminal until the operator opens one.
 - Evidence: EV-SHOT per step with sampled frame colours; the sink files; the EV-QEMU transcript of the key events; EV-PIDS.
-- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_3`, the last clause included: 5 s after `Alt+F4` no xterm has taken the session's place (the window tree is saved), and Xorg and mwm keep their pids from `pids-start` to `pids-end`. Recorded on the e2e VM: after `Alt+F9`, and again after `Alt+F4`, mwm put the keyboard focus on the remaining window, and one `Alt+Tab` then reached the icon.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s11_1_3`, the last clause included: 5 s after `Alt+F4` no xterm has taken the session's place (the window tree is saved), and Xorg and mwm keep their pids from `pids-before` to `pids-after`, the two listings diffed. Recorded on the e2e VM: after `Alt+F9`, and again after `Alt+F4`, mwm put the keyboard focus on the remaining window, and one `Alt+Tab` then reached the icon.
 
 ### F11.2 Working across applications
 
@@ -2345,10 +2347,10 @@ counted since its stories got Coverage lines (2026-10-06).
 | E5 Deploy tree | 50 | 49 | 0 | 0 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 40 | 0 | 0 | 0 |
-| E9 Test-suite quality | 17 | 11 | 1 | 5 | 0 |
+| E9 Test-suite quality | 17 | 13 | 1 | 3 | 0 |
 | E10 Maintainer experience | 23 | 22 | 0 | 0 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **268** | **256** | **1** | **5** | **6** |
+| **Total** | **268** | **258** | **1** | **3** | **6** |
 
 Regenerate after editing with:
 
@@ -2372,17 +2374,17 @@ reused by every story. Each story's directory is written in one format
 | `ev_begin <story> <title> [tier]` / `ev_end [reason]` / `ev_abort <reason>` | `ci/evidence.sh`, any shell tier | opens `artifacts/<story>/` and its `meta.tsv`; settles PASS/FAIL and renders `evidence.md`; `ev_abort` is what `fail()` calls, so a red story is still written |
 | `ev_check <claim> <cmd…>` / `ev_pass` / `ev_fail` | `ci/evidence.sh` | one line in `checks.tsv` per assertion, in order |
 | `ev_note <text>` | `ci/evidence.sh` | observed and recorded, deliberately not asserted (`notes.tsv`) |
-| `ev_save <moment> <what> <cmd…>` | `ci/evidence.sh` | runs the command and keeps the command line, its output (stderr included) and its exit status as the next numbered file (EV-STATE, EV-LOG-*); `$EV_LAST` names the file for a later `ev_diff` |
-| `ev_text`, `ev_copy`, `ev_diff`, `ev_attach` | `ci/evidence.sh` | text already in hand, a copied file (EV-CONFIG), `diff -u` of two kept files (EV-DIFF), a file already written |
+| `ev_save <moment> <what> <cmd…>` | `ci/evidence.sh` | runs the command and keeps the command line, its output (stderr included) and its exit status as the next numbered file (EV-STATE, EV-LOG-*); `$EV_LAST` names the file for a later `ev_diff`, `ev_last` prints it for a capture inside `$(…)`, and `ev_named <moment>` finds an earlier file by its moment, for a story a later phase reopens |
+| `ev_text`, `ev_copy`, `ev_diff`, `ev_attach` | `ci/evidence.sh` | text already in hand, a copied file (EV-CONFIG), `diff -u` of two kept files (EV-DIFF; its last argument, the lines expected to differ, goes into its index line), a file already written |
 | `EV_SIDE=h-` | `ci/evidence.sh` | a VM story written from the guest and the host at once; the host's files carry an `h` prefix |
-| `StoryWriter` | `ci/evlib.py` | the same, from Python; the operator phase's `Story` builds on it and adds `qemu.log`, its QMP transcript |
-| `Ctx.shot`, `Ctx.video`, `Ctx.pids`, `Ctx.diff`, `Ctx.save_cmd`, `Ctx.diagnostics` | `ci/vm/operator-e2e.py` | EV-SHOT, EV-VIDEO (frames, index, gif), EV-PIDS, EV-DIFF with both sides kept, command output, and the failure shot, tree, process table and desktop log |
+| `StoryWriter` | `ci/evlib.py` | the same, from Python (`.last` names the file it attached last); the operator phase's `Story` builds on it and adds `qemu.log`, its QMP transcript |
+| `Ctx.shot`, `Ctx.video`, `Ctx.pids`, `Ctx.diff`, `Ctx.save_cmd`, `Ctx.diagnostics` | `ci/vm/operator-e2e.py` | EV-SHOT, EV-VIDEO (frames, index, gif), EV-PIDS, EV-DIFF with both sides kept (`Ctx.diff`; `diff_kept` and `diff_named` for sides already kept; each takes `expect=`, the lines expected to differ), command output, and the failure shot, tree, process table and desktop log |
 | `ev_shot <moment> <what>` | `ci/vm/vm-e2e.sh` (host) | QEMU screendump into the open story |
 | `guest_ev <root\|""> <phase…>`, `ev_pull` | `ci/vm/vm-e2e.sh` (host) | runs a `vm-guest.sh` phase with evidence on and copies the guest's story directories back |
 | `ev_audio_start <moment> <hz>` / `ev_audio_stop <what> <secs> <peak> <hz>`, `ev_audio_check` | `ci/vm/vm-e2e.sh` (host) | `wavcapture` straight into the open story; on stop the WAV is indexed and `check-audio.py --report --plot` keeps its verdict and a level plot at the story's pitch beside it |
 | `QMP_TRANSCRIPT=<file>` | `ci/vm/qmp-type.py` | writes every QMP command it sends, timestamped (EV-QEMU) |
 | `write_manifest` | `ci/vm/vm-e2e.sh` (host) | `run.json`: image ids, QEMU, guest kernel and podman versions, git sha, date |
-| `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance); holds the ✅ marks in this document to the run's evidence |
+| `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance), that its pairs are diffed and its diffs say what they may differ in (S9.3.2), and that its survival claims are measured (S9.3.3); holds the ✅ marks in this document to the run's evidence |
 
 **Still to build** (the stories that name them stay ❌ until they exist):
 
