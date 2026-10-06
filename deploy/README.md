@@ -295,10 +295,10 @@ restorecon -R /etc/systemd /etc/ssh /etc/desktop-container \
 rsync-specific step.)
 
 `--chown=root:root` matters: `rsync -a` would otherwise preserve the repo
-checkout's owner on files under `/etc`. `-a` also copies the two symlinks
-in the tree as symlinks — keep that in mind if your provisioning tool
-flattens links (`default.target` and the `getty@tty1.service` mask are
-symlinks, see below).
+checkout's owner on files under `/etc`. `-a` also copies the symlinks in
+the tree as symlinks — keep that in mind if your provisioning tool
+flattens links (`default.target`, the `getty@tty1.service` mask and the
+five user-unit masks under `etc/systemd/user` are symlinks, see below).
 
 A reboot is the clean path and the honest production test — everything is
 wired into the boot transaction, and a host that only works after manual
@@ -323,6 +323,7 @@ point of the declarative form — the file list above *is* the state).
 | `etc/containers/systemd/desktop.container` | the quadlet unit that becomes `desktop.service`; `[Install]` is honored by the quadlet generator, so there is no `systemctl enable` |
 | `etc/systemd/system/default.target` → `multi-user.target` | the default boot target, as a symlink rather than `systemctl set-default` |
 | `etc/systemd/system/getty@tty1.service` → `/dev/null` | masks the getty (frees the VT), as a symlink rather than `systemctl mask` |
+| `etc/systemd/user/{pipewire,pipewire-pulse}.{socket,service}`, `etc/systemd/user/wireplumber.service` → `/dev/null` | masks a host PipeWire server in every user session (the container owns `/dev/snd`). `alsa-plugins-pulseaudio` pulls `pipewire-pulseaudio` and `wireplumber` in on EL9, and systemd's user presets enable their sockets and WirePlumber for every user. The desktop user's host login session would then listen on `/run/user/61000/pipewire-0` and `/run/user/61000/pulse/native`, the paths the container's PipeWire serves in the same runtime dir, and socket activation would start a second server and session manager the moment a client connects. Masks rather than package removals: the tree states the end state, whatever the host's packages pulled in |
 | `etc/systemd/logind.conf.d/50-desktop-container.conf` | logind `NAutoVTs=0` / `ReserveVT=0` drop-in |
 | `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix`; `/dev/snd` so its bind mount resolves on a soundless host |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
