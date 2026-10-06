@@ -141,7 +141,32 @@ restart_desktop() { # <moment>
 xorg_lines() { podman exec desktop sh -c "wc -l < $XORG_LOG" 2>/dev/null || echo 0; }
 xorg_since() { podman exec desktop sh -c "tail -n +$(( $1 + 1 )) $XORG_LOG"; }
 nvidia_host() { [ -e /dev/nvidiactl ] || grep -q '^nvidia ' /proc/modules; }
-spec_is_stub() { grep -q NVIDIA_CDI_STUB "$SPEC" 2>/dev/null; }
+# The checks below read generated files (the CDI spec, 20-gpu.conf, the
+# quadlet's unit) by their content lines only: the generators write comments
+# too, and quadlet copies the .container's comments into the unit, its
+# commented nvidia_drv.so Volume= lines among them (Requirements.md S9.1.2).
+# A command's output is captured before a reader that stops early sees it: a
+# producer killed by SIGPIPE would fail the pipeline under pipefail (S9.1.5).
+spec_is_stub() { grep -qE '^[[:space:]]*-[[:space:]]*NVIDIA_CDI_STUB=1' "$SPEC" 2>/dev/null; }
+# stdin: a 20-gpu.conf; $1: the driver its Device section names.
+conf_driver_is() { grep -qE "^[[:space:]]*Driver[[:space:]]+\"$1\""; }
+# stdin: a 20-gpu.conf; $1: a module directory one of its ModulePath lines names.
+conf_has_modpath() { awk -v d="\"$1\"" '$1 == "ModulePath" && $2 == d {f = 1} END {exit !f}'; }
+# stdin: `systemctl cat desktop.service`. A drop-in's Volume= lines reach the
+# container as ExecStart's -v arguments, which is what this reads.
+unit_has_x_driver() { grep -qE '^ExecStart=.*nvidia_drv\.so'; }
+# $1: a CDI spec; the driver version its versioned library paths carry.
+spec_version() {
+    local v
+    v=$(grep -m1 -oE 'libnvidia-glcore\.so\.[0-9][0-9.]*' "$1" 2>/dev/null)
+    v=${v%%$'\n'*}
+    printf '%s' "${v#libnvidia-glcore.so.}"
+}
+glx_is_nvidia() {
+    local g
+    g=$(xq glxinfo -B 2>/dev/null) || return 1
+    grep -qi 'OpenGL vendor string: *NVIDIA' <<<"$g"
+}
 gpu_lines() { podman logs desktop 2>&1 | grep -E 'xorg-gpu-conf|preflight:'; }
 
 # --- staging, and undoing it ---------------------------------------------------
@@ -215,7 +240,7 @@ gpu_mode_checks() { # the GPU mode, into the open story; sets GPU_CONF GPU_LOG G
     if spec_is_stub; then ev_fail "the CDI spec is the stub (NVIDIA_CDI_STUB): the toolkit made no real spec"
     else ev_pass "the CDI spec is a real one, not the stub"; fi
     GPU_CONF=$(ev_save gpu-conf "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf in the desktop" podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || true
-    if grep -q 'Driver *"nvidia"' <<<"$GPU_CONF"; then ev_pass '20-gpu.conf says Driver "nvidia"'
+    if conf_driver_is nvidia <<<"$GPU_CONF"; then ev_pass '20-gpu.conf says Driver "nvidia"'
     else ev_fail '20-gpu.conf does not say Driver "nvidia"'; fi
     GPU_LOG=$(ev_save gpu-log "EV-LOG-DESKTOP: podman logs desktop | grep -E 'xorg-gpu-conf|preflight:'" gpu_lines) || true
     if grep -q 'preflight: PASS: NVIDIA GPU injected together with X driver module' <<<"$GPU_LOG"; then
@@ -224,8 +249,8 @@ gpu_mode_checks() { # the GPU mode, into the open story; sets GPU_CONF GPU_LOG G
     GPU_GLX=$(ev_save glxinfo "EV-STATE: glxinfo -B in the desktop" xq glxinfo -B) || true
     if grep -qi 'OpenGL vendor string: *NVIDIA' <<<"$GPU_GLX"; then ev_pass "glxinfo -B: $(grep -m1 -i 'OpenGL renderer' <<<"$GPU_GLX")"
     else ev_fail "glxinfo -B does not report NVIDIA: $(grep -m1 -i 'OpenGL vendor' <<<"$GPU_GLX")"; fi
-    ev_save unit "EV-STATE: systemctl cat desktop.service | grep -E '^Image=|nvidia'" \
-        sh -c "systemctl cat desktop.service | grep -E '^Image=|nvidia'" >/dev/null
+    ev_save unit "EV-STATE: systemctl cat desktop.service: its Image= and ExecStart= lines and the other uncommented lines naming nvidia" \
+        sh -c "systemctl cat desktop.service | grep -E '^(Image|ExecStart)=|^[^#;]*nvidia'" >/dev/null
 }
 gpu_mode() {
     local photo moddir
@@ -243,10 +268,11 @@ gpu_mode() {
     ev_text gpu-conf "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf, the file xorg-gpu-conf.sh generated (S8.1.1's run)" "$GPU_CONF"
     ev_text gpu-log "EV-LOG-DESKTOP: xorg-gpu-conf.sh's evidence lines and decision (S8.1.1's run)" "$(grep xorg-gpu-conf <<<"$GPU_LOG")"
     ev_text glxinfo "EV-STATE: glxinfo -B in the desktop (S8.1.1's run)" "$GPU_GLX"
-    if grep -q 'Driver *"nvidia"' <<<"$GPU_CONF"; then ev_pass '20-gpu.conf says Driver "nvidia"'
+    if conf_driver_is nvidia <<<"$GPU_CONF"; then ev_pass '20-gpu.conf says Driver "nvidia"'
     else ev_fail '20-gpu.conf does not say Driver "nvidia"'; fi
-    moddir=$(sed -n 's/.*decision: NVIDIA driver (module dir \(.*\))$/\1/p' <<<"$GPU_LOG" | head -n1)
-    if [ -n "$moddir" ] && grep -q "ModulePath *\"$moddir\"" <<<"$GPU_CONF"; then
+    moddir=$(sed -n 's/.*decision: NVIDIA driver (module dir \(.*\))$/\1/p' <<<"$GPU_LOG")
+    moddir=${moddir%%$'\n'*}
+    if [ -n "$moddir" ] && conf_has_modpath "$moddir" <<<"$GPU_CONF"; then
         ev_pass "a ModulePath covers the injected nvidia_drv.so: $moddir"
     else ev_fail "no ModulePath for the injected nvidia_drv.so's directory (${moddir:-not in the log})"; fi
     if grep -qi 'OpenGL vendor string: *NVIDIA' <<<"$GPU_GLX"; then ev_pass "glxinfo -B reports NVIDIA"
@@ -284,7 +310,7 @@ no_xdriver() {
     restart_desktop restart-staged || ev_fail "the desktop did not come back after the restart"
     conf=$(ev_save gpu-conf "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf in the desktop" podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || true
     log=$(ev_save gpu-log "EV-LOG-DESKTOP: podman logs desktop | grep -E 'xorg-gpu-conf|preflight:'" gpu_lines) || true
-    if grep -q 'Driver *"modesetting"' <<<"$conf"; then ev_pass "20-gpu.conf takes the modesetting branch"
+    if conf_driver_is modesetting <<<"$conf"; then ev_pass "20-gpu.conf takes the modesetting branch"
     else ev_fail "20-gpu.conf is not the modesetting branch"; fi
     if grep -q 'warning: NVIDIA device nodes present but no nvidia_drv.so was injected' <<<"$log" \
        && grep -q 'warning: falling back to modesetting' <<<"$log"; then
@@ -308,10 +334,10 @@ no_xdriver() {
     undo_later "rm -f '$DROPIN'; systemctl daemon-reload; systemctl restart desktop.service"
     ev_copy "$DROPIN" dropin "EV-CONFIG: the fallback drop-in, from the quadlet's commented Volume= lines"
     ev_save daemon-reload "EV-PROCEDURE: systemctl daemon-reload" systemctl daemon-reload >/dev/null || true
-    unit=$(ev_save unit "EV-STATE: systemctl cat desktop.service: the merged Volume= lines (quadlet merges drop-ins from podman 5.0)" \
-        sh -c "systemctl cat desktop.service | grep -E 'nvidia_drv|libglxserver'") || true
-    if grep -q nvidia_drv <<<"$unit"; then ev_pass "the generated unit carries the drop-in's X driver volumes"
-    else ev_fail "the generated unit does not carry the drop-in (podman $(podman --version | awk '{print $3}'); quadlet merges drop-ins only from 5.0)"; fi
+    unit=$(ev_save unit "EV-STATE: systemctl cat desktop.service with the drop-in: the drop-in's Volume= lines reach ExecStart as -v (quadlet merges drop-ins from podman 5.0)" \
+        systemctl cat desktop.service) || true
+    if unit_has_x_driver <<<"$unit"; then ev_pass "the generated unit's ExecStart carries the drop-in's X driver volume"
+    else ev_fail "the generated unit's ExecStart does not carry the drop-in (podman $(podman --version | awk '{print $3}'); quadlet merges drop-ins only from 5.0)"; fi
     restart_desktop restart-fallback || ev_fail "the desktop did not come back with the fallback"
     glx=$(ev_save glxinfo "EV-STATE: glxinfo -B with the fallback" xq glxinfo -B) || true
     if grep -qi 'OpenGL vendor string: *NVIDIA' <<<"$glx"; then ev_pass "with the fallback glxinfo -B reports NVIDIA again"
@@ -326,11 +352,12 @@ no_xdriver() {
     # Back as it was: NVIDIA mode where the X driver was staged away, the
     # older toolkit's modesetting where it was installed that way.
     if [ "$staged" = yes ]; then
-        if wait_desktop 120 && xq glxinfo -B 2>/dev/null | grep -qi 'OpenGL vendor string: *NVIDIA'; then
+        if wait_desktop 120 && glx_is_nvidia; then
             ev_pass "undone: the toolkit's own spec back, the desktop in NVIDIA mode"
         else ev_fail "after undoing, the desktop is not back in NVIDIA mode"; fi
     else
-        if wait_desktop 120 && podman exec desktop grep -q 'Driver *"modesetting"' /etc/X11/xorg.conf.d/20-gpu.conf; then
+        if wait_desktop 120 && conf=$(podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) \
+           && conf_driver_is modesetting <<<"$conf"; then
             ev_pass "undone: the drop-in gone, the desktop back on modesetting as installed"
         else ev_fail "after undoing, the desktop is not back as it was"; fi
     fi
@@ -357,7 +384,7 @@ stub_toolkit() {
     if spec_is_stub; then ev_pass "desktop-cdi-refresh wrote the stub"; else ev_fail "the spec is not the stub"; fi
     restart_desktop restart-stub || ev_fail "the desktop did not come up on the stub"
     conf=$(ev_save gpu-conf "EV-CONFIG: 20-gpu.conf in the desktop" podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || true
-    if grep -q 'Driver *"modesetting"' <<<"$conf"; then ev_pass "the desktop came up on modesetting"; else ev_fail "20-gpu.conf is not modesetting"; fi
+    if conf_driver_is modesetting <<<"$conf"; then ev_pass "the desktop came up on modesetting"; else ev_fail "20-gpu.conf is not modesetting"; fi
     hpf=$(ev_save host-preflight "EV-STATE: desktop-preflight on the host" desktop-preflight) || true
     if grep -q 'FAIL: STUB CDI spec but NVIDIA hardware present' <<<"$hpf"; then ev_pass "the host preflight FAILs: STUB CDI spec but NVIDIA hardware present"
     else ev_fail "the host preflight does not FAIL on the stub with hardware"; fi
@@ -426,7 +453,7 @@ no_modeset() {
     restored)
         ev_begin S8.1.3 "NVIDIA host without nvidia_drm.modeset=1 and no injection" T4
         ev_save args-after "EV-STATE: the default kernel's arguments after the undo" grubby --info=DEFAULT >/dev/null || true
-        if wait_desktop 120 && ! spec_is_stub && xq glxinfo -B 2>/dev/null | grep -qi 'OpenGL vendor string: *NVIDIA'; then
+        if wait_desktop 120 && ! spec_is_stub && glx_is_nvidia; then
             ev_pass "undone: the host is back in NVIDIA mode after the reboot"
         else ev_fail "after the undo and reboot the host is not back in NVIDIA mode"; fi
         rm -f "$phase_f" "$HW_STATE/S8.1.3.args" "$HW_STATE/S8.1.3.ctk"
@@ -440,8 +467,11 @@ stale_spec() {
     local ver real stale jr out
     nvidia_host || { say "S5.4.3 needs an NVIDIA host with a real spec."; return 1; }
     spec_is_stub && { say "S5.4.3 needs a real spec; this one is the stub."; return 1; }
-    ver=$(grep -oE 'libnvidia-glcore\.so\.[0-9][0-9.]*' "$SPEC" | head -n1 | sed 's/^libnvidia-glcore\.so\.//')
-    [ -n "$ver" ] || ver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)
+    ver=$(spec_version "$SPEC")
+    if [ -z "$ver" ]; then
+        ver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null)
+        ver=${ver%%$'\n'*}
+    fi
     [ -n "$ver" ] || { say "could not tell the driver version from the spec or nvidia-smi"; return 1; }
     say "S5.4.3 stages what a driver update leaves behind: the spec's versioned paths ($ver) point at files that are gone. nvidia-ctk is set aside meanwhile so the desktop's restart cannot regenerate it. Then README.md's remedy."
     yes_no "Stage it?" || return 1
@@ -540,13 +570,14 @@ capture_layout() {
 # behind the KVM, so the cycle runs on a timer: switch away when told, come
 # back when told, and the script samples the connectors meanwhile.
 video_cycle() { # <story> <title> <what the tester does>
-    local story=$1 how=$3 x0 x1 t0 t1 lines secs=${HW_AWAY:-30}
+    local story=$1 how=$3 x0 x1 t0 t1 lines conf secs=${HW_AWAY:-30}
     wait_desktop 30 || say "the desktop is not up"
     grep -qE '^[^#[:space:]]+[[:space:]]+[0-9]+x[0-9]+' /etc/desktop-container/monitors.conf \
         || { say "$story needs a declared layout: run S8.2.3 first and keep its capture."; return 1; }
     story_begin "$story" "$2" T4
     if [ "$story" = S3.4.5 ]; then
-        podman exec desktop grep -q 'Driver *"nvidia"' /etc/X11/xorg.conf.d/20-gpu.conf \
+        conf=$(podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf 2>/dev/null)
+        conf_driver_is nvidia <<<"$conf" \
             || { ev_abort "S3.4.5's T4 half is the NVIDIA driver's: this desktop is not on it"; return 1; }
     fi
     ev_save gpu-conf "EV-CONFIG: 20-gpu.conf: the driver this cycle runs on" podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf >/dev/null || true
@@ -642,7 +673,7 @@ kvm_input() {
 # Typing through the keyboard the KVM just gave back, into a sink xterm.
 type_check() { # <label>
     local word got
-    word="kvm$(tr -dc 'a-z' < /dev/urandom | head -c 5)"
+    word="kvm$(od -An -N5 -tu1 /dev/urandom | awk '{for (i = 1; i <= NF; i++) printf "%c", 97 + $i % 26}')"
     podman exec desktop rm -f /tmp/hw-sink
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
         xterm -title hw-sink -geometry 40x5+200+200 -e sh -c 'IFS= read -r l; printf "%s" "$l" > /tmp/hw-sink'
@@ -667,7 +698,7 @@ wp_devices() {
 # S8.3.1 and S4.7.12: a USB headset or DAC plugged in after boot, with a
 # client playing throughout.
 usb_audio() {
-    local tone="$HW_STATE/tone.wav" w0 w1 w2 s0 s1 d0 d1 card sink src rec peak f m what
+    local tone="$HW_STATE/tone.wav" w0 w1 w2 s0 s1 d0 d1 card sinks sources sink src rec peak f m what
     wait_desktop 30 || say "the desktop is not up"
     have_probe || { say "S8.3.1 plays and records through the probe image ($PROBE_IMG): build it from Containerfile.testclient (Appendix A) and load it."; return 1; }
     story_begin S8.3.1 "USB audio devices" T4
@@ -700,8 +731,10 @@ PY
     card=$(comm -13 <(sort <<<"$d0") <(sort <<<"$d1"))
     if [ -n "$card" ]; then ev_pass "the device appears in wpctl status: $(tr -s ' ' <<<"$card" | tr '\n' ';')"
     else ev_fail "wpctl status lists no new device after the plug"; fi
-    sink=$(desk pactl list short sinks 2>/dev/null | awk '/usb/ {print $2; exit}')
-    src=$(desk pactl list short sources 2>/dev/null | awk '/usb/ && !/monitor/ {print $2; exit}')
+    sinks=$(desk pactl list short sinks 2>/dev/null)
+    sources=$(desk pactl list short sources 2>/dev/null)
+    sink=$(awk '/usb/ {print $2; exit}' <<<"$sinks")
+    src=$(awk '/usb/ && !/monitor/ {print $2; exit}' <<<"$sources")
     ev_note "the device's sink: ${sink:-none}; its source: ${src:-none}"
     if [ -n "$sink" ]; then
         ev_save default "EV-PROCEDURE: pactl set-default-sink $sink: the client's stream follows the default" desk pactl set-default-sink "$sink" >/dev/null || true
@@ -778,7 +811,7 @@ log_sample() {
     ev_end
 }
 log_check() {
-    local rows span max
+    local rows span max logcfg
     log_sample
     rows=$(($(wc -l < "$HW_STATE/log-bound.tsv") - 1))
     span=$(awk -F'\t' 'NR==2{a=$2} NR>1{b=$2} END{print b-a}' "$HW_STATE/log-bound.tsv")
@@ -788,19 +821,21 @@ log_check() {
     else ev_fail "$rows samples over $((${span:-0} / 3600)) h: the story wants daily samples over days (3 or more, 48 h or more of one uptime)"; fi
     if [ "$max" -le $((LOG_BOUND + LOG_BOUND / 20)) ]; then ev_pass "the log never exceeded ~64 MB: the largest sample $max bytes"
     else ev_fail "the log reached $max bytes, over ~64 MB"; fi
-    if podman inspect -f '{{json .HostConfig.LogConfig}}' desktop | grep -qiE '64 ?mb|67108864'; then ev_pass "the running container's LogConfig carries the 64 MB bound"
-    else ev_fail "the running container's LogConfig has no 64 MB bound"; fi
+    logcfg=$(podman inspect -f '{{json .HostConfig.LogConfig}}' desktop 2>/dev/null)
+    if grep -qiE '64 ?mb|67108864' <<<"$logcfg"; then ev_pass "the running container's LogConfig carries the 64 MB bound: $logcfg"
+    else ev_fail "the running container's LogConfig has no 64 MB bound: ${logcfg:-podman inspect gave nothing}"; fi
     ev_end
 }
 
 # S10.1.6: a GPU host from the documents alone, then S8.1.1's checks on its
 # first boot. Two runs: provision (it reboots), then check.
 gpu_from_docs() {
-    local phase_f="$HW_STATE/S10.1.6.phase" phase line rc i=0 hpf cpf
+    local phase_f="$HW_STATE/S10.1.6.phase" phase line rc i=0 hpf cpf pci
     phase=$(cat "$phase_f" 2>/dev/null || echo new)
     case "$phase" in
     new)
-        lspci 2>/dev/null | grep -qi nvidia || { say "S10.1.6 needs a host with an NVIDIA GPU."; return 1; }
+        pci=$(lspci 2>/dev/null)
+        grep -qi nvidia <<<"$pci" || { say "S10.1.6 needs a host with an NVIDIA GPU."; return 1; }
         say "S10.1.6 starts on a stock EL9 host, before the deploy tree: the NVIDIA driver stack installed as deploy/HOST-REQUIRES.md describes it, and the desktop image loaded or at hand. The script runs each documented command as written, at this terminal (answer dnf's questions yourself), keeps every command and its transcript, and the last one reboots."
         yes_no "Is the NVIDIA driver stack installed as HOST-REQUIRES.md describes (the kernel module and the Xorg driver pieces)?" \
             || { say "Install it first: deploy/HOST-REQUIRES.md, 'GPU hosts, additionally'."; return 1; }
