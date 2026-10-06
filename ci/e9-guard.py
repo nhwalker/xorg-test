@@ -71,7 +71,17 @@
           or writes is named a placeholder;
   S9.3.1  every story the harness begins is one Requirements.md defines, and
           the evidence check (ci/evlib.py check) fails each kind of
-          incomplete story directory.
+          incomplete story directory;
+  S9.3.2  every diff the harness writes says which lines are expected to
+          differ (ev_diff's and ev_diff_paths' fifth argument, Ctx.diff's
+          expect=), and the gate's pair check (ci/evlib.py discipline) fails
+          a before/after pair with no diff, a diff that states no
+          expectation, one expected to differ in nothing that differs, and
+          one that names neither file;
+  S9.3.3  a claim that a container or process lived through an event is made
+          where its story diffs a before/after pair, and the gate's survival
+          check fails a claim with no before/after measure of the kind it
+          needs (a container's id and restart count, a process's pid).
 
   ci/e9-guard.py [--rule S9.1.5,...] [--self-test]
 
@@ -2966,7 +2976,252 @@ def rule_s911(root, rep):
             f"{len(RULES)} e9-guard rule(s) with their plants; {len(rep.violations('S9.1.1'))} violation(s)")
 
 
-RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
+# --- S9.3.2 and S9.3.3: before/after pairs diffed; survival measured --------------
+
+DIFFERS = {"ev_diff": 4, "ev_diff_paths": 4}          # the arguments before <expected>
+PY_DIFFERS = {"diff", "diff_kept", "diff_named"}      # Ctx's: each takes expect=
+
+
+def evlib_module(root):
+    spec = importlib.util.spec_from_file_location("evlib", os.path.join(root, "ci", "evlib.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+LEADS = {"{", "(", "!", "if", "then", "do", "else", "elif", "while", "until", "time"}
+
+
+def shell_calls(cg, rel, start, text, names):
+    """(line, name, args) of each call of a shell function in names, its
+    continuation lines joined. A definition (name() { or function name {) is
+    not a call; a call in a body on the definition's line is."""
+    for line, src, toks in cg.logical_commands(rel, source=text):
+        if toks is None:
+            continue
+        for words in simple_commands(cg, toks):
+            k = 0
+            while k < len(words):
+                if words[k] in LEADS or words[k] in PREFIXES or re.match(r"^[A-Za-z_]\w*=", words[k]):
+                    k += 1
+                elif k + 1 < len(words) and words[k + 1] == "()":
+                    k += 2                                 # name (): a definition, its body after
+                elif words[k] == "function" and k + 1 < len(words):
+                    k += 2
+                else:
+                    break
+            if k < len(words) and words[k] in names:
+                yield start + line - 1, words[k], words[k + 1:]
+
+
+def py_files(root):
+    return [os.path.relpath(p, root) for p in sorted(glob.glob(os.path.join(root, "ci", "**", "*.py"), recursive=True))
+            if os.path.relpath(p, root) != "ci/e9-guard.py" and "__pycache__" not in p]
+
+
+def literal_text(node):
+    """A string constant's text, or an f-string's constant parts joined."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return literal_text(node.left) + literal_text(node.right)
+    return ""
+
+
+def planted_dirs(evlib, base, cases):
+    """Story directories written with StoryWriter: each case is (what, build,
+    want flagged), build(st) writing its files; returns (what, problems, want)."""
+    out = []
+    for n, (what, build, want) in enumerate(cases):
+        root = os.path.join(base, f"case{n}")
+        st = evlib.StoryWriter(root, "S9.1.5", "planted", "T0", "e9-guard.py")
+        build(st)
+        st.finish()
+        out.append((what, evlib.discipline(os.path.join(root, "S9.1.5")), want))
+    return out
+
+
+def judge_planted(rep, rule, results, which):
+    for what, problems, want in results:
+        mine = [p for r, p in problems if r == rule]
+        if bool(mine) == want:
+            rep.ok(rule, "ci/evlib.py", 0, f"{which} on {what}: {'; '.join(mine) or 'no problem'}")
+        else:
+            rep.flag(rule, "ci/evlib.py", 0, what, f"{which} on {what}: {'; '.join(mine) or 'no problem'}",
+                     f"the gate's {rule} check must flag what breaks the rule and pass what keeps it")
+
+
+def write_diff(st, moment, a, b, what):
+    """A diff the way ev_diff writes one, of two files the story holds."""
+    import difflib
+    ta, tb = open(st.path(a)).read(), open(st.path(b)).read()
+    d = "".join(difflib.unified_diff(ta.splitlines(True), tb.splitlines(True), a, b))
+    st.write(moment, d or f"(no differences between {a} and {b})\n", what, ext="diff")
+
+
+def rule_s932(root, rep):
+    """S9.3.2: every before/after pair has its diff, and every diff's index
+    line says which lines are expected to differ."""
+    cg = client_guard()
+    calls = 0
+    for rel, start, text in shell_units(root):
+        if rel == "ci/evidence.sh" or rel.endswith("/evidence.sh"):
+            continue
+        for line, name, args in shell_calls(cg, rel, start, text, DIFFERS):
+            calls += 1
+            need = DIFFERS[name]
+            if len(args) > need and args[need].strip():
+                rep.ok("S9.3.2", rel, line, f"{name} {args[0]}: expected to differ: {args[need][:80]}")
+            else:
+                rep.flag("S9.3.2", rel, line, f"{name} {' '.join(args)[:100]}",
+                         f"{name} without the lines expected to differ (its argument {need + 1})",
+                         "say which lines the diff is expected to differ in: \"nothing\" (or \"nothing: why\"), or which")
+    for rel in py_files(root):
+        try:
+            tree = ast.parse(read(os.path.join(root, rel)), rel)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr in PY_DIFFERS:
+                calls += 1
+                kw = {k.arg: k.value for k in node.keywords}
+                if "expect" in kw:
+                    rep.ok("S9.3.2", rel, node.lineno, f".{node.func.attr}(... expect={literal_text(kw['expect'])[:80]!r})")
+                else:
+                    rep.flag("S9.3.2", rel, node.lineno, f".{node.func.attr}(", f"a diff written without expect=",
+                             "pass expect=: \"nothing\" (or \"nothing: why\"), or the lines expected to differ")
+            elif node.func.attr == "write" and any(k.arg == "ext" and literal_text(k.value) == "diff" for k in node.keywords):
+                calls += 1
+                what = node.args[2] if len(node.args) > 2 else next((k.value for k in node.keywords if k.arg == "what"), None)
+                if what is not None and "expected to differ: " in literal_text(what):
+                    rep.ok("S9.3.2", rel, node.lineno, "a diff written with its expectation in the index line")
+                else:
+                    rep.flag("S9.3.2", rel, node.lineno, ".write(..., ext=\"diff\")",
+                             "a diff written without 'expected to differ: ...' in its index line",
+                             "end the index line with '; expected to differ: ...'")
+    evlib = evlib_module(root)
+    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as d:
+        def pair(st, b="a 1\nb 2\n", a="a 1\nb 2\n"):
+            st.write("pids-before", "PID COMM\n" + b, "EV-PIDS: before")
+            first = st.last
+            st.write("pids-after", "PID COMM\n" + a, "EV-PIDS: after")
+            return first, st.last
+        cases = [
+            ("a pair diffed, its expectation stated",
+             lambda st: write_diff(st, "pids", *pair(st), "EV-DIFF: pids; expected to differ: nothing: none restarted"),
+             False),
+            ("a pair with no diff", lambda st: pair(st), True),
+            ("a diff whose index line states no expectation",
+             lambda st: write_diff(st, "pids", *pair(st), "EV-DIFF: pids before and after"), True),
+            ("a diff expected to differ in nothing, which differs",
+             lambda st: write_diff(st, "pids", *pair(st, a="a 1\nb 3\n"), "EV-DIFF: pids; expected to differ: nothing"),
+             True),
+            ("a diff that names neither file",
+             lambda st: (pair(st), st.write("pids", "(no difference)\n", "EV-DIFF: pids; expected to differ: nothing",
+                                            ext="diff")), True),
+        ]
+        judge_planted(rep, "S9.3.2", planted_dirs(evlib, d, cases), "the gate's pair check")
+    return (f"S9.3.2: {calls} diff(s) written in the harness, {len(cases)} planted story directories judged; "
+            f"{len(rep.violations('S9.3.2'))} violation(s)")
+
+
+def shell_story_scopes(text):
+    """(first line, lines) of each stretch of a shell script that one story
+    holds: from an ev_begin to the next ev_begin, or the script's end."""
+    lines = text.split("\n")
+    starts = [i for i, l in enumerate(lines) if re.match(r"^\s*ev_begin\s", l)]
+    return [(s + 1, lines[s:(starts[k + 1] if k + 1 < len(starts) else len(lines))]) for k, s in enumerate(starts)]
+
+
+def rule_s933(root, rep):
+    """S9.3.3: a claim that a container or process lived through an event is
+    made where its story keeps a before/after pair diffed."""
+    evlib = evlib_module(root)
+    claims = 0
+    shell_diff = re.compile(r"\b(?:ev_diff|ev_diff_paths|snd_diffs|input_diffs|xi_judge_added|xi_judge_removed)\b")
+    # The claims a check can pass with: ev_fail's never passes, and the gate
+    # reads the passing ones.
+    claim_call = re.compile(r"\b(?:ev_pass|ev_check)\s+(\"(?:[^\"\\]|\\.)*\"|'[^']*')")
+    for rel in shell_files(root):
+        if rel.endswith("evidence.sh"):
+            continue
+        for first, lines in shell_story_scopes(read(os.path.join(root, rel))):
+            has_diff = any(shell_diff.search(code_of(l)) for l in lines)
+            for n, l in enumerate(lines):
+                for m in claim_call.finditer(l):
+                    if not evlib.SURVIVAL.search(m.group(1)):
+                        continue
+                    claims += 1
+                    if has_diff:
+                        rep.ok("S9.3.3", rel, first + n, f"a survival claim in a story that diffs a before/after pair: {m.group(1)[:80]}")
+                    else:
+                        rep.flag("S9.3.3", rel, first + n, l.strip()[:120],
+                                 "a claim that something lived through an event, in a story that diffs no before/after pair",
+                                 "keep the container's id and restart count, or the pids, before and after, and diff them")
+    for rel in py_files(root):
+        try:
+            tree = ast.parse(read(os.path.join(root, rel)), rel)
+        except SyntaxError:
+            continue
+        funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        differs = {f.name for f in funcs if any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                                                 and c.func.attr in PY_DIFFERS for c in ast.walk(f))}
+        for f in funcs:
+            calls = [c for c in ast.walk(f) if isinstance(c, ast.Call)]
+            has_diff = any((isinstance(c.func, ast.Attribute) and c.func.attr in PY_DIFFERS)
+                           or (isinstance(c.func, ast.Name) and c.func.id in differs) for c in calls)
+            for c in calls:
+                if not (isinstance(c.func, ast.Attribute) and c.func.attr == "check" and len(c.args) >= 2):
+                    continue
+                claim = literal_text(c.args[1])
+                if not evlib.SURVIVAL.search(claim):
+                    continue
+                claims += 1
+                if has_diff:
+                    rep.ok("S9.3.3", rel, c.lineno, f"a survival claim in {f.name}, which diffs a before/after pair: {claim[:80]}")
+                else:
+                    rep.flag("S9.3.3", rel, c.lineno, claim[:120],
+                             f"a claim that something lived through an event, in {f.name}, which diffs no before/after pair",
+                             "keep the container's id and restart count, or the pids, before and after, and diff them")
+    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as d:
+        def measured(st, before, after, claim):
+            st.write("pod-before", before, "EV-PIDS: before")
+            b = st.last
+            st.write("pod-after", after, "EV-PIDS: after")
+            write_diff(st, "pod", b, st.last, "EV-DIFF: the pod; expected to differ: nothing: the same container")
+            st.check(True, claim)
+        cases = [
+            ("a container's survival, its id and restart count before and after",
+             lambda st: measured(st, "containerID=abc restartCount=0\n", "containerID=abc restartCount=0\n",
+                                 "the pod is the same container, restartCount 0"), False),
+            ("a container's survival with nothing kept before and after",
+             lambda st: st.check(True, "the pod is the same container, restartCount 0"), True),
+            ("a container's survival, only a process's pid kept",
+             lambda st: measured(st, "PID COMM\n7 sh\n", "PID COMM\n7 sh\n", "the pod is the same container, "
+                                 "restartCount 0"), True),
+            ("a process's survival, its pid before and after",
+             lambda st: measured(st, "PID COMM\n7 Xorg\n", "PID COMM\n7 Xorg\n", "Xorg kept its pid"), False),
+            ("a check that something did not survive", lambda st: st.check(True, "neither sentinel survived the restart"),
+             False),
+            ("a process's survival, its pids in two listings a diff compares (named on and off)",
+             lambda st: (st.write("pids-on", "PID COMM\n7 Xorg\n", "EV-PIDS: on"),
+                         setattr(st, "first", st.last),
+                         st.write("pids-off", "PID COMM\n7 Xorg\n", "EV-PIDS: off"),
+                         write_diff(st, "pids", st.first, st.last, "EV-DIFF: the pids; expected to differ: nothing"),
+                         st.check(True, "Xorg kept its pid")), False),
+            ("a failing check that says a process survived", lambda st: st.check(False, "the same process on and off"),
+             False),
+        ]
+        judge_planted(rep, "S9.3.3", planted_dirs(evlib, d, cases), "the gate's survival check")
+    return (f"S9.3.3: {claims} survival claim(s) in the harness, {len(cases)} planted story directories judged; "
+            f"{len(rep.violations('S9.3.3'))} violation(s)")
+
+
+RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931, "S9.3.2": rule_s932, "S9.3.3": rule_s933}
 
 # --- the self-test --------------------------------------------------------------------
 
@@ -3015,6 +3270,20 @@ PLANTS = {
         ("ci/c4.py", "def f(g):\n    return int(g.sh('ls | wc -l').strip())\n", True),
         ("ci/c5.py", "def f(g):\n    try:\n        return int(g.sh('ls | wc -l').strip())\n    except (RuntimeError, ValueError):\n        return None\n", False),
         ("ci/c11.py", "def f(g):\n    try:\n        return int(g.sh('ls | wc -l').strip())\n    except ValueError:\n        return 0\n", True),
+    ],
+    "S9.3.2": [
+        ('ci/d1.sh', '#!/bin/bash\nset -euo pipefail\nev_diff pids "EV-DIFF: the pids" "$a" "$b"\n', True),
+        ('ci/d2.sh', '#!/bin/bash\nset -euo pipefail\nev_diff pids "EV-DIFF: the pids" "$a" "$b" "nothing: none restarted"\n', False),
+        ('ci/vm/d3.py', 'def f(ctx):\n    ctx.diff("tree", a, b, "EV-DIFF: the tree")\n', True),
+        ('ci/vm/d4.py', 'def f(ctx):\n    ctx.diff("tree", a, b, "EV-DIFF: the tree", expect="nothing: no window moved")\n', False),
+        ('ci/d5.sh', '#!/bin/bash\nset -euo pipefail\nev_diff_paths() { # <moment> <what> <a> <b> <expected>\n    :\n}\n'
+                     'function ev_diff { :; }\n', False),
+        ('ci/d6.sh', '#!/bin/bash\nset -euo pipefail\npd() { ev_diff pids "EV-DIFF: the pids" "$1" "$2"; }\n', True),
+    ],
+    "S9.3.3": [
+        ('ci/v1.sh', '#!/bin/bash\nset -euo pipefail\nev_begin S9.1.5 "a story" T3\nev_pass "the pod is the same container, restartCount 0"\nev_end\n', True),
+        ('ci/v2.sh', '#!/bin/bash\nset -euo pipefail\nev_begin S9.1.5 "a story" T3\nev_save pod-before "EV-PIDS: before" gq pod-state p\nb=$EV_LAST\nev_save pod-after "EV-PIDS: after" gq pod-state p\nev_diff pod "EV-DIFF: the pod" "$b" "$EV_LAST" "nothing: the same container"\nev_pass "the pod is the same container, restartCount 0"\nev_end\n', False),
+        ('ci/vm/v3.py', 'def s(ctx, st):\n    st.check(True, "Xorg kept its pid")\n', True),
     ],
     "S9.3.1": [
         ("ci/s1.sh", "ev_begin S99.1.1 \"no such story\" T0\n", True),
