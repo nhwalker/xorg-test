@@ -1795,6 +1795,54 @@ audio_reachable() {
     PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 20 pactl info >/dev/null 2>&1
 }
 
+verify_audio_x_restart() {
+    # The X direction of verify_audio_lifecycle (see there): the X server
+    # dies, the session comes back, and the audio stack must not notice.
+    # Its own step so the host can keep a tone playing across it (S4.5.1).
+    log al "audio survives an X session restart"
+    wait_for 30 2 "pipewire to be running" pipewire_running
+    pw_before=$(pipewire_pid)
+    [ -n "$pw_before" ] || fail "no pipewire process to start from"
+    audio_reachable || fail "audio was not reachable before the test even began"
+    session_up || fail "no X session to restart"
+    ev_begin S4.5.1 "Audio survives an X session restart" T3
+    ev_save pids-before "EV-PIDS: Xorg, mwm and the three audio daemons before Xorg is killed" \
+        ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    x_before=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1 || true)
+
+    # Kill the X server, not the container: the session dies, desktop-init
+    # notices and starts a new one. That is the ordinary failure this is
+    # about - Xorg crashing - rather than an operator restarting the unit.
+    # As the desktop uid, NOT as container root: CAP_KILL is dropped from
+    # this container (in the host pid namespace it would mean "may signal any
+    # process on the host"), so root in here cannot signal the session user's
+    # processes. Xorg runs rootless as 'desktop', and same-uid signaling needs
+    # no capability - the same route desktop-init takes via setpriv.
+    # The host marks the kill on S4.5.1's level plot from this time.
+    date +%s.%N > /run/verify-audio-x.kill
+    podman exec -u desktop desktop pkill -u desktop -x Xorg || true
+    ev_note "Xorg (pid $x_before) killed at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    x_new() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1); [ -n "$p" ] && [ "$p" != "$x_before" ] && session_up; }
+    wait_for 45 2 "a new X session (a new Xorg and mwm)" x_new
+    log al "  the X session restarted"
+    ev_note "a new Xorg and mwm up at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    ev_save pids-after "EV-PIDS: Xorg, mwm and the three audio daemons after the session came back" \
+        ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    ev_pass "the X session restarted: Xorg $x_before -> $(podman exec desktop pgrep -x Xorg 2>/dev/null | head -1)"
+
+    pw_after=$(pipewire_pid)
+    [ "$pw_after" = "$pw_before" ] \
+        || fail "pipewire pid changed from $pw_before to '$pw_after' across an X session restart: the audio stack is still in the X session's process session and gets killed with it"
+    ev_pass "pipewire kept its pid across the X restart ($pw_before)"
+    audio_reachable \
+        || fail "the exported pulse socket is unreachable after an X session restart, though pipewire kept its pid"
+    ev_save pactl-info "EV-STATE: pactl info from the host over the export, after the X restart" \
+        env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null || true
+    ev_pass "the export still answers pactl info"
+    ev_end
+    log al "  pipewire pid $pw_before unchanged, export still reachable"
+}
+
 verify_audio_lifecycle() {
     # The audio stack and the X session are supervised separately, and this
     # is the only test that can tell. Every other audio test here plays a
@@ -1812,33 +1860,12 @@ verify_audio_lifecycle() {
     #                exited, so one dead daemon went unnoticed and the stack
     #                stayed down - with a stale socket - until Xorg happened to
     #                exit. There was no recovery path to test.
-    log al "audio survives an X session restart"
+    # The X direction is verify_audio_x_restart's, run just before this so
+    # the host can play a tone across it (S4.5.1).
+    log al "audio recovers from its own crash"
     wait_for 30 2 "pipewire to be running" pipewire_running
     pw_before=$(pipewire_pid)
     [ -n "$pw_before" ] || fail "no pipewire process to start from"
-    audio_reachable || fail "audio was not reachable before the test even began"
-    session_up || fail "no X session to restart"
-
-    # Kill the X server, not the container: the session dies, desktop-init
-    # notices and starts a new one. That is the ordinary failure this is
-    # about - Xorg crashing - rather than an operator restarting the unit.
-    # As the desktop uid, NOT as container root: CAP_KILL is dropped from
-    # this container (in the host pid namespace it would mean "may signal any
-    # process on the host"), so root in here cannot signal the session user's
-    # processes. Xorg runs rootless as 'desktop', and same-uid signaling needs
-    # no capability - the same route desktop-init takes via setpriv.
-    podman exec -u desktop desktop pkill -u desktop -x Xorg || true
-    wait_for 45 2 "the X session to come back" session_up
-    log al "  the X session restarted"
-
-    pw_after=$(pipewire_pid)
-    [ "$pw_after" = "$pw_before" ] \
-        || fail "pipewire pid changed from $pw_before to '$pw_after' across an X session restart: the audio stack is still in the X session's process session and gets killed with it"
-    audio_reachable \
-        || fail "the exported pulse socket is unreachable after an X session restart, though pipewire kept its pid"
-    log al "  pipewire pid $pw_before unchanged, export still reachable"
-
-    log al "audio recovers from its own crash"
     # S4.5.2's "before": the X session's pids as well as the audio stack's, so
     # a recovery that took the session down with it cannot pass.
     ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T3
@@ -2286,23 +2313,219 @@ xi_test_start() { # <X id>
 xi_test_read() { podman exec desktop cat /tmp/xinput-test.txt 2>/dev/null || true; }
 xi_test_stop() { podman exec desktop pkill -f 'xinput test' 2>/dev/null || true; }
 
+# --- client journeys (F7.5, F7.6, F7.8): probes into a client pod --------------
+# The host drives the desktop's events and keeps the evidence; these reach
+# into a pod (ci/vm/journey-pod.yaml unless one is named) and look at the
+# display. Files go into a pod through `kubectl exec -i ... cat`, never
+# kubectl cp, which needs a tar the desktop image does not have. Anything that
+# must keep running starts through journey_run, as a child of the pod's agent:
+# started from a kubectl exec, it would last only as long as the exec (run
+# 37325367423's first xterm never reached the display).
+JPOD=journey
+journey_start() { # [manifest] [pod]
+    k3s kubectl apply -f "${1:-ci/vm/journey-pod.yaml}" >/dev/null
+    k3s kubectl wait --for=condition=Ready "pod/${2:-$JPOD}" --timeout=180s >/dev/null
+}
+jx_in() { local pod=$1; shift; k3s kubectl exec "$pod" -- "$@"; }
+# Start the script on stdin in the journey pod, as a child of its agent.
+journey_run() { # <name> < script
+    k3s kubectl exec -i "$JPOD" -- sh -c "cat > /tmp/run/.$1 && mv /tmp/run/.$1 /tmp/run/$1.sh"
+}
+# An xterm from the pod; its output in /tmp/<title>.log there. Its name
+# (WM_CLASS instance) is what win_up looks for, and it keeps its title:
+# without allowTitleOps off, the interactive bash it runs retitles it
+# user@host:dir at its first prompt (EL's /etc/bashrc PROMPT_COMMAND).
+journey_xterm() { # <title>
+    journey_run "xterm-$1" <<EOF
+exec xterm -name '$1' -T '$1' -xrm 'XTerm*allowTitleOps: false' -geometry 60x6+640+420 > /tmp/$1.log 2>&1
+EOF
+}
+# The pod's applications, one per line: pid and command line.
+journey_apps() { # [pod]
+    k3s kubectl exec "${1:-$JPOD}" -- pgrep -a -f 'xterm|paplay|shot-loop|screenshot' || true
+}
+# Whether an xterm started with -name <name> is on the display, seen from
+# the desktop: xwininfo -tree lists each window as
+# 0x... "<title>": ("<name>" "XTerm"). The name, not the title: an xterm's
+# shell can retitle its window, and EL's /etc/bashrc does at the first
+# prompt - three runs (37325367423, 37327333528, 37328956567) looked for the
+# title journey-1 under a window by then titled root@journey. The tree is
+# read whole before it is searched: piped into grep -q under pipefail,
+# xwininfo dies of SIGPIPE once grep has its match.
+win_up() {
+    local tree
+    tree=$(podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree 2>/dev/null) || return 1
+    grep -qF "(\"$1\" \"XTerm\")" <<<"$tree"
+}
+win_wait() { wait_for "${2:-30}" 1 "an xterm named $1 on the display" win_up "$1"; }
+# The display's windows, from the desktop (F7.5's xwininfo -root -tree).
+win_tree() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree; }
+# EV-SHOT-CLIENT: the toolkit's screenshot run in the pod, its PNG on stdout.
+client_shot() { # [pod]
+    k3s kubectl exec "${1:-$JPOD}" -- sh -c '"$DESKTOP_TOOLS_BIN"/screenshot --to-stdout'
+}
+# A tone WAV put into the pod, and the tone played there by its pulse client
+# in the background. The player's pid lands in /tmp/<tag>.pid, its start and
+# end times (the guest's clock, which the pod shares) in .t0 and .t1, its
+# exit status in .rc and its output in .log: a stream that stalls takes
+# longer than the tone lasts.
+journey_put() { # <tag> <hz> <seconds> [pod]
+    gen_tone "$2" "/tmp/$1.wav" "$3"
+    k3s kubectl exec -i "${4:-$JPOD}" -- sh -c "cat > /tmp/$1.wav" < "/tmp/$1.wav"
+}
+journey_tone() { # <tag> <hz> <seconds>
+    journey_put "$1" "$2" "$3"
+    k3s kubectl exec "$JPOD" -- rm -f "/tmp/$1.rc" "/tmp/$1.t0" "/tmp/$1.t1" "/tmp/$1.pid"
+    journey_run "tone-$1" <<EOF
+date +%s.%N > /tmp/$1.t0
+paplay /tmp/$1.wav > /tmp/$1.log 2>&1 &
+echo \$! > /tmp/$1.pid
+wait \$!
+r=\$?
+date +%s.%N > /tmp/$1.t1
+echo \$r > /tmp/$1.rc
+EOF
+}
+# "exited N" and "played S s, from T0 to T1" once the player ended (else
+# "running"), then "pid P", then its output.
+journey_tone_status() { # <tag> [pod]
+    local pod="${2:-$JPOD}" rc t
+    rc=$(k3s kubectl exec "$pod" -- cat "/tmp/$1.rc" 2>/dev/null || true)
+    if [ -n "$rc" ]; then
+        echo "exited $rc"
+        t=$(k3s kubectl exec "$pod" -- sh -c "cat /tmp/$1.t0 /tmp/$1.t1" 2>/dev/null | paste -sd' ')
+        [ -z "$t" ] || awk '{printf "played %.2f s, from %s to %s\n", $2 - $1, $1, $2}' <<<"$t"
+    else
+        echo running
+    fi
+    echo "pid $(k3s kubectl exec "$pod" -- cat "/tmp/$1.pid" 2>/dev/null || echo unknown)"
+    k3s kubectl exec "$pod" -- cat "/tmp/$1.log" 2>/dev/null || true
+}
+# The audio graph's client streams through the export (F7.6's common set).
+streams() {
+    local t
+    for t in sink-inputs source-outputs; do
+        echo "== pactl list short $t"
+        PULSE_SERVER=unix:/run/desktop-audio/pulse timeout 10 pactl list short "$t" 2>&1 \
+            || echo "(no answer: the export is down)"
+    done
+}
+# A file's identity in the pod: inode, change time (epoch seconds, then
+# readable) and name. A socket made anew has a change time after the event
+# that made it, whether or not the filesystem reused its inode number.
+journey_stat() { # <path> [pod]
+    k3s kubectl exec "${2:-$JPOD}" -- stat -c 'inode=%i ctime=%Z (%z) %n' "$1"
+}
+# The toolkit as the pod sees it (S7.8.2).
+journey_tools_ls() { k3s kubectl exec "${1:-$JPOD}" -- sh -c 'ls -li "$DESKTOP_TOOLS_BIN"'; }
+# S7.8.2's held screenshot: started before a desktop restart, it must still be
+# running when the toolkit is republished, and finish once released. A full
+# screen of random hex (the noise xterm) makes its PNG larger than a pipe
+# holds, so writing it into a pipe that nobody reads yet blocks the binary
+# mid-run, its executable mapped, until journey_held_release opens the tap.
+journey_noise() { # an xterm over all of Virtual-1, filled with random hex
+    journey_run noise <<'EOF'
+exec xterm -name noise -T noise -geometry 170x58+0+0 -hold -e od -An -tx1 -w56 -N 4000 /dev/urandom > /tmp/noise.log 2>&1
+EOF
+}
+journey_shot_size() { # the size of a PNG of the display as it is now
+    k3s kubectl exec "$JPOD" -- sh -c '"$DESKTOP_TOOLS_BIN"/screenshot --to-stdout | wc -c'
+}
+journey_held_start() {
+    k3s kubectl exec "$JPOD" -- rm -f /tmp/held.pid /tmp/held.rc /tmp/held.go /tmp/held.png /tmp/held.done
+    journey_run held <<'EOF'
+( sh -c 'echo $$ > /tmp/held.pid; exec "$DESKTOP_TOOLS_BIN"/screenshot --to-stdout'
+  echo $? > /tmp/held.rc ) |
+    ( while [ ! -f /tmp/held.go ]; do sleep 0.2; done; cat > /tmp/held.png )
+touch /tmp/held.done
+EOF
+}
+# The held screenshot as /proc shows it: alive or not, the executable it runs
+# (a replaced file reads "(deleted)") and that executable's inode, then the
+# toolkit file's own inode now.
+journey_held_state() {
+    k3s kubectl exec "$JPOD" -- sh -c 'p=$(cat /tmp/held.pid 2>/dev/null); echo "pid $p"
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            echo "alive yes"; echo "exe $(readlink /proc/$p/exe)"; echo "exe-inode $(stat -L -c %i /proc/$p/exe)"
+        else
+            echo "alive no"
+        fi
+        echo "file-inode $(stat -c %i "$DESKTOP_TOOLS_BIN"/screenshot)"'
+}
+# Open the tap: the held screenshot writes the rest of its PNG and exits.
+journey_held_release() {
+    k3s kubectl exec "$JPOD" -- sh -c 'touch /tmp/held.go
+        for i in $(seq 100); do [ -f /tmp/held.done ] && break; sleep 0.2; done
+        echo "rc $(cat /tmp/held.rc 2>/dev/null || echo none)"
+        echo "png-bytes $(wc -c < /tmp/held.png 2>/dev/null || echo 0)"
+        cat /tmp/run/held.out 2>/dev/null'
+}
+# S7.8.2's loop: the toolkit's screenshot every 0.5 s from the pod, each try
+# logged as "<guest time> <try> <exit status> <its output>".
+journey_loop_start() {
+    k3s kubectl exec "$JPOD" -- rm -f /tmp/shot-loop.log
+    journey_run shot-loop <<'EOF'
+i=0
+while :; do
+    i=$((i + 1))
+    t=$(date +%s.%N)
+    "$DESKTOP_TOOLS_BIN"/screenshot /tmp/loop.png > /tmp/loop.out 2>&1
+    r=$?
+    echo "$t $i $r $(tr '\n' ' ' < /tmp/loop.out | cut -c1-160)"
+    sleep 0.5
+done >> /tmp/shot-loop.log 2>&1
+EOF
+}
+journey_loop_stop() { k3s kubectl exec "$JPOD" -- pkill -f shot-loop.sh 2>/dev/null || true; }
+journey_loop_log() { k3s kubectl exec "$JPOD" -- cat /tmp/shot-loop.log 2>/dev/null || true; }
+# EV-LOG-DESKTOP for the toolkit: the publish lines of the desktop container
+# now running (a restart makes a new one, with a log of its own).
+# PipeWire's threads with their scheduling (class, realtime priority, nice)
+# and pw-top's batch view, whose ERR column counts each node's xruns.
+audio_sched() {
+    local pw
+    pw=$(pipewire_pid)
+    echo "== ps -T -p ${pw:-?} -o tid,cls,rtprio,ni,comm (pipewire's threads)"
+    [ -z "$pw" ] || ps -T -p "$pw" -o tid,cls,rtprio,ni,comm 2>&1
+    echo "== pw-top -b -n 2 (the second iteration has the counts; ERR is each node's xruns)"
+    desk timeout 10 pw-top -b -n 2 2>&1 || echo "(pw-top gave no answer)"
+}
+# The desktop container's log since a time (a Unix timestamp), its last 300 lines.
+desktop_log_since() { podman logs --since "${1:?unix time}" desktop 2>&1 | tail -300; }
+desktop_publish_log() {
+    podman logs desktop 2>&1 | grep -E 'publish|Text file busy|ETXTBSY' || echo "(no publish line in podman logs desktop)"
+}
+journey_cleanup() { k3s kubectl delete pod journey early --ignore-not-found --wait=true >/dev/null 2>&1 || true; }
+# X answering and the session's mwm up: the desktop is back.
+x_up() { podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2>&1 && session_up; }
+
 # A tone played by a pulse client in the background, as the session user:
-# paplay, to <sink> (or the default sink with "-"), for <seconds>. Its stderr
-# and exit status land in /tmp/<tag>.log and /tmp/<tag>.rc in the container;
-# tone_status says "running" until the .rc exists.
+# paplay, to <sink> (or the default sink with "-"), for <seconds>. Its output,
+# exit status and pid land in /tmp/<tag>.log, .rc and .pid in the container,
+# its start and end times (the guest's clock) in .t0 and .t1; tone_status
+# says "running" until the .rc exists.
 tone_start() { # <tag> <hz> <seconds> <sink|->
     local tag="${1:?tag}" hz="${2:?hz}" secs="${3:?seconds}" sink="${4:--}" dev=""
     gen_tone "$hz" "/tmp/$tag.wav" "$secs"
     podman cp "/tmp/$tag.wav" "desktop:/tmp/$tag.wav"
-    podman exec desktop rm -f "/tmp/$tag.log" "/tmp/$tag.rc"
+    podman exec desktop rm -f "/tmp/$tag.log" "/tmp/$tag.rc" "/tmp/$tag.t0" "/tmp/$tag.t1" "/tmp/$tag.pid"
     [ "$sink" = - ] || dev="--device=$sink"
     podman exec -d -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop \
-        sh -c "paplay $dev /tmp/$tag.wav > /tmp/$tag.log 2>&1; echo \$? > /tmp/$tag.rc"
+        sh -c "date +%s.%N > /tmp/$tag.t0; paplay $dev /tmp/$tag.wav > /tmp/$tag.log 2>&1 & echo \$! > /tmp/$tag.pid; wait \$!; r=\$?; date +%s.%N > /tmp/$tag.t1; echo \$r > /tmp/$tag.rc"
 }
+# "exited N" and "played S s, from T0 to T1" once it ended (else "running"),
+# then "pid P", then its output: the same report as journey_tone_status.
 tone_status() { # <tag>
-    local rc
+    local rc t
     rc=$(podman exec desktop cat "/tmp/${1:?tag}.rc" 2>/dev/null || true)
-    if [ -n "$rc" ]; then echo "exited $rc"; else echo running; fi
+    if [ -n "$rc" ]; then
+        echo "exited $rc"
+        t=$(podman exec desktop sh -c "cat /tmp/$1.t0 /tmp/$1.t1" 2>/dev/null | paste -sd' ')
+        [ -z "$t" ] || awk '{printf "played %.2f s, from %s to %s\n", $2 - $1, $1, $2}' <<<"$t"
+    else
+        echo running
+    fi
+    echo "pid $(podman exec desktop cat "/tmp/$1.pid" 2>/dev/null || echo unknown)"
     podman exec desktop cat "/tmp/$1.log" 2>/dev/null || true
 }
 
@@ -2615,7 +2838,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|verify-postmortem|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -2634,6 +2857,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     verify-log-bounds) verify_log_bounds ;;
     verify-audio-lifecycle) verify_audio_lifecycle ;;
     verify-postmortem) verify_postmortem ;;
+    verify-audio-x) verify_audio_x_restart ;;
     layout-declare) layout_declare ;;
     layout-roundtrip) layout_roundtrip ;;
     layout-unplug) layout_unplug ;;
@@ -2654,6 +2878,34 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     xi-test-read) xi_test_read ;;
     xi-test-stop) xi_test_stop ;;
     tone-start) tone_start "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    journey-start) journey_start "${2:-}" "${3:-}" ;;
+    jx) shift; jx_in "$JPOD" "$@" ;;
+    jx-in) shift; jx_in "$@" ;;
+    journey-xterm) journey_xterm "${2:-}" ;;
+    journey-apps) journey_apps "${2:-}" ;;
+    win-up) win_up "${2:-}" ;;
+    win-wait) win_wait "${2:-}" "${3:-}" ;;
+    win-tree) win_tree ;;
+    client-shot) client_shot "${2:-}" ;;
+    journey-put) journey_put "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    journey-tone) journey_tone "${2:-}" "${3:-}" "${4:-}" ;;
+    journey-tone-status) journey_tone_status "${2:-}" "${3:-}" ;;
+    streams) streams ;;
+    journey-stat) journey_stat "${2:-}" "${3:-}" ;;
+    journey-tools-ls) journey_tools_ls "${2:-}" ;;
+    journey-noise) journey_noise ;;
+    journey-shot-size) journey_shot_size ;;
+    journey-held-start) journey_held_start ;;
+    journey-held-state) journey_held_state ;;
+    journey-held-release) journey_held_release ;;
+    journey-loop-start) journey_loop_start ;;
+    journey-loop-stop) journey_loop_stop ;;
+    journey-loop-log) journey_loop_log ;;
+    desktop-publish-log) desktop_publish_log ;;
+    audio-sched) audio_sched ;;
+    desktop-log-since) desktop_log_since "${2:-}" ;;
+    x-up) x_up ;;
+    journey-cleanup) journey_cleanup ;;
     tone-status) tone_status "${2:-}" ;;
     operator-teardown) operator_teardown ;;
     *) fail "unknown phase $1" ;;

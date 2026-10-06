@@ -1,0 +1,52 @@
+# A client started while the desktop is down (Requirements.md S7.5.4, S7.6.5;
+# test-only). Its script retries the way an application has to: xterm until
+# one stays up, and in the background paplay until one play succeeds, each
+# try logged with its time in /tmp/x-tries.log and /tmp/audio-tries.log. The
+# tone is the WAV the host puts in /tmp/early.wav. restartPolicy Always: had
+# the container died and been restarted while it waited, restartCount would
+# say so. Like x11-testclient it declares nothing but the display, audio and
+# toolkit capabilities; the toolkit is for its own screenshot (EV-SHOT-CLIENT).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: early
+spec:
+  restartPolicy: Always
+  containers:
+    - name: client
+      image: localhost/desktop-container:latest
+      imagePullPolicy: Never
+      command: ["sh", "-c"]
+      args:
+        - |
+          date -u +%FT%T.%3NZ > /tmp/started
+          (
+            n=0
+            while :; do
+              n=$((n + 1))
+              if [ ! -f /tmp/early.wav ]; then
+                echo "$(date -u +%T.%3N) try $n: no tone file yet"
+              elif paplay /tmp/early.wav 2> /tmp/paplay.err; then
+                echo "$(date -u +%T.%3N) try $n: paplay played the tone"
+                echo 0 > /tmp/early.rc
+                break
+              else
+                echo "$(date -u +%T.%3N) try $n: paplay exited $?: $(tr '\n' ' ' < /tmp/paplay.err)"
+              fi
+              sleep 1
+            done >> /tmp/audio-tries.log 2>&1
+          ) &
+          n=0
+          while :; do
+            n=$((n + 1))
+            echo "$(date -u +%T.%3N) try $n: xterm" >> /tmp/x-tries.log
+            xterm -name early-client -T early-client -xrm 'XTerm*allowTitleOps: false' \
+              -geometry 60x6+640+300 >> /tmp/x-tries.log 2>&1
+            echo "$(date -u +%T.%3N) try $n: xterm exited $?" >> /tmp/x-tries.log
+            sleep 1
+          done
+      resources:
+        limits:
+          desktop.local/display: 1
+          desktop.local/audio: 1
+          desktop.local/tools: 1
