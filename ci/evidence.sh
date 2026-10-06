@@ -48,6 +48,9 @@
 #   ev_abort <reason>                 record a failure and end (for fail())
 #   ev_log <kind> <text>              one line of the timeline (EV-TIMELINE):
 #                                     the run's and the open story's
+#   ev_mark <label>                   an event a recording running now names
+#                                     the frame of (EV-VIDEO, S9.3.5): a
+#                                     "mark" line of the timeline
 #
 # Sourcing it also wraps podman and kubectl: each call a script makes while
 # evidence is on is a line of the timeline before it runs (Requirements.md
@@ -124,6 +127,11 @@ ev_log() { # <kind> <text>
     { printf '%s\n' "$line" >> "$EV_ROOT/timeline.log"; } 2>/dev/null || true
     [ -z "$EV_DIR" ] || { printf '%s\n' "$line" >> "$EV_DIR/${EV_SIDE}timeline.log"; } 2>/dev/null || true
 }
+
+# The event a recording should name the frame of: what the harness did, as
+# it does it (Requirements.md S9.3.5). The recorder reads the "mark" lines of
+# the story's timeline when it stops (evlib.py video-events).
+ev_mark() { ev_log mark "$1"; }
 
 ev_begin() { # <story> <title> [tier]
     EV_STORY=$1

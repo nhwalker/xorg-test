@@ -269,27 +269,69 @@ vnc_head() { # <moment> <width> <height> <what>
 # behind a frame) until ev_video_stop, which indexes the frames and a gif of
 # them. The recorder keeps the directory it started in; reopen that story
 # before ev_video_stop, which attaches to the open one.
-EV_VID="" EV_VID_PID=""
+#
+# The gif's line in the index names its event frames (Requirements.md
+# S9.3.5): the frame at or after each mark (ev_mark) the story's timeline
+# holds within the recording, and the frames where the screen first and last
+# changes (evlib.py video-events). ev_video_stop's further arguments are
+# other stories whose marks count too: the guest marks events in the story it
+# is writing. The guest's marks are on its clock, which ev_video_start
+# measures against this host's.
+EV_VID="" EV_VID_PID="" EV_VID_FRAMES="" EV_VID_SKEW=0 EV_VID_STORY="" EV_VID_DIR="" EV_VID_EVENTS=""
+# The guest's clock less this host's, in seconds: the midpoint of a round trip.
+guest_skew() {
+    local t0 g t1
+    t0=$(date +%s.%N); g=$(gnow); t1=$(date +%s.%N)
+    [ -n "$g" ] || { echo 0; return 0; }
+    awk -v a="$t0" -v g="$g" -v b="$t1" 'BEGIN { printf "%.3f\n", g - (a + b) / 2 }'
+}
 ev_video_start() { # <moment>
-    EV_VID="" EV_VID_PID=""
+    EV_VID="" EV_VID_PID="" EV_VID_EVENTS=""
     [ -n "$EV_DIR" ] || return 0
     EV_VID=$(ev_name "$1" "")
-    python3 qmp-tool.py video "$QMPV" "$EV_DIR/$EV_VID" "${EV_VID_FPS:-2}" &
+    EV_VID_FRAMES=${EV_VID_FPS:-2}
+    EV_VID_SKEW=$(guest_skew 2>/dev/null || echo 0)
+    python3 qmp-tool.py video "$QMPV" "$EV_DIR/$EV_VID" "$EV_VID_FRAMES" &
     EV_VID_PID=$!
     sleep 1
 }
-ev_video_stop() { # <what>
+ev_video_stop() { # <what> [another story whose marks count]...
     [ -n "$EV_VID_PID" ] || return 0
     sleep 1
     kill "$EV_VID_PID" 2>/dev/null || true
     wait "$EV_VID_PID" 2>/dev/null || true
     EV_VID_PID=""
-    ev_attach "$EV_VID/" "EV-VIDEO raw frames at 2 fps; index.txt gives each frame's UTC time, to read against timeline.log, and how long QEMU took to write it"
-    if convert -delay 50 -loop 0 "$EV_DIR/$EV_VID"/frame-*.png -resize 50% "$EV_DIR/$EV_VID.gif" 2>/dev/null; then
-        ev_attach "$EV_VID.gif" "$1"
+    local what=$1 s tl=()
+    shift
+    for s in "$EV_STORY" "$@"; do
+        tl+=(--host "$EV_ROOT/$s/${EV_SIDE}timeline.log")
+        # Where this host writes the h- side, the plain side is the guest's.
+        [ -z "$EV_SIDE" ] || tl+=(--guest "$EV_ROOT/$s/timeline.log")
+    done
+    EV_VID_EVENTS=$(python3 ../evlib.py video-events "$EV_DIR/$EV_VID" --skew "$EV_VID_SKEW" "${tl[@]}" 2>/dev/null) \
+        || EV_VID_EVENTS="event frames: none: evlib.py could not read the recording"
+    EV_VID_STORY=$EV_STORY EV_VID_DIR=$EV_DIR
+    ev_attach "$EV_VID/" "EV-VIDEO raw frames at $EV_VID_FRAMES fps; index.txt gives each frame's UTC time, to read against timeline.log, and how long QEMU took to write it; changes.txt the share of each frame's rows that differ from the frame before; events.txt the event frames"
+    if convert -delay "$((100 / EV_VID_FRAMES))" -loop 0 "$EV_DIR/$EV_VID"/frame-*.png -resize 50% "$EV_DIR/$EV_VID.gif" 2>/dev/null; then
+        ev_attach "$EV_VID.gif" "$what; $EV_VID_EVENTS"
     else
         ev_note "the frames in $EV_VID/ could not be assembled into a gif"
     fi
+}
+# The recording ev_video_stop just kept, filed as well under a story of the
+# guest's whose event it holds (S9.3.5: each story whose event changes the
+# screen holds its video): a copy of the gif, its line naming the event frames
+# and where the frames are.
+ev_video_cite() { # <story> <title> <what>
+    local name
+    [ -n "$EV_VID_DIR" ] && [ -s "$EV_VID_DIR/$EV_VID.gif" ] || return 0
+    ev_begin "$1" "$2" T3
+    if [ -n "$EV_DIR" ]; then
+        name=$(ev_name "${EV_VID#*-}" gif)
+        cp "$EV_VID_DIR/$EV_VID.gif" "$EV_DIR/$name"
+        ev_attach "$name" "$3 ($EV_VID_STORY's recording: its frames are in $EV_VID_STORY/$EV_VID/); $EV_VID_EVENTS"
+    fi
+    ev_end
 }
 
 # A saved command's output, without ev_save's "$ command" and "[exit N]" lines.
@@ -1050,11 +1092,25 @@ if in_shard core; then
     EV_SIDE=h-
     ev_begin S3.4.10 "A live disconnect does not move the geometry" T3
     ev_video_start live-disconnect
+    ev_mark "the guest's layout-unplug runs: Virtual-1 forced off and set back to detect, then Virtual-2 forced on and set back (the guest marks each)"
 fi
 guest_ev "$pd_ev" layout-unplug || fail "fixed monitor layout: the live disconnect or the re-plug moved something"
 if in_shard core; then
-    ev_video_stop "EV-VIDEO: head 0 across Virtual-1's forced disconnect and its re-plug (the guest's notes give both times); nothing on it should move"
+    ev_video_stop "EV-VIDEO: head 0 across Virtual-1's forced disconnect and its re-plug, then Virtual-2 forced on and set back (the guest's notes give the times); nothing on it should move" \
+        S3.10.1 S3.10.2 S3.10.3 S3.10.4 S7.7.3
     ev_end
+    # S3.10.1-S3.10.4 and S7.7.3 judge parts of the same events: each files
+    # the recording too (Requirements.md S9.3.5).
+    ev_video_cite S3.10.1 "Monitor plug-out with a declared layout holds the geometry" \
+        "EV-VIDEO: head 0 across Virtual-1's forced disconnect: nothing on it should move"
+    ev_video_cite S3.10.2 "Monitor plug-out is reported by RandR" \
+        "EV-VIDEO: head 0 across Virtual-1's forced disconnect, which RandR reports"
+    ev_video_cite S3.10.3 "Monitor re-plug after plug-out restores connected status without moving anything" \
+        "EV-VIDEO: head 0 across Virtual-1's re-plug: nothing on it should move"
+    ev_video_cite S3.10.4 "Monitor plug-in on an empty connector, layout declared" \
+        "EV-VIDEO: head 0 while Virtual-2 is forced on and set back: Virtual-1's picture should not change"
+    ev_video_cite S7.7.3 "Client windows stay put across a monitor plug-out and re-plug (layout declared)" \
+        "EV-VIDEO: head 0, the client's window on it, across Virtual-1's forced disconnect and re-plug: it should not move"
     # S7.7.3: the client's own view before, while Virtual-1 was off and after
     # the re-plug, compared over its window and over the whole screen.
     ev_begin S7.7.3 "Client windows stay put across a monitor plug-out and re-plug (layout declared)" T3
@@ -1096,6 +1152,7 @@ if [ "$SHARD" = soundless ]; then
     ev_end
     ev_begin S2.4.6 "$SL6_T" T3
     ev_copy "$ART/soundless-audio-group.txt" renumber "EV-STATE: the harness's groupmod -g 1063 audio on the host before the tree was applied, and getent group audio after it"
+    ev_mark "device_add usb-audio: the VM's first sound card"
     ev_qemu sl-plug "EV-QEMU: device_add usb-audio,id=slsnd,audiodev=snd0,bus=xhci.0 (the first sound card this VM has) and QEMU's reply (empty: accepted)" \
         "device_add usb-audio,id=slsnd,audiodev=snd0,bus=xhci.0" >/dev/null || fail "S2.4.6: QEMU refused the usb-audio card"
     ev_end
@@ -1106,6 +1163,7 @@ if [ "$SHARD" = soundless ]; then
     EV_SIDE=h-
     ev_begin S7.7.9 "$SL9_T" T3
     ev_audio_start client 550
+    ev_mark "the guest restarts the audio stack with the card (soundless realign); the client plays once it is back"
     ev_end
     EV_SIDE=
     guest_ev "$GUEST_EV" soundless realign || { audio_capture_stop; fail "S2.4.6: the stack's next start did not align the audio group, or the card did not come up"; }
@@ -1115,7 +1173,7 @@ if [ "$SHARD" = soundless ]; then
     ev_audio_stop "EV-AUDIO: the machine's output from before the stack's restart until after the client played: its 550 Hz tone, played by the client that started before the card existed" 3 0.02 550 \
         || fail "S7.7.9: the client's 550 Hz tone was not heard"
     ev_pass "the client's 550 Hz tone is heard through the card that arrived after it started"
-    ev_video_stop "EV-VIDEO: the display from before the card was plugged in until after the client played; index.txt gives each frame's UTC time"
+    ev_video_stop "EV-VIDEO: the display from before the card was plugged in until after the client played; index.txt gives each frame's UTC time" S2.4.6
     ev_end
     for st in "S2.4.6:770:the session user's tone through the realigned card" "S4.7.10:990:a tone through the card that arrived after the soundless boot"; do
         sid=${st%%:*} rest=${st#*:}
@@ -1148,11 +1206,13 @@ if in_shard core; then
     ev_begin S3.10.5 "$S5_T" T3; ev_video_start ad-plugin; ev_end
     guest_ev "$GUEST_EV" autodetect plugin before || fail "S3.10.5: the state before the plug-in is not what it should be"
     ev_begin S3.10.5 "$S5_T" T3
+    ev_mark "QEMU plugs a 1024x768 monitor into head 1 (Virtual-2)"
     vnc_head vnc-plug 1024 768 "EV-QEMU: vnc-head.py 1024 768: QEMU asked, through its VNC server on head 1, to plug a 1024x768 monitor into Virtual-2, and its answer" \
         || fail "S3.10.5: QEMU did not take the request to plug a monitor into head 1"
     ev_end
     guest_ev "$GUEST_EV" autodetect plugin on || fail "S3.10.5: the plugged-in monitor was not detected as it should be, or something moved"
     ev_begin S3.10.5 "$S5_T" T3
+    ev_mark "QEMU takes the monitor away from head 1"
     vnc_head vnc-unplug 0 0 "EV-QEMU: vnc-head.py 0 0: QEMU asked to take the monitor away from head 1, and its answer" \
         || fail "S3.10.5: QEMU did not take the request to unplug head 1"
     ev_end
@@ -1160,7 +1220,9 @@ if in_shard core; then
     ev_begin S3.10.5 "$S5_T" T3
     ev_video_stop "EV-VIDEO: head 0 while QEMU plugged a monitor into Virtual-2 and took it away, no layout declared (the notes give the times): nothing on it should move"
     ev_end
-    ev_begin S3.10.6 "$S6_T" T3; ev_video_start ad-unplug; ev_end
+    ev_begin S3.10.6 "$S6_T" T3; ev_video_start ad-unplug
+    ev_mark "the guest forces Virtual-1, the only enabled output, off and sets it back to detect (the guest marks each)"
+    ev_end
     guest_ev "$GUEST_EV" autodetect unplug || fail "S3.10.6: X did not live through its only output's plug-out as it should"
     ev_begin S3.10.6 "$S6_T" T3
     ev_video_stop "EV-VIDEO: head 0 while Virtual-1, the only enabled output, was forced off and set back to detect"
@@ -1168,6 +1230,7 @@ if in_shard core; then
     ev_begin S3.10.7 "$S7_T" T3; ev_video_start ad-edid; ev_end
     guest_ev "$GUEST_EV" autodetect edid prep || fail "S3.10.7: the EDID could not be injected"
     ev_begin S3.10.7 "$S7_T" T3
+    ev_mark "QEMU plugs a 1024x768 monitor with the injected EDID into head 1 (Virtual-2); the guest marks enabling it"
     vnc_head vnc-plug 1024 768 "EV-QEMU: vnc-head.py 1024 768: QEMU asked, through its VNC server on head 1, to plug a 1024x768 monitor into Virtual-2, and its answer" \
         || fail "S3.10.7: QEMU did not take the request to plug a monitor into head 1"
     ev_end
@@ -1181,6 +1244,7 @@ if in_shard core; then
     ev_end
     guest_ev "$GUEST_EV" autodetect edid off || fail "S3.10.7: Virtual-2 would not turn off"
     ev_begin S3.10.7 "$S7_T" T3
+    ev_mark "QEMU takes the monitor away from head 1"
     vnc_head vnc-unplug 0 0 "EV-QEMU: vnc-head.py 0 0: QEMU asked to take the monitor away from head 1, and its answer" \
         || fail "S3.10.7: QEMU did not take the request to unplug head 1"
     ev_end
@@ -1363,6 +1427,7 @@ log "session restart: what goes with a killed X server, what stays, and the VT"
 EV_SIDE=h-
 ev_begin S2.3.2 "The session restarts after Xorg exits, and the operator gets the desktop back" T3
 ev_video_start session-restart
+ev_mark "the guest moves the console to tty2 and kills Xorg (verify-session-restart; the guest marks the kill)"
 ev_end
 EV_SIDE=
 guest_ev "$GUEST_EV" verify-session-restart \
@@ -1500,6 +1565,7 @@ kvm_nodes=$(dev_events "$EV_DIR/$B_DEV" "QEMU QEMU USB Keyboard")
 [ -n "$kvm_nodes" ] || fail "no 'QEMU QEMU USB Keyboard' in /proc/bus/input/devices before the switch: the boot-time USB keyboard is missing"
 ev_note "the USB keyboard's event node(s) before the switch: $kvm_nodes"
 
+ev_mark "device_del kvmkbd: the KVM switches away"
 ev_qemu device-del "EV-QEMU: device_del kvmkbd (the KVM switches away) and QEMU's reply (empty: accepted)" \
     "device_del kvmkbd" >/dev/null || fail "QEMU refused device_del kvmkbd"
 kvm_off_host=$kvm_base_host kvm_off_nodes=$kvm_base_nodes
@@ -1544,6 +1610,7 @@ ev_end
 ev_begin S3.9.1 "Keyboard plug-in reaches the container" T3
 input_import S3.9.3 switched-away "after device_del kvmkbd (the KVM switched away)"
 xl2=$(xorg_len) || fail "could not read the Xorg log's length before the KVM switches back"
+ev_mark "device_add usb-kbd: the KVM switches back"
 ev_qemu device-add-usb "EV-QEMU: device_add usb-kbd,id=kvmkbd,bus=xhci.0 (the KVM switches back) and QEMU's reply (empty: accepted)" \
     "device_add usb-kbd,id=kvmkbd,bus=xhci.0" >/dev/null || fail "QEMU refused to re-add the USB keyboard"
 kvm_on_host=$kvm_off_host kvm_on_nodes=$kvm_off_nodes
@@ -1580,11 +1647,12 @@ ev_begin S3.9.6 "The session accepts input after a keyboard cycle" T3
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-start'
 sleep 2
 qlog=$(ev_name qmp-input txt)
+ev_mark "kvmok typed into the sink xterm"
 QMP_TRANSCRIPT="$EV_DIR/$qlog" python3 qmp-type.py "$QMP" "$res" 550 395 kvmok
 ev_attach "$qlog" "EV-QEMU: every QMP command sent after the cycle - the pointer to the sink xterm's centre (550,395 on $res), a click to focus it, then k v m o k Return"
 sleep 2
 ev_shot after-cycle "EV-SHOT: the sink xterm (title inputtest) right after kvmok was typed, the keyboard cycle behind it"
-ev_video_stop "EV-VIDEO: the display across the whole cycle - removal, re-add, then the sink xterm opening and kvmok typed into it (index.txt and timeline.log give the times)"
+ev_video_stop "EV-VIDEO: the display across the whole cycle - removal, re-add, then the sink xterm opening and kvmok typed into it (index.txt and timeline.log give the times)" S3.9.3 S3.9.1
 ev_save sink-file "EV-LOG-CLIENT: what the sink xterm's shell read (/tmp/inputproof in the desktop container); must be exactly 'kvmok'" \
     vm_ssh 'sudo podman exec desktop cat /tmp/inputproof 2>/dev/null; echo' >/dev/null || true
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check kvmok' \
@@ -2204,6 +2272,7 @@ ev_end
 EV_SIDE=h-
 ev_begin S2.3.6 "mwm exit ends the session and it restarts" T3
 ev_video_start mwm-exit
+ev_mark "the guest sends mwm SIGTERM (mwm-exit; the guest marks it)"
 ev_end
 EV_SIDE=
 guest_ev "$GUEST_EV" mwm-exit || fail "S2.3.6: mwm's exit did not end the session, or no new one started"
@@ -2885,12 +2954,14 @@ ev_save player-before "EV-PIDS: the pod's applications before the kill: its play
 T_PLAY_B=$EV_LAST
 pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 sleep 2
+ev_mark "Xorg killed (pkill -x Xorg, as the desktop user)"
 t_kill=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x Xorg' 2>/dev/null | sed -n 1p || true)
 ev_note "Xorg (pid $x_old) killed (SIGTERM, as the desktop user) at $t_kill, about 5 s into the pod's 20 s tone"
 ev_save streams-during "EV-STATE: the sink-inputs and source-outputs right after the kill, while the X session restarts" \
     gq streams >/dev/null || true
 si_d=$(sink_inputs "$(ev_out)")
 x_wait "$x_old" || { audio_capture_stop; fail "no new X session within 60 s of the kill"; }
+ev_mark "a new X session answers"
 ev_note "a new X session (Xorg $(xorg_pid)) answered at $(gnow)"
 ev_save streams-after "EV-STATE: the sink-inputs and source-outputs once the X session is back, the tone still playing" \
     gq streams >/dev/null || true
@@ -3160,6 +3231,7 @@ x_old=$(xorg_pid)
 [ -n "$x_old" ] || fail "no Xorg running before the restart"
 ev_video_start desktop-restart
 ev_note "systemctl restart desktop.service at $(gnow)"
+ev_mark "systemctl restart desktop.service"
 vm_ssh 'sudo systemctl restart desktop.service' || fail "systemctl restart desktop.service failed"
 x_wait "$x_old" || fail "no new X session within 60 s of the restart"
 t_back=$(gnow)
@@ -3289,6 +3361,7 @@ ev_end
 ev_begin S7.5.4 "A client started before the desktop is up works once it is, without restarting" T3
 ev_video_start desktop-start
 ev_note "systemctl start desktop.service at $(gnow)"
+ev_mark "systemctl start desktop.service"
 vm_ssh 'sudo systemctl start desktop.service' || fail "systemctl start desktop.service failed"
 ev_end
 ev_begin S7.6.5 "A client started before the audio stack is up plays once it is, without restarting" T3
@@ -3325,6 +3398,7 @@ ev_pass "the early pod is the same container it started as, restartCount 0"
 ev_end
 ev_begin S7.5.4 "A client started before the desktop is up works once it is, without restarting" T3
 gqw win-wait early-client 120 >/dev/null || fail "the early pod's xterm never appeared once the desktop was up"
+ev_mark "the early pod's xterm is on the display"
 ev_note "the early pod's xterm was on the display at $(gnow)"
 ev_video_stop "EV-VIDEO: the display from desktop.service's start until the early pod's xterm is on it (index.txt and the notes give the times)"
 ev_shot early-client "EV-SHOT: the desktop once it came up, with the early pod's xterm (title early-client)"
@@ -3379,6 +3453,7 @@ u_si=$(sink_inputs "$(ev_out)")
 ev_save player-before "EV-PIDS: the pod's applications before the USB card arrives: its player" gq journey-apps >/dev/null || true
 u_pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 t_plug=$(gnow)
+ev_mark "device_add usb-audio: the USB card arrives under the pod's tone"
 ev_qemu device-add "EV-QEMU: device_add usb-audio,id=s774snd,audiodev=snd0,bus=xhci.0 under the pod's tone, and QEMU's reply (empty: accepted)" \
     "device_add usb-audio,id=s774snd,audiodev=snd0,bus=xhci.0" >/dev/null || { audio_capture_stop; fail "QEMU refused device_add usb-audio"; }
 ev_note "device_add usb-audio at $t_plug (the guest's clock), about 4 s into the pod's 20 s tone"
@@ -3453,6 +3528,10 @@ gq desk pactl set-sink-mute "$u_builtin" 1 >/dev/null || fail "pactl set-sink-mu
 ev_save wpctl "EV-STATE: wpctl status with the built-in card the default (marked *) and muted, the USB card at full volume" \
     gq desk wpctl status >/dev/null || true
 ev_audio_start by-name 990
+# F7.7's common set: the display across the event, here a player started
+# with the card present (nothing on the screen should change).
+ev_video_start by-name
+ev_mark "the pod's new player starts: PULSE_SINK=$u_sink paplay"
 gq journey-tone named776 990 4 "$u_sink" >/dev/null || { audio_capture_stop; fail "could not start the pod's player with PULSE_SINK=$u_sink"; }
 w_on=""
 for _ in $(seq 6); do
@@ -3473,6 +3552,7 @@ w_player=$(ev_out)
 w_heard=yes
 ev_audio_stop "EV-AUDIO: the machine's output while the pod's new player played 990 Hz to the USB card by name, the built-in card the default and muted: what is heard came out of the USB card - listen for one beep" \
     2 0.05 990 || w_heard=no
+ev_video_stop "EV-VIDEO: the display while the pod's new player played to the USB card by name (index.txt and the notes give the times): an audio event, so nothing on it should change"
 gq desk pactl set-sink-mute "$u_builtin" 0 >/dev/null || true
 ev_save pod-after "EV-PIDS: the journey pod's container after its new player ended" gq pod-state journey >/dev/null || true
 W_POD_A=$EV_LAST
@@ -3511,6 +3591,7 @@ V_SINKS_B=$EV_LAST
 ev_save player-before "EV-PIDS: the pod's applications before the removal: its player" gq journey-apps >/dev/null || true
 v_pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 t_unplug=$(gnow)
+ev_mark "device_del s774snd: the USB card leaves under the pod's tone"
 ev_qemu device-del "EV-QEMU: device_del s774snd under the pod's tone, and QEMU's reply (empty: accepted)" \
     "device_del s774snd" >/dev/null || { audio_capture_stop; fail "QEMU refused device_del s774snd"; }
 ev_note "device_del s774snd at $t_unplug (the guest's clock), about 4 s into the pod's 20 s tone"
@@ -3612,6 +3693,7 @@ else
     snd_set base "before device_add $cap_model"
     snd_keep
     ev_video_start capture-card
+    ev_mark "device_add $cap_model: the capture card arrives"
     ev_qemu device-add "EV-QEMU: device_add $cap_model,id=s777cap,audiodev=snd0 and QEMU's reply (empty: accepted)" \
         "device_add $cap_model,id=s777cap,audiodev=snd0" >/dev/null || fail "QEMU refused device_add $cap_model"
     r_src=""
@@ -3636,6 +3718,7 @@ else
     rfacts=$(rec_facts "$EV_DIR/$rname" 2 2>&1) || rfacts_ok=no
     ev_text rec-facts "EV-AUDIO-REC: $rname's frames, duration, format and peak (python's wave module)" "$rfacts"
     snd_keep
+    ev_mark "device_del s777cap: the capture card leaves"
     ev_qemu device-del "EV-QEMU: device_del s777cap and QEMU's reply (empty: accepted; the PCI unplug then waits on the guest)" \
         "device_del s777cap" >/dev/null || fail "QEMU refused device_del s777cap"
     r_gone=no

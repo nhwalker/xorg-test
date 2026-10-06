@@ -1089,6 +1089,7 @@ layout_unplug() {
     ev_begin S3.4.10 "A live disconnect does not move the geometry" T3
     layout_set before "with the declared layout live, before Virtual-1 is forced off"
     xl0=$(xorg_log_lines 2>/dev/null || echo 0)
+    ev_mark "Virtual-1 forced off under the running server"
     echo off > "$conn/status"
     [ "$(cat "$conn/status")" = disconnected ] \
         || fail "forcing $conn off did not take (kernel without connector force?)"
@@ -1151,6 +1152,7 @@ layout_unplug() {
     ev_begin S3.10.3 "Monitor re-plug after plug-out restores connected status without moving anything" T3
     layout_copy before "before the force (taken in S3.4.10)"
     xl0=$(xorg_log_lines 2>/dev/null || echo 0)
+    ev_mark "Virtual-1 set back to detect: re-plugged"
     echo detect > "$conn/status"
     wait_for 10 1 "Virtual-1 connected again" conn_connected "$conn"
     ev_note "$conn/status set back to detect at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
@@ -1183,6 +1185,7 @@ layout_unplug() {
     ev_begin S3.10.4 "Monitor plug-in on an empty connector, layout declared" T3
     layout_copy replugged "before Virtual-2 is forced on (taken in S3.10.3)"
     xl0=$(xorg_log_lines 2>/dev/null || echo 0)
+    ev_mark "Virtual-2 forced on"
     echo on > "$conn2/status"
     wait_for 10 1 "sysfs to read Virtual-2 connected" conn_connected "$conn2"
     ev_note "$conn2/status forced on at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
@@ -1203,6 +1206,7 @@ layout_unplug() {
     moved=$(diff <(client_windows "$T/replugged-tree.txt") <(client_windows "$T/v2-on-tree.txt") || true)
     [ -z "$moved" ] || fail "a window changed when Virtual-2 was forced on: $(echo $moved)"
     ev_pass "no client window moved or resized"
+    ev_mark "Virtual-2 set back to detect"
     echo detect > "$conn2/status"
     ev_note "$conn2/status set back to detect at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     v2_off() { xr_is Virtual-2 disconnected 1024x768+1024+0; }
@@ -1349,6 +1353,7 @@ ad_unplug() { # S3.10.6: the only enabled output forced off, then back
     layout_set ad6-before "under autodetection, before Virtual-1, the only enabled output, is forced off"
     dims0=$(dpy_dims)
     xl0=$(xorg_log_lines 2>/dev/null || echo 0)
+    ev_mark "Virtual-1, the only enabled output, forced off"
     echo off > "$conn/status"
     [ "$(cat "$conn/status")" = disconnected ] || fail "forcing $conn off did not take"
     ev_note "$conn/status forced off at $(ad_now)"
@@ -1364,6 +1369,7 @@ ad_unplug() { # S3.10.6: the only enabled output forced off, then back
     podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2>&1 || fail "xdpyinfo did not answer with Virtual-1 forced off"
     ev_pass "xdpyinfo answers with Virtual-1 forced off"
     ev_note "what X reports with its only output forced off (the characterisation): $(xr_line Virtual-1); the screen is $(dpy_dims), as it was $dims0 before"
+    ev_mark "Virtual-1 set back to detect"
     echo detect > "$conn/status"
     wait_for 10 1 "Virtual-1 connected again in sysfs" conn_connected "$conn"
     ev_note "$conn/status set back to detect at $(ad_now)"
@@ -1440,6 +1446,7 @@ $(grep -h 'CONFIG_DRM_LOAD_EDID_FIRMWARE' "/boot/config-$(uname -r)" 2>/dev/null
             ev_pass "the kernel took the EDID as Virtual-2's override"
             # What the connector force gives with the override set: recorded,
             # not asserted. It is why the monitor comes from QEMU instead.
+            ev_mark "Virtual-2 forced on with the EDID override set (its EDID is not read this way)"
             echo on > "$conn2/status"
             ev_note "with the override set and Virtual-2 forced on: sysfs reads $(cat "$conn2/status"), its EDID is $(wc -c < "$conn2/edid") bytes and it has $(sort -u "$conn2/modes" | wc -l) mode sizes, the largest $(sort -t x -k1,1nr "$conn2/modes" | sed -n 1p): virtio-gpu's own list, not the EDID's"
             echo detect > "$conn2/status"
@@ -1483,6 +1490,7 @@ $(grep -h 'CONFIG_DRM_LOAD_EDID_FIRMWARE' "/boot/config-$(uname -r)" 2>/dev/null
                          e && /^\t\t[0-9a-f]+$/ {printf "%s", $1; next} {e = 0}' "$T/ad7-on-xrandr.txt")
             [ "$xedid" = "$kedid" ] || fail "X's EDID property for Virtual-2 is not the injected EDID ($(( ${#xedid} / 2 )) bytes)"
             ev_pass "X's EDID property for Virtual-2 is the injected EDID"
+            ev_mark "xrandr --output Virtual-2 --auto"
             desk xrandr --output Virtual-2 --auto || fail "xrandr --output Virtual-2 --auto failed"
             ev_note "xrandr --output Virtual-2 --auto at $(ad_now)"
             v2_enabled() { case "$(xr_line Virtual-2)" in "Virtual-2 connected "*1024x768+*) return 0 ;; esac; return 1; }
@@ -1498,6 +1506,7 @@ $(grep -h 'CONFIG_DRM_LOAD_EDID_FIRMWARE' "/boot/config-$(uname -r)" 2>/dev/null
             ev_pass "Virtual-1 is where it was: $v1 (the screen was $dims0 and is $(dpy_dims))"
             ;;
         off)
+            ev_mark "xrandr --output Virtual-2 --off"
             desk xrandr --output Virtual-2 --off || fail "xrandr --output Virtual-2 --off failed"
             wait_for 10 1 "Virtual-2 connected and no longer enabled" ad_v2_connected_unused
             ev_pass "xrandr --output Virtual-2 --off turned it off: $(xr_line Virtual-2)"
@@ -2211,6 +2220,7 @@ verify_mwm_exit() {
         ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg,$mwm" >/dev/null || true
     p_before=$EV_LAST
     n_lines=$(podman logs desktop 2>&1 | wc -l)
+    ev_mark "mwm sent SIGTERM, as the session user"
     podman exec -u desktop desktop pkill -TERM -u desktop -x mwm || fail "no mwm to send SIGTERM to"
     ev_note "mwm (pid $mwm) sent SIGTERM, kill's default, as the session user at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     xn() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null | sed -n 1p || true); [ -n "$p" ] && [ "$p" != "$xorg" ] && session_up; }
@@ -4668,6 +4678,7 @@ desktop-session-lead, pid $lead: the host's login session - must stay"
         ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg,$mwm" >/dev/null || true
     p_before=$EV_LAST
     n_lines=$(podman logs desktop 2>&1 | wc -l)
+    ev_mark "Xorg killed (SIGTERM, as the session user), the console on tty2"
     t_kill=$(date +%s.%N)
     podman exec -u desktop desktop pkill -u desktop -x Xorg || true
     ev_note "Xorg (pid $xorg) killed at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), the console on tty2"
