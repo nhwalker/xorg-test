@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Requirements.md E9, the test-suite rules a read of the tree can hold.
 
+  S9.1.1  (its static half) the checks are seen to fail: each tree guard
+          the static job runs (GUARDS: client-guard, e9-guard, script-list,
+          layout-keywords) runs there with its self-test, which plants what
+          its checks must catch; the static job runs no checker GUARDS does
+          not name; every rule here plants a violation it must flag and a
+          form it must pass, and so does client-guard's self-test. Whether a
+          pull request names the mutation its new assertions were tried
+          against is not read here;
   S9.1.2  an assertion over a generated artefact (a CDI spec, 20-gpu.conf or
           30-monitors.conf, a unit as systemctl cat or quadlet's dry run
           prints it, a rendered chart) reads it so that a comment cannot
@@ -2891,11 +2899,83 @@ def rule_s914(root, rep):
             f"{len(rep.violations('S9.1.4'))} violation(s)")
 
 
-RULES = {"S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
+# --- S9.1.1's static half: the guards see their own checks fail ----------------------
+
+# Each tree guard the static job runs, and the argument that runs its
+# self-test: a planted violation each check must flag, the guard failing if
+# one is missed (client-guard and e9-guard also plant forms that must pass).
+GUARDS = {"ci/client-guard.py": "--self-test", "ci/e9-guard.py": "--self-test",
+          "ci/script-list.py": "self-test", "ci/layout-keywords.py": "self-test"}
+
+
+def static_job_runs(root):
+    """(first line, text) of each run: block of ci.yml's static job."""
+    rel = ".github/workflows/ci.yml"
+    path = os.path.join(root, rel)
+    if not os.path.exists(path):
+        return []
+    lines = read(path).split("\n")
+    start = next((i for i, l in enumerate(lines) if re.match(r"^  static:\s*$", l)), None)
+    if start is None:
+        return []
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^  [\w-]+:\s*$", lines[i])), len(lines))
+    return [(first, text) for r, first, text, _ in workflow_runs(root) if r == rel and start < first <= end]
+
+
+def rule_s911(root, rep):
+    """S9.1.1's static half: every tree guard the static job runs runs its
+    self-test; the static job runs no checker GUARDS does not name; every
+    e9-guard rule plants a violation it must flag and a form it must pass."""
+    rel = ".github/workflows/ci.yml"
+    invoked = {}
+    for first, text in static_job_runs(root):
+        for n, l in enumerate(text.split("\n")):
+            for m in re.finditer(r"\bpython3\s+(ci/[\w-]+\.py)((?:\s+[^\s;|&>()]+)*)", l):
+                invoked.setdefault(m.group(1), (first + n, set()))[1].update(m.group(2).split())
+    for g, arg in GUARDS.items():
+        if g not in invoked:
+            rep.flag("S9.1.1", rel, 0, g, f"the static job does not run {g}",
+                     f"run {g} {arg} in the static job, and fail the step on its status")
+        elif arg not in invoked[g][1]:
+            rep.flag("S9.1.1", rel, invoked[g][0], g, f"the static job runs {g} without its self-test ({arg})",
+                     f"run {g} {arg}: the checks are seen to fail on what it plants before they judge the tree")
+        else:
+            rep.ok("S9.1.1", rel, invoked[g][0], f"the static job runs {g} {arg}")
+    for g, (line, _) in sorted(invoked.items()):
+        if g not in GUARDS:
+            rep.flag("S9.1.1", rel, line, g, f"the static job runs {g}, a checker with no self-test GUARDS names",
+                     "give it a self-test that plants what it must catch, run it in the static job, and add it to GUARDS")
+    for r in RULES:
+        wants = [w for _, _, w in PLANTS.get(r, [])]
+        if not any(wants) or all(wants):
+            rep.flag("S9.1.1", "ci/e9-guard.py", 0, r,
+                     f"e9-guard's rule {r} plants {'no violation it must flag' if not any(wants) else 'no form it must pass'}",
+                     "add a planted file to PLANTS for each kind")
+        else:
+            rep.ok("S9.1.1", "ci/e9-guard.py", 0, f"rule {r} plants {sum(wants)} violation(s) it must flag and "
+                   f"{len(wants) - sum(wants)} form(s) it must pass")
+    expected = [e for _, e in client_guard().SELF_TEST.values()]
+    if not any(expected) or all(expected):
+        rep.flag("S9.1.1", "ci/client-guard.py", 0, "SELF_TEST",
+                 "client-guard's self-test plants no " + ("violation" if not any(expected) else "allowed form"),
+                 "add a planted file of each kind to SELF_TEST")
+    else:
+        rep.ok("S9.1.1", "ci/client-guard.py", 0, f"its self-test plants {sum(1 for e in expected if e)} violation(s) "
+               f"and {sum(1 for e in expected if not e)} allowed form(s)")
+    return (f"S9.1.1 (static half): {len(GUARDS)} guard(s) named, {len(invoked)} checker(s) the static job runs, "
+            f"{len(RULES)} e9-guard rule(s) with their plants; {len(rep.violations('S9.1.1'))} violation(s)")
+
+
+RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
 
 # --- the self-test --------------------------------------------------------------------
 
 PLANTS = {
+    "S9.1.1": [
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py >/dev/null || rc=$?\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/new-check.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/script-list.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', False),
+    ],
     "S9.1.5": [
         ("ci/p1.sh", "#!/bin/bash\nset -euo pipefail\nx=$(podman ps | grep -q y)\n", True),
         ("ci/p2.sh", "#!/bin/bash\nset -euo pipefail\nfoo | head -n1 || true\n", True),
