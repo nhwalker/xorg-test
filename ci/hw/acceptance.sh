@@ -14,6 +14,9 @@
 #                                              cron can run it)
 #   sudo ci/hw/acceptance.sh pack              a tarball of the evidence so far
 #
+# The first run asks the tester's name (or takes HW_TESTER) and keeps it in
+# $HW_STATE/tester: every story's evidence names who ran it, and when.
+#
 # Run it as root from a checkout of this repository, over ssh from a machine
 # that is not behind the host's KVM: a provisioned host's console is the
 # desktop (no getty on any VT), and the KVM stories switch its keyboard away.
@@ -68,6 +71,18 @@ yes_no() { # <question>: 0 for yes
         read -r a < /dev/tty || return 1
         case "$a" in y|Y|yes) return 0 ;; n|N|no) return 1 ;; esac
     done
+}
+# Who ran it, for every story's meta.tsv (E8: a T4 result carries the
+# tester's name and date): HW_TESTER, else the name given at the first run,
+# kept in $HW_STATE/tester so that later runs and the cron samples carry it.
+tester() {
+    local name=${HW_TESTER:-}
+    [ -n "$name" ] || name=$(cat "$HW_STATE/tester" 2>/dev/null || true)
+    if [ -z "$name" ]; then
+        name=$(ask "Your name, for the evidence:" rehearsal)
+        if [ -n "$name" ] && [ -z "$HW_REHEARSE" ]; then printf '%s\n' "$name" > "$HW_STATE/tester"; fi
+    fi
+    printf '%s' "${name:-not given}"
 }
 # What only a person can see or hear, as a check.
 observe() { # <claim>
@@ -885,10 +900,14 @@ mkdir -p "$HW_STATE" "$EV_ROOT"
 case "${1:-}" in
     list) list ;;
     pack) pack ;;
-    S8.3.2) [ "${2:-}" = sample ] || { usage; exit 2; }; log_sample ;;
+    S8.3.2)
+        [ "${2:-}" = sample ] || { usage; exit 2; }
+        EV_SOURCE="$EV_SOURCE; tester: $(tester)"
+        log_sample ;;
     run)
         shift
         [ $# -gt 0 ] || { list; exit 2; }
+        EV_SOURCE="$EV_SOURCE; tester: $(tester)"
         done_fns=" "
         for s in "$@"; do
             fn=$(story_fn "$s") || { echo "acceptance: no T4 story $s (list shows them)" >&2; exit 2; }

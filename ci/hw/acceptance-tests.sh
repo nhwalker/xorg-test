@@ -170,5 +170,15 @@ grep -q $'FAIL\t2 samples over 0 h' "$EV_ROOT/S8.3.2/checks.tsv" && ok "two samp
 grep -q $'PASS\tthe running container.s LogConfig carries the 64 MB bound' "$EV_ROOT/S8.3.2/checks.tsv" && ok "the LogConfig bound is read" || bad "LogConfig not read"
 [ -s "$EV_ROOT/S8.3.2/evidence.md" ] && ok "evidence.md rendered" || bad "no evidence.md"
 
+# --- tester: HW_TESTER, else the kept name; a rehearsal keeps none ---------------
+rm -f "$HW_STATE/tester"
+got=$(HW_TESTER='A. Tester' tester)
+[ "$got" = "A. Tester" ] && ok "HW_TESTER names the tester" || bad "HW_TESTER gave '$got'"
+got=$(HW_REHEARSE=1 tester)
+[ "$got" = rehearsal ] && [ ! -e "$HW_STATE/tester" ] && ok "a rehearsal is 'rehearsal' and keeps no name" || bad "rehearsal gave '$got'"
+echo "B. Kept" > "$HW_STATE/tester"
+got=$(tester)
+[ "$got" = "B. Kept" ] && ok "a later run takes the kept name" || bad "the kept name read as '$got'"
+
 echo "---- $fails failure(s)"
 exit "$fails"
