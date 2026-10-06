@@ -167,17 +167,18 @@ ci/vm/vm-e2e.sh            # every shard in one VM; or: ci/vm/vm-e2e.sh core
 
 ---
 
-## 3. Tooling the probes need and do not yet have
+## 3. Tooling the probes need, and where it is
 
 | Need | Why | Where to add it |
 |---|---|---|
-| `xinput` | the only clean way to list X input devices by name and to stream events from **one specific device** (`xinput test <id>`); replaces counting `Adding input device` log lines, which also fire for devices Xorg then ignores | `Containerfile.testclient` (CI-only, networked build; run it as a podman client with `--device desktop.local/display=all` in phase-deploy, or from the `x11-testclient` pod in phase 2). Adding it to `Containerfile.base` also works but forces a base rebuild. |
-| `xev` | optional: root-window event stream for pointer motion | same |
+| `xinput` | the only clean way to list X input devices by name and to stream events from **one specific device** (`xinput test <id>`); replaces counting `Adding input device` log lines, which also fire for devices Xorg then ignores | **already in the desktop image**: on Rocky 9 `xorg-x11-server-utils` provides it, the package the image's `xrandr`, `xset`, `xsetroot` and `xhost` resolve to. Run it in the desktop as the session user (`podman exec -u desktop -e DISPLAY=:0 desktop xinput …`, `vm-guest.sh`'s `desk xinput`). `Containerfile.testclient` does not carry it. |
+| `xev` | optional: root-window event stream for pointer motion | **already in the desktop image**: `xorg-x11-utils` provides it, the package the image's `xdpyinfo` resolves to, with `xwininfo` and `xprop` |
 | `pw-cli`, `wpctl`, `pactl`, `pw-play`, `paplay`, `parec`, `aplay`, `arecord` | already in the desktop image and in the testclient | — |
 | `alsa-utils` + `alsa-plugins-pulseaudio` on the VM **host** | host-side ALSA probes (Requirements S4.2.2); not hotplug-specific | `vm-guest.sh phase_deploy` dnf line |
 
-Package names on Rocky 9 AppStream: `xinput`, `xev` (split out of the old
-`xorg-x11-utils`; confirm with `dnf provides '*/xinput'` on first use).
+On Rocky 9 `xinput` and `xev` are not packages of their own: they are names
+that `xorg-x11-server-utils` and `xorg-x11-utils` provide (checked with
+`rpm -q --whatprovides` in the desktop's base image, `base-bcf0dfd55ad0e461`).
 
 ---
 
@@ -223,7 +224,7 @@ sudo podman exec desktop ls -l /dev/input/
 # layer 4 (Xorg)
 sudo podman exec desktop grep -E 'Adding input device|removing device|XINPUT: Adding' \
     /home/desktop/.local/share/xorg/Xorg.0.log
-sudo podman run --rm --device desktop.local/display=all localhost/desktop-testclient xinput list
+sudo podman exec -u desktop -e DISPLAY=:0 desktop xinput list
 ```
 
 Removal in the Xorg log looks like:
@@ -253,8 +254,9 @@ unbound ones. That needs an `id=` on the e2e's `-device virtio-vga`:
 Extend `ci/vm/qmp-type.py` with an optional `--device <display id>` argument
 that adds that field to the command. Then, after the re-add, type `kvmdev`
 through `kvmkbd` and read it back from the sink xterm — or run
-`xinput test <id-of-"QEMU QEMU USB Keyboard">` in the background from the
-testclient and assert `key press`/`key release` lines appear.
+`xinput test <id-of-"QEMU QEMU USB Keyboard">` in the background in the
+desktop (`vm-guest.sh`'s `xi_test_start`) and assert `key press`/`key release`
+lines appear.
 
 #### 4.1.5 Gotchas
 
@@ -656,7 +658,7 @@ sudo podman exec desktop tail -50 /home/desktop/.local/share/xorg/Xorg.0.log
 sudo podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop \
     sh -c 'wpctl status; pw-cli ls Device; pactl list short sinks sources'
 sudo podman exec -u desktop -e DISPLAY=:0 desktop xrandr --query --verbose
-sudo podman run --rm --device desktop.local/display=all localhost/desktop-testclient xinput list
+sudo podman exec -u desktop -e DISPLAY=:0 desktop xinput list
 
 # audio stack health across an event
 sudo podman exec desktop sh -c 'pgrep -x pipewire; pgrep -x wireplumber; pgrep -x pipewire-pulse'
@@ -733,7 +735,9 @@ facts observed in this repository's CI:
    bus refuses `device_add`, and `usb-audio` is playback-only. Still to try:
    a PCI hot-add of `AC97` or `ES1370` (both capture), if the guest image has
    the driver. If not, capture hotplug is T4 only.
-5. Package names `xinput` and `xev` on Rocky 9 AppStream.
+5. ~~Package names `xinput` and `xev` on Rocky 9 AppStream~~: settled.
+   `xorg-x11-server-utils` and `xorg-x11-utils` provide them, and both are in
+   the desktop image (§3).
 6. The runner's QEMU version supports `screendump -f png` (the script already
    falls back to PPM). `input-send-event`'s `"device"` routes by display
    device, not by input device id (§4.1.4); `usb-mouse` cannot be routed that

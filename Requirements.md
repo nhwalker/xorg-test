@@ -61,8 +61,8 @@ renumbering.
 | **T0 static** | any machine, no root | files only | `ci.yml` `static`: go fmt/vet/test, shellcheck, `py_compile` of the VM harness, `ci/monitor-layout-tests.sh`, ARG-scoping check, helm/kubeconform |
 | **T1 script-unit** | any machine, no root, or a scratch container of the image | one script with fabricated inputs | `ci.yml` `static`: `ci/script-unit-tests.sh`, for the scripts an Appendix A override or a fake on `PATH` already reaches; the scripts that need more (Appendix A) are still to come |
 | **T2 build-smoke** | ubuntu runner, root, podman, systemd, **no sound card, no SELinux**; KMS not guaranteed (the Azure runners usually expose a Hyper-V DRM device, and X then really runs, per `ci/smoke-deploy.sh`) | the deploy tree booting a real container | `ci.yml` `build-smoke` + `ci/smoke-deploy.sh` |
-| **T3 VM e2e** | Rocky 9 KVM guest, virtio GPU/input/HDA, **SELinux enforcing**, k3s + CRI-O | real Xorg on a real KMS device, hotplug via QEMU, confined clients, a capturable display and audio backend | `ci.yml` `images` → `vm` (shards `core`, `operator`, `k8s`, each its own VM) → `ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh` + `ci/vm/operator-e2e.py` |
-| **T4 hardware** | a provisioned physical host | NVIDIA, physical KVM switch, real monitors/EDID, USB audio, a person | manual checklist (Appendix C); to become a guided script that prompts the tester for each physical action and gathers the evidence itself |
+| **T3 VM e2e** | Rocky 9 KVM guest, virtio GPU/input/HDA, **SELinux enforcing**, k3s + CRI-O | real Xorg on a real KMS device, hotplug via QEMU, confined clients, a capturable display and audio backend | `ci.yml` `images` → `vm` (shards `core`, `operator`, `k8s`, `soundless`, each its own VM) → `ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh` + `ci/vm/operator-e2e.py`; the maintainer's journeys (E10) in `maintainer.yml`, a stock VM each → `ci/vm/maint-e2e.sh` + `ci/vm/maint-guest.sh` |
+| **T4 hardware** | a provisioned physical host | NVIDIA, physical KVM switch, real monitors/EDID, USB audio, a person | `ci/hw/acceptance.sh` (Appendix C): a guided script that prompts the tester for each physical action, asks for what only a person can see or hear and for the photos and videos, and gathers the rest of the evidence itself, in CI's layout; not yet run on hardware |
 
 A story's tier is the *lowest* tier that can prove it honestly. Pushing a
 story down a tier (e.g. from T3 to T1) is a valid improvement if the proof
@@ -75,7 +75,7 @@ stays real.
 | ✅ | asserted by an existing test, **and every evidence item the story names is saved in the run's uploaded artifacts** (its own `artifacts/<story>/`, or another story's directory, which the line names); the reference names the function or step |
 | 🟡 | the named evidence is saved, but the assertion is partial or only a side effect of another test; the gap is named |
 | ❌ | no test, or some named evidence is not saved (when a test does assert the story, the line says which); the acceptance column is the spec for the one to write |
-| 🔧 | needs real hardware or a person; manual acceptance procedure in Appendix C, to become a guided hardware script |
+| 🔧 | needs real hardware or a person: `ci/hw/acceptance.sh` (Appendix C) runs the story at a provisioned host and saves its evidence there; no hardware run's evidence has been reviewed yet |
 
 Text in a job log is not saved evidence here: it is not indexed per story,
 and nothing checks that it was produced. This is the rule Appendix D counts
@@ -459,15 +459,15 @@ the same directory also receives the diagnostics the harness already prints
 
 **S3.1.1 NVIDIA path**
 - Requirement: with `/dev/nvidiactl` (or `nvidia0`) **and** an injected `nvidia_drv.so`, write `20-gpu.conf` with `Driver "nvidia"` and a `ModulePath` covering it.
-- Acceptance: on a real NVIDIA host (T4). Proving the NVIDIA paths with fabricated device nodes and a fake module was considered and rejected: the hardware-only stories are proven on hardware, by the guided hardware script.
+- Acceptance: on a real NVIDIA host (T4). Proving the NVIDIA paths with fabricated device nodes and a fake module was considered and rejected: the hardware-only stories are proven on hardware, by the guided hardware script (`ci/hw/acceptance.sh`).
 - Evidence: the generated file (EV-CONFIG); the script's evidence lines (EV-LOG-DESKTOP); `glxinfo -B` (EV-STATE) and EV-PHOTO of the desktop.
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S3.1.1` (Appendix C), not yet run on hardware. One run with S8.1.1, on an NVIDIA host whose toolkit injects the X driver: `20-gpu.conf` from the desktop, which must say `Driver "nvidia"` with a `ModulePath` naming the module directory of `xorg-gpu-conf.sh`'s decision line; that script's evidence lines and decision; `glxinfo -B` reporting NVIDIA; S8.1.1's EV-PHOTO of the desktop.
 
 **S3.1.2 NVIDIA nodes without the X driver fall back to modesetting**
 - Requirement: nodes present, no `nvidia_drv.so` → both `warning:` lines and the modesetting branch.
 - Acceptance: on a real NVIDIA host with an old toolkit (T4), for the reason S3.1.1 gives.
 - Evidence: EV-CONFIG + EV-LOG-DESKTOP warnings; EV-PHOTO.
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S3.1.2` (Appendix C), not yet run on hardware. One run with S8.1.4, on an NVIDIA host. A toolkit that does not inject `nvidia_drv.so` is taken as installed; one that does is made into an older one, if the tester agrees: a copy of the spec without the X driver's mounts, with `nvidia-ctk` set aside so nothing regenerates it, both undone at the end. After `systemctl restart desktop.service`: `20-gpu.conf` takes the modesetting branch, `xorg-gpu-conf.sh` logs both `warning:` lines, the tester confirms an unaccelerated desktop on the monitor, and an EV-PHOTO of it.
 
 **S3.1.3 modesetting picks the first connected connector's card**
 - Requirement: the first `connected` connector's card becomes `kmsdev`; otherwise `card0`.
@@ -575,7 +575,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: one `MetaModes`, `ModeValidation AllowNonEdidModes`, opt-in `ConnectedMonitor`/`CustomEDID`, pinned `Virtual`, no `Monitor` sections.
 - Acceptance: `layout-tests` "nvidia"; T4 the layout survives a KVM switch.
 - Evidence: EV-CONFIG; T4 `xrandr` before/after the switch (EV-DIFF empty) and EV-PHONEVIDEO of the switch.
-- Tier: T0/T4 · Coverage: ✅ the T0 half: `layout-tests` "nvidia" saves both cases' input, generated file and log under `artifacts/S3.4.5/` (artifact `evidence-static`) and checks one `MetaModes` carrying the whole layout, `ModeValidation AllowNonEdidModes`, `ConnectedMonitor` and `CustomEDID` only when asked for, the pinned `Virtual`, and no `Monitor` sections or invented timings. 🔧 the KVM-switch half: guided hardware script, not yet written.
+- Tier: T0/T4 · Coverage: ✅ the T0 half: `layout-tests` "nvidia" saves both cases' input, generated file and log under `artifacts/S3.4.5/` (artifact `evidence-static`) and checks one `MetaModes` carrying the whole layout, `ModeValidation AllowNonEdidModes`, `ConnectedMonitor` and `CustomEDID` only when asked for, the pinned `Virtual`, and no `Monitor` sections or invented timings. 🔧 the KVM-switch half: `ci/hw/acceptance.sh run S3.4.5` (Appendix C), not yet run on hardware. S8.2.2's cycle, on a desktop whose `20-gpu.conf` says `Driver "nvidia"` (the story stops otherwise), with S8.2.3's layout declared: `20-gpu.conf` and `monitors.conf`; `xrandr --query` and `xwininfo -root -tree` before and after the switch away and back, each pair's diff required empty; the connectors' status every 2 s through the cycle; the Xorg log's lines from it; the tester confirms the picture came back unchanged; EV-PHONEVIDEO of the cycle.
 
 **S3.4.6 Degraded host: no Device section**
 - Requirement: without `gpu0`, Monitor sections only and a warning.
@@ -865,7 +865,7 @@ event, EV-TIMELINE.
 **S3.10.8 Physical monitor plug-out and plug-in**
 - Requirement: S8.2.2 and S8.2.3.
 - Evidence: EV-PHONEVIDEO of the cable/KVM action with the screen in frame; `xrandr` before/after (EV-DIFF); EV-PHOTO of the desktop after.
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written (manual steps for S8.2.2/S8.2.3 in Appendix C).
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S3.10.8` (Appendix C), not yet run on hardware: S8.2.2's cycle, its action a video cable pulled out of one declared monitor for 30 s (`HW_AWAY`) and put back, with the same checks and EV-PHONEVIDEO, then an EV-PHOTO of the desktop after. Needs S8.2.3's layout installed.
 
 ### F3.11 HMI hotplug: KVM switch composite
 
@@ -1049,7 +1049,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 **S4.7.12 Physical USB audio plug-in and plug-out**
 - Requirement: S8.3.1.
 - Evidence: EV-PHONEVIDEO of the device being plugged with audible output; `wpctl status` before/after (EV-DIFF); for capture, an EV-AUDIO-REC of speech into the device's microphone.
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written (manual steps for S8.3.1 in Appendix C).
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S4.7.12` (Appendix C), not yet run on hardware: one run with S8.3.1, whose `wpctl status` states and diffs, EV-PHONEVIDEO and EV-AUDIO-REC it copies; it passes when S8.3.1's run passed every check.
 
 ---
 
@@ -1163,7 +1163,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: after a driver update the stale spec fails container creation; `systemctl restart desktop-cdi-refresh` fixes it.
 - Acceptance: manual.
 - Evidence: EV-LOG-JOURNAL of `desktop.service` (the creation error) and `desktop-cdi-refresh`; the spec before/after (EV-DIFF).
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S5.4.3` (Appendix C), not yet run on hardware. On an NVIDIA host with a real spec, what a driver update leaves behind is staged: every `.so.<driver version>` path in the spec renamed, and `nvidia-ctk` set aside so that the restart cannot regenerate it; the spec before and after is diffed. `systemctl restart desktop.service` must leave the desktop down, its journal naming the missing file. Then, the toolkit back, `README.md`'s "CDI spec staleness" entry is read out of the document and its remedy, `systemctl restart desktop-cdi-refresh.service`, run: a real spec regenerated (diffed against the stale one), and `desktop-cdi-refresh`'s journal. The story also requires the desktop back within 60 s of the remedy alone, which this run settles: the entry does not say to start the desktop again, and with the quadlet's `Restart=always` and systemd's default start limit, a creation error that fails fast may leave the unit failed at its limit. If so the story fails there, and the script restarts the desktop.
 
 ### F5.5 Client CDI specs
 
@@ -1741,64 +1741,65 @@ the referenced feature.
 
 ## E8 — Hardware-only behaviours (manual acceptance)
 
-Evidence for every story here is captured by a person: EV-PHOTO of the screen,
+Evidence for every story here needs a person: EV-PHOTO of the screen,
 EV-PHONEVIDEO of the physical action with the screen (and where relevant the
 speakers) in frame, plus the same EV-STATE / EV-LOG pairs the automated stories
-use, collected with the commands in Appendix C and the hardware table in
-`HotpluggingTestHelp.md` §6, and attached to the report with the tester's name
-and date. A T4 result without a photo or video is a note,
-not evidence.
+use. `ci/hw/acceptance.sh` (Appendix C) collects them: it saves the state and
+the logs itself, asks the tester for each photo and video, and keeps every
+story's evidence with the tester's name and the date. `HotpluggingTestHelp.md`
+§6 has the wider hardware table. A T4 result without a photo or video is a
+note, not evidence.
 
 ### F8.1 NVIDIA GPU mode
 
 **S8.1.1 NVIDIA GPU mode**
 - Requirement: with the driver and a toolkit that ships `nvidia_drv.so`: real CDI spec, `Driver "nvidia"`, `glxinfo -B` reports NVIDIA, preflight `PASS: NVIDIA GPU injected together with X driver module`; the operator sees an accelerated desktop.
 - Evidence: EV-PHOTO; `glxinfo -B`, `head -5 /etc/cdi/nvidia.yaml`, `20-gpu.conf`, preflight block (EV-STATE/EV-CONFIG).
-- Tier: T4 · Coverage: 🔧 Appendix C; guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S8.1.1` (Appendix C), not yet run on hardware. One run with S3.1.1, on an NVIDIA host whose toolkit injects the X driver: `/proc/cmdline` and `nvidia_drm`'s modeset parameter, `nvidia-smi` and the NVIDIA packages, `head -5 /etc/cdi/nvidia.yaml` (a real spec, not the stub), `20-gpu.conf` (`Driver "nvidia"`), the container preflight's `PASS: NVIDIA GPU injected together with X driver module`, `glxinfo -B` reporting NVIDIA, the unit's `Image=` and NVIDIA lines, and `desktop-preflight`; the tester confirms the desktop on the monitor, and an EV-PHOTO of it.
 
 **S8.1.2 NVIDIA host with missing/broken toolkit**
 - Requirement: stub spec, modesetting desktop comes up, both preflights FAIL on "stub + hardware".
 - Evidence: EV-PHOTO of the (working) desktop; both preflight outputs with the FAIL rows; the stub spec.
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S8.1.2` (Appendix C), not yet run on hardware. On an NVIDIA host, a missing toolkit staged if the tester agrees (`nvidia-ctk` set aside, the real spec moved away): `desktop-cdi-refresh` writes the stub, its journal and the stub kept; after a restart the desktop is on modesetting; `desktop-preflight` FAILs `STUB CDI spec but NVIDIA hardware present` and the container preflight `NVIDIA hardware visible but the host injected a STUB CDI spec`; the tester confirms a working desktop, and an EV-PHOTO of it. Undone: the toolkit back and a real spec regenerated.
 
 **S8.1.3 NVIDIA host without `nvidia_drm.modeset=1` and no injection**
 - Requirement: preflight `FAIL: no /dev/dri/card* visible` with the kernel-cmdline hint.
 - Evidence: `cat /proc/cmdline`, `ls /dev/dri`, the preflight row.
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S8.1.3` (Appendix C), not yet run on hardware, three times across two reboots. On an NVIDIA-only host: `nvidia_drm.modeset=0` on the default kernel's command line (`grubby`), `nvidia-ctk` set aside and the real spec moved away, then a reboot. After it: `/proc/cmdline` and the modeset parameter, `ls -l /dev/dri` with no `card*`, the stub spec, the container preflight's `FAIL: no /dev/dri/card* visible` with its `nvidia_drm.modeset=1` hint, and `desktop-preflight`. Then everything is put back and the host reboots; the third run checks it is in NVIDIA mode again.
 
 **S8.1.4 Old toolkit without `nvidia_drv.so`**
 - Requirement: preflight `WARN: nvidia_drv.so NOT injected`; the documented bind-mount fallback restores NVIDIA mode.
 - Evidence: preflight before/after the drop-in (EV-DIFF); `systemctl cat desktop.service` showing the merged `Volume=` lines; `glxinfo -B` after.
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S8.1.4` (Appendix C), not yet run on hardware. One run with S3.1.2, from its state without the X driver: the container preflight's `WARN: NVIDIA device nodes present but nvidia_drv.so NOT injected`; `README.md`'s "nvidia_drv.so missing" entry read out of the document; its fallback, the quadlet's commented `Volume=` lines, written as a drop-in, then `systemctl daemon-reload`: the generated unit's `ExecStart` carries them as `-v` (quadlet merges drop-ins from podman 5.0; the comments it copies into the unit, the commented lines among them, do not count). After a restart `glxinfo -B` reports NVIDIA again and the container preflight PASSes the injection, the preflight before and after diffed. Undone: the drop-in removed and the desktop back as it was.
 
 ### F8.2 Physical KVM switch and monitors
 
 **S8.2.1 Physical KVM: input**
 - Requirement: a non-HID-emulating USB KVM switched away and back leaves keyboard and mouse working without a service restart, on the first switch back and on the tenth.
 - Evidence: EV-PHONEVIDEO of the switch and of typing afterwards; `ls /dev/input/by-id` before/after (EV-DIFF showing re-enumeration); `xinput list` pair; `podman logs desktop` has no restart in the window (EV-LOG-DESKTOP); the KVM model stated.
-- Tier: T4 · Coverage: 🔧 `e2e` "KVM switch simulation: remove the keyboard and bring it back" covers one USB keyboard re-enumeration, with typing working afterwards and no restart; guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `e2e` "KVM switch simulation: remove the keyboard and bring it back" covers one USB keyboard re-enumeration, with typing working afterwards and no restart. `ci/hw/acceptance.sh run S8.2.1` (Appendix C), not yet run on hardware: ten KVM switches (`HW_SWITCHES`), the KVM's make and model kept. Before and after: `ls -l /dev/input/by-id`, `/dev/input` in the desktop and `xinput list`, each pair diffed; `udevadm monitor` of input events through the switches; the container, Xorg and mwm the same throughout, and no session restart in the desktop log. After the first switch back and after the tenth, a word the script picks, typed through the KVM into a sink xterm, must arrive exactly, and the tester confirms the mouse moves the pointer and clicks (mwm may focus a new window by itself, so the typing does not prove the mouse). EV-PHONEVIDEO of the switching and typing.
 
 **S8.2.2 Physical KVM: video, modesetting and NVIDIA**
 - Requirement: with a declared layout, `xrandr` geometry and window positions are unchanged across a switch cycle; the panel shows the picture after link retraining.
 - Evidence: EV-PHONEVIDEO with the monitor in frame through the whole cycle; `xrandr --query` and `xwininfo -root -tree` before/after (EV-DIFF empty); `cat /sys/class/drm/card*-*/status` during the away period; EV-LOG-XORG connector lines.
-- Tier: T4 · Coverage: 🔧 `guest:layout_unplug` forces a connector off under a running X and asserts the declared geometry holds; guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `guest:layout_unplug` forces a connector off under a running X and asserts the declared geometry holds. `ci/hw/acceptance.sh run S8.2.2` (Appendix C), not yet run on hardware, with S8.2.3's layout declared, on whichever driver the desktop runs (S3.4.5's run is the same cycle on NVIDIA): `20-gpu.conf` and `monitors.conf`; `xrandr --query` and `xwininfo -root -tree` before and after the switch away and back, each pair's diff required empty; `cat /sys/class/drm/card*-*/status` every 2 s through the away period; the Xorg log's lines from the cycle; the tester confirms the panel shows the picture again after the link retrained; EV-PHONEVIDEO of the cycle.
 
 **S8.2.3 Real EDID and `desktop-monitors-capture`**
 - Requirement: the capture tool prints the real output names and rates; pasting them yields the same arrangement after restart.
 - Evidence: the tool's output; `monitors.conf` as installed; `xrandr` before/after the restart (EV-DIFF empty); `cat /sys/class/drm/*/edid | edid-decode` (EV-STATE).
-- Tier: T4 · Coverage: 🔧 guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S8.2.3` (Appendix C), not yet run on hardware: `desktop-monitors-capture`'s output, which the tester confirms names this desk's monitors and rates, installed as `monitors.conf` as it is; after `systemctl restart desktop.service`, each connected output's name, primary flag and geometry from `xrandr --query` must be the same as autodetected before. The full diff is kept and need not be empty: the declared layout's modes may be named differently from the EDID's. Also `xorg-monitor-conf`'s lines and every connected monitor's EDID (`edid-decode`, or hex when it is not installed). The tester decides whether the layout stays installed for the KVM stories.
 
 ### F8.3 Audio hardware and long-run behaviour
 
 **S8.3.1 USB audio devices**
 - Requirement: a USB headset/DAC plugged in after boot appears in `wpctl status` and is audible; its microphone records from a client; unplugging returns sound to the speakers; a client application playing throughout is not restarted.
 - Evidence: EV-PHONEVIDEO with audible output from the device; `wpctl status` pair (EV-DIFF); EV-AUDIO-REC of speech into the device's microphone from a client pod; the pod's `restartCount` (EV-PIDS).
-- Tier: T4 · Coverage: 🔧 `e2e` "audio hotplug: plug and unplug a USB sound card while the desktop runs" covers plug and unplug with QEMU's `usb-audio`; guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `e2e` "audio hotplug: plug and unplug a USB sound card while the desktop runs" covers plug and unplug with QEMU's `usb-audio`. `ci/hw/acceptance.sh run S8.3.1` (Appendix C), not yet run on hardware, with the probe image loaded: a podman client of it, holding `desktop.local/audio=all`, plays a 440 Hz tone on a loop throughout (standing in for the pod, as F7.7's common set allows). The device plugged in: `wpctl status` lists it (diffed against before), the default sink is set to it, the tester confirms the tone from it, and EV-PHONEVIDEO. Where the device has a microphone, a client records 6 s from it while the tester speaks (EV-AUDIO-REC, peak at least 2% of full scale); a device without one, a DAC, is noted and not recorded. Unplugged: `wpctl status` lists the devices from before, and the tester confirms the tone back on the speakers. The client is the same container throughout, with 0 restarts.
 
 **S8.3.2 Long-run log bound**
 - Requirement: over days of uptime the container log never exceeds ~64 MB.
 - Evidence: `ls -l` of the log file daily (EV-STATE table); `podman inspect` LogConfig.
-- Tier: T4 · Coverage: 🔧 `smoke` and `guest:verify_log_bounds` assert the 64 MB bound is set on the running container; guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `smoke` and `guest:verify_log_bounds` assert the 64 MB bound is set on the running container. `ci/hw/acceptance.sh S8.3.2 sample` (Appendix C), daily from cron, adds a row to a table (time, uptime, the container's start, the log's size), each sample a check within ~64 MB; `ci/hw/acceptance.sh run S8.3.2`, after 48 h or more, requires three samples or more over 48 h or more of uptime, the largest within ~64 MB, and the running container's `LogConfig` carrying the bound. Not yet run on hardware.
 
 ---
 
@@ -1936,7 +1937,7 @@ not, supposed to happen.
 - Requirement: a physical NVIDIA host given both lines of `deploy/HOST-REQUIRES.md` (with the driver stack it describes), the image and S10.1.2's three commands shows an accelerated desktop on its first boot, with S8.1.1's checks passing, both preflights at 0 FAILs, and no step beyond those documents.
 - Acceptance: S8.1.1's assertions after S10.1.2's procedure.
 - Evidence: every command the tester typed, as typed (EV-PROCEDURE); EV-PHOTO of the desktop; S8.1.1's state set.
-- Tier: T4 · Coverage: 🔧 Appendix C; guided hardware script, not yet written.
+- Tier: T4 · Coverage: 🔧 `ci/hw/acceptance.sh run S10.1.6` (Appendix C), not yet run on hardware, twice across the documented reboot. On a stock EL9 host with the NVIDIA driver stack installed as `deploy/HOST-REQUIRES.md` describes: the host's state and package list kept; `HOST-REQUIRES.md`'s "Every host" and "GPU hosts" lines, the image's `podman load` (when it is not loaded yet), and `deploy/README.md`'s "Apply" block, each read out of the document and run as written at the terminal with its transcript kept, the last one the reboot. On the first boot: the desktop up, S8.1.1's checks, both preflights at 0 FAILs, the tester confirms, and an EV-PHOTO.
 
 ### F10.2 Verifying a host the way the documentation says to
 
@@ -2190,8 +2191,8 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 
 | Tool | Needed by | Where |
 |---|---|---|
-| `xinput` | S3.9.2, S3.9.4, S3.9.5, S3.9.8, S3.9.10, S3.9.11, S3.9.12 | `Containerfile.testclient` (CI-only); run as a podman client in phase-deploy or from `x11-testclient` in phase 2 |
-| `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.5.3, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S10.2.2, S11.1.1–S11.1.3, S11.2.1 | **shipped**: `Containerfile.testclient` carries both, and the operator phase runs them in its observer container; on a T4 host, built and loaded there too (Appendix C) |
+| `xinput` | S3.9.2, S3.9.4, S3.9.5, S3.9.8, S3.9.10, S3.9.11, S3.9.12, S8.2.1 | **in the desktop image**: `xorg-x11-server-utils`, which the image's `xrandr`, `xset`, `xsetroot` and `xhost` resolve to on Rocky 9, ships it. The VM shards run it in the desktop container (`desk xinput`), and so does `ci/hw/acceptance.sh`; `Containerfile.testclient` does not carry it |
+| `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.5.3, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S8.2.2, S10.2.2, S11.1.1–S11.1.3, S11.2.1 | **shipped**, twice: in the desktop image (`xorg-x11-utils`, which its `xdpyinfo` resolves to on Rocky 9, ships both), and in `Containerfile.testclient`, whose observer container the operator phase runs them in; `ci/hw/acceptance.sh` runs them in the desktop |
 | `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | **shipped**: imagemagick is on the `ci.yml` `vm` job's apt line and makes the gifs; ffmpeg is not installed |
 | `sox` or `ffmpeg` | spectrograms for EV-AUDIO | not installed; the operator phase draws a level plot at the story's pitch instead (EV-AUDIO) |
 | `inotify-tools` | S7.2.3 | the `build-smoke` runner (apt), S7.2.3 being T2 |
@@ -2242,57 +2243,61 @@ stories of `ci/vm/operator-e2e.py`, the host-side checks of `ci/vm/vm-e2e.sh`, a
 | `verify-maintainer-onboarding` (extend phase 2; the README's steps verbatim) | S10.6.1, S10.6.2 | `maintainer.yml`: `maint-k8s` |
 | operator phase | S3.3.2, S3.3.3, S3.5.2, S3.5.3, S11.1.1–S11.1.3, S11.2.1, S11.3.1; with them S2.3.6 (Quit session), S3.6.1 (menu), S3.6.3, S5.7.2 (menu-launched shell) | `ci/vm/operator-e2e.py`, the `operator` shard (QMP pointer and key events only) |
 
-## Appendix C — Hardware acceptance checklist (T4)
+## Appendix C — Hardware acceptance (T4)
 
-Run on a provisioned physical host after each image or tree release. For each
-row record the command output **and** the photo/video named in the story.
-
-The host has no X client tools (`deploy/HOST-REQUIRES.md`), so X queries run
-inside the desktop image, which carries `xrandr`, `xdpyinfo` and `glxinfo`
-(`xq` below). `xinput` and `xwininfo` are in neither the image nor the host:
-the lines using them need the Appendix A probe image
-(`Containerfile.testclient`, which carries `xwininfo` and `xprop`; `xinput`
-is still to be added), built and loaded onto the T4 host first (`probe`
-below).
+`ci/hw/acceptance.sh` runs the T4 stories at a provisioned physical host,
+after each image or tree release, and writes each story's evidence in CI's
+layout (`ci/evidence.sh`; `ci/evlib.py` renders its `evidence.md`). It checks
+what the host and the desktop report itself. What only a person can see or
+hear (a picture on a panel, a tone from a speaker) it asks the tester, as a
+check that passes or fails, and the photo, video or recording a story names
+is copied in from a path the tester gives. It has not yet been run on
+hardware: every story here stays 🔧 until a run's evidence is reviewed.
 
 ```sh
-xq()    { podman exec -u desktop -e DISPLAY=:0 desktop "$@"; }
-probe() { podman run --rm --device desktop.local/display=all localhost/desktop-testclient "$@"; }
-
-# S10.1.6 — GPU host from the documents: record every command typed, from the
-# HOST-REQUIRES.md lines through the deploy/README.md "Apply" block; then S8.1.x
-
-# S8.1.x — GPU mode
-desktop-preflight
-podman logs desktop | grep -E 'preflight:|xorg-gpu-conf: decision'
-podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf
-head -5 /etc/cdi/nvidia.yaml
-xq glxinfo -B | grep -E 'OpenGL (vendor|renderer)'
-systemctl cat desktop.service | grep -E '^Image=|nvidia_drv'
-# photo of the desktop
-
-# S8.2.1 — KVM input: film the switch; then
-ls -l /dev/input/by-id; podman exec desktop ls /dev/input
-probe xinput list
-# type into a CLIENT xterm; it must respond without `systemctl restart desktop.service`
-
-# S8.2.2 / S8.2.3 — KVM video: film the monitor through the whole cycle
-desktop-monitors-capture            # paste into monitors.conf, restart, then:
-xq xrandr --query; probe xwininfo -root -tree      # before
-# switch away, wait, switch back
-xq xrandr --query; probe xwininfo -root -tree      # must be identical
-podman logs desktop | grep xorg-monitor-conf
-for e in /sys/class/drm/card*-*/edid; do [ "$(wc -c <"$e")" -gt 0 ] && { echo "== $e"; edid-decode "$e"; }; done
-
-# S8.3.1 — USB audio: film with sound; a client pod playing throughout
-podman exec desktop ls /dev/snd     # before and after plugging the device
-podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop wpctl status
-kubectl get pod <player> -o jsonpath='{.status.containerStatuses[0].restartCount}'
-# record speech from the device's microphone in a client pod; attach the WAV
-
-# S8.3.2 — log bound (daily)
-ls -l /var/lib/containers/storage/overlay-containers/*/userdata/ctr.log*
+sudo ci/hw/acceptance.sh list                 # the stories and what each needs
+sudo ci/hw/acceptance.sh run S8.1.1 S8.2.3    # run stories (a pair runs once for both)
+sudo ci/hw/acceptance.sh S8.3.2 sample        # S8.3.2's daily row (cron; no terminal)
+sudo ci/hw/acceptance.sh pack                 # a tarball of the evidence: the report
 ```
+
+- Run it as root, from a checkout of this repository, over ssh from a
+  machine that is not behind the host's KVM: a provisioned host's console is
+  the desktop (no getty on any VT), and the KVM stories switch its keyboard
+  away.
+- Evidence goes under `/var/lib/hw-acceptance/artifacts/<story>/`
+  (`HW_STATE`), which survives the reboots S8.1.3 and S10.1.6 take. Each
+  story's `meta.tsv` names the host and the tester (asked at the first run
+  and kept, or `HW_TESTER`), and every row is timestamped. A new attempt at
+  a story sets the last one's directory aside.
+- Whatever a story stages (a spec set aside, a drop-in, a kernel argument)
+  is undone before it ends, and on an interrupt; a story that reboots keeps
+  its place in `HW_STATE` and undoes its staging on its last run. The
+  evidence keeps both the staging and the undoing.
+- `HW_REHEARSE=1` answers every question yes and attaches no media, so the
+  machine side can be tried on any host; its evidence says it was a
+  rehearsal, and no observation or media check passes in it.
+
+| Stories | The tester provides | The script stages and checks |
+|---|---|---|
+| S8.1.1, S3.1.1 | an NVIDIA host whose toolkit injects the X driver; a photo | the GPU mode, read from the host and the desktop |
+| S3.1.2, S8.1.4 | an NVIDIA host; a photo | an older toolkit (staged where this one injects the X driver), then `README.md`'s bind-mount fallback |
+| S8.1.2 | an NVIDIA host; a photo | a missing toolkit (staged): the stub, and both preflights' FAILs |
+| S8.1.3 | an NVIDIA-only host; three runs across two reboots | `nvidia_drm.modeset=0` and no injection (staged) |
+| S5.4.3 | an NVIDIA host with a real spec | a stale spec (staged), then `README.md`'s remedy |
+| S8.2.3 | the desk's monitors; `edid-decode`, if installed | `desktop-monitors-capture` installed as it is |
+| S8.2.2, S3.4.5, S3.10.8 | a KVM switch cycle, or a cable pulled and put back; a phone video (S3.10.8: and a photo) | the declared layout across it (S3.4.5: on an NVIDIA desktop); needs S8.2.3's layout |
+| S8.2.1 | ten KVM switches, typing and clicking after the first and the last; a phone video | the input devices and the desktop's processes across them |
+| S8.3.1, S4.7.12 | a USB headset or DAC; speech; a phone video | a client playing throughout, from the probe image |
+| S8.3.2 | days of uptime | the container log's size, daily |
+| S10.1.6 | a stock NVIDIA host; two runs across the documented reboot | the documents' commands as written, then S8.1.1's checks |
+
+The X tools the stories use are the desktop image's own: `xrandr`,
+`xdpyinfo` and `glxinfo`, and with them `xinput`, `xwininfo` and `xprop`
+(`xorg-x11-server-utils` and `xorg-x11-utils`, the packages its `xrandr` and
+`xdpyinfo` resolve to on Rocky 9). Only S8.3.1 needs the Appendix A probe
+image (`Containerfile.testclient`), built and loaded onto the host first,
+for its player and recorder.
 
 ## Appendix D — Coverage summary
 
