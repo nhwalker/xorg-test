@@ -33,7 +33,8 @@ above -40 dBFS:
                   from it: a tone of known length that comes out shorter lost
                   that time
   --mark SEC      draw a red line on the plot SEC seconds after the span
-                  begins (an event, timed by the player's clock)
+                  begins (an event, timed by the player's clock); give it
+                  once per event
 """
 import math
 import os
@@ -46,7 +47,8 @@ TOL_HZ = 25.0
 
 # --report / --plot, then the positional arguments.
 args, report_path, plot_path = [], None, None
-max_gap = span = mark = None
+max_gap = span = None
+marks = []
 argv = sys.argv[1:]
 while argv:
     a = argv.pop(0)
@@ -59,7 +61,7 @@ while argv:
     elif a == "--span" and len(argv) >= 2:
         span = (float(argv.pop(0)), float(argv.pop(0)))
     elif a == "--mark" and argv:
-        mark = float(argv.pop(0))
+        marks.append(float(argv.pop(0)))
     else:
         args.append(a)
 report = open(report_path, "w") if report_path else None
@@ -169,10 +171,10 @@ def levels_at(samples, sr, freq):
     return levels
 
 
-def level_plot(samples, sr, freq, out, mark_i=None):
+def level_plot(samples, sr, freq, out, marks_i=()):
     """One bar per 0.1 s: the amplitude at `freq` on a -60..0 dBFS scale,
-    with dashed lines at -20 and -40 dB, and a red line before window
-    `mark_i` if given. Draws no text; the report says what it shows."""
+    with dashed lines at -20 and -40 dB, and a red line before each window
+    in `marks_i`. Draws no text; the report says what it shows."""
     levels = levels_at(samples, sr, freq)
     # Short captures (a 1.5 s beep) get wider bars, so the plot stays readable.
     bw = max(2, min(8, 400 // max(1, len(levels))))
@@ -188,7 +190,8 @@ def level_plot(samples, sr, freq, out, mark_i=None):
         y = int(db / -60 * (h - 1))
         for x in range(0, w, 4):
             img[(y * w + x) * 3:(y * w + x) * 3 + 3] = b"\x4a\x51\x5c"
-    if mark_i is not None and 0 <= mark_i < len(levels):
+    drawn = [m for m in marks_i if 0 <= m < len(levels)]
+    for mark_i in drawn:
         for y in range(h):
             for x in (bw * mark_i, bw * mark_i + 1):
                 img[(y * w + x) * 3:(y * w + x) * 3 + 3] = b"\xe0\x40\x40"
@@ -205,28 +208,28 @@ def level_plot(samples, sr, freq, out, mark_i=None):
         os.unlink(ppm)
     say(f"check-audio: plot {out}: the level at {freq:.0f} Hz, one bar per 0.1 s "
         f"({len(levels)} bars), -60..0 dBFS, dashed lines at -20 and -40 dB"
-        + (f", a red line at {mark_i * 0.1:.1f}s" if mark_i is not None and 0 <= mark_i < len(levels) else ""))
+        + "".join(f", a red line at {m * 0.1:.1f}s" for m in drawn))
 
 
 # The tone's span (--max-gap, --span, --mark): its windows at EXPECTED_HZ.
 FLOOR = 10 ** (-40 / 20)
 lv = loud = None
-if expected_hz is not None and left and (max_gap is not None or span is not None or mark is not None):
+if expected_hz is not None and left and (max_gap is not None or span is not None or marks):
     lv = levels_at(left, rate, expected_hz)
     loud = [i for i, a in enumerate(lv) if a >= FLOOR]
     if loud:
         say(f"check-audio: the tone spans {loud[0] * 0.1:.1f}..{(loud[-1] + 1) * 0.1:.1f}s "
             f"of the capture: {(loud[-1] + 1 - loud[0]) * 0.1:.1f}s")
-mark_i = None
-if mark is not None:
+marks_i = []
+for mark in marks:
     if loud:
-        mark_i = loud[0] + int(round(mark / 0.1))
-        say(f"check-audio: the mark, {mark:.2f}s after the tone begins, falls at {mark_i * 0.1:.1f}s of the capture")
+        marks_i.append(loud[0] + int(round(mark / 0.1)))
+        say(f"check-audio: the mark, {mark:.2f}s after the tone begins, falls at {marks_i[-1] * 0.1:.1f}s of the capture")
     else:
         say("check-audio: no mark: the tone never reaches -40 dBFS, so there is nothing to time it from")
 
 if plot_path and left:
-    level_plot(left, rate, dominant if expected_hz is None and dominant else (expected_hz or 1000.0), plot_path, mark_i)
+    level_plot(left, rate, dominant if expected_hz is None and dominant else (expected_hz or 1000.0), plot_path, marks_i)
 
 if duration < min_sec:
     die(f"only {duration:.2f}s captured (need >= {min_sec}s) - "

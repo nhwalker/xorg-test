@@ -789,6 +789,101 @@ ev_diff_paths() { # <moment> <what> <path a> <path b>
 # moved" compares.
 client_windows() { grep -E '^ +0x[0-9a-f]+ "[^"]*": \("' "$1" | sed 's/^ *//' | sort; }
 
+# --- S7.7.3: a client's window across the declared layout's unplug ---------
+# A podman client's xterm on Virtual-1's half, below the session's xterm,
+# started before Virtual-1 is forced off: its window's xwininfo and the
+# client's own screenshot before, while Virtual-1 is off, and after the
+# re-plug, then its container before and after. Only where evidence is kept
+# (the core shard); the host then compares the three screenshots.
+S773=op-s773 S773_ON="" S773_WIN=""
+s773_win() { local t; t=$(xtree) || return 1; awk '/\("s773app" "XTerm"\)/ {print $1; exit}' <<<"$t"; }
+# The client's own capture, PNG on stdout. CDI gave the client DISPLAY and
+# DESKTOP_TOOLS_BIN, which a podman exec does not see: they are read from
+# its main process.
+s773_shot() {
+    podman exec "$S773" sh -c 'eval "$(tr "\0" "\n" < /proc/1/environ | grep -E "^(DISPLAY|DESKTOP_TOOLS_BIN)=" | sed "s/^/export /")"; exec "${DESKTOP_TOOLS_BIN:-/usr/libexec/desktop-tools}"/screenshot --to-stdout'
+}
+s773_open() { ev_begin S7.7.3 "Client windows stay put across a monitor plug-out and re-plug (layout declared)" T3; }
+s773_moment() { # <moment: before|during|after> <when>
+    [ -n "$S773_ON" ] || return 0
+    local name
+    s773_open
+    ev_save "xwininfo-$1" "EV-STATE: xwininfo -id $S773_WIN, the client's window, $2" \
+        podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -id "$S773_WIN" >/dev/null || true
+    case "$1" in
+        before) S773_INFO_before=$EV_LAST ;;
+        during) S773_INFO_during=$EV_LAST ;;
+        after) S773_INFO_after=$EV_LAST ;;
+    esac
+    name=$(ev_name "client-view-$1" png)
+    s773_shot > "$EV_DIR/$name" 2>/dev/null || true
+    if [ -s "$EV_DIR/$name" ]; then
+        ev_attach "$name" "EV-SHOT-CLIENT: the display as the client captures it from inside its own container (the toolkit's screenshot), $2"
+    else
+        rm -f "${EV_DIR:?}/${name:?}"
+        ev_note "the client's own screenshot ($1) was not produced"
+    fi
+    ev_end
+}
+s773_before() {
+    [ -n "${EV_ROOT:-}" ] || return 0
+    podman rm -f "$S773" >/dev/null 2>&1 || true
+    podman run -d --name "$S773" --device desktop.local/display=all --device desktop.local/tools=all \
+        localhost/desktop-container:latest \
+        xterm -name s773app -T s773app -xrm 'XTerm*allowTitleOps: false' -geometry 40x6+300+510 >/dev/null \
+        || fail "S7.7.3's client container did not start"
+    wait_for 30 1 "S7.7.3's client window on the display" win_up s773app
+    S773_WIN=$(s773_win)
+    [ -n "$S773_WIN" ] || fail "S7.7.3's client window is not in the window tree"
+    S773_ON=1
+    s773_open
+    ev_note "the client: podman run --device desktop.local/display=all --device desktop.local/tools=all localhost/desktop-container:latest xterm -name s773app, its window $S773_WIN"
+    ev_save client-before "EV-PIDS: the client container before Virtual-1 is forced off: its id, its main process's host pid, restart count and start time" \
+        podman inspect --format '{{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}}' "$S773" >/dev/null || true
+    S773_CB=$EV_LAST
+    ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before Virtual-1 is forced off" \
+        ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    S773_DB=$EV_LAST
+    ev_end
+    s773_moment before "with the declared layout live, before Virtual-1 is forced off"
+}
+s773_after() {
+    [ -n "$S773_ON" ] || return 0
+    local cb ca db da
+    s773_moment after "after Virtual-1 was set back to detect and reads connected"
+    s773_open
+    ev_save client-after "EV-PIDS: the client container after the re-plug" \
+        podman inspect --format '{{.Id}} pid={{.State.Pid}} restarts={{.RestartCount}} started={{.State.StartedAt}}' "$S773" >/dev/null || true
+    ev_diff client "EV-DIFF: the client container before and after (no differences: the same container and process, never restarted)" "$S773_CB" "$EV_LAST"
+    cb=$(sed '1d;$d' "$EV_DIR/$S773_CB") ca=$(sed '1d;$d' "$EV_DIR/$EV_LAST")
+    ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the re-plug" \
+        ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the unplug and re-plug (no differences)" "$S773_DB" "$EV_LAST"
+    db=$(sed '1d;$d' "$EV_DIR/$S773_DB") da=$(sed '1d;$d' "$EV_DIR/$EV_LAST")
+    ev_save client-log "EV-LOG-CLIENT: the client container's own output (podman logs)" podman logs "$S773" >/dev/null || true
+    ev_diff geometry-during "EV-DIFF: xwininfo of the client's window before the force and while Virtual-1 was off (no differences: it did not move or resize)" "$S773_INFO_before" "$S773_INFO_during"
+    ev_diff geometry-after "EV-DIFF: xwininfo of the client's window before the force and after the re-plug (no differences)" "$S773_INFO_before" "$S773_INFO_after"
+    [ "$(sed '1d;$d' "$EV_DIR/$S773_INFO_before")" = "$(sed '1d;$d' "$EV_DIR/$S773_INFO_during")" ] \
+        || fail "the client's window changed while Virtual-1 was forced off (see the geometry-during diff)"
+    [ "$(sed '1d;$d' "$EV_DIR/$S773_INFO_before")" = "$(sed '1d;$d' "$EV_DIR/$S773_INFO_after")" ] \
+        || fail "the client's window changed across the re-plug (see the geometry-after diff)"
+    ev_pass "the client's window, $S773_WIN, had the same xwininfo before, while Virtual-1 was off and after the re-plug: $(sed -n 's/^ *-geometry //p' "$EV_DIR/$S773_INFO_before" | sed -n 1p)"
+    [ -n "$cb" ] && [ "$cb" = "$ca" ] && grep -q ' restarts=0 ' <<<"$ca" \
+        || fail "the client container changed or restarted: '$cb' -> '$ca'"
+    ev_pass "the same container and process before and after, restarts 0: $(awk '{print $2}' <<<"$ca")"
+    [ -n "$db" ] && [ "$db" = "$da" ] || fail "Xorg, mwm or an audio daemon changed across the unplug and re-plug"
+    ev_pass "Xorg, mwm and the three audio daemons kept their pids and start times"
+    ev_end
+}
+# The client goes only once layout_unplug is done: S3.10.4 takes S3.10.3's
+# snapshot as its "before", so the window must still be there for its
+# "after" (run 37352221011 removed it in between, and S3.10.4 failed).
+s773_cleanup() {
+    [ -n "$S773_ON" ] || return 0
+    podman rm -f "$S773" >/dev/null 2>&1 || true
+    S773_ON=""
+}
+
 layout_declare() {
     local dims out before
 
@@ -924,6 +1019,7 @@ layout_unplug() {
     #
     # S3.4.10 holds F3.10's common set (the host adds its video there);
     # S3.10.1, S3.10.2 and S3.10.3 each judge their own part of it.
+    s773_before
     log pd "fixed monitor layout: a live disconnect does not move the geometry"
     ev_begin S3.4.10 "A live disconnect does not move the geometry" T3
     layout_set before "with the declared layout live, before Virtual-1 is forced off"
@@ -963,6 +1059,7 @@ layout_unplug() {
     log pd "  both outputs now disconnected, both still scanning out where they were declared"
     ev_end
 
+    s773_moment during "while Virtual-1 is forced off"
     ev_begin S3.10.1 "Monitor plug-out with a declared layout holds the geometry" T3
     layout_copy before "before the force (taken in S3.4.10)"
     layout_copy forced-off "after Virtual-1 was forced off (taken in S3.4.10)"
@@ -1010,6 +1107,7 @@ layout_unplug() {
     [ -z "$moved" ] || fail "a window changed across the unplug and re-plug: $(echo $moved)"
     ev_pass "no client window moved or resized across the unplug and re-plug"
     ev_end
+    s773_after
 
     # The other direction, on the connector nothing is plugged into: a
     # monitor arriving where the layout already scans out. Only xrandr's word
@@ -1044,6 +1142,7 @@ layout_unplug() {
     layout_set v2-detect "after Virtual-2 was set back to detect"
     ev_pass "set back to detect, Virtual-2 reads disconnected again, still at 1024x768+1024+0"
     ev_end
+    s773_cleanup
 }
 
 layout_restore() {
@@ -1093,6 +1192,283 @@ layout_restore() {
         xr >/dev/null || true
     ev_pass "xrandr: Virtual-2 disconnected and the screen autodetected at $dims, not the declared 2048x768 (asserted above)"
     ev_end
+}
+
+# --- monitors under autodetection (S3.10.5-S3.10.7) -------------------------
+# After layout_restore: no layout declared, Virtual-1 the only output. A
+# monitor is plugged into Virtual-2 the way QEMU plugs one: the host asks
+# QEMU's VNC server on head 1 for a size (vnc-head.py), virtio-gpu enables
+# the head with an EDID of that size, or disables it for 0x0, and raises a
+# display event, and the guest's driver reads every head's EDID and geometry
+# again and reports a hotplug. The connector force cannot stand in for that
+# here: a connector forced on gets virtio-gpu's own mode list and no EDID,
+# with an EDID override or drm.edid_firmware set (S3.10.7 records it). Each
+# story is several calls with the host's plug or unplug between them; what a
+# later call compares against is kept in $AD_TMP.
+AD_TMP=/run/ev-ad
+AD7_EDID=$AD_TMP/edid.bin
+ad_v2_connected_unused() { xr_is Virtual-2 connected; }
+ad_v2_disconnected() { xr_is Virtual-2 disconnected; }
+# An output's status and geometry, without the physical size after them: a
+# display event makes virtio-gpu read every head's EDID again, which can give
+# Virtual-1 back the size its EDID states without anything having moved.
+xr_head() { xr_line "$1" | sed 's/ (.*//'; }
+ad_keep() { # <tag>: the screen, Virtual-1 and the Xorg log's length now
+    mkdir -p "$AD_TMP"
+    printf 'dims=%s\nv1=%s\nxl0=%s\n' "$(dpy_dims)" "$(xr_head Virtual-1)" "$(xorg_log_lines 2>/dev/null || echo 0)" \
+        > "$AD_TMP/$1"
+}
+ad_get() { sed -n "s/^$2=//p" "$AD_TMP/$1" 2>/dev/null; }   # <tag> <key>
+ad_now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+# The client windows of two snapshots, compared: empty when none moved.
+ad_moved() { diff <(client_windows "$1") <(client_windows "$2") || true; }
+
+ad_plugin() { # before|on|off: S3.10.5, around the host's plug and unplug
+    local T=$LAYOUT_TMP dims0 v1 xl0 moved
+    layout_connectors
+    ev_begin S3.10.5 "Monitor plug-in without a layout is detected and does not reflow" T3
+    case "${1:-}" in
+        before)
+            log pd "autodetection: QEMU plugs a monitor into Virtual-2, no layout declared"
+            ad_v2_disconnected || fail "Virtual-2 is not disconnected and unused before the plug-in: $(xr_line Virtual-2)"
+            layout_set ad5-before "under autodetection, before QEMU plugs a monitor into Virtual-2"
+            ad_keep ad5
+            ev_pass "under autodetection Virtual-2 reads disconnected and unused; the screen is $(dpy_dims) and $(xr_head Virtual-1)"
+            ;;
+        on)
+            dims0=$(ad_get ad5 dims) v1=$(ad_get ad5 v1) xl0=$(ad_get ad5 xl0)
+            wait_for 20 1 "sysfs to read Virtual-2 connected" conn_connected "$conn2"
+            wait_for 20 1 "xrandr to report Virtual-2 connected" ad_v2_connected_unused
+            ev_note "Virtual-2 read connected at $(ad_now), in sysfs and in xrandr"
+            layout_set ad5-on "with the monitor QEMU plugged into Virtual-2"
+            xorg_slice "${xl0:-0}" "$T/ad5-xorg-log.txt"
+            ev_copy "$T/ad5-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the plug-in"
+            ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across the plug-in" "$T/ad5-before-xrandr.txt" "$T/ad5-on-xrandr.txt"
+            ev_diff_paths tree "EV-DIFF: the window tree across the plug-in (empty: no window changed)" "$T/ad5-before-tree.txt" "$T/ad5-on-tree.txt"
+            ev_pass "sysfs reads Virtual-2 connected, and RandR lists it connected and not enabled: $(xr_line Virtual-2)"
+            [ "$(dpy_dims)" = "$dims0" ] || fail "the screen changed from $dims0 to $(dpy_dims) when the monitor arrived"
+            [ "$(xr_head Virtual-1)" = "$v1" ] || fail "Virtual-1 changed when the monitor arrived: '$v1' -> '$(xr_head Virtual-1)'"
+            ev_pass "the screen stayed $dims0 and Virtual-1 is where it was: $v1"
+            [ -n "$(client_windows "$T/ad5-before-tree.txt")" ] || fail "the window tree before the plug-in lists no client window to compare"
+            moved=$(ad_moved "$T/ad5-before-tree.txt" "$T/ad5-on-tree.txt")
+            [ -z "$moved" ] || fail "a window changed when the monitor arrived: $(echo $moved)"
+            ev_pass "no client window moved or resized ($(client_windows "$T/ad5-before-tree.txt" | wc -l) windows)"
+            ;;
+        off)
+            dims0=$(ad_get ad5 dims)
+            wait_for 20 1 "xrandr to report Virtual-2 disconnected again" ad_v2_disconnected
+            ev_note "Virtual-2 read disconnected again at $(ad_now)"
+            layout_set ad5-off "after QEMU took the monitor away"
+            [ "$(dpy_dims)" = "$dims0" ] || fail "the screen is $(dpy_dims) after the monitor left, not $dims0"
+            ev_pass "with the monitor gone Virtual-2 reads disconnected and unused again, and the screen is still $dims0"
+            ;;
+        *) fail "autodetect plugin: before, on or off" ;;
+    esac
+    ev_end
+}
+
+ad_unplug() { # S3.10.6: the only enabled output forced off, then back
+    local T=$LAYOUT_TMP dims0 xl0 x0 x1 pb
+    layout_connectors
+    log pd "autodetection: Virtual-1, the only enabled output, forced off"
+    ev_begin S3.10.6 "Monitor plug-out without a layout is characterised" T3
+    ev_save pids-before "EV-PIDS: desktop-init, Xorg and mwm before Virtual-1 is forced off" \
+        ctr_pids desktop-init,Xorg,mwm >/dev/null || true
+    pb=$EV_LAST
+    x0=$(podman exec desktop pgrep -x Xorg 2>/dev/null | sed -n 1p || true)
+    layout_set ad6-before "under autodetection, before Virtual-1, the only enabled output, is forced off"
+    dims0=$(dpy_dims)
+    xl0=$(xorg_log_lines 2>/dev/null || echo 0)
+    echo off > "$conn/status"
+    [ "$(cat "$conn/status")" = disconnected ] || fail "forcing $conn off did not take"
+    ev_note "$conn/status forced off at $(ad_now)"
+    sleep 3
+    xr >/dev/null || true          # a query makes X probe, as any client's would
+    layout_set ad6-off "with Virtual-1, the only enabled output, forced off"
+    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose across the only output's plug-out" "$T/ad6-before-xrandr.txt" "$T/ad6-off-xrandr.txt"
+    ev_diff_paths tree "EV-DIFF: the window tree across the only output's plug-out" "$T/ad6-before-tree.txt" "$T/ad6-off-tree.txt"
+    x1=$(podman exec desktop pgrep -x Xorg 2>/dev/null | sed -n 1p || true)
+    [ -n "$x0" ] && [ "$x1" = "$x0" ] || fail "Xorg did not live through the only output's plug-out: $x0 -> ${x1:-none}"
+    ev_pass "Xorg kept running through the only output's plug-out: the same pid ($x0)"
+    podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2>&1 || fail "xdpyinfo did not answer with Virtual-1 forced off"
+    ev_pass "xdpyinfo answers with Virtual-1 forced off"
+    ev_note "what X reports with its only output forced off (the characterisation): $(xr_line Virtual-1); the screen is $(dpy_dims), as it was $dims0 before"
+    echo detect > "$conn/status"
+    wait_for 10 1 "Virtual-1 connected again in sysfs" conn_connected "$conn"
+    ev_note "$conn/status set back to detect at $(ad_now)"
+    v1_back() { case "$(xr_line Virtual-1)" in "Virtual-1 connected "*[0-9]x[0-9]*+*) return 0 ;; esac; return 1; }
+    wait_for 10 1 "xrandr to report Virtual-1 connected and enabled again" v1_back
+    layout_set ad6-detect "after Virtual-1 was set back to detect"
+    xorg_slice "$xl0" "$T/ad6-xorg-log.txt"
+    ev_copy "$T/ad6-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines from just before the force to after the re-detect"
+    ev_save pids-after "EV-PIDS: desktop-init, Xorg and mwm after Virtual-1 came back" \
+        ctr_pids desktop-init,Xorg,mwm >/dev/null || true
+    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across the plug-out and back (no differences: none restarted)" "$pb" "$EV_LAST"
+    [ "$(sed '1d;$d' "$EV_DIR/$pb")" = "$(sed '1d;$d' "$EV_DIR/$EV_LAST")" ] \
+        || fail "desktop-init, Xorg or mwm changed across the plug-out and back (see the pids diff)"
+    ev_pass "desktop-init, Xorg and mwm kept their pids and start times across the plug-out and back"
+    [ "$(dpy_dims)" = "$dims0" ] || fail "the screen is $(dpy_dims) after Virtual-1 came back, not $dims0"
+    ev_pass "set back to detect, Virtual-1 reads connected and the screen is $dims0, as before: $(xr_head Virtual-1)"
+    ev_end
+}
+
+# An EDID for a 1024x768@60 monitor (S3.10.7): 1024x768@60 preferred, the
+# size QEMU is asked to enable head 1 at, which a preferred mode must match
+# for virtio-gpu to keep it; 640x480@60 and 800x600@60 established; no
+# continuous-frequency flag, so the kernel infers no modes from the range
+# limits. X adds none of its own either: its default modes only when the
+# driver gives none, and modesetting's only on an output with a panel fitter
+# (a "scaling mode" property), which virtio-gpu's connectors lack. Both list
+# exactly these three.
+write_edid() { # <file>
+    python3 - "$1" <<'EOF'
+import sys
+e = bytearray(128)
+e[0:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+e[8:10] = ((20 << 10) | (19 << 5) | 20).to_bytes(2, "big")          # "TST"
+e[10:12], e[12:16], e[16], e[17] = (1).to_bytes(2, "little"), (1).to_bytes(4, "little"), 1, 30
+e[18], e[19], e[20], e[21], e[22], e[23], e[24] = 1, 3, 0x80, 34, 27, 120, 0x0a
+e[25:35] = bytes([0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54])
+e[35], e[36], e[37] = 0x21, 0x08, 0x00                                # 640x480@60 800x600@60 1024x768@60
+e[38:54] = b"\x01\x01" * 8
+clk, ha, hb, va, vb, hfp, hsw, vfp, vsw, hmm, vmm = 6500, 1024, 320, 768, 38, 24, 136, 3, 6, 340, 270
+d = bytearray(18)
+d[0:2] = clk.to_bytes(2, "little")
+d[2], d[3], d[4] = ha & 0xff, hb & 0xff, ((ha >> 8) << 4) | (hb >> 8)
+d[5], d[6], d[7] = va & 0xff, vb & 0xff, ((va >> 8) << 4) | (vb >> 8)
+d[8], d[9], d[10] = hfp & 0xff, hsw & 0xff, ((vfp & 0xf) << 4) | (vsw & 0xf)
+d[11] = ((hfp >> 8) << 6) | ((hsw >> 8) << 4) | ((vfp >> 4) << 2) | (vsw >> 4)
+d[12], d[13], d[14], d[17] = hmm & 0xff, vmm & 0xff, ((hmm >> 8) << 4) | (vmm >> 8), 0x18
+e[54:72] = d
+e[72:90] = b"\x00\x00\x00\xfc\x00" + b"EV-TEST\n".ljust(13, b" ")
+e[90:108] = b"\x00\x00\x00\xfd\x00" + bytes([50, 75, 30, 80, 8, 0x00, 0x0a]) + b" " * 6
+e[108:126] = b"\x00\x00\x00\x10\x00" + bytes(13)
+e[127] = (-sum(e[:127])) & 0xff
+open(sys.argv[1], "wb").write(bytes(e))
+EOF
+}
+
+ad_edid() { # prep|on|off|gone: S3.10.7, around the host's plug, shot and unplug
+    local T=$LAYOUT_TMP dbg dims0 v1 xl0 v2modes kmodes unoffered v1cur kedid xedid want=640x480,800x600,1024x768
+    layout_connectors
+    dbg=$(ls -d /sys/kernel/debug/dri/*/Virtual-2 2>/dev/null | head -n1 || true)
+    ev_begin S3.10.7 "A plugged-in monitor with an EDID exposes modes" T3
+    case "${1:-}" in
+        prep)
+            log pd "autodetection: an EDID injected for Virtual-2, before QEMU plugs a monitor in there"
+            ev_text edid-route "EV-STATE: how the EDID is injected: Virtual-2's DRM debugfs edid_override (the kernel then reads it in place of the monitor's own EDID), and whether the kernel has the other route, CONFIG_DRM_LOAD_EDID_FIRMWARE" \
+                "debugfs connector directory: ${dbg:-none}
+edid_override present: $([ -n "$dbg" ] && [ -e "$dbg/edid_override" ] && echo yes || echo no)
+$(grep -h 'CONFIG_DRM_LOAD_EDID_FIRMWARE' "/boot/config-$(uname -r)" 2>/dev/null || echo "CONFIG_DRM_LOAD_EDID_FIRMWARE: not in /boot/config-$(uname -r)")"
+            [ -n "$dbg" ] && [ -e "$dbg/edid_override" ] || fail "no DRM debugfs edid_override for Virtual-2 (is debugfs mounted?)"
+            mkdir -p "$AD_TMP"
+            write_edid "$AD7_EDID"
+            ev_save edid-injected "EV-STATE: the EDID injected (od -An -tx1 -v): monitor EV-TEST, 1024x768@60 preferred, 640x480@60 and 800x600@60 established, no continuous-frequency flag" \
+                od -An -tx1 -v "$AD7_EDID" >/dev/null || true
+            cat "$AD7_EDID" > "$dbg/edid_override" || fail "the kernel refused the EDID as Virtual-2's override"
+            ev_pass "the kernel took the EDID as Virtual-2's override"
+            # What the connector force gives with the override set: recorded,
+            # not asserted. It is why the monitor comes from QEMU instead.
+            echo on > "$conn2/status"
+            ev_note "with the override set and Virtual-2 forced on: sysfs reads $(cat "$conn2/status"), its EDID is $(wc -c < "$conn2/edid") bytes and it has $(sort -u "$conn2/modes" | wc -l) mode sizes, the largest $(sort -t x -k1,1nr "$conn2/modes" | sed -n 1p): virtio-gpu's own list, not the EDID's"
+            echo detect > "$conn2/status"
+            wait_for 10 1 "xrandr to report Virtual-2 disconnected and unused again" ad_v2_disconnected
+            layout_set ad7-before "under autodetection, with the EDID injected, before QEMU plugs a monitor into Virtual-2"
+            ad_keep ad7
+            ev_pass "Virtual-2 reads disconnected and unused before the plug-in"
+            ;;
+        on)
+            dims0=$(ad_get ad7 dims) v1=$(ad_get ad7 v1) xl0=$(ad_get ad7 xl0)
+            wait_for 20 1 "sysfs to read Virtual-2 connected" conn_connected "$conn2"
+            wait_for 20 1 "xrandr to report Virtual-2 connected" ad_v2_connected_unused
+            ev_note "Virtual-2 read connected at $(ad_now), in sysfs and in xrandr"
+            ev_save edid-kernel "EV-STATE: Virtual-2's EDID as the kernel reports it, its sysfs edid (od -An -tx1 -v)" \
+                od -An -tx1 -v "$conn2/edid" >/dev/null || true
+            kedid=$(od -An -tx1 -v "$conn2/edid" | tr -d ' \n')
+            [ -n "$kedid" ] && [ "$kedid" = "$(od -An -tx1 -v "$AD7_EDID" | tr -d ' \n')" ] \
+                || fail "Virtual-2's EDID in sysfs is not the injected one ($(( ${#kedid} / 2 )) bytes)"
+            ev_pass "the kernel gives the plugged-in Virtual-2 the injected EDID, byte for byte ($(( ${#kedid} / 2 )) bytes)"
+            ev_save modes-kernel "EV-STATE: the modes the kernel offers on Virtual-2, its sysfs modes" \
+                cat "$conn2/modes" >/dev/null || true
+            kmodes=$(sort -u "$conn2/modes" | sort -t x -k1,1n | paste -sd, -)
+            [ "$kmodes" = "$want" ] || fail "the kernel offers Virtual-2 the modes ${kmodes:-none}, not the EDID's $want"
+            ev_pass "the kernel offers Virtual-2 exactly the EDID's modes: $kmodes"
+            layout_set ad7-on "with the monitor plugged into Virtual-2"
+            # X's modes for Virtual-2 from the plain query. After its last
+            # output xrandr prints every mode no output offers, and --verbose
+            # prints those just as it prints an output's modes, so they read
+            # as the last output's. The plain query prints an output's modes
+            # three spaces in, and those two in, with their ids.
+            xr > "$T/ad7-on-query.txt" 2>&1 || true
+            ev_copy "$T/ad7-on-query.txt" ad7-on-query "EV-STATE: xrandr --query, with the monitor plugged into Virtual-2 (an output's modes three spaces in; after the last output, two in and with their ids, the modes no output offers)"
+            v2modes=$(awk '/^Virtual-2 /{f = 1; next} /^[^ ]/{f = 0} f && /^   [0-9]+x[0-9]+i? / {print $1}' "$T/ad7-on-query.txt" \
+                | sort -u | sort -t x -k1,1n | paste -sd, -)
+            [ "$v2modes" = "$want" ] || fail "xrandr lists Virtual-2's modes as ${v2modes:-none}, not the EDID's $want"
+            ev_pass "xrandr lists exactly the EDID's modes for Virtual-2: $v2modes"
+            unoffered=$(awk '/^  [0-9]+x[0-9]+i? \(0x[0-9a-f]+\)/ {print $1 " " $2}' "$T/ad7-on-query.txt" | paste -sd, -)
+            v1cur=$(awk '/^Virtual-1 / {for (i = 2; i <= NF; i++) if ($i ~ /^\(0x[0-9a-f]+\)$/) {print $i; exit}}' "$T/ad7-on-xrandr.txt")
+            [ -z "$unoffered" ] || ev_note "after its last output xrandr lists the modes no output offers: $unoffered; Virtual-1 runs mode ${v1cur:-none}"
+            xedid=$(awk '/^Virtual-2 /{f = 1; next} /^[A-Za-z]/{f = 0; e = 0} f && /^\tEDID:/ {e = 1; next}
+                         e && /^\t\t[0-9a-f]+$/ {printf "%s", $1; next} {e = 0}' "$T/ad7-on-xrandr.txt")
+            [ "$xedid" = "$kedid" ] || fail "X's EDID property for Virtual-2 is not the injected EDID ($(( ${#xedid} / 2 )) bytes)"
+            ev_pass "X's EDID property for Virtual-2 is the injected EDID"
+            desk xrandr --output Virtual-2 --auto || fail "xrandr --output Virtual-2 --auto failed"
+            ev_note "xrandr --output Virtual-2 --auto at $(ad_now)"
+            v2_enabled() { case "$(xr_line Virtual-2)" in "Virtual-2 connected "*1024x768+*) return 0 ;; esac; return 1; }
+            wait_for 10 1 "Virtual-2 enabled at 1024x768" v2_enabled
+            layout_set ad7-enabled "after xrandr --output Virtual-2 --auto"
+            xorg_slice "${xl0:-0}" "$T/ad7-xorg-log.txt"
+            ev_copy "$T/ad7-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the plug-in"
+            ev_diff_paths xrandr "EV-DIFF: xrandr --verbose from before the plug-in to Virtual-2 enabled" "$T/ad7-before-xrandr.txt" "$T/ad7-enabled-xrandr.txt"
+            ev_diff_paths tree "EV-DIFF: the window tree from before the plug-in to Virtual-2 enabled (empty: no window changed)" "$T/ad7-before-tree.txt" "$T/ad7-enabled-tree.txt"
+            ev_pass "xrandr --auto enabled Virtual-2 at the EDID's preferred mode: $(xr_line Virtual-2)"
+            [ "$(xr_head Virtual-1)" = "$v1" ] || fail "Virtual-1 changed when Virtual-2 was enabled: '$v1' -> '$(xr_head Virtual-1)'"
+            ev_pass "Virtual-1 is where it was: $v1 (the screen was $dims0 and is $(dpy_dims))"
+            ;;
+        off)
+            desk xrandr --output Virtual-2 --off || fail "xrandr --output Virtual-2 --off failed"
+            wait_for 10 1 "Virtual-2 connected and no longer enabled" ad_v2_connected_unused
+            ev_pass "xrandr --output Virtual-2 --off turned it off: $(xr_line Virtual-2)"
+            ;;
+        gone)
+            dims0=$(ad_get ad7 dims) v1=$(ad_get ad7 v1)
+            wait_for 20 1 "xrandr to report Virtual-2 disconnected and unused" ad_v2_disconnected
+            ev_note "Virtual-2 read disconnected again at $(ad_now)"
+            # Exactly "reset", five bytes: with echo's newline the kernel reads
+            # the write as an EDID, refuses it and keeps the override.
+            printf reset > "$dbg/edid_override" || fail "the kernel did not reset Virtual-2's EDID override"
+            ev_note "Virtual-2's EDID override reset at $(ad_now)"
+            layout_set ad7-after "after QEMU took the monitor away and the override was reset"
+            [ "$(dpy_dims)" = "$dims0" ] || fail "the screen is $(dpy_dims) after the monitor left, not $dims0"
+            [ "$(xr_head Virtual-1)" = "$v1" ] || fail "Virtual-1 changed: '$v1' -> '$(xr_head Virtual-1)'"
+            ev_pass "with the monitor gone Virtual-2 reads disconnected and unused, the screen is $dims0 and Virtual-1 where it was"
+            ;;
+        *) fail "autodetect edid: prep, on, off or gone" ;;
+    esac
+    ev_end
+}
+autodetect() { # plugin before|on|off, unplug, edid prep|on|off|gone
+    case "${1:-}" in
+        plugin) ad_plugin "${2:-}" ;;
+        unplug) ad_unplug ;;
+        edid) ad_edid "${2:-}" ;;
+        *) fail "autodetect: plugin, unplug or edid" ;;
+    esac
+}
+# The operator phase's layout switch (S3.11.2): "two" declares Virtual-1 and
+# Virtual-2 side by side, as layout_declare does; "shipped" puts the
+# shipped, comment-only file back. Either way the desktop restarts on it.
+monitors_set() { # two|shipped
+    case "${1:-}" in
+        two) printf 'Virtual-1  1024x768@60  +0+0      primary\nVirtual-2  1024x768@60  +1024+0\n' \
+                > /etc/desktop-container/monitors.conf ;;
+        shipped) install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf ;;
+        *) fail "monitors-set: two or shipped" ;;
+    esac
+    systemctl restart desktop.service
+    desktop_up
+    x_up_wait() { session_up; }
+    wait_for 40 2 "the new session's mwm" x_up_wait
 }
 
 phase2() {
@@ -2761,12 +3137,12 @@ journey_put() { # <tag> <hz> <seconds> [pod]
     gen_tone "$2" "/tmp/$1.wav" "$3"
     k3s kubectl exec -i "${4:-$JPOD}" -- sh -c "cat > /tmp/$1.wav" < "/tmp/$1.wav"
 }
-journey_tone() { # <tag> <hz> <seconds>
+journey_tone() { # <tag> <hz> <seconds> [sink: PULSE_SINK, a sink by name]
     journey_put "$1" "$2" "$3"
     k3s kubectl exec "$JPOD" -- rm -f "/tmp/$1.rc" "/tmp/$1.t0" "/tmp/$1.t1" "/tmp/$1.pid"
     journey_run "tone-$1" <<EOF
 date +%s.%N > /tmp/$1.t0
-paplay /tmp/$1.wav > /tmp/$1.log 2>&1 &
+${4:+PULSE_SINK='$4' }paplay /tmp/$1.wav > /tmp/$1.log 2>&1 &
 echo \$! > /tmp/$1.pid
 wait \$!
 r=\$?
@@ -2789,6 +3165,29 @@ journey_tone_status() { # <tag> [pod]
     echo "pid $(k3s kubectl exec "$pod" -- cat "/tmp/$1.pid" 2>/dev/null || echo unknown)"
     k3s kubectl exec "$pod" -- cat "/tmp/$1.log" 2>/dev/null || true
 }
+# A client records <source> for <seconds> into /tmp/<tag>.wav: the session
+# user in the desktop container (rec-source), or a process of its own in the
+# journey pod (journey-rec). SIGINT ends parecord, which then finishes the
+# WAV; --preserve-status reports parecord's own exit status, not timeout's.
+# --latency-msec=50, as in verify_record: with pipewire-pulse's default
+# 64 KiB fragments a 3 s recording kept 1.11 s (run 37345104044's S4.7.9).
+rec_source() { # <source> <seconds> <tag>
+    local rc=0
+    podman exec desktop rm -f "/tmp/${3:?tag}.wav"
+    echo "\$ parecord --latency-msec=50 -d $1 /tmp/$3.wav, as the session user in the desktop container, ended by SIGINT after $2 s"
+    desk timeout --preserve-status -s INT "${2:?seconds}" parecord --latency-msec=50 -d "${1:?source}" "/tmp/$3.wav" 2>&1 || rc=$?
+    echo "parecord exited $rc"
+    podman exec desktop ls -l "/tmp/$3.wav" 2>&1 || true
+}
+journey_rec() { # <source> <seconds> <tag>
+    local rc=0
+    k3s kubectl exec "$JPOD" -- rm -f "/tmp/${3:?tag}.wav"
+    echo "\$ parecord --latency-msec=50 -d $1 /tmp/$3.wav, a new process in the journey pod, ended by SIGINT after $2 s"
+    k3s kubectl exec "$JPOD" -- timeout --preserve-status -s INT "${2:?seconds}" parecord --latency-msec=50 -d "${1:?source}" "/tmp/$3.wav" 2>&1 || rc=$?
+    echo "parecord exited $rc"
+    k3s kubectl exec "$JPOD" -- ls -l "/tmp/$3.wav" 2>&1 || true
+}
+journey_file() { k3s kubectl exec "$JPOD" -- cat "${1:?path}"; }
 # The audio graph's client streams through the export (F7.6's common set).
 streams() {
     local t
@@ -3262,21 +3661,27 @@ operator_setup() {
     # One continuous 150 s stream for the sound story, long enough to outlast
     # every command typed under it. 441 frames hold exactly 11 cycles of
     # 1100 Hz at 44.1 kHz, so repeating them is seamless.
-    log op "write the sound story's 1100 Hz tone"
-    python3 - /tmp/op-tone-1100.wav <<'EOF'
-import math, sys, wave
-rate, freq, secs, amp = 44100, 1100, 150, 0.5
-cycle = bytearray()
-for i in range(441):
-    s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
-    b = s.to_bytes(2, "little", signed=True)
-    cycle += b + b
-w = wave.open(sys.argv[1], "wb")
-w.setnchannels(2)
-w.setsampwidth(2)
-w.setframerate(rate)
-w.writeframes(bytes(cycle) * (rate * secs // 441))
-w.close()
+    log op "write the stories' tones: 1100 Hz for 150 s (the sound story's), 660 Hz for 3 s"
+    python3 - <<'EOF'
+import math, wave
+rate, amp = 44100, 0.5
+# Each file is one stretch repeated: rate / gcd(freq, rate) samples, the
+# shortest that holds whole cycles of its pitch (441 for 1100 Hz, 735 for
+# 660 Hz). A stretch that cut a cycle short would repeat as a different
+# sound: 441 samples of 660 Hz, repeated, came out at 700 Hz.
+for path, freq, secs in (("/tmp/op-tone-1100.wav", 1100, 150), ("/tmp/op-tone-660-3s.wav", 660, 3)):
+    n = rate // math.gcd(freq, rate)
+    cycle = bytearray()
+    for i in range(n):
+        s = int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))
+        b = s.to_bytes(2, "little", signed=True)
+        cycle += b + b
+    w = wave.open(path, "wb")
+    w.setnchannels(2)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    w.writeframes(bytes(cycle) * (rate * secs // n))
+    w.close()
 EOF
     log op "operator-setup done"
 }
@@ -3284,7 +3689,7 @@ EOF
 operator_teardown() {
     # Every container the stories started is named op-*, the observer too.
     podman ps -a --format '{{.Names}}' | grep '^op-' | xargs -r podman rm -f -t 2 >/dev/null 2>&1 || true
-    rm -f /tmp/op-tone-1100.wav /tmp/op-host-whoami
+    rm -f /tmp/op-tone-1100.wav /tmp/op-tone-660-3s.wav /tmp/op-host-whoami
     log op "operator-teardown done"
 }
 
@@ -3777,7 +4182,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -3809,6 +4214,8 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     layout-roundtrip) layout_roundtrip ;;
     layout-unplug) layout_unplug ;;
     layout-restore) layout_restore ;;
+    autodetect) autodetect "${2:-}" "${3:-}" ;;
+    monitors-set) monitors_set "${2:-}" ;;
     deploy-proof) deploy_proof ;;
     hotplug-probe) hotplug_probe ;;
     snd-probe) snd_probe ;;
@@ -3835,7 +4242,10 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     win-tree) win_tree ;;
     client-shot) client_shot "${2:-}" ;;
     journey-put) journey_put "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
-    journey-tone) journey_tone "${2:-}" "${3:-}" "${4:-}" ;;
+    journey-tone) journey_tone "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    rec-source) rec_source "${2:-}" "${3:-}" "${4:-}" ;;
+    journey-rec) journey_rec "${2:-}" "${3:-}" "${4:-}" ;;
+    journey-file) journey_file "${2:-}" ;;
     journey-tone-status) journey_tone_status "${2:-}" "${3:-}" ;;
     streams) streams ;;
     journey-stat) journey_stat "${2:-}" "${3:-}" ;;

@@ -15,6 +15,9 @@ QMP=qmp.sock
 # A second QMP monitor for EV-VIDEO alone (qmp-tool.py video): QMP serves one
 # client at a time, and a recorder on the first would hold up everything else.
 QMPV=qmpv.sock
+# QEMU's VNC server bound to the virtio-vga's head 1 (vnc-head.py): how a
+# monitor is plugged into Virtual-2 and taken away (S3.10.5, S3.10.7).
+VNC1=vnc-head1.sock
 SSHPORT=2222
 mkdir -p "$ART"
 
@@ -185,6 +188,12 @@ gqw() { vm_ssh "sudo repo/ci/vm/vm-guest.sh $*"; }
 # they accept; returns 1 when QEMU says Error.
 ev_qemu() { # <moment> <what> <monitor command>
     ev_save "$1" "$2" python3 qmp-tool.py hmp "$QMP" "$3"
+}
+# EV-QEMU into the open story: QEMU plugs a WIDTHxHEIGHT monitor into the
+# virtio-vga's head 1, or takes it away for 0x0 (vnc-head.py), and its
+# answer. Returns 1 unless QEMU says it forwarded the request.
+vnc_head() { # <moment> <width> <height> <what>
+    ev_save "$1" "$4" python3 vnc-head.py "$VNC1" "$2" "$3" >/dev/null
 }
 
 # EV-VIDEO into the open story: screendumps at 2 fps on the video monitor (a
@@ -455,6 +464,31 @@ audio_pids() {
     vm_ssh_quick 'sudo podman exec desktop sh -c "pgrep -x pipewire; pgrep -x wireplumber; pgrep -x pipewire-pulse"' \
         2>/dev/null | paste -sd' ' || true
 }
+# EV-AUDIO-REC's facts about a recording: frames, duration, format and peak.
+# Exits 1 when it holds less than <min seconds>.
+rec_facts() { # <wav> <min seconds>
+    python3 - "$1" "$2" <<'EOF'
+import array, sys, wave
+w = wave.open(sys.argv[1])
+n, rate, ch, width = w.getnframes(), w.getframerate(), w.getnchannels(), w.getsampwidth()
+data = w.readframes(n)
+peak = max((abs(x) for x in array.array("h", data)), default=0) / 32768 if width == 2 else 0.0
+dur = n / rate if rate else 0.0
+print(f"{n} frames: {dur:.2f} s at {rate} Hz, {ch} channel(s), {8 * width}-bit; peak {peak:.4f} of full scale")
+sys.exit(0 if dur >= float(sys.argv[2]) else 1)
+EOF
+}
+# The PCI sound card with a capture path QEMU can hot-add here, if the guest
+# kernel has its driver: usb-audio has no capture path and QEMU's HDA codec
+# bus refuses device_add, so AC97 (snd-intel8x0) or ES1370 (snd-ens1370).
+# Sets cap_probe (modinfo's answer for both) and cap_model (empty: neither).
+cap_card_probe() {
+    cap_probe=$(vm_ssh_quick 'for m in snd-intel8x0 snd-ens1370; do printf "%s: " "$m"; modinfo -n "$m" 2>&1 | head -1; done' || true)
+    cap_model=""
+    grep -q '^snd-intel8x0: /' <<<"$cap_probe" && cap_model=AC97
+    [ -z "$cap_model" ] && grep -q '^snd-ens1370: /' <<<"$cap_probe" && cap_model=ES1370
+    return 0
+}
 # Poll (10 s at most) until the default sink is one of the sinks there are:
 # the judgement is S4.7.5's, on the picture taken after.
 snd_wait_default() {
@@ -719,12 +753,21 @@ cloud-localds seed.img user-data meta-data
 # Everything else on the display is unaffected: with no layout declared, X
 # autodetects and never enables a disconnected output, so the second
 # connector is inert for the rest of the suite.
+#
+# One frontend is attached all the same: a VNC server bound to head 1, which
+# nothing talks to until the monitor stories under autodetection (S3.10.5,
+# S3.10.7). There vnc-head.py asks it for a size with SetDesktopSize, and
+# QEMU does what it does for any frontend that reports one: it enables head
+# 1 with an EDID of that size and tells the guest, which sees a monitor
+# plugged in. 0x0 takes it away. With no VNC client connected the server
+# only re-arms its refresh timer every 3 s.
 log "boot VM (KVM, virtio-vga with 2 connectors, virtio input, intel-hda)"
 qemu-system-x86_64 \
     -enable-kvm -cpu host -m 6144 -smp 3 \
     -drive "file=$DISK,if=virtio" \
     -drive "file=seed.img,if=virtio,format=raw" \
     -device virtio-vga,max_outputs=2,id=vga0 -display none \
+    -vnc "unix:$VNC1,display=vga0,head=1" \
     -device virtio-keyboard-pci -device virtio-tablet-pci \
     -device qemu-xhci,id=xhci -device usb-kbd,id=kvmkbd,bus=xhci.0 \
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -842,9 +885,85 @@ guest_ev "$pd_ev" layout-unplug || fail "fixed monitor layout: the live disconne
 if in_shard core; then
     ev_video_stop "EV-VIDEO: head 0 across Virtual-1's forced disconnect and its re-plug (the guest's notes give both times); nothing on it should move"
     ev_end
+    # S7.7.3: the client's own view before, while Virtual-1 was off and after
+    # the re-plug, compared over its window and over the whole screen.
+    ev_begin S7.7.3 "Client windows stay put across a monitor plug-out and re-plug (layout declared)" T3
+    s773_view() { ls "$EV_ROOT/S7.7.3/"*"-client-view-$1.png" 2>/dev/null | sed -n 1p; }
+    s773_rect=$(awk '/Absolute upper-left X/ {x = $NF} /Absolute upper-left Y/ {y = $NF} /^ *Width:/ {w = $NF} /^ *Height:/ {h = $NF} END {if (w) printf "%dx%d+%d+%d", w, h, x, y}' \
+        "$(ls "$EV_ROOT/S7.7.3/"*-xwininfo-before.txt 2>/dev/null | sed -n 1p)")
+    [ -n "$s773_rect" ] || fail "S7.7.3: no window rectangle in the client's xwininfo"
+    for s773_m in during after; do
+        s773_a=$(s773_view before) s773_b=$(s773_view "$s773_m")
+        [ -n "$s773_a" ] && [ -n "$s773_b" ] || fail "S7.7.3: the client's own screenshot before or $s773_m is missing"
+        convert "$s773_a" -crop "$s773_rect" +repage "${ART:?}/.s773-a.png" \
+            && convert "$s773_b" -crop "$s773_rect" +repage "${ART:?}/.s773-b.png" \
+            || fail "S7.7.3: could not cut the client's window out of its screenshots"
+        s773_win_ae=$(compare -metric AE "${ART:?}/.s773-a.png" "${ART:?}/.s773-b.png" null: 2>&1 | awk '{print $1}' || true)
+        s773_all_ae=$(compare -metric AE "$s773_a" "$s773_b" null: 2>&1 | awk '{print $1}' || true)
+        rm -f "${ART:?}/.s773-a.png" "${ART:?}/.s773-b.png"
+        ev_note "the client's own view, before against $s773_m: ${s773_win_ae:-?} pixels differ over its window ($s773_rect), ${s773_all_ae:-?} over the whole screen"
+        [ "${s773_win_ae:-x}" = 0 ] || fail "S7.7.3: the client's own view of its window differs before and $s773_m (${s773_win_ae:-?} pixels)"
+        ev_pass "the client's own view of its window ($s773_rect) is the same before and $s773_m: 0 pixels differ (over the whole screen: ${s773_all_ae:-?})"
+    done
+    ev_end
     EV_SIDE=
 fi
 guest_ev "$pd_ev" layout-restore || fail "fixed monitor layout: the shipped config did not restore autodetection"
+if in_shard core; then
+    # S3.10.5-S3.10.7 under autodetection. QEMU itself plugs a monitor into
+    # Virtual-2 and takes it away again (vnc_head, through the VNC server on
+    # head 1); the guest's steps run one at a time so that this side can
+    # plug, unplug, shoot and record between them.
+    log "monitors under autodetection: a plug-in, the only output's plug-out, an EDID's modes"
+    EV_SIDE=h-
+    S5_T="Monitor plug-in without a layout is detected and does not reflow"
+    S6_T="Monitor plug-out without a layout is characterised"
+    S7_T="A plugged-in monitor with an EDID exposes modes"
+    ev_begin S3.10.5 "$S5_T" T3; ev_video_start ad-plugin; ev_end
+    guest_ev "$GUEST_EV" autodetect plugin before || fail "S3.10.5: the state before the plug-in is not what it should be"
+    ev_begin S3.10.5 "$S5_T" T3
+    vnc_head vnc-plug 1024 768 "EV-QEMU: vnc-head.py 1024 768: QEMU asked, through its VNC server on head 1, to plug a 1024x768 monitor into Virtual-2, and its answer" \
+        || fail "S3.10.5: QEMU did not take the request to plug a monitor into head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect plugin on || fail "S3.10.5: the plugged-in monitor was not detected as it should be, or something moved"
+    ev_begin S3.10.5 "$S5_T" T3
+    vnc_head vnc-unplug 0 0 "EV-QEMU: vnc-head.py 0 0: QEMU asked to take the monitor away from head 1, and its answer" \
+        || fail "S3.10.5: QEMU did not take the request to unplug head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect plugin off || fail "S3.10.5: Virtual-2 did not go back to disconnected"
+    ev_begin S3.10.5 "$S5_T" T3
+    ev_video_stop "EV-VIDEO: head 0 while QEMU plugged a monitor into Virtual-2 and took it away, no layout declared (the notes give the times): nothing on it should move"
+    ev_end
+    ev_begin S3.10.6 "$S6_T" T3; ev_video_start ad-unplug; ev_end
+    guest_ev "$GUEST_EV" autodetect unplug || fail "S3.10.6: X did not live through its only output's plug-out as it should"
+    ev_begin S3.10.6 "$S6_T" T3
+    ev_video_stop "EV-VIDEO: head 0 while Virtual-1, the only enabled output, was forced off and set back to detect"
+    ev_end
+    ev_begin S3.10.7 "$S7_T" T3; ev_video_start ad-edid; ev_end
+    guest_ev "$GUEST_EV" autodetect edid prep || fail "S3.10.7: the EDID could not be injected"
+    ev_begin S3.10.7 "$S7_T" T3
+    vnc_head vnc-plug 1024 768 "EV-QEMU: vnc-head.py 1024 768: QEMU asked, through its VNC server on head 1, to plug a 1024x768 monitor into Virtual-2, and its answer" \
+        || fail "S3.10.7: QEMU did not take the request to plug a monitor into head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect edid on || fail "S3.10.7: the monitor's EDID or modes were not the injected ones, or it would not enable"
+    ev_begin S3.10.7 "$S7_T" T3
+    shot=$(ev_shot_head head1-enabled 1 "EV-SHOT: QEMU's screendump of head 1, Virtual-2's scanout, enabled at 1024x768 by xrandr --auto at +0+0: the desktop's top-left 1024x768") \
+        || fail "S3.10.7: no screendump of head 1"
+    [ "${shot%% *}" = 1024x768 ] || fail "S3.10.7: head 1's screendump is ${shot%% *}, not 1024x768"
+    awk -v s="${shot#* }" 'BEGIN { exit !(s > 0.01) }' || fail "S3.10.7: head 1's screendump is blank (grayscale stddev ${shot#* })"
+    ev_pass "QEMU's head 1 shows Virtual-2's scanout: a ${shot%% *} image, not blank (grayscale stddev ${shot#* })"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect edid off || fail "S3.10.7: Virtual-2 would not turn off"
+    ev_begin S3.10.7 "$S7_T" T3
+    vnc_head vnc-unplug 0 0 "EV-QEMU: vnc-head.py 0 0: QEMU asked to take the monitor away from head 1, and its answer" \
+        || fail "S3.10.7: QEMU did not take the request to unplug head 1"
+    ev_end
+    guest_ev "$GUEST_EV" autodetect edid gone || fail "S3.10.7: Virtual-2 did not withdraw cleanly"
+    ev_begin S3.10.7 "$S7_T" T3
+    ev_video_stop "EV-VIDEO: head 0 while Virtual-2 got its EDID, was plugged in, enabled with xrandr --auto, turned off and taken away: Virtual-1 should not change"
+    ev_end
+    EV_SIDE=
+fi
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh deploy-proof' || fail "could not put the deploy-proof xterm up"
 write_manifest
 screendump desktop-deploy
@@ -1695,14 +1814,64 @@ ev_pass "within 10 s of the removal the player $outcome"
 ev_end
 snd_wait_default
 
+log "audio hotplug: five plug/unplug cycles leave no phantom devices"
+# Requirements.md S4.7.11: after each removal every count is back at its
+# baseline, and after the fifth PipeWire's Device objects are the
+# baseline's, byte for byte. Each cycle's card has an id of its own, so a
+# removal QEMU had not finished could not make the next add a duplicate.
+ev_begin S4.7.11 "Repeated audio cycles leave no phantom devices" T3
+snd_set base "before the first of five plug/unplug cycles"
+snd_keep
+read -r cyc_n0 cyc_d0 <<<"$(snd_probe)"
+cyc_h0=$(vm_ssh_quick 'ls /dev/snd | wc -l' 2>/dev/null || echo 0)
+cyc_rows=$(printf '%-6s %-9s %-15s %-20s %s' cycle state host-snd-nodes container-controlC wireplumber-alsa-cards)
+cyc_row() { cyc_rows+=$'\n'$(printf '%-6s %-9s %-15s %-20s %s' "$@"); }
+cyc_row 0 baseline "$cyc_h0" "$cyc_n0" "$cyc_d0"
+cyc_in=yes cyc_out=yes
+for i in 1 2 3 4 5; do
+    python3 qmp-tool.py hmp "$QMP" "device_add usb-audio,id=cyc$i,audiodev=snd0,bus=xhci.0" >/dev/null \
+        || fail "QEMU refused device_add usb-audio in cycle $i"
+    n=0 d=0
+    for _ in $(seq 30); do
+        read -r n d <<<"$(snd_probe)"
+        [ "$n" -gt "$cyc_n0" ] && [ "$d" -gt "$cyc_d0" ] && break
+        sleep 1
+    done
+    hn=$(vm_ssh_quick 'ls /dev/snd | wc -l' 2>/dev/null || echo 0)
+    cyc_row "$i" plugged "$hn" "$n" "$d"
+    { [ "$n" -gt "$cyc_n0" ] && [ "$d" -gt "$cyc_d0" ]; } || cyc_in=no
+    python3 qmp-tool.py hmp "$QMP" "device_del cyc$i" >/dev/null || fail "QEMU refused device_del cyc$i"
+    for _ in $(seq 30); do
+        read -r n d <<<"$(snd_probe)"
+        hn=$(vm_ssh_quick 'ls /dev/snd | wc -l' 2>/dev/null || echo 0)
+        [ "$n" = "$cyc_n0" ] && [ "$d" = "$cyc_d0" ] && [ "$hn" = "$cyc_h0" ] && break
+        sleep 1
+    done
+    cyc_row "$i" removed "$hn" "$n" "$d"
+    { [ "$n" = "$cyc_n0" ] && [ "$d" = "$cyc_d0" ] && [ "$hn" = "$cyc_h0" ]; } || cyc_out=no
+done
+ev_text cycles "EV-STATE: the counter table, one row per plug-in and per removal: sound nodes on the VM host, controlC* nodes in the container, WirePlumber's alsa_card Devices" "$cyc_rows"
+snd_wait_default
+snd_set final "after the fifth cycle"
+snd_diffs final "the five cycles"
+[ "$cyc_in" = yes ] || fail "a plug-in did not raise the container's controlC* nodes and WirePlumber's devices (see the counter table)"
+ev_pass "each of the five plug-ins raised the container's controlC* nodes and WirePlumber's alsa_card devices"
+[ "$cyc_out" = yes ] || fail "a removal did not bring every count back to its baseline (see the counter table)"
+ev_pass "each of the five removals brought the host's nodes, the container's and WirePlumber's devices back to the baseline ($cyc_h0, $cyc_n0, $cyc_d0)"
+[ "$(ev_payload "$EV_DIR/$SB_PW")" = "$(ev_payload "$EV_DIR/$SN_PW")" ] \
+    || fail "pw-cli ls Device after the fifth cycle is not the baseline's (see the pw-devices diff)"
+ev_pass "pw-cli ls Device after the fifth cycle is the baseline's, byte for byte: no alsa_card object outlived its card"
+hz=$(freq_for pulse)
+ev_audio_start after-cycles "$hz"
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio pulse' \
+    || { audio_capture_stop; fail "a pulse client could not play after the five cycles"; }
+ev_audio_stop "EV-AUDIO: the machine's output after the five cycles, while a pulse client played its $hz Hz tone on the built-in card - listen for one beep" 1 0.05 "$hz" \
+    || fail "the built-in card is silent after the five cycles"
+ev_pass "after the five cycles the built-in card plays: a pulse client's $hz Hz tone came out of the machine"
+ev_end
+
 log "audio hotplug: a capture-capable card on PCI"
-# usb-audio has no capture path, and QEMU's HDA codec bus refuses device_add,
-# so a hot-added capture card can only be a PCI card with its codec built in:
-# AC97 or ES1370, if the guest kernel has a driver for one.
-cap_probe=$(vm_ssh_quick 'for m in snd-intel8x0 snd-ens1370; do printf "%s: " "$m"; modinfo -n "$m" 2>&1 | head -1; done' || true)
-cap_model=""
-grep -q '^snd-intel8x0: /' <<<"$cap_probe" && cap_model=AC97
-[ -z "$cap_model" ] && grep -q '^snd-ens1370: /' <<<"$cap_probe" && cap_model=ES1370
+cap_card_probe
 if [ -z "$cap_model" ]; then
     # S4.7.8 stays T4: its attempt is kept, outside any story.
     mkdir -p "$ART/S4.7.8-attempt"
@@ -1727,6 +1896,27 @@ else
     [ -n "$new_src" ] || fail "no alsa_input source appeared within 30 s of device_add $cap_model"
     ev_pass "the $cap_model card brought a capture source: $new_src"
     snd_keep
+    ev_end
+
+    # S4.7.9: a client records from it. QEMU's audiodev here is "none", whose
+    # capture side is silence: the recording proves the stream opened and
+    # delivered frames, not what a microphone would have heard.
+    ev_begin S4.7.9 "Recording from a hot-added capture device works" T3
+    rec=$(ev_save recorder "EV-LOG-CLIENT: the session user's parecord from $new_src for 3 s (SIGINT ends it, so the WAV is finished): its command, its output, its exit status and the file" \
+        gq rec-source "$new_src" 3 s479) || true
+    rname=$(ev_name rec-from-capture-card wav)
+    vm_ssh_quick 'sudo podman exec desktop cat /tmp/s479.wav' > "$EV_DIR/$rname" 2>/dev/null || true
+    [ -s "$EV_DIR/$rname" ] && ev_attach "$rname" "EV-AUDIO-REC: what the session user's parecord recorded from $new_src: silence, which is all QEMU's none backend gives a capture, so its frames are the proof"
+    rfacts_ok=yes
+    rfacts=$(rec_facts "$EV_DIR/$rname" 2 2>&1) || rfacts_ok=no
+    ev_text rec-facts "EV-AUDIO-REC: the recording's frames, duration, format and peak (python's wave module)" "$rfacts"
+    grep -q '^parecord exited 0$' <<<"$rec" || fail "parecord from $new_src did not exit 0: $(grep '^parecord exited' <<<"$rec")"
+    ev_pass "the session user's parecord opened $new_src and exited 0"
+    [ "$rfacts_ok" = yes ] || fail "the recording from $new_src holds less than 2 s of its 3: $rfacts"
+    ev_pass "it delivered frames: $rfacts (silence: all QEMU's none backend gives a capture)"
+    ev_end
+
+    ev_begin S4.7.8 "Capture device plug-in and plug-out reach WirePlumber" T3
     ev_qemu device-del "EV-QEMU: device_del hotcap and QEMU's reply (empty: accepted; the PCI unplug then waits on the guest)" \
         "device_del hotcap" >/dev/null || fail "QEMU refused device_del hotcap"
     gone=no
@@ -2675,6 +2865,314 @@ ev_pass "the early pod's xterm failed $x_fail times while the desktop was down; 
 pod_same "$E_POD_B" "$E_POD_A" || fail "the early pod's container changed while it waited for the desktop"
 ev_pass "the early pod is the same container it started as, restartCount 0"
 ev_end
+
+# --- the pod's audio across hot-added sound cards (S7.7.4-S7.7.7) -----------
+# The journey pod has run since the journeys began. A USB sound card arrives
+# under its tone and becomes the default (S7.7.4); a new player in the pod
+# targets the card by name (S7.7.6); the card leaves under the pod's next
+# tone (S7.7.5); the pod records from a capture card hot-added on PCI
+# (S7.7.7). Every card QEMU adds plays into the audiodev the capture reads.
+log "client journeys: the pod's audio across hot-added sound cards (F7.7)"
+# The sink-input <id>'s sink index in a `streams` listing.
+si_sink() { awk -v s="$2" '/^== pactl list short sink-inputs/ {f = 1; next} /^==/ {f = 0} f && $1 == s {print $2}' <<<"$1"; }
+# A sink's index by name, now.
+sink_idx() { gq desk pactl list short sinks 2>/dev/null | awk -v n="$1" '$2 == n {print $1}'; }
+ev_begin S7.7.4 "A client already playing is heard on a hot-added audio device, without restarting" T3
+ev_save pod-before "EV-PIDS: the journey pod's container before the USB card arrives" gq pod-state journey >/dev/null || true
+U_POD_B=$EV_LAST
+ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the USB card arrives" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+U_D_B=$EV_LAST
+u_dmn_b=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
+snd_set base "before the USB sound card arrives"
+snd_keep
+u_builtin=$(ev_payload "$EV_DIR/$SN_DEF" | head -1)
+[ -n "$u_builtin" ] || fail "no default sink before the USB card arrives"
+ev_video_start usb-arrives
+ev_audio_start arrival 1100
+gq journey-tone usb774 1100 20 >/dev/null || { audio_capture_stop; fail "could not start the pod's 20 s tone"; }
+sleep 4
+ev_save streams-before "EV-STATE: the streams (pactl list short sink-inputs and source-outputs) with the pod's tone on the built-in card, before the USB card arrives" \
+    gq streams >/dev/null || true
+u_si=$(sink_inputs "$(ev_out)")
+ev_save player-before "EV-PIDS: the pod's applications before the USB card arrives: its player" gq journey-apps >/dev/null || true
+u_pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
+t_plug=$(gnow)
+ev_qemu device-add "EV-QEMU: device_add usb-audio,id=s774snd,audiodev=snd0,bus=xhci.0 under the pod's tone, and QEMU's reply (empty: accepted)" \
+    "device_add usb-audio,id=s774snd,audiodev=snd0,bus=xhci.0" >/dev/null || { audio_capture_stop; fail "QEMU refused device_add usb-audio"; }
+ev_note "device_add usb-audio at $t_plug (the guest's clock), about 4 s into the pod's 20 s tone"
+u_sink=""
+for _ in $(seq 15); do
+    u_sink=$(comm -13 <(ev_payload "$EV_DIR/$SB_SINKS" | awk '{print $2}' | sort) \
+                      <(gq desk pactl list short sinks 2>/dev/null | awk '{print $2}' | sort) | head -1)
+    [ -n "$u_sink" ] && break
+    sleep 1
+done
+[ -n "$u_sink" ] || { audio_capture_stop; fail "no sink appeared for the USB card within 15 s"; }
+# WirePlumber gives a new device 0.40, which the USB card renders at about
+# -24 dB (S4.7.3): full volume, so the level plot shows the move, not a drop.
+gq desk pactl set-sink-volume "$u_sink" 100% >/dev/null || true
+gq desk pactl set-default-sink "$u_sink" >/dev/null || { audio_capture_stop; fail "pactl set-default-sink $u_sink failed"; }
+ev_note "the USB card's sink, $u_sink, made the default at full volume at $(gnow)"
+u_on=""
+for _ in $(seq 10); do
+    u_idx=$(sink_idx "$u_sink")
+    [ -n "$u_idx" ] && [ "$(si_sink "$(gq streams 2>/dev/null || true)" "$u_si")" = "$u_idx" ] && { u_on=yes; break; }
+    sleep 1
+done
+ev_save streams-on "EV-STATE: the streams once the USB card is the default: the pod's sink-input $u_si on the card's sink" gq streams >/dev/null || true
+ev_save sinks-on "EV-STATE: pactl list short sinks with the USB card plugged in (index, then name)" gq desk pactl list short sinks >/dev/null || true
+ev_save player-on "EV-PIDS: the pod's applications with its stream on the USB card" gq journey-apps >/dev/null || true
+u_pl_on=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
+snd_set on "with the USB card plugged in and the default, the pod's tone playing on it"
+snd_diffs on "the USB card's arrival"
+tone_wait usb774 journey 30 || ev_note "the pod's tone had not ended 30 s after the card arrived"
+ev_save player "EV-LOG-CLIENT: the pod's player (paplay): its exit status, how long it played and from when to when, its pid, its output" \
+    gq journey-tone-status usb774 >/dev/null || true
+u_player=$(ev_out)
+u_t0=$(awk '/^played/ {print $5}' <<<"$u_player")
+m_plug=$(awk -v k="$t_plug" -v s="$u_t0" 'BEGIN {if (k != "" && s != "") printf "%.2f", k - s}')
+u_heard=yes
+ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played a 20 s 1100 Hz tone, the USB card plugged in about 4 s in (the red line, timed by the player's clock) and made the default: the tone must play on, the second part from the USB card, with no gap and none of it missing" \
+    15 0.05 1100 --max-gap 0.1 --span 19.6 20.6 ${m_plug:+--mark "$m_plug"} || u_heard=no
+ev_video_stop "EV-VIDEO: the display while the USB card arrives under the pod's tone (index.txt and the notes give the times)"
+ev_save pod-after "EV-PIDS: the journey pod's container after the USB card arrived" gq pod-state journey >/dev/null || true
+U_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across the card's arrival (no differences: the same container, not restarted)" "$U_POD_B" "$U_POD_A"
+ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the USB card arrived" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+u_dmn_a=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
+ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the card's arrival (no differences: none restarted)" "$U_D_B" "$EV_LAST"
+[ "$u_on" = yes ] || fail "the pod's stream (sink-input $u_si) never sat on the USB card's sink $u_sink"
+ev_pass "with the USB card the default, the pod's existing stream, sink-input $u_si, moved onto its sink $u_sink"
+grep -q '^exited 0$' <<<"$u_player" || fail "the pod's player did not end cleanly: $(echo $u_player)"
+u_played=$(awk '/^played/ {print $2}' <<<"$u_player")
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 21.0 else 1)' "${u_played:-99}" \
+    || fail "the pod's 20 s tone took ${u_played:-?} s to play: its stream stalled when the card arrived"
+u_pid=$(awk '/^pid / {print $2}' <<<"$u_player")
+[ -n "$u_pl_b" ] && [ "$u_pl_b" = "$u_pl_on" ] && [ "$u_pl_b" = "$u_pid" ] \
+    || fail "the pod's player is not one process across the card's arrival: $u_pl_b before, $u_pl_on on the USB card, $u_pid by its own record"
+ev_pass "one player process (pid $u_pl_b) played before and after the card arrived, and exited 0 after ${u_played} s"
+[ "$u_heard" = yes ] || fail "the machine's output did not carry the tone whole across the card's arrival (check-audio's verdict says where)"
+ev_pass "the machine's output carried the tone across the arrival: no stretch below -40 dBFS longer than 0.1 s, and its 20 s span with nothing missing"
+[ -n "$u_dmn_b" ] && [ "$u_dmn_b" = "$u_dmn_a" ] || fail "Xorg, mwm or an audio daemon changed: $u_dmn_b -> $u_dmn_a"
+ev_pass "Xorg, mwm and the three audio daemons kept their pids ($u_dmn_b)"
+pod_same "$U_POD_B" "$U_POD_A" || fail "the journey pod's container changed across the card's arrival"
+ev_pass "the pod is the same container, restartCount 0"
+ev_end
+
+ev_begin S7.7.6 "A client started while the hot-added device is present can target it by name" T3
+ev_save pod-before "EV-PIDS: the journey pod's container before its new player starts" gq pod-state journey >/dev/null || true
+W_POD_B=$EV_LAST
+# The default back on the built-in card, muted: a player that did not name
+# the USB card would go there and not be heard.
+gq desk pactl set-default-sink "$u_builtin" >/dev/null || fail "pactl set-default-sink $u_builtin failed"
+gq desk pactl set-sink-mute "$u_builtin" 1 >/dev/null || fail "pactl set-sink-mute $u_builtin 1 failed"
+ev_save wpctl "EV-STATE: wpctl status with the built-in card the default (marked *) and muted, the USB card at full volume" \
+    gq desk wpctl status >/dev/null || true
+ev_audio_start by-name 990
+gq journey-tone named776 990 4 "$u_sink" >/dev/null || { audio_capture_stop; fail "could not start the pod's player with PULSE_SINK=$u_sink"; }
+w_on=""
+for _ in $(seq 6); do
+    sleep 0.5
+    w_ls=$(gq streams 2>/dev/null || true)
+    w_idx=$(sink_idx "$u_sink")
+    for w_si in $(sink_inputs "$w_ls"); do
+        [ -n "$w_idx" ] && [ "$(si_sink "$w_ls" "$w_si")" = "$w_idx" ] && { w_on=$w_si; break; }
+    done
+    [ -n "$w_on" ] && break
+done
+ev_text streams-during "EV-STATE: the streams while the new player played: its sink-input on the USB card's sink (index ${w_idx:-?})" "${w_ls:-(no listing)}"
+ev_save sinks-during "EV-STATE: pactl list short sinks while the new player played (index, then name)" gq desk pactl list short sinks >/dev/null || true
+tone_wait named776 journey 15 || true
+ev_save player "EV-LOG-CLIENT: the pod's new player (PULSE_SINK=$u_sink paplay): its exit status, how long it played, its pid, its output" \
+    gq journey-tone-status named776 >/dev/null || true
+w_player=$(ev_out)
+w_heard=yes
+ev_audio_stop "EV-AUDIO: the machine's output while the pod's new player played 990 Hz to the USB card by name, the built-in card the default and muted: what is heard came out of the USB card - listen for one beep" \
+    2 0.05 990 || w_heard=no
+gq desk pactl set-sink-mute "$u_builtin" 0 >/dev/null || true
+ev_save pod-after "EV-PIDS: the journey pod's container after its new player ended" gq pod-state journey >/dev/null || true
+W_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across its new player (no differences: the same container)" "$W_POD_B" "$W_POD_A"
+grep -q '^exited 0$' <<<"$w_player" || fail "the pod's player for $u_sink did not end cleanly: $(echo $w_player)"
+[ -n "$w_on" ] || fail "no stream sat on the USB card's sink while the player that named it played"
+ev_pass "the new player, PULSE_SINK=$u_sink paplay (pid $(awk '/^pid / {print $2}' <<<"$w_player")), played to the USB card by name: its sink-input $w_on sat on that sink (index $w_idx), and it exited 0"
+[ "$w_heard" = yes ] || fail "the 990 Hz tone sent to the USB card by name was not heard"
+ev_pass "with the default on the muted built-in card, the machine's output carried the 990 Hz tone: the USB card rendered it"
+pod_same "$W_POD_B" "$W_POD_A" || fail "the journey pod's container changed"
+ev_pass "the pod is the same container, restartCount 0"
+ev_end
+
+ev_begin S7.7.5 "A client playing on the hot-added device survives its removal" T3
+ev_save pod-before "EV-PIDS: the journey pod's container before the USB card is removed" gq pod-state journey >/dev/null || true
+V_POD_B=$EV_LAST
+ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the USB card is removed" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+V_D_B=$EV_LAST
+v_dmn_b=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
+gq desk pactl set-default-sink "$u_sink" >/dev/null || fail "pactl set-default-sink $u_sink failed"
+snd_set plugged "with the USB card plugged in and the default, before the pod's tone"
+snd_keep
+ev_video_start usb-leaves
+ev_audio_start removal 880
+gq journey-tone usb775 880 20 >/dev/null || { audio_capture_stop; fail "could not start the pod's 20 s tone"; }
+sleep 4
+ev_save streams-before "EV-STATE: the streams with the pod's tone playing, before the USB card is removed" gq streams >/dev/null || true
+v_ls=$(ev_out)
+v_si=$(sink_inputs "$v_ls")
+v_on_usb=no
+[ -n "$v_si" ] && [ "$(si_sink "$v_ls" "$v_si")" = "$(sink_idx "$u_sink")" ] && v_on_usb=yes
+ev_save sinks-before "EV-STATE: pactl list short sinks before the removal (index, then name)" gq desk pactl list short sinks >/dev/null || true
+ev_save player-before "EV-PIDS: the pod's applications before the removal: its player" gq journey-apps >/dev/null || true
+v_pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
+t_unplug=$(gnow)
+ev_qemu device-del "EV-QEMU: device_del s774snd under the pod's tone, and QEMU's reply (empty: accepted)" \
+    "device_del s774snd" >/dev/null || { audio_capture_stop; fail "QEMU refused device_del s774snd"; }
+ev_note "device_del s774snd at $t_unplug (the guest's clock), about 4 s into the pod's 20 s tone"
+v_out=""
+for _ in $(seq 10); do
+    st=$(gq journey-tone-status usb775 2>/dev/null | sed -n 1p || true)
+    if [ "${st%% *}" = exited ]; then v_out="ended ($st)"; break; fi
+    b_idx=$(sink_idx "$u_builtin")
+    if [ -n "$b_idx" ] && [ "$(si_sink "$(gq streams 2>/dev/null || true)" "$v_si")" = "$b_idx" ]; then
+        v_out="kept playing, its sink-input $v_si moved to the built-in card's sink $u_builtin"
+        break
+    fi
+    sleep 1
+done
+ev_note "the pod's stream after the removal: ${v_out:-neither moved nor ended within 10 s}, at $(gnow)"
+ev_save streams-after "EV-STATE: the streams after the removal" gq streams >/dev/null || true
+ev_save sinks-after "EV-STATE: pactl list short sinks after the removal" gq desk pactl list short sinks >/dev/null || true
+snd_set off "after the USB card's removal"
+snd_diffs off "the USB card's removal"
+tone_wait usb775 journey 30 || ev_note "the pod's tone had not ended 30 s after the removal"
+ev_save player "EV-LOG-CLIENT: the pod's player (paplay): its exit status, how long it played and from when to when, its pid, its output" \
+    gq journey-tone-status usb775 >/dev/null || true
+v_player=$(ev_out)
+v_t0=$(awk '/^played/ {print $5}' <<<"$v_player")
+m_unplug=$(awk -v k="$t_unplug" -v s="$v_t0" 'BEGIN {if (k != "" && s != "") printf "%.2f", k - s}')
+# Moved, the tone must go on (resuming within 1 s, at most 1.5 s of it
+# lost); ended, the capture holds it up to the removal, and the next
+# playback below is the proof.
+v_heard=yes
+case $v_out in
+    "kept playing"*)
+        ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played a 20 s 880 Hz tone on the USB card, the card removed about 4 s in (the red line, timed by the player's clock): the tone must go on from the built-in card" \
+            15 0.05 880 --max-gap 1.0 --span 18.5 20.6 ${m_unplug:+--mark "$m_unplug"} || v_heard=no ;;
+    *)
+        ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played a 20 s 880 Hz tone on the USB card, the card removed about 4 s in (the red line, timed by the player's clock): the stream ended with the card" \
+            2 0.05 880 ${m_unplug:+--mark "$m_unplug"} || v_heard=no ;;
+esac
+ev_video_stop "EV-VIDEO: the display while the USB card leaves under the pod's tone (index.txt and the notes give the times)"
+ev_audio_start next 660
+gq journey-tone next775 660 3 >/dev/null || { audio_capture_stop; fail "could not start the pod's next tone"; }
+tone_wait next775 journey 15 || true
+ev_save next-player "EV-LOG-CLIENT: the pod's next player, after the card was gone" gq journey-tone-status next775 >/dev/null || true
+v_next=$(ev_out)
+v_next_heard=yes
+ev_audio_stop "EV-AUDIO: the machine's output while the same pod played its next tone, 660 Hz, after the card was gone - listen for one beep" 2 0.05 660 \
+    || v_next_heard=no
+ev_save pod-after "EV-PIDS: the journey pod's container after the USB card's removal and its next tone" gq pod-state journey >/dev/null || true
+V_POD_A=$EV_LAST
+ev_diff pod "EV-DIFF: the journey pod across the card's removal (no differences: the same container, not restarted)" "$V_POD_B" "$V_POD_A"
+ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the removal" \
+    gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+v_dmn_a=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
+ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the removal (no differences: none restarted)" "$V_D_B" "$EV_LAST"
+[ "$v_on_usb" = yes ] || fail "the pod's stream (sink-input ${v_si:-?}) was not on the USB card's sink before the removal"
+ev_pass "before the removal the pod's stream, sink-input $v_si, played on the USB card's sink $u_sink"
+[ -n "$v_out" ] || fail "10 s after the removal the pod's stream had neither moved to the built-in card nor ended"
+case $v_out in
+    "kept playing"*)
+        ev_pass "within 10 s of the removal the pod's player $v_out"
+        grep -q '^exited 0$' <<<"$v_player" || fail "the moved stream's player did not end cleanly: $(echo $v_player)"
+        [ "$(awk '/^pid / {print $2}' <<<"$v_player")" = "$v_pl_b" ] || fail "the player is not the one that played before the removal"
+        ev_pass "the same player (pid $v_pl_b) played on to its end and exited 0"
+        [ "$v_heard" = yes ] || fail "the tone did not go on from the built-in card after the removal (check-audio's verdict says where)"
+        ev_pass "the machine's output carried the tone on through the removal: no quiet stretch longer than 1 s, and at most 1.5 s of its 20 s lost" ;;
+    *)
+        grep -q '^exited [1-9]' <<<"$v_player" || fail "the stream ended with the card, but its player did not report an error: $(echo $v_player)"
+        ev_pass "within 10 s of the removal the pod's player $v_out, its error quoted in its record"
+        [ "$v_heard" = yes ] || fail "the capture does not hold the tone up to the removal" ;;
+esac
+grep -q '^exited 0$' <<<"$v_next" || fail "the pod's next player after the removal did not end cleanly: $(echo $v_next)"
+[ "$v_next_heard" = yes ] || fail "the pod's next tone after the removal was not heard"
+ev_pass "the pod's next playback after the removal, 660 Hz, was heard, and its player exited 0"
+[ -n "$v_dmn_b" ] && [ "$v_dmn_b" = "$v_dmn_a" ] || fail "Xorg, mwm or an audio daemon changed: $v_dmn_b -> $v_dmn_a"
+ev_pass "Xorg, mwm and the three audio daemons kept their pids ($v_dmn_b)"
+pod_same "$V_POD_B" "$V_POD_A" || fail "the journey pod's container changed across the card's removal"
+ev_pass "the pod is the same container, restartCount 0"
+ev_end
+snd_wait_default
+
+cap_card_probe
+if [ -z "$cap_model" ]; then
+    mkdir -p "$ART/S7.7.7-attempt"
+    printf '%s\n' "$cap_probe" > "$ART/S7.7.7-attempt/modinfo.txt"
+    log "  no AC97 or ES1370 driver in the guest kernel; S7.7.7's attempt is in S7.7.7-attempt/"
+else
+    ev_begin S7.7.7 "A client records from a hot-added capture device without restarting" T3
+    ev_text modinfo "EV-STATE: modinfo -n for the two candidate drivers on the VM host" "$cap_probe"
+    ev_save pod-before "EV-PIDS: the journey pod's container before the capture card arrives" gq pod-state journey >/dev/null || true
+    R_POD_B=$EV_LAST
+    ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the capture card arrives" \
+        gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    R_D_B=$EV_LAST
+    r_dmn_b=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
+    snd_set base "before device_add $cap_model"
+    snd_keep
+    ev_video_start capture-card
+    ev_qemu device-add "EV-QEMU: device_add $cap_model,id=s777cap,audiodev=snd0 and QEMU's reply (empty: accepted)" \
+        "device_add $cap_model,id=s777cap,audiodev=snd0" >/dev/null || fail "QEMU refused device_add $cap_model"
+    r_src=""
+    for _ in $(seq 30); do
+        r_src=$(comm -13 <(ev_payload "$EV_DIR/$SB_SOURCES" | awk '{print $2}' | sort) \
+                         <(gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | sort) | grep '^alsa_input\.' | head -1 || true)
+        [ -n "$r_src" ] && break
+        sleep 1
+    done
+    snd_set on "with the $cap_model card plugged in"
+    snd_diffs on "the $cap_model card's arrival"
+    [ -n "$r_src" ] || fail "no alsa_input source appeared within 30 s of device_add $cap_model"
+    ev_pass "the $cap_model card brought a capture source: $r_src"
+    rec=$(ev_save recorder "EV-LOG-CLIENT: parecord from $r_src for 3 s, a new process in the journey pod (SIGINT ends it, so the WAV is finished): its command, its output, its exit status and the file" \
+        gq journey-rec "$r_src" 3 s777) || true
+    rname=$(ev_name rec-in-pod wav)
+    vm_ssh_quick 'sudo repo/ci/vm/vm-guest.sh journey-file /tmp/s777.wav' > "$EV_DIR/$rname" 2>/dev/null || true
+    [ -s "$EV_DIR/$rname" ] && ev_attach "$rname" "EV-AUDIO-REC: what the pod's parecord recorded from $r_src: silence, which is all QEMU's none backend gives a capture, so its frames are the proof"
+    rfacts_ok=yes
+    rfacts=$(rec_facts "$EV_DIR/$rname" 2 2>&1) || rfacts_ok=no
+    ev_text rec-facts "EV-AUDIO-REC: the recording's frames, duration, format and peak (python's wave module)" "$rfacts"
+    snd_keep
+    ev_qemu device-del "EV-QEMU: device_del s777cap and QEMU's reply (empty: accepted; the PCI unplug then waits on the guest)" \
+        "device_del s777cap" >/dev/null || fail "QEMU refused device_del s777cap"
+    r_gone=no
+    for _ in $(seq 30); do
+        gq desk pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qxF -- "$r_src" || { r_gone=yes; break; }
+        sleep 1
+    done
+    snd_set off "after device_del s777cap"
+    snd_diffs off "the $cap_model card's removal"
+    ev_video_stop "EV-VIDEO: the display while the capture card arrives and leaves, the journey pod recording from it (index.txt and the notes give the times)"
+    ev_save pod-after "EV-PIDS: the journey pod's container after it recorded from the card and the card left" gq pod-state journey >/dev/null || true
+    R_POD_A=$EV_LAST
+    ev_diff pod "EV-DIFF: the journey pod across the capture card's arrival and removal (no differences: the same container)" "$R_POD_B" "$R_POD_A"
+    ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the capture card left" \
+        gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    r_dmn_a=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
+    ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the capture card's arrival and removal (no differences)" "$R_D_B" "$EV_LAST"
+    grep -q '^parecord exited 0$' <<<"$rec" || fail "the pod's parecord from $r_src did not exit 0: $(grep '^parecord exited' <<<"$rec")"
+    ev_pass "the pod, running since before the card arrived, opened $r_src with parecord, which exited 0"
+    [ "$rfacts_ok" = yes ] || fail "the pod's recording from $r_src holds less than 2 s of its 3: $rfacts"
+    ev_pass "it delivered frames: $rfacts (silence: all QEMU's none backend gives a capture)"
+    [ "$r_gone" = yes ] || fail "the capture source $r_src was still listed 30 s after device_del s777cap"
+    [ -n "$r_dmn_b" ] && [ "$r_dmn_b" = "$r_dmn_a" ] || fail "Xorg, mwm or an audio daemon changed: $r_dmn_b -> $r_dmn_a"
+    ev_pass "Xorg, mwm and the three audio daemons kept their pids ($r_dmn_b); the card's source left with it"
+    pod_same "$R_POD_B" "$R_POD_A" || fail "the journey pod's container changed across the capture card"
+    ev_pass "the pod is the same container, restartCount 0"
+    ev_end
+fi
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh journey-cleanup' || true
 
 log "k8s teardown: uninstall the plugin releases; resources withdrawn, host CDI specs and the desktop survive"
