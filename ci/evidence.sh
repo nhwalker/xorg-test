@@ -45,6 +45,11 @@ _ev_ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 # messages with \r\n, and a reader splitting on \r would break the row).
 _ev_one() { printf '%s' "$*" | tr '\t\n\r' '   '; }
 
+# The first line of a command's output, read whole first: a reader that stops
+# early (head -1) would fail the pipeline under pipefail once its producer
+# writes again (Requirements.md S9.1.5). The command's own status is not kept.
+first_of() { local o; o=$("$@" 2>/dev/null) || true; printf '%s' "${o%%$'\n'*}"; }
+
 ev_log() { # <kind> <text>
     [ -n "$EV_ROOT" ] || return 0
     local line

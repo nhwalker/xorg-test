@@ -51,8 +51,10 @@ helm template p charts/cdi-device-plugin --set cdiDevice=missing-equals >/dev/nu
 # The resource names are a contract between the plugin releases, the CDI
 # generator and every client manifest; nothing at template time would catch
 # them drifting apart, so read them back from the rendered chart.
-DISPLAY_RES=$(echo "$DP" | sed -n 's/.*value: "\(desktop\.local\/display\)"$/\1/p' | head -1)
-AUDIO_RES=$(echo "$DPA" | sed -n 's/.*value: "\(desktop\.local\/audio\)"$/\1/p' | head -1)
+DISPLAY_RES=$(sed -n 's/.*value: "\(desktop\.local\/display\)"$/\1/p' <<<"$DP")
+DISPLAY_RES=${DISPLAY_RES%%$'\n'*}
+AUDIO_RES=$(sed -n 's/.*value: "\(desktop\.local\/audio\)"$/\1/p' <<<"$DPA")
+AUDIO_RES=${AUDIO_RES%%$'\n'*}
 [ -n "$DISPLAY_RES" ] && [ -n "$AUDIO_RES" ] \
     || { echo "FAIL: could not read the advertised resource names from the chart"; exit 1; }
 echo "PASS: plugin advertises $DISPLAY_RES and $AUDIO_RES"

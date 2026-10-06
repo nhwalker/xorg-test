@@ -514,14 +514,18 @@ def container_cases():
         dict(id="unknown-output", what="a monitors.conf declaring DP-9, which no DRM connector has (MONITORS_CONF)",
              setup="printf 'DP-9 1920x1080 +0+0\\n' > /tmp/ev-monitors.conf; export MONITORS_CONF=/tmp/ev-monitors.conf",
              rows=["fixed monitor layout names output(s)$unknown with no matching DRM connector ($(ls -d /sys/class/drm/card*-* 2>/dev/null | sed 's|.*/card[0-9]*-||' | tr '\\n' ' ')). Expected on NVIDIA (its output names differ from the kernel's); a typo anywhere else - that output would never be configured"]),
-        dict(id="stub-with-nvidia", what="NVIDIA_CDI_STUB=1 in the environment (as the stub spec injects it) and a /dev/nvidiactl",
-             setup=": > /dev/nvidiactl", opts=["-e", "NVIDIA_CDI_STUB=1"],
+        dict(id="stub-with-nvidia", what="the stub CDI spec's device (its one edit is NVIDIA_CDI_STUB=1) and a /dev/nvidiactl",
+             setup=": > /dev/nvidiactl", opts=["--device", "nvidia.com/gpu=all"], stub_spec=True,
              rows=["NVIDIA hardware visible but the host injected a STUB CDI spec: nvidia container toolkit missing/broken on the host (desktop-cdi-refresh fell back). GPU acceleration is OFF; fix the host toolkit and restart",
                    "NVIDIA device nodes present but nvidia_drv.so NOT injected: X falls back to unaccelerated modesetting. Toolkit CDI spec lacks the X driver, see README ('nvidia_drv.so missing')"]),
         dict(id="driver-no-device", what="an nvidia_drv.so and no NVIDIA device node",
              setup="mkdir -p /usr/lib64/xorg/modules/drivers && : > /usr/lib64/xorg/modules/drivers/nvidia_drv.so",
              rows=["nvidia_drv.so present but no NVIDIA device nodes: GPU not injected (missing AddDevice=nvidia.com/gpu=all drop-in?)"]),
     ]
+
+
+STUB_SPEC = "/etc/cdi/nvidia.yaml"
+CONVERGER = "deploy/host/usr/local/libexec/desktop-cdi-refresh"
 
 
 def cmd_container(image):
@@ -534,7 +538,31 @@ def cmd_container(image):
         for case in container_cases():
             inner = (case["setup"] + "\n" if case["setup"] else "") + "/usr/local/bin/preflight-check.sh"
             cmd = runner + ["--rm", "--network=none", "--user", "0"] + case.get("opts", []) + [image, "bash", "-c", inner]
-            r = run(cmd)
+            made_stub = False
+            if case.get("stub_spec"):
+                # The stub, as the host's converger writes it: the device the
+                # case requests resolves to it, and NVIDIA_CDI_STUB=1 reaches
+                # the container the way it reaches the desktop, as a CDI edit
+                # (Requirements.md S9.2.1: no -e that duplicates one).
+                made_stub = not os.path.exists(STUB_SPEC)
+                if made_stub:
+                    c = run(["sudo", CONVERGER])
+                    w.write(f"{case['id']}-converger", f"$ sudo {CONVERGER}\n# exit {c.returncode}\n{c.stdout}{c.stderr}",
+                            f"EV-STATE: {case['id']}: the converger writes the stub CDI spec this case resolves its device to")
+                spec = run(["sudo", "cat", STUB_SPEC])
+                if "NVIDIA_CDI_STUB=1" not in spec.stdout:
+                    raise RuntimeError(f"{STUB_SPEC} is not the stub ({case['id']} cannot be staged): {spec.stdout[:200]}")
+                w.write(f"{case['id']}-spec", spec.stdout, f"EV-CONFIG: {case['id']}: {STUB_SPEC}, the stub")
+            try:
+                r = run(cmd)
+            finally:
+                if made_stub:
+                    run(["sudo", "rm", "-f", STUB_SPEC])
+            if made_stub:
+                gone = not os.path.exists(STUB_SPEC)
+                w.check(gone, f"{case['id']}: the stub CDI spec this case wrote is removed again ({STUB_SPEC})")
+                if not gone:
+                    raise RuntimeError(f"{STUB_SPEC} is still there after {case['id']}")
             shown = " ".join(c if re.fullmatch(r"[\w@%+=:,./-]+", c) else "'" + c.replace("'", "'\\''") + "'" for c in cmd)
             w.write(case["id"], f"# staged: {case['what']}\n$ {shown}\n# exit {r.returncode}\n{r.stdout}{r.stderr}",
                     f"EV-LOG-DESKTOP: {case['id']}: {case['what']}: the podman run command and the preflight block")
