@@ -7,8 +7,9 @@ Positions the absolute pointer at pixel (PX_X, PX_Y) on a WIDTHxHEIGHT
 screen, left-clicks (to focus the window under mwm's click-to-focus),
 then types TEXT followed by Return. Every event is a real virtio HID
 event, so this exercises the whole path: QEMU device -> evdev -> Xorg ->
-focused client. TEXT must be lowercase letters/digits (they double as
-QEMU qcodes).
+focused client. TEXT is lowercase letters and digits (they double as
+QEMU qcodes), spaces and the few signs in SIGNS: enough for a shell
+command such as "echo word >/tmp/file".
 
 Absolute axis values are 0..0x7fff mapped across the screen, so pixel
 coords convert as px / dimension * 0x7fff.
@@ -32,6 +33,9 @@ width, height = (int(v) for v in res.lower().split("x"))
 px_x, px_y = int(px_x), int(px_y)
 ABS_MAX = 0x7FFF
 transcript = None
+# Characters that are not their own qcode: (qcode, with shift), US layout.
+SIGNS = {" ": ("spc", False), "/": ("slash", False), ".": ("dot", False),
+         "-": ("minus", False), ">": ("dot", True)}
 
 
 def main():
@@ -92,8 +96,13 @@ def main():
     send(btn(False))
     time.sleep(0.4)                    # let mwm settle focus
     for ch in text:
-        send_key(key(ch, True))
-        send_key(key(ch, False))
+        qcode, shift = SIGNS.get(ch, (ch, False))
+        if shift:
+            send_key(key("shift", True))
+        send_key(key(qcode, True))
+        send_key(key(qcode, False))
+        if shift:
+            send_key(key("shift", False))
         time.sleep(0.05)
     send_key(key("ret", True))
     send_key(key("ret", False))

@@ -217,6 +217,32 @@ ev_video_stop() { # <what>
 
 # A saved command's output, without ev_save's "$ command" and "[exit N]" lines.
 ev_payload() { sed '1d;$d' "$1"; }
+# The output of the command the last ev_save kept, without its "$ command"
+# and "[exit N]" lines.
+ev_out() { ev_payload "$EV_DIR/$EV_LAST"; }
+# The same container before and after: its pod-state lines unchanged and
+# restartCount 0. Both files are in the open story.
+pod_same() { # <before file> <after file>
+    local pb pa
+    pb=$(ev_payload "$EV_DIR/$1"); pa=$(ev_payload "$EV_DIR/$2")
+    grep -q 'restartCount=0 ' <<<"$pa" && [ -n "$pb" ] && [ "$pb" = "$pa" ]
+}
+# EV-SHOT-CLIENT into the open story: the screenshot run in a pod (the
+# toolkit's, or its image's own where the pod has no toolkit).
+ev_client_shot() { # <moment> <pod> <what>
+    local name
+    name=$(ev_name "$1" png)
+    vm_ssh_quick "sudo repo/ci/vm/vm-guest.sh client-shot $2" > "$EV_DIR/$name" 2>/dev/null || true
+    if [ -s "$EV_DIR/$name" ]; then ev_attach "$name" "$3"; return 0; fi
+    rm -f "${EV_DIR:?}/${name:?}"
+    ev_note "the pod's own screenshot ($1) was not produced"
+    return 1
+}
+# The first window on the screen in a pod-windows listing (stdin), as
+# "<id> <width> <height> <x> <y>" with the absolute position.
+win_rect() {
+    sed -nE 's/^(0x[0-9a-f]+) .* ([0-9]+)x([0-9]+)\+-?[0-9]+\+-?[0-9]+ +\+(-?[0-9]+)\+(-?[0-9]+) map=IsViewable$/\1 \2 \3 \4 \5/p' | sed -n 1p
+}
 # The guest's clock now, as a Unix time with nanoseconds.
 gnow() { vm_ssh_quick 'date +%s.%N' 2>/dev/null | tail -1; }
 # QEMU's own trace of its emulated HDA codec (-trace on the command line)
@@ -1749,16 +1775,68 @@ fi # ---- end shard: operator --------------------------------------------------
 if in_shard k8s; then
 
 log "phase 2: k3s + a cdi-device-plugin release per capability, desktop still on the quadlet"
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh phase2' \
+guest_ev "$GUEST_EV" phase2 \
     || { vm_ssh 'sudo journalctl -b --no-pager | tail -150' 2>&1 | tee "$ART/guest-journal-fail.log" || true; fail "guest phase2 failed"; }
 screendump desktop-k3s-client
 assert_nonblank desktop-k3s-client
+# S7.3.7's picture: the desktop after CRI-O and k3s arrived (the guest kept
+# the proof that its processes are the same ones).
+EV_SIDE=h-
+ev_begin S7.3.7 "The desktop survives CRI-O and k3s arriving" T3
+ev_shot after-install "EV-SHOT: the desktop after CRI-O and k3s were installed and the demo pod started: the session's xterm, and the demo pod's xterm over it"
+ev_end
+EV_SIDE=
+
+log "the demo pod's window is usable: clicked at its centre and typed into"
+# Requirements.md S7.5.2: S7.5.1 for examples/x11-client-pod.yaml. The demo's
+# window is found by its X client - the pod's main process, its xterm - not
+# by its title: the image's /etc/bashrc retitles an xterm at its shell's
+# first prompt, so the example's -title "CDI demo" does not last. The click
+# lands at the window's centre, and the line typed runs in the demo's shell,
+# which writes it to a file in the pod.
+res=$(vm_ssh 'sudo podman exec -u desktop -e DISPLAY=:0 desktop \
+    sh -c "xdpyinfo | awk \"/dimensions:/{print \\\$2; exit}\""')
+[ -n "$res" ] || fail "could not read the display's size for input injection"
+ev_begin S7.5.2 "The same under kubernetes" T3
+ev_save pod-before "EV-PIDS: the demo pod x11-client-demo's container (restartCount, id, start time) and its main process's host pid - its xterm - before it is used" \
+    gq pod-state x11-client-demo >/dev/null || true
+D_POD_B=$EV_LAST
+ev_save windows "EV-STATE: the demo pod's main process (its xterm), the X client it holds (screenshot --list-clients) and the windows X allocated to that client in xwininfo -root -tree, each named one with its map state" \
+    gq pod-windows x11-client-demo >/dev/null || fail "the demo pod's xterm holds no X connection"
+rect=$(ev_out | win_rect || true)
+[ -n "$rect" ] || fail "the demo pod's xterm has no window on the screen"
+read -r d_wid d_w d_h d_x d_y <<<"$rect"
+d_cx=$((d_x + d_w / 2)) d_cy=$((d_y + d_h / 2))
+ev_pass "the demo pod's xterm is on the desktop: window $d_wid, ${d_w}x${d_h} at +$d_x+$d_y, found as its pod's X client"
+ev_save tree "EV-STATE: xwininfo -root -tree with the demo's window in it" gq win-tree >/dev/null || true
+qlog=$(ev_name qmp txt)
+QMP_TRANSCRIPT="$EV_DIR/$qlog" python3 qmp-type.py "$QMP" "$res" "$d_cx" "$d_cy" "echo typedintodemo752 >/tmp/s752" \
+    || fail "QMP input to the demo pod's window failed"
+ev_attach "$qlog" "EV-QEMU: every QMP command sent: the absolute pointer to the window's centre ($d_cx,$d_cy), a click, then the keys of the line typed and Return"
+got=""
+for _ in $(seq 8); do
+    got=$(gq jx-in x11-client-demo cat /tmp/s752 2>/dev/null || true)
+    [ -n "$got" ] && break
+    sleep 1
+done
+ev_text sink "EV-STATE: /tmp/s752 read inside the demo pod: what the shell in its xterm wrote when the typed line ran" "${got:-(no file)}"
+[ "$got" = typedintodemo752 ] || fail "the demo pod's shell did not run the typed line: /tmp/s752 holds '${got:-nothing}'"
+ev_pass "the click at the window's centre and the line typed reached the demo pod: its shell ran it, and /tmp/s752 holds typedintodemo752"
+ev_shot typed "EV-SHOT: the desktop with the demo pod's xterm: the line typed into it, echo typedintodemo752 >/tmp/s752, at its prompt"
+ev_client_shot client-view x11-client-demo "EV-SHOT-CLIENT: the display as the demo pod captures it from inside (with the screenshot binary its image ships: the demo requests no toolkit), the typed line in its window" \
+    || fail "the demo pod could not capture the display from inside"
+ev_save pod-log "EV-LOG-CLIENT: kubectl logs x11-client-demo: its xterm's own output" gq pod-logs x11-client-demo >/dev/null || true
+ev_save pod-after "EV-PIDS: the demo pod after it was used" gq pod-state x11-client-demo >/dev/null || true
+ev_diff pod "EV-DIFF: the demo pod before and after (empty: the same container)" "$D_POD_B" "$EV_LAST"
+pod_same "$D_POD_B" "$EV_LAST" || fail "the demo pod changed or restarted while it was used"
+ev_pass "the same container and xterm before and after, restartCount 0"
+ev_end
 
 log "cdi: a requesting pod gets DISPLAY + sockets injected by the runtime"
 # The verifier pod declares no env/mounts of its own and an identical pod
 # WITHOUT the resource request is checked to get nothing, so these
 # assertions prove the plugin -> CRI-O CDI path end to end in a live pod.
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-cdi' \
+guest_ev "$GUEST_EV" verify-cdi \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod cdi-verify; echo ---; sudo /usr/local/bin/k3s kubectl get pods -o wide; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          2>&1 | tee "$ART/cdi-verify-fail.log" || true; fail "CDI injection verification failed"; }
 screendump cdi-verify-window
@@ -1771,19 +1849,79 @@ log "cdi: each device grants ONLY its own capability"
 guest_ev "$GUEST_EV" verify-split \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl describe pod display-only audio-only; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          2>&1 | tee "$ART/verify-split-fail.log" || true; fail "capability split verification failed"; }
+# S7.3.2's EV-AUDIO: the audio-only pod plays, and the machine's output
+# carries it. Then the narrow pods go.
+EV_SIDE=h-
+ev_begin S7.3.2 "Split holds in pods" T3
+ev_audio_start audio-only 440
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh play-audio-pod pulse audio-only' \
+    || { audio_capture_stop; fail "the audio-only pod could not play"; }
+ev_audio_stop "EV-AUDIO: the machine's output while the audio-only pod played a 440 Hz tone over pulse - listen for one beep" 1 0.05 440 \
+    || fail "the audio-only pod's tone was not heard"
+ev_pass "audio-only plays: its 440 Hz tone came out of the machine"
+ev_end
+EV_SIDE=
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh split-cleanup' || true
 
 log "cdi: each audio path works from the requesting pod (injected env only)"
 # One capture per path, played from the verifier pod using only injected
 # env - proves the CDI spec wired pulse/pipewire/ALSA, not the desktop
-# image's own local session.
+# image's own local session. Requirements.md S7.6.1 with F7.6's common set:
+# for each path the streams before, during (polled until the player's own
+# stream shows) and after, the player's own output and the capture with its
+# verdict; the pod and the three audio daemons before and after.
+# The host's side is S7.6.1's own: nothing in the guest writes to it, so
+# the host keeps its title, tier and result (ev_begin with EV_SIDE empty).
+EV_SIDE=
+ev_begin S7.6.1 "A client plays and the operator hears it" T3
+ev_save pod-before "EV-PIDS: the cdi-verify pod's container and its main process's host pid, before it plays" \
+    gq pod-state cdi-verify >/dev/null || true
+A_POD_B=$EV_LAST
+ev_save daemons-before "EV-PIDS: the desktop's three audio daemons before the pod plays" \
+    gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+A_DMN_B=$EV_LAST
+# Each player's stream is found by its client's executable: paplay and
+# pw-play are links to pacat and pw-cat, which is what their clients run
+# (stream_apps says more).
 for path in pulse pipewire alsa; do
-    audio_capture_start "audio-cdi-$path"
-    vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path" \
-        || { audio_capture_stop; fail "client pod $path playback failed"; }
-    audio_capture_stop
-    python3 check-audio.py "$ART/audio-cdi-$path.wav" 1 0.05 "$(freq_for "$path")" \
+    hz=$(freq_for "$path")
+    case $path in pulse) pbin=pacat ;; pipewire) pbin=pw-cat ;; alsa) pbin=aplay ;; esac
+    ev_save "streams-before-$path" "EV-STATE: the streams playing before the pod's $path tone" gq stream-apps >/dev/null || true
+    ev_audio_start "cdi-$path" "$hz"
+    vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path cdi-verify 3" > "$ART/.player-$path.out" 2>&1 &
+    pl=$!
+    during="" s="" polls=""
+    for _ in $(seq 16); do
+        sleep 0.5
+        s=$(gq stream-apps 2>/dev/null || true)
+        polls+="--- $(date -u +%H:%M:%S.%3N)"$'\n'"$s"$'\n'
+        if grep -Eq "binary \"$pbin\"" <<<"$s"; then during=$s; break; fi
+    done
+    pl_rc=0
+    wait "$pl" || pl_rc=$?
+    if [ -n "$during" ]; then
+        ev_text "streams-during-$path" "EV-STATE: the streams while the pod's $path player played (polled every 0.5 s until its stream showed): its stream, its client's executable $pbin and pid" "$during"
+    else
+        ev_text "streams-during-$path" "EV-STATE: every listing taken while the pod's $path player played, each with its time (UTC): none shows a stream whose client runs $pbin" "${polls:-(no listing)}"
+    fi
+    ev_audio_stop "EV-AUDIO: the machine's output while the cdi-verify pod played its $hz Hz tone over the $path path, with only the injected env - listen for one beep" 1 0.05 "$hz" \
         || fail "client pod $path audio capture is empty or silent"
+    ev_copy "$ART/.player-$path.out" "player-$path" "EV-LOG-CLIENT: the pod's $path player: its command, its own output and its exit status"
+    ev_save "streams-after-$path" "EV-STATE: the streams after the $path player ended" gq stream-apps >/dev/null || true
+    [ "$pl_rc" = 0 ] || fail "client pod $path playback failed (see the player's log)"
+    [ -n "$during" ] || fail "no stream of the pod's $path player was listed while it played"
+    ev_pass "over $path the pod's player played: its stream was listed while it played ($(grep -E "binary \"$pbin\"" <<<"$during" | sed -n 1p)), and the machine's output carried its $hz Hz tone"
 done
+ev_save pod-after "EV-PIDS: the cdi-verify pod after the three paths played" gq pod-state cdi-verify >/dev/null || true
+ev_diff pod "EV-DIFF: the cdi-verify pod before and after (empty: the same container)" "$A_POD_B" "$EV_LAST"
+pod_same "$A_POD_B" "$EV_LAST" || fail "the cdi-verify pod changed or restarted while it played"
+ev_save daemons-after "EV-PIDS: the desktop's three audio daemons after the pod played" \
+    gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+ev_diff daemons "EV-DIFF: the audio daemons before and after (empty: none restarted)" "$A_DMN_B" "$EV_LAST"
+[ "$(ev_payload "$EV_DIR/$A_DMN_B")" = "$(ev_out)" ] || fail "an audio daemon restarted while the pod played"
+ev_pass "the same pod (restartCount 0) and the same three audio daemons before and after"
+ev_end
+EV_SIDE=
 
 log "cdi: a client can RECORD from the desktop audio (loopback via monitor)"
 # Capture direction, not just playback: record the sink monitor while a tone
@@ -1840,6 +1978,41 @@ for path in pulse pipewire alsa; do
         || fail "lean client $path audio capture is empty or silent"
     ev_pass "the lean client played over the $path path and the machine's output carried its $hz Hz tone"
 done
+ev_end
+
+log "the lean client plays all three paths and records, with the injected env alone"
+# Requirements.md S7.6.6. The lean image runs no PipeWire of its own (S7.3.4
+# lists its processes). Its three tones were just heard, in S7.3.4; their
+# captures are kept here again with their verdicts, and then the lean client
+# records the default sink's monitor while a tone plays through it.
+# S7.6.6, like S7.6.1, is the host's alone: its own side.
+EV_SIDE=
+ev_begin S7.6.6 "A lean client with no PipeWire of its own plays and records" T3
+ev_save pod-before "EV-PIDS: the lean client pod x11-testclient's container and its main process's host pid" \
+    gq pod-state x11-testclient >/dev/null || true
+L_POD_B=$EV_LAST
+for path in pulse pipewire alsa; do
+    hz=$(freq_for "$path")
+    src=$(ls "$EV_ROOT/S7.3.4/"*"-testclient-$path-${hz}hz.wav" 2>/dev/null | sed -n 1p || true)
+    [ -n "$src" ] || fail "S7.3.4 kept no capture of the lean client's $path tone"
+    ev_copy "$src" "testclient-$path-${hz}hz" "EV-AUDIO: the machine's output while the lean client played its $hz Hz tone over $path (captured in S7.3.4) - listen for one beep"
+    ev_audio_check "testclient-$path" "$EV_LAST" 1 0.05 "$hz" \
+        || fail "the lean client's $path capture is silent or not $hz Hz"
+    ev_pass "the lean client's $path tone was heard: $hz Hz at the machine's output"
+done
+vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-record x11-testclient 660' \
+    || fail "the lean client could not record the sink's monitor"
+recwav=$(ev_name recording-660hz wav)
+vm_ssh 'cat /tmp/rec-pulled.wav' > "$EV_DIR/$recwav" \
+    || fail "could not copy the lean client's recording out of the VM"
+ev_attach "$recwav" "EV-AUDIO-REC: what the lean client recorded with parec from the default sink's monitor while a 660 Hz tone played through it - listen for the beep"
+ev_audio_check recording "$recwav" 0.5 0.02 660 \
+    || fail "the lean client's recording is silent or not 660 Hz"
+ev_pass "the lean client recorded the sink's monitor with only the injected env: its recording carries the 660 Hz tone"
+ev_save pod-after "EV-PIDS: the lean client pod after it played and recorded" gq pod-state x11-testclient >/dev/null || true
+ev_diff pod "EV-DIFF: the lean client pod before and after (empty: the same container)" "$L_POD_B" "$EV_LAST"
+pod_same "$L_POD_B" "$EV_LAST" || fail "the lean client pod changed or restarted"
+ev_pass "the same container throughout, restartCount 0"
 ev_end
 EV_SIDE=
 
@@ -1971,6 +2144,9 @@ EV_SIDE=h-
 ev_begin S7.3.5 "Concurrency" T3
 ev_shot concurrent-clients "EV-SHOT: the three pods' xterms one above the other on the right of the screen, each title bar naming its pod (x11-client-a, -b, -c), each its pod's live X connection; bottom left, pod a's second xterm (the hold), if it has not exited yet"
 ev_end
+ev_begin S7.5.7 "Many clients share one desktop" T3
+ev_shot three-clients "EV-SHOT: the three pods' xterms at their own places on the right of the screen, none covering another (each window's place is in the guest's windows-a, -b and -c files)"
+ev_end
 EV_SIDE=
 
 log "client journeys: long-running pods through the desktop's own restarts"
@@ -2008,16 +2184,6 @@ tone_wait() { # <tag> [pod] [seconds]: until the pod's player has ended
     done
     return 1
 }
-# The output of the command the last ev_save kept, without its "$ command"
-# and "[exit N]" lines.
-ev_out() { ev_payload "$EV_DIR/$EV_LAST"; }
-# The same container before and after: its pod-state lines unchanged and
-# restartCount 0. Both files are in the open story.
-pod_same() { # <before file> <after file>
-    local pb pa
-    pb=$(ev_payload "$EV_DIR/$1"); pa=$(ev_payload "$EV_DIR/$2")
-    grep -q 'restartCount=0 ' <<<"$pa" && [ -n "$pb" ] && [ "$pb" = "$pa" ]
-}
 # The sink-input indexes in a `streams` listing.
 sink_inputs() { awk '/^== pactl list short sink-inputs/ {s = 1; next} /^==/ {s = 0} s && /^[0-9]/ {print $1}' <<<"$1" | paste -sd' '; }
 # One field of a journey-stat line: inode or ctime.
@@ -2030,16 +2196,6 @@ pids_of() { # <ctr-pids output> <comm...>
 }
 # What a player or an xterm said last: the last two non-empty lines.
 said() { grep -v '^[[:space:]]*$' | tail -2 | paste -sd' '; }
-# EV-SHOT-CLIENT into the open story: the toolkit's screenshot run in a pod.
-ev_client_shot() { # <moment> <pod> <what>
-    local name
-    name=$(ev_name "$1" png)
-    vm_ssh_quick "sudo repo/ci/vm/vm-guest.sh client-shot $2" > "$EV_DIR/$name" 2>/dev/null || true
-    if [ -s "$EV_DIR/$name" ]; then ev_attach "$name" "$3"; return 0; fi
-    rm -f "$EV_DIR/$name"
-    ev_note "the pod's own screenshot ($1) was not produced"
-    return 1
-}
 
 # --- the X server killed under the pod (S7.5.5, S7.6.3, S7.8.3) --------------
 ev_begin S7.5.5 "After an X session restart, a client container reconnects without being recreated" T3
@@ -2522,9 +2678,14 @@ ev_end
 vm_ssh 'sudo repo/ci/vm/vm-guest.sh journey-cleanup' || true
 
 log "k8s teardown: uninstall the plugin releases; resources withdrawn, host CDI specs and the desktop survive"
-vm_ssh 'sudo repo/ci/vm/vm-guest.sh verify-teardown' \
+guest_ev "$GUEST_EV" verify-teardown \
     || { vm_ssh 'sudo /usr/local/bin/k3s kubectl get deploy,ds,pods -A -o wide; echo ---; sudo /usr/local/bin/k3s kubectl get node -o jsonpath="{.items[0].status.allocatable}"; echo ---; sudo cat /etc/cdi/desktop-display.yaml /etc/cdi/desktop-audio.yaml' \
          2>&1 | tee "$ART/teardown-fail.log" || true; fail "k8s teardown check failed"; }
+EV_SIDE=h-
+ev_begin S7.3.6 "Teardown seam" T3
+ev_shot after-uninstall "EV-SHOT: the desktop after the three plugin releases were uninstalled: the client pod that was running, x11-client-td, still has its xterm on it (bottom left)"
+ev_end
+EV_SIDE=
 
 # Every screendump this shard measured, the client's capture among them:
 # this shard is the one that takes all four S3.5.1 names.

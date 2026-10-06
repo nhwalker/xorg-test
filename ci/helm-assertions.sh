@@ -95,8 +95,23 @@ nk "$AUDIO_RES"      "$DO" "display-only: does NOT request audio"
 AO=$(grep -v '^[[:space:]]*#' ci/vm/audio-only-pod.yaml)
 ck "$AUDIO_RES: 1"   "$AO" "audio-only: requests audio"
 nk "$DISPLAY_RES"    "$AO" "audio-only: does NOT request display"
-for m in ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml ci/vm/testpattern-pod.yaml; do
-    nk 'securityContext' "$(grep -v '^[[:space:]]*#' "$m")" "$m: no securityContext (stays confined)"
+
+# Every client manifest - the example, the whole-desktop and narrow fixtures,
+# the test pattern and the journey pods - declares nothing of its own: no
+# securityContext (it stays a confined container_t), no volumes, mounts or
+# env, no CDI annotation, nothing privileged. All it gets comes from the CDI
+# specs through its resource requests (Requirements.md S7.3.3).
+for m in examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml \
+         ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml ci/vm/testpattern-pod.yaml \
+         ci/vm/journey-pod.yaml ci/vm/early-pod.yaml; do
+    M=$(grep -v '^[[:space:]]*#' "$m")
+    ck 'desktop\.local/'              "$M" "$m: requests a desktop.local resource"
+    nk 'securityContext'               "$M" "$m: no securityContext (stays a confined container_t)"
+    nk 'volumeMounts'                  "$M" "$m: no volumeMounts of its own"
+    nk '^  volumes:'                   "$M" "$m: no volumes of its own"
+    nk '^      env:'                   "$M" "$m: no env of its own"
+    nk 'cdi\.k8s\.io'                  "$M" "$m: no CDI annotation"
+    nk 'privileged'                    "$M" "$m: not privileged"
 done
 
 echo "== all helm assertions passed"
