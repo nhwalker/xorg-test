@@ -194,6 +194,17 @@ fallback_lines() {
 
 # --- the stories ---------------------------------------------------------------
 
+# A story's first ev_begin in an attempt: an earlier attempt's directory is
+# moved aside (<story>.<UTC time>), so that its checks do not count in this
+# one. The later phases of a story that reboots, and S8.3.2's daily samples,
+# add to the directory they find (ev_begin).
+story_begin() { # <story> <title> [tier]
+    if [ -n "$EV_ROOT" ] && [ -d "$EV_ROOT/$1" ]; then
+        mv "$EV_ROOT/$1" "$EV_ROOT/$1.$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+    ev_begin "$@"
+}
+
 # S8.1.1 and S3.1.1: an NVIDIA host whose toolkit injects the X driver.
 gpu_mode_checks() { # the GPU mode, into the open story; sets GPU_CONF GPU_LOG GPU_GLX
     ev_save cmdline "EV-STATE: /proc/cmdline and nvidia_drm's modeset parameter" \
@@ -220,7 +231,7 @@ gpu_mode() {
     local photo moddir
     nvidia_host || { say "S8.1.1 and S3.1.1 need an NVIDIA host: no /dev/nvidiactl and no nvidia module here."; return 1; }
     wait_desktop 30 || say "the desktop is not up; the checks will say why"
-    ev_begin S8.1.1 "NVIDIA GPU mode" T4
+    story_begin S8.1.1 "NVIDIA GPU mode" T4
     gpu_mode_checks
     ev_save host-preflight "EV-STATE: desktop-preflight on the host" desktop-preflight >/dev/null
     observe "the desktop is on this host's monitor: the dark root, the session xterm in mwm's frame"
@@ -228,7 +239,7 @@ gpu_mode() {
     photo=$MEDIA_LAST
     ev_end
 
-    ev_begin S3.1.1 "NVIDIA path" T4
+    story_begin S3.1.1 "NVIDIA path" T4
     ev_text gpu-conf "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf, the file xorg-gpu-conf.sh generated (S8.1.1's run)" "$GPU_CONF"
     ev_text gpu-log "EV-LOG-DESKTOP: xorg-gpu-conf.sh's evidence lines and decision (S8.1.1's run)" "$(grep xorg-gpu-conf <<<"$GPU_LOG")"
     ev_text glxinfo "EV-STATE: glxinfo -B in the desktop (S8.1.1's run)" "$GPU_GLX"
@@ -250,7 +261,7 @@ gpu_mode() {
 no_xdriver() {
     local keep="$HW_STATE/nvidia.yaml.real" n conf log glx pf0 pf1 unit real_f staged=no
     nvidia_host || { say "S3.1.2 and S8.1.4 need an NVIDIA host."; return 1; }
-    ev_begin S3.1.2 "NVIDIA nodes without the X driver fall back to modesetting" T4
+    story_begin S3.1.2 "NVIDIA nodes without the X driver fall back to modesetting" T4
     ev_copy "$SPEC" spec-real "EV-CONFIG: /etc/cdi/nvidia.yaml as this host's toolkit generated it"
     real_f=$EV_LAST
     if grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
@@ -283,7 +294,7 @@ no_xdriver() {
     media EV-PHOTO desktop "the desktop on this host's monitor, modesetting with NVIDIA nodes present"
     ev_end
 
-    ev_begin S8.1.4 "Old toolkit without nvidia_drv.so" T4
+    story_begin S8.1.4 "Old toolkit without nvidia_drv.so" T4
     ev_save preflight-before "EV-LOG-DESKTOP: the container preflight, the X driver not injected" sh -c 'podman logs desktop 2>&1 | grep preflight:' >/dev/null || true
     pf0=$EV_LAST
     if grep -q 'WARN: NVIDIA device nodes present but nvidia_drv.so NOT injected' "$EV_DIR/$pf0"; then
@@ -333,7 +344,7 @@ stub_toolkit() {
     nvidia_host || { say "S8.1.2 needs an NVIDIA host."; return 1; }
     say "S8.1.2 stages a missing toolkit: nvidia-ctk set aside and the real spec moved away, so desktop-cdi-refresh writes the stub. Both are put back at the end."
     yes_no "Stage it?" || return 1
-    ev_begin S8.1.2 "NVIDIA host with missing/broken toolkit" T4
+    story_begin S8.1.2 "NVIDIA host with missing/broken toolkit" T4
     if command -v nvidia-ctk >/dev/null; then
         ctk_aside || { ev_abort "could not set nvidia-ctk aside"; return 1; }
     else ev_note "this host has no nvidia-ctk: the missing toolkit, as installed"; fi
@@ -370,7 +381,7 @@ no_modeset() {
     new)
         say "S8.1.3 needs nvidia-drm without modeset and no GPU injection. The script sets nvidia_drm.modeset=0 on the default kernel's command line (grubby), sets nvidia-ctk aside and moves the real spec away (desktop-cdi-refresh then writes the stub), and reboots. Run 'run S8.1.3' again after the boot; that run checks, puts everything back and reboots once more; a third run checks the host is whole."
         yes_no "Stage it and reboot?" || return 1
-        ev_begin S8.1.3 "NVIDIA host without nvidia_drm.modeset=1 and no injection" T4
+        story_begin S8.1.3 "NVIDIA host without nvidia_drm.modeset=1 and no injection" T4
         args=$(grubby --info=DEFAULT | sed -n 's/^args="\(.*\)"$/\1/p')
         printf '%s\n' "$args" > "$HW_STATE/S8.1.3.args"
         ev_text args-before "EV-STATE: the default kernel's arguments before the staging" "$args"
@@ -434,7 +445,7 @@ stale_spec() {
     [ -n "$ver" ] || { say "could not tell the driver version from the spec or nvidia-smi"; return 1; }
     say "S5.4.3 stages what a driver update leaves behind: the spec's versioned paths ($ver) point at files that are gone. nvidia-ctk is set aside meanwhile so the desktop's restart cannot regenerate it. Then README.md's remedy."
     yes_no "Stage it?" || return 1
-    ev_begin S5.4.3 "Stale real spec fails loudly, regenerates on restart" T4
+    story_begin S5.4.3 "Stale real spec fails loudly, regenerates on restart" T4
     ev_copy "$SPEC" spec-real "EV-CONFIG: the real spec, driver $ver"
     real=$EV_LAST
     ctk_aside || { ev_abort "could not set nvidia-ctk aside"; return 1; }
@@ -486,7 +497,7 @@ arrangement() { # <xrandr file>
 capture_layout() {
     local cap x0 x1 e
     wait_desktop 30 || say "the desktop is not up"
-    ev_begin S8.2.3 "Real EDID and desktop-monitors-capture" T4
+    story_begin S8.2.3 "Real EDID and desktop-monitors-capture" T4
     ev_save xrandr-before "EV-STATE: xrandr --query before the capture" xq xrandr --query >/dev/null || true
     x0=$EV_LAST
     ev_save capture "EV-STATE: desktop-monitors-capture: the real output names and rates (stdout and stderr)" desktop-monitors-capture >/dev/null || true
@@ -533,7 +544,7 @@ video_cycle() { # <story> <title> <what the tester does>
     wait_desktop 30 || say "the desktop is not up"
     grep -qE '^[^#[:space:]]+[[:space:]]+[0-9]+x[0-9]+' /etc/desktop-container/monitors.conf \
         || { say "$story needs a declared layout: run S8.2.3 first and keep its capture."; return 1; }
-    ev_begin "$story" "$2" T4
+    story_begin "$story" "$2" T4
     if [ "$story" = S3.4.5 ]; then
         podman exec desktop grep -q 'Driver *"nvidia"' /etc/X11/xorg.conf.d/20-gpu.conf \
             || { ev_abort "S3.4.5's T4 half is the NVIDIA driver's: this desktop is not on it"; return 1; }
@@ -581,7 +592,7 @@ video_cycle() { # <story> <title> <what the tester does>
 kvm_input() {
     local model n=${HW_SWITCHES:-10} b0 b1 c0 c1 s0 s1 p0 p1 x0 x1 since mon
     wait_desktop 30 || say "the desktop is not up"
-    ev_begin S8.2.1 "Physical KVM: input" T4
+    story_begin S8.2.1 "Physical KVM: input" T4
     model=$(ask "The KVM's make and model:" "rehearsal")
     ev_note "the KVM: $model"
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -659,7 +670,7 @@ usb_audio() {
     local tone="$HW_STATE/tone.wav" w0 w1 w2 s0 s1 d0 d1 card sink src rec peak f m what
     wait_desktop 30 || say "the desktop is not up"
     have_probe || { say "S8.3.1 plays and records through the probe image ($PROBE_IMG): build it from Containerfile.testclient (Appendix A) and load it."; return 1; }
-    ev_begin S8.3.1 "USB audio devices" T4
+    story_begin S8.3.1 "USB audio devices" T4
     python3 - "$tone" <<'PY'
 import math, struct, sys, wave
 w = wave.open(sys.argv[1], "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
@@ -736,7 +747,7 @@ PY
     undo_all
     ev_end
     # S4.7.12: the same run, its own story.
-    ev_begin S4.7.12 "Physical USB audio plug-in and plug-out" T4
+    story_begin S4.7.12 "Physical USB audio plug-in and plug-out" T4
     while IFS=$'\t' read -r _ f what; do
         case "$what" in
             "EV-STATE: wpctl"*|"EV-DIFF: wpctl"*|EV-PHONEVIDEO*|EV-AUDIO-REC*)
@@ -793,7 +804,7 @@ gpu_from_docs() {
         say "S10.1.6 starts on a stock EL9 host, before the deploy tree: the NVIDIA driver stack installed as deploy/HOST-REQUIRES.md describes it, and the desktop image loaded or at hand. The script runs each documented command as written, at this terminal (answer dnf's questions yourself), keeps every command and its transcript, and the last one reboots."
         yes_no "Is the NVIDIA driver stack installed as HOST-REQUIRES.md describes (the kernel module and the Xorg driver pieces)?" \
             || { say "Install it first: deploy/HOST-REQUIRES.md, 'GPU hosts, additionally'."; return 1; }
-        ev_begin S10.1.6 "A GPU host provisioned from the documentation comes up accelerated on its first boot" T4
+        story_begin S10.1.6 "A GPU host provisioned from the documentation comes up accelerated on its first boot" T4
         ev_save stock "EV-STATE: the stock host: release, kernel, cmdline, the NVIDIA packages" \
             sh -c 'cat /etc/redhat-release; uname -r; cat /proc/cmdline; rpm -qa | grep -iE "nvidia|cuda" | sort; nvidia-smi 2>&1 | head -12' >/dev/null || true
         ev_save rpm-stock "EV-STATE: rpm -qa | sort, the stock host" sh -c 'rpm -qa | sort' >/dev/null || true

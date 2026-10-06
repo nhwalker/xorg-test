@@ -180,5 +180,20 @@ echo "B. Kept" > "$HW_STATE/tester"
 got=$(tester)
 [ "$got" = "B. Kept" ] && ok "a later run takes the kept name" || bad "the kept name read as '$got'"
 
+# --- story_begin: a fresh attempt moves the last one aside; ev_begin adds -------
+mkdir -p "$EV_ROOT/S9.9.9"
+printf 'x\tFAIL\tan earlier attempt\n' > "$EV_ROOT/S9.9.9/checks.tsv"
+story_begin S9.9.9 "a test story" T4 2>/dev/null
+ev_pass "this attempt" 2>/dev/null
+ev_begin S9.9.9 "a test story" T4 2>/dev/null
+ev_pass "its second phase" 2>/dev/null
+ev_end 2>/dev/null
+moved=$(find "$EV_ROOT" -maxdepth 1 -name 'S9.9.9.*' | wc -l)
+if [ "$moved" = 1 ] && grep -q "an earlier attempt" "$EV_ROOT"/S9.9.9.*/checks.tsv \
+   && ! grep -q "an earlier attempt" "$EV_ROOT/S9.9.9/checks.tsv" \
+   && [ "$(grep -c 'PASS' "$EV_ROOT/S9.9.9/checks.tsv")" = 2 ] && [ "$(cat "$EV_ROOT/S9.9.9/result")" = PASS ]; then
+    ok "story_begin set the earlier attempt aside; the second phase added to this one, which passes"
+else bad "story_begin: $moved moved; checks: $(cut -f2- "$EV_ROOT/S9.9.9/checks.tsv" | tr '\n' ';')"; fi
+
 echo "---- $fails failure(s)"
 exit "$fails"
