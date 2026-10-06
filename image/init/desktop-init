@@ -318,6 +318,21 @@ supervise_audio() {
     done
 }
 
+x_shut_down_cleanly() {
+    # The X server's own word on how it ended. xinit exits 0 whenever the
+    # server goes away after it came up: when it shuts the server down
+    # because the session's client exited (Quit session, mwm gone), but
+    # equally when the server was killed or crashed - so the session's rc
+    # cannot tell a crash from a clean end. The server's log can: Xorg
+    # closes it with "Server terminated successfully" only after a clean
+    # shutdown. A crash closes it "with error", and a server killed outright
+    # (SIGKILL, the OOM killer) never closes it at all. Newest log, from the
+    # same places session-postmortem reads.
+    local xlog
+    xlog=$(ls -t /home/$DESK_USER/.local/share/xorg/Xorg.*.log /var/log/Xorg.*.log 2>/dev/null | head -n 1)
+    [ -n "$xlog" ] && grep -q 'Server terminated successfully' "$xlog"
+}
+
 run_session() {
     # setsid -c: fresh session with fd 0's tty (tty1) as controlling tty -
     # what StandardInput=tty used to arrange, and what lets Xorg -keeptty
@@ -363,6 +378,10 @@ while :; do
     stop_tree "$session_pid" "$session_tag"
     if [ "$rc" != 0 ]; then
         SERVICE_RESULT=exit-code EXIT_CODE=exited EXIT_STATUS=$rc \
+            /usr/local/bin/session-postmortem || true
+    elif ! x_shut_down_cleanly; then
+        log "the X server did not shut down cleanly (killed or crashed): its log does not say 'Server terminated successfully', though xinit exited 0"
+        SERVICE_RESULT=x-server-died EXIT_CODE=exited EXIT_STATUS=0 \
             /usr/local/bin/session-postmortem || true
     fi
     log "session exited (rc=$rc); restarting in 3s"
