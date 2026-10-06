@@ -27,9 +27,22 @@
 #                                     printed to stderr too, for the job log
 #   ev_copy <src> <moment> <what>     copy a file in (EV-CONFIG)
 #   ev_text <moment> <what> <text>    write text you already have
-#   ev_diff <moment> <what> <a> <b>   diff -u of two evidence files
+#   ev_diff <moment> <what> <a> <b> <expected>
+#                                     diff -u of two evidence files; <expected>
+#                                     says which lines are expected to differ,
+#                                     "nothing" (or "nothing: why") when none
+#                                     is, and goes into the index after <what>
+#                                     (Requirements.md S9.3.2: the gate fails
+#                                     a diff without it, and one expected to
+#                                     differ in nothing that differs)
 #   $EV_LAST                          the file the last ev_save/ev_copy/ev_text
 #                                     wrote (not set when called inside $(...))
+#   ev_last                           the file the story indexed last: what
+#                                     $EV_LAST would hold after an ev_save run
+#                                     inside $(...)
+#   ev_named <moment>                 the file the story indexed under a moment,
+#                                     in this run of the script or an earlier
+#                                     one (a VM phase): the "before" to diff
 #   ev_attach <file> <what>           index a file already in the directory
 #   ev_end [reason]                   settle PASS/FAIL, render evidence.md
 #   ev_abort <reason>                 record a failure and end (for fail())
@@ -154,6 +167,12 @@ ev_name() { # <moment> <ext> -> the next numbered file name
     printf '%s%02d-%s%s' "${EV_SIDE:+h}" "$n" "$1" "${2:+.$2}"
 }
 
+ev_last() { [ -z "$EV_DIR" ] || tail -n 1 "$EV_DIR/${EV_SIDE}files.tsv" 2>/dev/null | cut -f2; }
+ev_named() { # <moment>
+    [ -n "$EV_DIR" ] || return 0
+    cut -f2 "$EV_DIR/${EV_SIDE}files.tsv" 2>/dev/null | grep -E "^h?[0-9]+-$1\.[a-z]+\$" | tail -n 1 || true
+}
+
 ev_attach() { # <file> <what>
     [ -n "$EV_DIR" ] || return 0
     printf '%s\t%s\t%s\n' "$(_ev_ts)" "$1" "$(_ev_one "$2")" >> "$EV_DIR/${EV_SIDE}files.tsv"
@@ -209,13 +228,13 @@ ev_copy() { # <src> <moment> <what>
     fi
 }
 
-ev_diff() { # <moment> <what> <a> <b>   (names inside the story directory)
+ev_diff() { # <moment> <what> <a> <b> <expected>   (names inside the story directory)
     [ -n "$EV_DIR" ] || return 0
     local name
     name=$(ev_name "$1" diff)
     diff -u "$EV_DIR/$3" "$EV_DIR/$4" > "$EV_DIR/$name" || true
     [ -s "$EV_DIR/$name" ] || echo "(no differences between $3 and $4)" > "$EV_DIR/$name"
-    ev_attach "$name" "$2"
+    ev_attach "$name" "$2${5:+; expected to differ: $5}"
 }
 
 ev_end() { # [reason]
