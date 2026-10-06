@@ -37,7 +37,11 @@ spec:
   restartPolicy: Never
   containers:
     - name: xterm
-      image: desktop-container:latest
+      # The desktop's own image, which podman loaded on the node and CRI-O
+      # shares: named in full. CRI-O does not take an unqualified name for
+      # podman's localhost/ one; it pulls it from its search registries
+      # instead (desktop-container:latest went to quay.io: 404).
+      image: localhost/desktop-container:latest
       # :latest defaults the pull policy to Always, which tries a registry
       # pull even when the image is already present on the node.
       imagePullPolicy: IfNotPresent
