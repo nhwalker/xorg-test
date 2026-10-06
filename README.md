@@ -960,26 +960,31 @@ podman exec desktop pgrep -u desktop -x mwm    # the session, in one probe
 loginctl list-sessions                         # desktop on seat0/tty1 (host session)
 podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf   # nvidia vs modesetting
 podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf  # fixed layout, if declared
-DISPLAY=:0 xrandr                              # display up, modes listed
-DISPLAY=:0 glxinfo -B                          # GPU mode: "NVIDIA"; else llvmpipe
+podman exec -u desktop -e DISPLAY=:0 desktop xrandr      # display up, modes listed
+podman exec -u desktop -e DISPLAY=:0 desktop glxinfo -B  # GPU mode: "NVIDIA"; else llvmpipe
 fgconsole                                      # VT 1 active
 podman exec desktop ps -o user= -C Xorg        # "desktop", not root (rootless X)
 podman logs desktop | grep align               # gid alignment log
-podman exec -u desktop desktop wpctl status    # sound devices present
+podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop wpctl status  # sound devices present
 # audio, one per protocol (repeat from host and from a scratch container):
 pw-play      /usr/share/sounds/alsa/Front_Center.wav   # PIPEWIRE_REMOTE set
 paplay       /usr/share/sounds/alsa/Front_Center.wav   # PULSE_SERVER set
 aplay        /usr/share/sounds/alsa/Front_Center.wav   # via the ALSA drop-in
 ```
 
+The X and PipeWire probes run in the container. `xrandr` and `glxinfo`
+are the image's; the documented host packages do not install them.
+`wpctl` must reach the session's PipeWire, which it finds through
+`XDG_RUNTIME_DIR`, and `podman exec` does not set that.
+
 Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 (uevents arrive because the container shares the host network namespace).
 Audio hotplug: plug in a USB headset or DAC; a new `controlC*` must appear in
 the container (`podman exec desktop ls /dev/snd`) and the device must show up
-in `podman exec -u desktop desktop wpctl status`.
+in `podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop wpctl status`.
 
 Video, on a host that declared a layout ("Fixed monitor layout" above): switch
-the KVM away and back. `DISPLAY=:0 xrandr` must report the same geometry
+the KVM away and back. `podman exec -u desktop -e DISPLAY=:0 desktop xrandr` must report the same geometry
 throughout, and no window may have moved. `podman logs desktop | grep xorg-monitor-conf` says what was configured at
 boot.
 
