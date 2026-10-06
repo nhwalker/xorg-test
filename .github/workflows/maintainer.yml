@@ -39,6 +39,14 @@
 #                  converted with deploy/README.md's live sequence; the
 #                  outcome classified against the document's two, and its
 #                  reboot taken if the second (S10.1.5)
+#   maint-k8s      one host provisioned the same way, with k3s and CRI-O
+#                  (installed as ci.yml's k8s shard installs them: README.md
+#                  takes both as given), then README.md's Kubernetes steps as
+#                  written - its CRI-O drop-in, the three helm installs, the
+#                  describe and apply lines - and the demo xterm typed into;
+#                  then the node staged as one the desktop never provisioned,
+#                  and a client needing the toolkit, Pending until the
+#                  desktop's start publishes it (S10.6.1, S10.6.2)
 # The gate then holds this workflow's stories (their Coverage lines name
 # it: "(workflow `maintainer.yml`)") to the evidence the run left.
 #
@@ -64,6 +72,11 @@ on:
       - deploy/HOST-REQUIRES.md
       - ci/doc-blocks.py
       - ci/vm/maint-*.sh
+      # what maint-k8s's steps apply: README.md's chart and example, and
+      # S10.6.2's client
+      - charts/cdi-device-plugin/**
+      - examples/x11-client-pod.yaml
+      - ci/vm/unprovisioned-pod.yaml
       # maint-session's menu steps (--maint), and the terminal the
       # documented commands run at
       - ci/vm/operator-e2e.py
@@ -159,7 +172,8 @@ jobs:
     # host, and about fifteen desktop restarts. maint-session: one host, a
     # reboot, three desktop restarts and an image build. maint-live: two
     # stock hosts provisioned from nothing, no reboot. maint-gdm: one host,
-    # gdm and its desktop installed, and up to two reboots.
+    # gdm and its desktop installed, and up to two reboots. maint-k8s: one
+    # host, CRI-O and k3s installed, and a desktop stop and start.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -178,6 +192,8 @@ jobs:
           - shard: maint-live
             extra: ""
           - shard: maint-gdm
+            extra: ""
+          - shard: maint-k8s
             extra: ""
     steps:
       - uses: actions/checkout@v4

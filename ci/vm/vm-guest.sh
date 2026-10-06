@@ -2477,6 +2477,86 @@ host_audio() { # pulse-play|autospawn|alsa-setup|alsa-play|alsa-control|null-on|
     esac
 }
 
+# --- k3s on CRI-O: phase2's node, and the maintainer's (maint-guest.sh) ---------
+# Client pods reach the display through CDI, which only the CRI resolves - so
+# k3s runs on an EXTERNAL CRI-O instead of the bundled containerd. CRI-O scans
+# /etc/cdi, which is where the specs live. In three steps, so that a caller
+# loads images into the storage CRI-O shares with podman, and writes its own
+# crio.conf.d drop-ins (the cdi_spec_dirs one: phase2's, or README.md's
+# block), after the package and before CRI-O first starts.
+k8s_crio_pkg() { # <log tag>
+    log "$1" "install CRI-O ${CRIO_VERSION} (the documented runtime for CDI clients)"
+    cat > /etc/yum.repos.d/cri-o.repo <<EOF
+[cri-o]
+name=CRI-O ${CRIO_VERSION}
+baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/repodata/repomd.xml.key
+EOF
+    dnf -y -q install cri-o >/dev/null
+}
+k8s_crio_start() {
+    # k3s writes its flannel CNI config + plugin binaries under its own tree,
+    # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
+    # dirs so the pod network comes up (else kubelet stays NetworkNotReady).
+    mkdir -p /etc/crio/crio.conf.d
+    cat > /etc/crio/crio.conf.d/11-k3s-cni.conf <<'EOF'
+[crio.network]
+network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
+EOF
+    systemctl enable --now crio >/dev/null 2>&1 \
+        || { journalctl -u crio --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
+             fail "crio failed to start (bad crio.conf.d drop-in?)"; }
+    wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
+}
+k8s_k3s() { # <log tag>
+    log "$1" "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
+    # On an enforcing EL host k3s needs its own policy module: its tree under
+    # /var/lib/rancher and its agent processes are not covered by stock
+    # container-selinux (which is what CRI-O and the client pods rely on).
+    # The installer is supposed to detect enforcing SELinux and pull
+    # k3s-selinux from rpm.rancher.io itself, so INSTALL_K3S_SKIP_SELINUX_RPM
+    # is deliberately NOT set - but that is the INSTALLER's behaviour, not
+    # ours, and it is exactly the kind of thing that changes upstream without
+    # us noticing. Assert the result below rather than trusting it.
+    #
+    # Output goes to a file rather than /dev/null: a policy install that failed
+    # or was skipped explains itself there, and discarding it is why this was
+    # unverifiable in the first place.
+    if ! curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
+        --container-runtime-endpoint=unix:///run/crio/crio.sock \
+        --kubelet-arg=cgroup-driver=systemd \
+        --disable traefik --disable metrics-server" sh - >/tmp/k3s-install.log 2>&1
+    then
+        tail -40 /tmp/k3s-install.log >&2 || true
+        fail "k3s install failed (see output above)"
+    fi
+
+    log "$1" "k3s brought its own SELinux policy module (required on an enforcing EL host)"
+    if semodule -l 2>/dev/null | grep -qi '^k3s'; then
+        log "$1" "  policy module loaded: $(semodule -l | grep -i '^k3s' | tr '\n' ' ')"
+        rpm -q k3s-selinux >/dev/null 2>&1 && log "$1" "  from $(rpm -q k3s-selinux)"
+    else
+        echo "---- selinux lines from the k3s installer ----" >&2
+        grep -i selinux /tmp/k3s-install.log >&2 || echo "(none)" >&2
+        echo "---- loaded policy modules ----" >&2
+        semodule -l 2>/dev/null | tail -20 >&2 || true
+        fail "no k3s SELinux policy module loaded - the installer skipped it, and k3s is unconfined-by-omission on an enforcing host"
+    fi
+    wait_for 60 5 "k3s node ready" \
+        sh -c "k3s kubectl get nodes | grep -q ' Ready'"
+    # Prove the node really runs CRI-O, not the bundled containerd.
+    k3s kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' \
+        | grep -q cri-o || fail "node runtime is not cri-o"
+
+    curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
+        | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+}
+
 phase2() {
     # The quadlet desktop stays UP for the whole of this phase, and that is
     # the point: kubernetes here carries application containers, never the
@@ -2511,18 +2591,8 @@ phase2() {
     ev_pass "before the install: desktop-init, Xorg, mwm and pipewire are running"
 
     # Client pods reach the display through CDI, which only the CRI
-    # resolves - so this phase runs k3s on an EXTERNAL CRI-O instead of the
-    # bundled containerd. CRI-O scans /etc/cdi, which is where the specs live.
-    log p2 "install CRI-O ${CRIO_VERSION} (the documented runtime for CDI clients)"
-    cat > /etc/yum.repos.d/cri-o.repo <<EOF
-[cri-o]
-name=CRI-O ${CRIO_VERSION}
-baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/
-enabled=1
-gpgcheck=1
-gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/${CRIO_VERSION}/rpm/repodata/repomd.xml.key
-EOF
-    dnf -y -q install cri-o >/dev/null
+    # resolves - so this phase runs k3s on an EXTERNAL CRI-O (k8s_crio_pkg).
+    k8s_crio_pkg p2
 
     # podman and CRI-O share /var/lib/containers/storage by default, so a root
     # `podman load` is visible to CRI-O - no ctr import or skopeo needed. Load
@@ -2553,75 +2623,22 @@ EOF
     grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "/etc/cdi/desktop-audio.yaml missing or malformed before k3s install"
 
-    # k3s writes its flannel CNI config + plugin binaries under its own tree,
-    # not CRI-O's default /etc/cni/net.d + /opt/cni/bin. Point CRI-O at k3s's
-    # dirs so the pod network comes up (else kubelet stays NetworkNotReady).
-    mkdir -p /etc/crio/crio.conf.d
-    cat > /etc/crio/crio.conf.d/11-k3s-cni.conf <<'EOF'
-[crio.network]
-network_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
-plugin_dirs = ["/var/lib/rancher/k3s/data/current/bin", "/opt/cni/bin"]
-EOF
     # Everything downstream rests on CRI-O scanning /etc/cdi. That IS the
     # default, but state it explicitly rather than depend on it: the default
     # does not appear in `crio config` output (the man page documents the
     # option as cdi_spec_dirs=[], with the real list applied internally), so
     # relying on it is both invisible and unverifiable from outside.
-    # An unknown key here would stop crio starting, which the next line
+    # An unknown key here would stop crio starting, which k8s_crio_start
     # catches - a loud, immediate failure rather than a puzzling one later.
+    mkdir -p /etc/crio/crio.conf.d
     cat > /etc/crio/crio.conf.d/12-cdi.conf <<'EOF'
 [crio.runtime]
 cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
 EOF
-    systemctl enable --now crio >/dev/null 2>&1 \
-        || { journalctl -u crio --no-pager -o cat 2>/dev/null | tail -20 >&2 || true
-             fail "crio failed to start (bad crio.conf.d drop-in?)"; }
-    wait_for 30 2 "crio socket" test -S /run/crio/crio.sock
+    k8s_crio_start
     log p2 "crio configured to scan /etc/cdi for device specs"
 
-    log p2 "install k3s driving the external CRI-O (kubelet cgroup driver = systemd to match)"
-    # On an enforcing EL host k3s needs its own policy module: its tree under
-    # /var/lib/rancher and its agent processes are not covered by stock
-    # container-selinux (which is what CRI-O and the client pods rely on).
-    # The installer is supposed to detect enforcing SELinux and pull
-    # k3s-selinux from rpm.rancher.io itself, so INSTALL_K3S_SKIP_SELINUX_RPM
-    # is deliberately NOT set - but that is the INSTALLER's behaviour, not
-    # ours, and it is exactly the kind of thing that changes upstream without
-    # us noticing. Assert the result below rather than trusting it.
-    #
-    # Output goes to a file rather than /dev/null: a policy install that failed
-    # or was skipped explains itself there, and discarding it is why this was
-    # unverifiable in the first place.
-    if ! curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
-        --container-runtime-endpoint=unix:///run/crio/crio.sock \
-        --kubelet-arg=cgroup-driver=systemd \
-        --disable traefik --disable metrics-server" sh - >/tmp/k3s-install.log 2>&1
-    then
-        tail -40 /tmp/k3s-install.log >&2 || true
-        fail "k3s install failed (see output above)"
-    fi
-
-    log p2 "k3s brought its own SELinux policy module (required on an enforcing EL host)"
-    if semodule -l 2>/dev/null | grep -qi '^k3s'; then
-        log p2 "  policy module loaded: $(semodule -l | grep -i '^k3s' | tr '\n' ' ')"
-        rpm -q k3s-selinux >/dev/null 2>&1 && log p2 "  from $(rpm -q k3s-selinux)"
-    else
-        echo "---- selinux lines from the k3s installer ----" >&2
-        grep -i selinux /tmp/k3s-install.log >&2 || echo "(none)" >&2
-        echo "---- loaded policy modules ----" >&2
-        semodule -l 2>/dev/null | tail -20 >&2 || true
-        fail "no k3s SELinux policy module loaded - the installer skipped it, and k3s is unconfined-by-omission on an enforcing host"
-    fi
-    wait_for 60 5 "k3s node ready" \
-        sh -c "k3s kubectl get nodes | grep -q ' Ready'"
-    # Prove the node really runs CRI-O, not the bundled containerd.
-    k3s kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' \
-        | grep -q cri-o || fail "node runtime is not cri-o"
-
-    curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz \
-        | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
-
-    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    k8s_k3s p2
 
     # The desktop must have survived the CRI-O + k3s install unscathed: a
     # container runtime arriving on the node is exactly the kind of thing

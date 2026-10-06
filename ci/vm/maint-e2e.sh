@@ -972,6 +972,106 @@ maint_gdm() {
     mt_typing S10.1.5 gdmconverted || mt_failed S10.1.5 "in the end state, typed text did not reach the focused xterm"
 }
 
+# --- F10.6: client workloads on a provisioned host --------------------------------
+# S10.6.1's demo xterm, used the way the operator would: a click at its centre
+# and a line typed, through QEMU's own devices, which its shell runs in the pod
+# (S7.5.2's check, here after README.md's steps as written).
+mt_k8s_type() {
+    local res rect d_wid d_w d_h d_x d_y qlog got=""
+    res=$(gq desk xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}')
+    mt_open S10.6.1
+    [ -n "$res" ] || { ev_fail "could not read the display's size for the input"; mt_close; return 1; }
+    ev_save windows "EV-STATE: the demo pod's main process (its xterm), the X client it holds and its windows, read just before the click" \
+        gq pod-windows x11-client-demo >/dev/null || true
+    rect=$(ev_out | win_rect || true)
+    [ -n "$rect" ] || { ev_fail "the demo pod's xterm has no window on the screen"; mt_close; return 1; }
+    read -r d_wid d_w d_h d_x d_y <<<"$rect"
+    qlog=$(ev_name qmp-input txt)
+    if ! QMP_TRANSCRIPT="$EV_DIR/$qlog" python3 qmp-type.py "$QMP" "$res" $((d_x + d_w / 2)) $((d_y + d_h / 2)) "echo typedintodemo1061 >/tmp/s1061"; then
+        ev_fail "QMP input to the demo pod's window failed"
+        mt_close
+        return 1
+    fi
+    ev_attach "$qlog" "EV-QEMU: every QMP command sent: the pointer to the centre of the demo's window $d_wid (${d_w}x${d_h}+$d_x+$d_y on $res), a click, then the keys of the line and Return"
+    for _ in $(seq 8); do
+        got=$(gq jx-in x11-client-demo cat /tmp/s1061 2>/dev/null || true)
+        [ -z "$got" ] || break
+        sleep 1
+    done
+    ev_text typed-file "EV-STATE: /tmp/s1061 read inside the demo pod: what the shell in its xterm wrote when the typed line ran" "${got:-(no file)}"
+    ev_shot typed "EV-SHOT: the demo pod's xterm with the line typed into it"
+    if [ "$got" = typedintodemo1061 ]; then
+        ev_pass "the operator can click into the demo's xterm and type: the line typed through QEMU's devices ran in the pod's shell, which wrote typedintodemo1061 to /tmp/s1061 (S7.5.2's check)"
+        mt_close
+        return 0
+    fi
+    ev_fail "the demo pod's shell did not run the typed line: /tmp/s1061 holds '${got:-nothing}'"
+    mt_close
+    return 1
+}
+
+# S10.6.2: the node staged as never provisioned; a client that needs the
+# toolkit is Pending until the desktop's start publishes it, then runs.
+mt_unprovisioned() {
+    local vid t0
+    log "S10.6.2: the node staged as one the desktop never provisioned; a client needing the toolkit, Pending until the desktop's start publishes it"
+    mg unprov-stage || { mt_failed S10.6.2 "the node could not be staged as never provisioned"; return 0; }
+    mt_open S10.6.2
+    ev_shot stopped "EV-SHOT: the screen with the desktop stopped and the node staged as never provisioned"
+    mt_close
+    mg unprov-pod || mt_failed S10.6.2 "the client needing the toolkit was not a visible scheduling failure"
+    mt_open S10.6.2
+    EV_VID_FPS=1 ev_video_start start
+    vid="$EV_DIR/$EV_VID"
+    mt_close
+    t0=$(date +%s.%N)
+    mg unprov-start || mt_failed S10.6.2 "after the desktop's start, the same pod did not schedule, run and capture"
+    if ! mt_wait_screen "$vid" 180; then
+        mt_open S10.6.2
+        ev_video_stop "EV-VIDEO: the screen for 180 s from systemctl start desktop.service: the desktop did not appear"
+        mt_failed S10.6.2 "180 s after the start the desktop is not on the screen"
+        return 0
+    fi
+    sleep 2
+    mt_open S10.6.2
+    ev_video_stop "EV-VIDEO: the screen at 1 fps from systemctl start desktop.service until the desktop was on it; index.txt gives each frame's UTC time"
+    ev_note "the desktop was on the screen $(mt_elapsed "$t0") s after the start (${MT_BACK%% *} at ${MT_BACK#* })"
+    mt_screen_check started "EV-SHOT: the screen after the start: the #101216 root, the session's xterm in mwm's frame" \
+        || ev_fail "the screen does not show the desktop after the start"
+    mt_close
+    mg unprov-after || mt_failed S10.6.2 "the desktop did not come back whole, or the state after the start could not be recorded"
+}
+
+maint_k8s() {
+    log "maintainer: a host provisioned the documented way, k3s and CRI-O on it, then README.md's Kubernetes steps as written (S10.6.1); then the node staged as never provisioned (S10.6.2)"
+    mt_unpack
+    mt_provision_quiet
+    mg k8s-node || fail "S10.6.1: k3s and CRI-O could not be brought up on the provisioned host"
+    if ! mg k8s-plugins; then
+        mt_failed S10.6.1 "README.md's helm installs did not give 10 of each resource"
+        mt_failed S10.6.2 "not run: the node has none of README.md's plugins"
+        return 0
+    fi
+    mt_open S10.6.1
+    ev_shot before-apply "EV-SHOT: the screen before README.md's apply line: the desktop, nothing of the demo pod's"
+    ev_video_start apply
+    mt_close
+    if mg k8s-apply; then
+        mt_open S10.6.1
+        ev_video_stop "EV-VIDEO: the screen from before README.md's apply line until the demo pod's xterm was on it; index.txt gives each frame's UTC time"
+        ev_shot demo "EV-SHOT: the screen with the demo pod's xterm on it"
+        mt_close
+        mt_k8s_type || mt_failed S10.6.1 "the click and the line typed did not reach the demo pod's xterm"
+    else
+        mt_open S10.6.1
+        ev_video_stop "EV-VIDEO: the screen from before README.md's apply line, while it failed"
+        mt_close
+        mt_failed S10.6.1 "README.md's apply line did not put the demo pod's xterm on the screen"
+    fi
+    mg k8s-after || mt_failed S10.6.1 "the desktop restarted during README.md's steps, or the state after them could not be recorded"
+    mt_unprovisioned
+}
+
 # Every story the journey wrote, as the gate will read it: a story can fail
 # a check without failing the step that ran it (a checklist's line, say).
 mt_verdict() {
@@ -996,6 +1096,7 @@ maint_main() { # <journey>
         faults) maint_faults ;;
         live) maint_live ;;
         gdm) maint_gdm ;;
+        k8s) maint_k8s ;;
         *) fail "no maintainer journey named '$1'" ;;
     esac
     write_manifest
