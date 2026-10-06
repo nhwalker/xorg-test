@@ -61,6 +61,10 @@ on:
     # Tuesdays, the morning after base-rebuild.yml refreshes the bases.
     - cron: "41 5 * * 2"
   workflow_dispatch:
+  # TEMPORARY, removed before this branch's pull request: workflow_dispatch
+  # only reaches workflows on the default branch, which this one is not yet.
+  push:
+    branches: [claude/evidence-13c]
   pull_request:
     paths:
       - README.md
