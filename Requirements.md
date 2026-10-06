@@ -824,25 +824,25 @@ event, EV-TIMELINE.
 - Requirement: forcing a declared connector down under the running server changes neither the screen size nor any output's or window's position.
 - Acceptance: S3.4.10.
 - Evidence: common set.
-- Tier: T3 · Coverage: ✅ `guest:layout_unplug`, on S3.4.10's force: the screen size (2048x768), every output's position (`Virtual-1` at +0+0, `Virtual-2` at +1024+0) and every client window's id, size and position held, asserted in S3.4.10 on the same snapshots; F3.10's common set before and after the force (sysfs, `xrandr --verbose`, `xwininfo -root -tree`), the tree's diff (empty) and the Xorg log since just before the force, under `artifacts/S3.10.1/`; the video and the `xrandr` diff under `artifacts/S3.4.10/` (artifact `evidence-vm-core`).
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`, on S3.4.10's force: the screen size (2048x768), every output's position (`Virtual-1` at +0+0, `Virtual-2` at +1024+0) and every client window's id, size and position held, asserted in S3.4.10 on the same snapshots; F3.10's common set before and after the force (sysfs, `xrandr --verbose`, `xwininfo -root -tree`), the tree's diff (empty), the Xorg log since just before the force and S3.4.10's video of it, its event frames named, under `artifacts/S3.10.1/`; the video's frames and the `xrandr` diff under `artifacts/S3.4.10/` (artifact `evidence-vm-core`).
 
 **S3.10.2 Monitor plug-out is reported by RandR**
 - Requirement: after the connector goes down, `xrandr` reports it `disconnected` while it stays enabled.
 - Acceptance: `xr_is Virtual-1 disconnected 1024x768+0+0`.
 - Evidence: common set.
-- Tier: T3 · Coverage: ✅ `guest:layout_unplug`: after S3.4.10's force sysfs reads `Virtual-1` `disconnected`, and `xrandr` reports `Virtual-1 disconnected primary 1024x768+0+0`, still enabled; the snapshots before and after the force under `artifacts/S3.10.2/`, their diffs under `artifacts/S3.4.10/` (artifact `evidence-vm-core`).
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`: after S3.4.10's force sysfs reads `Virtual-1` `disconnected`, and `xrandr` reports `Virtual-1 disconnected primary 1024x768+0+0`, still enabled; the snapshots before and after the force, and S3.4.10's video of it with its event frames named, under `artifacts/S3.10.2/`; their diffs under `artifacts/S3.4.10/` (artifact `evidence-vm-core`).
 
 **S3.10.3 Monitor re-plug after plug-out restores connected status without moving anything**
 - Requirement: `detect` under the running server returns `xrandr` to `connected` with the same geometry and windows.
 - Acceptance: poll `xrandr` for `Virtual-1 connected 1024x768+0+0`; dims `2048x768`; window tree unchanged.
 - Evidence: common set.
-- Tier: T3 · Coverage: ✅ `guest:layout_unplug` sets `Virtual-1`'s `status` back to `detect`, waits for sysfs to read `connected`, then polls `xrandr` until it reads `Virtual-1 connected primary 1024x768+0+0`; the screen is still 2048x768, `Virtual-2` still at 1024x768+1024+0, and no client window moved or resized across the unplug and re-plug. Sysfs, `xrandr --verbose` and the tree before the force and after the re-plug, their diffs (the tree's empty) and the Xorg log since just before the re-plug, under `artifacts/S3.10.3/` (artifact `evidence-vm-core`).
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug` sets `Virtual-1`'s `status` back to `detect`, waits for sysfs to read `connected`, then polls `xrandr` until it reads `Virtual-1 connected primary 1024x768+0+0`; the screen is still 2048x768, `Virtual-2` still at 1024x768+1024+0, and no client window moved or resized across the unplug and re-plug. Sysfs, `xrandr --verbose` and the tree before the force and after the re-plug, their diffs (the tree's empty), the Xorg log since just before the re-plug and S3.4.10's video of the unplug and re-plug, its event frames named, under `artifacts/S3.10.3/` (artifact `evidence-vm-core`).
 
 **S3.10.4 Monitor plug-in on an empty connector, layout declared**
 - Requirement: forcing `Virtual-2` to `on` under a layout that declares it changes nothing except `xrandr` now saying `connected`.
 - Acceptance: `echo on`; `xr_is Virtual-2 connected 1024x768+1024+0`; dims `2048x768`; `echo detect` afterwards.
 - Evidence: common set.
-- Tier: T3 · Coverage: ✅ `guest:layout_unplug`: with the layout declared, Virtual-2 forced `on` reads `connected 1024x768+1024+0`, the screen stays 2048x768 with Virtual-1 at `1024x768+0+0`, and no client window moves or resizes (the window-tree diff is empty); set back to `detect`, Virtual-2 reads disconnected again at the same place. `artifacts/S3.10.4/` (artifact `evidence-vm-core`) holds sysfs, `xrandr --verbose` and the window tree at each step, with the diffs and the Xorg log.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`: with the layout declared, Virtual-2 forced `on` reads `connected 1024x768+1024+0`, the screen stays 2048x768 with Virtual-1 at `1024x768+0+0`, and no client window moves or resizes (the window-tree diff is empty); set back to `detect`, Virtual-2 reads disconnected again at the same place. `artifacts/S3.10.4/` (artifact `evidence-vm-core`) holds sysfs, `xrandr --verbose` and the window tree at each step, with the diffs and the Xorg log, and S3.4.10's video of the forces, its event frames named.
 
 **S3.10.5 Monitor plug-in without a layout is detected and does not reflow**
 - Requirement: under autodetection a connector coming up is `connected` in `xrandr`; screen size and existing geometry unchanged (no auto-enable).
@@ -1595,7 +1595,7 @@ the client window; EV-SHOT-CLIENT from inside the client; EV-LOG-CLIENT;
 - Requirement: when Xorg restarts, X clients lose their connection (that is X11); the application container itself must not need recreating: its next `xterm` connects to the new server, `restartCount` 0, same container id.
 - Acceptance: pod running `sleep infinity` spawns an xterm; kill Xorg; after the session returns, the pod spawns another xterm, which appears; the pod's container id unchanged.
 - Evidence: common set across the restart; EV-LOG-CLIENT (the first xterm's error on losing its server is expected and quoted); EV-VIDEO.
-- Tier: T3 · Coverage: ✅ `e2e` "client journeys": the journey pod's xterm journey-1 is on the screen when Xorg is killed; it ends with its X server, its own error quoted; once the session is back, the same pod's next xterm, journey-2, appears and the pod's own screenshot reaches the new server; the pod is the same container, `restartCount` 0. `artifacts/S7.5.5/` (artifact `evidence-vm-k8s`) holds the pod and its applications before and after with the diff, both screens with the pod's own screenshots, the window trees, the first xterm's log and the video across the restart.
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys": the journey pod's xterm journey-1 is on the screen when Xorg is killed; it ends with its X server, its own error quoted; once the session is back, the same pod's next xterm, journey-2, appears and the pod's own screenshot reaches the new server; the pod is the same container, `restartCount` 0. `artifacts/S7.5.5/` (artifact `evidence-vm-k8s`) holds the pod and its applications before and after with the diff, both screens with the pod's own screenshots, the window trees, the first xterm's log and S7.6.3's video across the restart, its event frames (the kill, the new session) named.
 
 **S7.5.6 A client's capture matches what the operator sees**
 - Requirement: EV-SHOT-CLIENT from a client matches the QEMU screendump of the same moment far better than any flipped, mirrored or rotated version of it. They may legitimately differ (a pointer drawn into one capture and not the other), so the comparison is a margin, not equality.
@@ -1679,7 +1679,7 @@ the referenced feature.
 - Requirement: a client window's geometry (`xwininfo`) is identical before the connector goes down, while it is down, and after it returns; the client is not restarted.
 - Acceptance: `xwininfo -id <client window>` at the three moments equal; `restartCount` 0.
 - Evidence: common set; the three `xwininfo` outputs (EV-DIFF empty); EV-SHOT-CLIENT at the three moments (the client's own view is unchanged); EV-VIDEO.
-- Tier: T3 · Coverage: ✅ `guest:layout_unplug`, with the host comparing the client's own captures: a podman client's xterm (holding the display and tools devices) on Virtual-1's half of the declared layout lives through S3.4.10's force. Its window's `xwininfo` is the same before, while Virtual-1 is off and after the re-plug. The client's own capture (the toolkit's screenshot), compared on the host over its window (259x82+307+534), has 0 pixels changed during and after, and 0 over the whole screen. The client is the same container and process (`RestartCount` 0); Xorg, mwm and the three audio daemons kept their pids and start times. `artifacts/S7.7.3/` (artifact `evidence-vm-core`) holds the client and the daemons before and after with the diffs (empty), the window's `xwininfo` at the three moments with the diffs (empty), the client's three captures, and its log.
+- Tier: T3 · Coverage: ✅ `guest:layout_unplug`, with the host comparing the client's own captures: a podman client's xterm (holding the display and tools devices) on Virtual-1's half of the declared layout lives through S3.4.10's force. Its window's `xwininfo` is the same before, while Virtual-1 is off and after the re-plug. The client's own capture (the toolkit's screenshot), compared on the host over its window (259x82+307+534), has 0 pixels changed during and after, and 0 over the whole screen. The client is the same container and process (`RestartCount` 0); Xorg, mwm and the three audio daemons kept their pids and start times. `artifacts/S7.7.3/` (artifact `evidence-vm-core`) holds the client and the daemons before and after with the diffs (empty), the window's `xwininfo` at the three moments with the diffs (empty), the client's three captures, its log, and S3.4.10's video of the force, its event frames named.
 
 **S7.7.4 A client already playing is heard on a hot-added audio device, without restarting**
 - Requirement: an application container playing a continuous tone to the default sink keeps playing while a USB sound card is added; once that card becomes the default sink (WirePlumber policy, or the test sets it), the client's **existing stream** is heard on the new device; the container and the player are the same process throughout.
@@ -1697,7 +1697,7 @@ the referenced feature.
 - Requirement: a new client can `pw-play --target` / `PULSE_SINK=<usb sink>` and be heard on it.
 - Acceptance: as stated with a 990 Hz tone.
 - Evidence: EV-AUDIO; `pactl list short sink-inputs` naming the sink; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": with the USB card present, the default is the built-in card, muted, and the USB card is at full volume. A new player in the pod, `PULSE_SINK=<the USB card's sink> paplay`, plays 990 Hz: its sink-input sits on that sink and it exits 0, and the tone is heard, so the USB card rendered it. The pod is the same container, `restartCount` 0. `artifacts/S7.7.6/` (artifact `evidence-vm-k8s`) holds `wpctl status` (the default and its mute), the streams and sinks while it played, the player's log, the capture with its verdict and level plot, and the pod before and after with the diff (empty).
+- Tier: T3 · Coverage: ✅ `e2e` "client journeys: the pod's audio across hot-added sound cards (F7.7)": with the USB card present, the default is the built-in card, muted, and the USB card is at full volume. A new player in the pod, `PULSE_SINK=<the USB card's sink> paplay`, plays 990 Hz: its sink-input sits on that sink and it exits 0, and the tone is heard, so the USB card rendered it. The pod is the same container, `restartCount` 0. `artifacts/S7.7.6/` (artifact `evidence-vm-k8s`) holds `wpctl status` (the default and its mute), the streams and sinks while it played, the player's log, the capture with its verdict and level plot, the pod before and after with the diff (empty), and the EV-VIDEO of the display while the player played (F7.7's common set), its event frame the player's start: nothing on the screen changes.
 
 **S7.7.7 A client records from a hot-added capture device without restarting**
 - Requirement: a running pod can open the new source and deliver frames.
@@ -1811,18 +1811,18 @@ and E11, which follow, included); the suite's own history (see comments in
 
 `ci/e9-guard.py`, in the static job, holds the rules that a read of the tree
 can check: S9.1.1's static half, S9.1.2, S9.1.3, S9.1.4, S9.1.5, S9.2.1,
-S9.2.2, S9.2.3, S9.2.4, S9.2.5, S9.2.6 and the static halves of S9.3.1,
-S9.3.2, S9.3.3, S9.3.4 and S9.3.6, each as its own story with its own
-evidence. Their run-time halves are `ci/evlib.py`'s `check` and `gate`,
-which read every story directory a run leaves. Nothing checks the others
-yet; their Coverage lines say what holds them today.
+S9.2.2, S9.2.3, S9.2.4, S9.2.5, S9.2.6 and the static halves of S9.3.1 to
+S9.3.6, each as its own story with its own evidence. Their run-time halves
+are `ci/evlib.py`'s `check` and `gate`, which read every story directory a
+run leaves. S9.1.1's other half is `ci/pr-mutations.py`, which reads a pull
+request's description.
 
 ### F9.1 Assertion discipline
 
 **S9.1.1 Every assertion has been seen to fail**
 - Requirement: a new assertion is verified against a deliberate mutation before it is merged.
 - Acceptance: the PR description names the mutation.
-- Tier: T0 · Coverage: 🟡 the static half. `ci/e9-guard.py --rule S9.1.1`, run by the static job, holds that each tree guard the static job runs (`ci/client-guard.py`, `ci/e9-guard.py`, `ci/script-list.py` and `ci/layout-keywords.py`, named in its GUARDS) runs there with its self-test, which plants what its checks must catch and fails the step if one is missed; that the static job runs no checker GUARDS does not name; and that every e9-guard rule, this one included, plants a violation it must flag and a form it must pass, as client-guard's self-test does. Its self-test flags a workflow that runs client-guard without its self-test and one that runs a checker GUARDS does not name, and passes one that runs all four with theirs. The gap: nothing reads a pull request's description, so whether a pull request names the mutation its new assertions were tried against is unchecked; the repository has no PR template, and no workflow reads the event's body. The guard's output is under `artifacts/S9.1.1/` (artifact `evidence-static`).
+- Tier: T0 · Coverage: ✅ both halves. The pull request's: `ci/pr-mutations.py`, run by the static job on a pull request, lists the assertions the diff adds to the test suite (under `ci/` and the workflows: `ev_pass`, `ev_fail`, `ev_check`, `want` and `fail` with their claim in the shell; `.check(`, `assert`, `rep.flag(` and `raise StoryFailed` in the Python) and fails when it adds some and the description has no Mutations heading, or one with nothing under it. The description reaches it through the environment, never through the script's text. Its self-test, which the static job runs always, fails new assertions under no Mutations heading and under an empty one, and passes a heading that names a mutation and a diff that adds no assertion. It reads what a description says, not whether the mutation was run: the reviewer sees that in the pull request's own runs. The static half: `ci/e9-guard.py --rule S9.1.1` holds that each tree guard the static job runs (`ci/client-guard.py`, `ci/e9-guard.py`, `ci/script-list.py`, `ci/layout-keywords.py` and `ci/pr-mutations.py`, named in its GUARDS) runs there with its self-test, which plants what its checks must catch and fails the step if one is missed; that the static job runs no checker GUARDS does not name; and that every e9-guard rule, this one included, plants a violation it must flag and a form it must pass, as client-guard's self-test does. Its self-test flags a workflow that runs client-guard without its self-test and one that runs a checker GUARDS does not name, and passes one that runs every guard with its self-test. Both halves' output is under `artifacts/S9.1.1/` (artifact `evidence-static`), with the description and the check's findings on a pull request.
 
 **S9.1.2 Assert generated output, not source text**
 - Requirement: quadlet/CDI/config assertions read the *generated* artefact, anchored so comments cannot match.
@@ -1887,7 +1887,7 @@ yet; their Coverage lines say what holds them today.
 
 **S9.3.5 Video covers every dynamic step**
 - Requirement: any story whose event changes the screen over time (a restart, a reflow, a display or input hotplug) attaches an EV-VIDEO with the event frames named in the index.
-- Tier: T0 · Coverage: ❌ no check: nothing lists the stories whose event changes the screen over time, or checks that each attaches an EV-VIDEO with its event frames named.
+- Tier: T0 · Coverage: ✅ at run time, `ci/evlib.py`'s `check` and `gate` read every video (a `.gif` or `.mp4` in a story's index). Its line must name at least one event frame, and each frame it names must be in its frames directory: the gif's own, or the one a copy names. The gate also holds each story whose own lines or whose feature's common set ask for EV-VIDEO, and that runs at T3, to a video in its evidence, in the gate of the workflow that records it. Both recorders (`ev_video_start` and `ev_video_stop` in the shell, `Ctx.video` in the Python) keep each frame's time (`index.txt`) and the share of its rows that differ from the frame before (`changes.txt`). When a recording stops, `evlib.py video-events` names on the gif's line, and in `events.txt`, the frame at or after each `mark` line of the timeline within the recording (`ev_mark` and `Ctx.mark`, written as the harness sets the event off; the guest's moved onto the host's clock by the skew `ev_video_start` measures), and the frames where the screen first, most and last changes. A recording filed in another story (`ev_video_copy`, `ev_video_cite`) is a copy of the gif whose line names the same frames and the directory they are in. At T0, `ci/e9-guard.py --rule S9.3.5` checks that each of the 40 recordings in the harness (15 in `vm-e2e.sh`, 11 in `maint-e2e.sh`, 14 in `operator-e2e.py`) marks its event; that both recorders put the event frames on the gif's line; and that the shell files a video in another story only through `ev_video_copy`. It also runs the gate's video check on five planted story directories: it fails a video whose line names no event frame, one naming a frame its directory lacks and one whose event frames are "none", and passes a video with its frames and a copy naming its source's. It runs the "holds a video" check on a planted document: it fails a story asked to record that holds none, and passes one with its video, one another workflow records and one asked for none. On batch 13a's evidence (`ci.yml` 37445408722, `maintainer.yml` 37445404359), none of the 61 videos in 40 stories named an event frame, and S3.10.3, S3.10.4, S7.7.3 and S7.7.6, asked to record, held no video. S3.10.1 to S3.10.4 and S7.7.3 now file S3.4.10's recording of the same force, S7.7.6 records the display while its player plays, and every recording names its frames; this batch's runs (`ci.yml` 37452974297, `maintainer.yml` 37452971343) leave none of it. The check reads that a video names its frames, not that they show the event: a reviewer sees that in the frames. The guard's output is under `artifacts/S9.3.5/` (artifact `evidence-static`).
 
 **S9.3.6 The timeline is the spine**
 - Requirement: every harness action is appended to `timeline.log` with an ISO timestamp, and every evidence file name appears in the timeline at the moment it was captured.
@@ -2190,26 +2190,27 @@ EV-PIDS for Xorg, mwm and any client application involved; EV-TIMELINE.
 
 ## Appendix A — Testability prerequisites for the T1 tier and the probes
 
-Several scripts hard-code the paths they read, which is why their branch
-coverage sits at ❌. Each needs an environment override (the pattern
-`xorg-monitor-conf.sh` already uses) so a `ci/script-unit-tests.sh` can drive
-them without root or a container. Defaults must remain the production paths.
+Several scripts hard-code the paths they read. A T1 test drives such a
+script without root or a container through an environment override (the
+pattern `xorg-monitor-conf.sh` uses), and defaults must remain the production
+paths. The table says, for each, the override built and used, or how its
+stories are proven without one.
 
 | Script | Hard-coded today | Proposed override | Unblocks |
 |---|---|---|---|
-| `image/xorg/xorg-gpu-conf.sh` | `/dev/dri`, `/dev/nvidia*`, `/sys/class/drm`, lib dirs, output path | `GPU_DEV_DIR`, `GPU_SYS_DRM`, `GPU_LIB_DIRS`, `GPU_OUT` | S3.1.1–S3.1.5 |
+| `image/xorg/xorg-gpu-conf.sh` | `/dev/dri`, `/dev/nvidia*`, `/sys/class/drm`, lib dirs, output path | **built**: `GPU_DEV_DIR`, `GPU_SYS_DRM`, `GPU_LIB_DIRS`, `GPU_OUT` (`script-unit`) | S3.1.3–S3.1.5; S3.1.1 and S3.1.2 are T4 |
 | `image/xorg/align-device-groups.sh` | node globs under `/dev` | **not needed**: a scratch container of the image per branch, plain files with the wanted group standing in for the nodes (`ci/align-groups-tests.sh`) | S3.2.2 |
-| `image/xorg/ensure-vt-devices.sh` | `/dev` | `DEV_ROOT` | S3.2.3 |
+| `image/xorg/ensure-vt-devices.sh` | `/dev` | **not needed**: the smoke proves it at T2, on a runner that exposes neither node | S3.2.3 |
 | `image/xorg/preflight-check.sh` | all of the above plus `/run/udev`, the pid file, `/proc/self/mounts`, `/etc/desktop-container` | **used**: `podman run` with the quadlet's mounts and devices omitted (`ci/preflight-rows.py container`) | S5.11.2 |
 | `image/session/session-postmortem` | Xorg log glob | **built**: `POSTMORTEM_XLOG_GLOB` | S2.3.5 |
 | `image/session/start-audio` | daemons by name | `PATH` (used: fake daemons) | S2.4.4, S2.4.5 |
 | `image/session/host-shell-setup.sh` | `SRC`, `DHOME` | **not needed**: a scratch container of the image per case (`ci/host-shell-setup-tests.sh`) | S5.7.7 |
 | `image/session/host-terminal` | `ssh` by name | `PATH` (used: a fake `ssh`) | S5.7.8 |
-| `image/tools/publish-tools.sh` | `SRC`, `DEST` | export the existing variables | S7.2.2, S7.2.3 |
+| `image/tools/publish-tools.sh` | `SRC`, `DEST` | **not needed**: the smoke proves both at T2, on the published directory | S7.2.2, S7.2.3 |
 | `deploy/host/usr/local/libexec/desktop-host-shell-setup` | `/etc/desktop-container`, `/etc/ssh/authorized_keys.d` | **built**: `DESKTOP_CONTAINER_DIR`, `HOST_SHELL_AK_DIR` | S5.7.5 |
 | `deploy/host/usr/local/bin/desktop-monitors-capture` | `podman exec … xrandr --query` | **built**: `DESKTOP_XRANDR_CMD` | S3.4.12 |
 | `deploy/host/usr/local/libexec/desktop-selinux` | takes paths as args already | — | S5.6.4–S5.6.6 |
-| `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | also honour an env override | S5.5.4 |
+| `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | **not needed**: the smoke sets `TOOLS_DIR` in the override file (T2) | S5.5.4 |
 | `deploy/host/usr/local/libexec/desktop-cdi-refresh` | `/proc/modules` (the loaded-`nvidia` trigger of the no-downgrade rule) | **built**: `CDI_PROC_MODULES` | S5.4.2 (module half) |
 
 Probe tooling the client-side and hotplug stories need, and where it stands:
@@ -2218,8 +2219,8 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 |---|---|---|
 | `xinput` | S3.9.2, S3.9.4, S3.9.5, S3.9.8, S3.9.10, S3.9.11, S3.9.12, S8.2.1 | **in the desktop image**: `xorg-x11-server-utils`, which the image's `xrandr`, `xset`, `xsetroot` and `xhost` resolve to on Rocky 9, ships it. The VM shards run it in the desktop container (`desk xinput`), and so does `ci/hw/acceptance.sh`; `Containerfile.testclient` does not carry it |
 | `xwininfo`, `xprop` | S3.3.3, S3.5.2, S3.5.3, S3.6.3, S3.10.*, S7.5.*, S7.7.3, S8.2.2, S10.2.2, S11.1.1–S11.1.3, S11.2.1 | **shipped**, twice: in the desktop image (`xorg-x11-utils`, which its `xdpyinfo` resolves to on Rocky 9, ships both), and in `Containerfile.testclient`, whose observer container the operator phase runs them in; `ci/hw/acceptance.sh` runs them in the desktop |
-| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | **shipped**: imagemagick is on the `ci.yml` `vm` job's apt line and makes the gifs; ffmpeg is not installed |
-| `sox` or `ffmpeg` | spectrograms for EV-AUDIO | not installed; the operator phase draws a level plot at the story's pitch instead (EV-AUDIO) |
+| `ffmpeg` or imagemagick `convert` for gif | EV-VIDEO | **shipped**: imagemagick is on the apt line of `ci.yml`'s `vm` job and `maintainer.yml`'s, and makes the gifs; ffmpeg is not installed |
+| `sox` or `ffmpeg` | spectrograms for EV-AUDIO | not installed; `check-audio.py --plot` draws every recording's level plot instead, at the story's pitch, or broadband for a voice sample or silence (S9.3.4) |
 | `inotify-tools` | S7.2.3 | the `build-smoke` runner (apt), S7.2.3 being T2 |
 | `alsa-utils` + `alsa-plugins-pulseaudio` | S4.2.2 | VM guest |
 | `pipewire-utils`, `pulseaudio-utils`, `alsa-utils` as declared host probes | S10.1.1, S10.2.1 | VM guest, installed after the documented package line, so S10.1.1 can tell the two apart |
@@ -2227,10 +2228,10 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 | `edid-decode` | S8.2.3 | T4 host |
 
 The `script-unit` step of `ci.yml` `static` covers S1.1.3, S2.3.5, S2.4.4,
-S2.4.5, S3.4.12, S5.7.5 and S5.7.8 so far. S3.1.x need the `xorg-gpu-conf.sh`
-overrides above. S5.7.7's and S3.2.2's T1 halves run in scratch containers of
-the image in `build-smoke`, since they install files as the session user or
-create groups; S3.2.3, which creates device nodes, needs the same.
+S2.4.5, S3.1.3, S3.1.4, S3.1.5, S3.4.12, S5.7.5 and S5.7.8. S5.7.7's and
+S3.2.2's T1 halves run in scratch containers of the image in `build-smoke`,
+since they install files as the session user or create groups; S3.2.3, which
+creates device nodes, is proven at T2 by the smoke instead.
 
 ## Appendix B — VM e2e phases, as suggested and as built
 
@@ -2347,10 +2348,10 @@ counted since its stories got Coverage lines (2026-10-06).
 | E5 Deploy tree | 50 | 49 | 0 | 0 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 40 | 0 | 0 | 0 |
-| E9 Test-suite quality | 17 | 15 | 1 | 1 | 0 |
+| E9 Test-suite quality | 17 | 17 | 0 | 0 | 0 |
 | E10 Maintainer experience | 23 | 22 | 0 | 0 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **268** | **260** | **1** | **1** | **6** |
+| **Total** | **268** | **262** | **0** | **0** | **6** |
 
 Regenerate after editing with:
 
@@ -2377,29 +2378,31 @@ reused by every story. Each story's directory is written in one format
 | `ev_save <moment> <what> <cmd…>` | `ci/evidence.sh` | runs the command and keeps the command line, its output (stderr included) and its exit status as the next numbered file (EV-STATE, EV-LOG-*); `$EV_LAST` names the file for a later `ev_diff`, `ev_last` prints it for a capture inside `$(…)`, and `ev_named <moment>` finds an earlier file by its moment, for a story a later phase reopens |
 | `ev_text`, `ev_copy`, `ev_diff`, `ev_attach` | `ci/evidence.sh` | text already in hand, a copied file (EV-CONFIG), `diff -u` of two kept files (EV-DIFF; its last argument, the lines expected to differ, goes into its index line), a file already written |
 | `EV_SIDE=h-` | `ci/evidence.sh` | a VM story written from the guest and the host at once; the host's files carry an `h` prefix |
-| `StoryWriter` | `ci/evlib.py` | the same, from Python (`.last` names the file it attached last); the operator phase's `Story` builds on it and adds `qemu.log`, its QMP transcript |
-| `Ctx.shot`, `Ctx.video`, `Ctx.pids`, `Ctx.diff`, `Ctx.save_cmd`, `Ctx.diagnostics` | `ci/vm/operator-e2e.py` | EV-SHOT, EV-VIDEO (frames, index, gif), EV-PIDS, EV-DIFF with both sides kept (`Ctx.diff`; `diff_kept` and `diff_named` for sides already kept; each takes `expect=`, the lines expected to differ), command output, and the failure shot, tree, process table and desktop log |
+| `StoryWriter` | `ci/evlib.py` | the same, from Python (`.last` names the file it attached last; `.mark` writes a `mark` line); the operator phase's `Story` builds on it and adds `qemu.log`, its QMP transcript |
+| `Ctx.shot`, `Ctx.video`, `Ctx.mark`, `Ctx.pids`, `Ctx.diff`, `Ctx.save_cmd`, `Ctx.diagnostics` | `ci/vm/operator-e2e.py` | EV-SHOT, EV-VIDEO (frames, index, gif, its line naming the event frames; `Ctx.mark` marks the event), EV-PIDS, EV-DIFF with both sides kept (`Ctx.diff`; `diff_kept` and `diff_named` for sides already kept; each takes `expect=`, the lines expected to differ), command output, and the failure shot, tree, process table and desktop log |
 | `ev_shot <moment> <what>` | `ci/vm/vm-e2e.sh` (host) | QEMU screendump into the open story |
+| `ev_video_start <moment>` / `ev_video_stop <what> [story…]`; `ev_video_copy <moment> <what>`, `ev_video_cite <story> <title> <what>` | `ci/vm/vm-e2e.sh` (host) | EV-VIDEO: a background screendump loop on a QMP socket of its own (`qmp-tool.py video`, 2 fps or `EV_VID_FPS`) into the open story; on stop, the frames with `index.txt` (each frame's UTC time), `changes.txt` (the share of its rows that differ from the frame before) and `events.txt`, and a gif whose line names the event frames (`evlib.py video-events`); `ev_video_copy` files that recording in the open story as well, `ev_video_cite` in a story of its own, each copy's line naming the same frames and where they are |
+| `ev_mark <what>` | `ci/evidence.sh` | a `mark` line of the timeline: the moment the harness sets an event off, which `video-events` turns into a recording's event frame |
+| `ev_qemu <moment> <what> <monitor command>` | `ci/vm/vm-e2e.sh` (host) | a QEMU monitor command (each `device_add` and `device_del`) with QEMU's answer into the open story (EV-QEMU); `input_set` and `snd_set` keep `info usb` with F3.9's and F4.7's common sets |
 | `guest_ev <root\|""> <phase…>`, `ev_pull` | `ci/vm/vm-e2e.sh` (host) | runs a `vm-guest.sh` phase with evidence on and copies the guest's story directories back |
 | `ev_audio_start <moment> <hz>` / `ev_audio_stop <what> <secs> <peak> <hz>`, `ev_audio_check` | `ci/vm/vm-e2e.sh` (host) | `wavcapture` straight into the open story; on stop the WAV is indexed and `check-audio.py --report --plot` keeps its verdict and a level plot at the story's pitch beside it |
 | `ev_audio_silence <wav>`, `mt_heard <wav> <what>` | `ci/vm/vm-e2e.sh`, `ci/vm/maint-e2e.sh` (host) | a recording with no pitch to check (silence by design; a voice sample): `check-audio.py`'s report and its broadband level plot beside it |
 | `ev_log <kind> <text>`; `podman`, `kubectl` | `ci/evidence.sh` | one line of the timeline, the run's and the open story's, stamped and kept to one line; sourcing the file wraps `podman` and `kubectl` so each call is such a line before it runs (`vm_ssh`, `mon_cmd` and the direct probes log theirs) |
 | `QMP_TRANSCRIPT=<file>` | `ci/vm/qmp-type.py` | writes every QMP command it sends, timestamped (EV-QEMU) |
 | `write_manifest` | `ci/vm/vm-e2e.sh` (host) | `run.json`: image ids, QEMU, guest kernel and podman versions, git sha, date |
-| `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance), that its pairs are diffed and its diffs say what they may differ in (S9.3.2), that its survival claims are measured (S9.3.3), that each recording is judged, pictured and named for what to hear (S9.3.4), and that its timeline is stamped line by line and logs each file (S9.3.6); holds the ✅ marks in this document to the run's evidence |
+| `evlib.py render` / `check` / `gate` | `ci/evlib.py`; `gate` runs in `ci.yml` `coverage-gate` | renders `evidence.md`; checks every story directory is complete (S9.3.1's acceptance), that its pairs are diffed and its diffs say what they may differ in (S9.3.2), that its survival claims are measured (S9.3.3), that each recording is judged, pictured and named for what to hear (S9.3.4), that each video names its event frames and each story asked to record holds one (S9.3.5), and that its timeline is stamped line by line and logs each file (S9.3.6); holds the ✅ marks in this document to the run's evidence |
+| `pr-mutations.py check` / `--self-test` | `ci/pr-mutations.py`; `ci.yml` `static` | on a pull request, the assertions its diff adds to the test suite and its description's Mutations section; fails when it adds some and names no mutation (S9.1.1) |
 
-**Still to build** (the stories that name them stay ❌ until they exist):
+**Suggested here, and done under other names** (no one helper does each; this is what does the work):
 
-| Helper | Side | Does |
-|---|---|---|
-| `ev_video_start <fps>` / `ev_video_stop` | host | the shell phases' EV-VIDEO: a background screendump loop; on stop the gif and the frame list |
-| `ev_pids <moment> [pod…]` | guest | the shell phases' EV-PIDS table, plus any pods' `restartCount`/container id |
-| `ev_desktop_log` | guest | `podman logs desktop` from the story's start marker |
-| `ev_client_log <pod\|ctr>` | guest | `kubectl logs` / `podman logs` plus any sink file |
-| `ev_qemu <moment>` | host | `info usb`, `info pci`, `info qtree` into the story |
-| `ev_procedure <doc> <heading> [n]` | host extracts, guest runs | copies the n-th fenced block under `<heading>` in `<doc>`, at the run's git sha, into `procedure.sh`; runs it one command at a time as the maintainer would (a root shell on the guest); writes `procedure-transcript.txt` with each command's output and exit status (EV-PROCEDURE). Placeholders come from a declared map that the index lists |
-| `ev_fresh_host [profile]` | host | a new qcow2 overlay on the stock cloud image, booted, so a provisioning story starts from a host nothing has touched; `profile` selects variants such as the `gdm` image for S10.1.5 |
-| `ev_time_to_desktop <mark>` | host | from a timeline mark, polls until the display shows the desktop by S3.3.3's probes (root-colour pixel, an xterm in the window tree); writes the elapsed seconds to the index |
+| Suggested | What does it |
+|---|---|
+| `ev_pids <moment> [pod…]` | `ev_save` of the guest's `ctr-pids`, `pod-state` and `journey-apps` steps (`vm-guest.sh`); `mt_pids` and `mt_pids_moved` (`maint-guest.sh`); `Ctx.pids` (`operator-e2e.py`) |
+| `ev_desktop_log` | `ev_save` of `podman logs desktop` (or `ev_text` of what the harness read of it) in the stories that keep EV-LOG-DESKTOP; `mt_logs` (`maint-guest.sh`) keeps the journal and the desktop's log since a moment |
+| `ev_client_log <pod\|ctr>` | `ev_save` of the client's own output (`kubectl logs`, `podman logs`, or the file it writes) in the stories that keep EV-LOG-CLIENT |
+| `ev_procedure <doc> <heading> [n]` | `ci/doc-blocks.py` reads a document's block from the run's own tree; `maint-guest.sh` keeps it (EV-PROCEDURE) and runs it as written, each command's output and exit status kept (`mt_checklist`, and the journeys' Apply, Install and live sequences) |
+| `ev_fresh_host [profile]` | each maintainer shard boots a stock host from the cloud image; `vm_fresh_host <name>` (`vm-e2e.sh`) boots another on a new overlay when a journey needs one (`host-b`); the gdm journey gives its host the `gdm` profile with the guest's `maint gdm-profile` step (S10.1.5) |
+| `ev_time_to_desktop <mark>` | `mt_wait_screen` and `mt_elapsed` (`maint-e2e.sh`): the first recorded frame that shows the desktop again once it has gone (`mt_is_desktop`: the root's colour, S3.3.3's, and the session xterm's, S3.5.2's), timed from the command |
 
 Audio frequency registry (keep in `freq_for` in `vm-e2e.sh` and `gen_tone` in
 `vm-guest.sh`):
