@@ -305,7 +305,8 @@ no_xdriver() {
         fi
         ev_note "harness-only staging: the spec without the X driver's $n mount(s), as an older toolkit writes it"
         ev_copy "$SPEC" spec-staged "EV-CONFIG: the staged spec, the X driver's mounts dropped"
-        ev_diff spec "EV-DIFF: the toolkit's spec (-) against the staged one (+)" "$real_f" "$EV_LAST"
+        ev_diff spec "EV-DIFF: the toolkit's spec (-) against the staged one (+)" "$real_f" "$EV_LAST" \
+            "only the X driver's mount entries, dropped from the staged spec; every other device and mount must not"
     else
         ev_note "this host's toolkit does not inject nvidia_drv.so: the older toolkit the stories ask for, as installed"
     fi
@@ -349,7 +350,8 @@ no_xdriver() {
     else ev_fail "with the fallback glxinfo -B does not report NVIDIA: $(grep -m1 -i 'OpenGL vendor' <<<"$glx")"; fi
     ev_save preflight-after "EV-LOG-DESKTOP: the container preflight with the fallback" sh -c 'podman logs desktop 2>&1 | grep preflight:' >/dev/null || true
     pf1=$EV_LAST
-    ev_diff preflight "EV-DIFF: the container preflight, the X driver missing (-) against the fallback (+)" "$pf0" "$pf1"
+    ev_diff preflight "EV-DIFF: the container preflight, the X driver missing (-) against the fallback (+)" "$pf0" "$pf1" \
+        "the preflight's rows about the NVIDIA X driver module: missing without the fallback, injected with it; the other rows must not"
     if grep -q 'PASS: NVIDIA GPU injected together with X driver module' "$EV_DIR/$pf1"; then
         ev_pass "with the fallback the container preflight PASSes the NVIDIA injection"
     else ev_fail "with the fallback the container preflight does not PASS the NVIDIA injection"; fi
@@ -490,7 +492,8 @@ stale_spec() {
     sed -i "s/\\.so\\.${ver//./\\.}/.so.${ver}-gone/g" "$SPEC"
     ev_copy "$SPEC" spec-stale "EV-CONFIG: the staged stale spec: every .so.$ver path is .so.$ver-gone"
     stale=$EV_LAST
-    ev_diff staging "EV-DIFF: the real spec (-) against the stale one (+)" "$real" "$stale"
+    ev_diff staging "EV-DIFF: the real spec (-) against the stale one (+)" "$real" "$stale" \
+        "every line with a .so.$ver path, renamed .so.$ver-gone (the staging); nothing else"
     ev_note "harness-only staging: the spec's .so.$ver paths renamed, as after a driver update"
     jr=$(date '+%Y-%m-%d %H:%M:%S')
     ev_save restart "EV-PROCEDURE: harness-only staging: systemctl restart desktop.service on the stale spec, as the first start after a driver update" \
@@ -516,7 +519,8 @@ stale_spec() {
     ev_save cdi-journal "EV-LOG-JOURNAL: desktop-cdi-refresh's journal after the remedy" \
         journalctl --no-pager -o short-precise -u desktop-cdi-refresh.service --since "$jr" >/dev/null || true
     ev_copy "$SPEC" spec-regenerated "EV-CONFIG: the spec after the remedy"
-    ev_diff remedy "EV-DIFF: the stale spec (-) against the regenerated one (+)" "$stale" "$EV_LAST"
+    ev_diff remedy "EV-DIFF: the stale spec (-) against the regenerated one (+)" "$stale" "$EV_LAST" \
+        "the library paths, back to the installed driver's, and whatever else the toolkit writes for this driver"
     if ! gen_grep -q "$ver-gone" "$SPEC" && ! spec_is_stub; then ev_pass "the remedy regenerated a real spec"
     else ev_fail "after the remedy the spec is still stale or the stub"; fi
     if wait_desktop 60; then ev_pass "after the remedy alone the desktop is back"
@@ -556,7 +560,8 @@ capture_layout() {
     ev_save xorg-monitor-conf "EV-LOG-DESKTOP: podman logs desktop | grep xorg-monitor-conf" sh -c 'podman logs desktop 2>&1 | grep xorg-monitor-conf' >/dev/null || true
     ev_save xrandr-after "EV-STATE: xrandr --query after the restart, the captured layout declared" xq xrandr --query >/dev/null || true
     x1=$EV_LAST
-    ev_diff xrandr "EV-DIFF: xrandr --query autodetected (-) against the declared capture (+)" "$x0" "$x1"
+    ev_diff xrandr "EV-DIFF: xrandr --query autodetected (-) against the declared capture (+)" "$x0" "$x1" \
+        "at most the current modes' names and refresh rates (the capture names cvt's modes); the outputs' arrangement must not"
     if diff -q <(arrangement "$EV_DIR/$x0") <(arrangement "$EV_DIR/$x1") >/dev/null; then
         ev_pass "the same arrangement after the restart: $(arrangement "$EV_DIR/$x1" | tr '\n' ';')"
     else ev_fail "the arrangement changed: $(arrangement "$EV_DIR/$x0" | tr '\n' ';') -> $(arrangement "$EV_DIR/$x1" | tr '\n' ';')"; fi
@@ -618,8 +623,8 @@ video_cycle() { # <story> <title> <what the tester does>
     x1=$EV_LAST
     ev_save tree-after "EV-STATE: xwininfo -root -tree after" xq xwininfo -root -tree >/dev/null || true
     t1=$EV_LAST
-    ev_diff xrandr "EV-DIFF: xrandr --query before (-) and after (+): empty" "$x0" "$x1"
-    ev_diff tree "EV-DIFF: the window tree before (-) and after (+): empty" "$t0" "$t1"
+    ev_diff xrandr "EV-DIFF: xrandr --query before (-) and after (+)" "$x0" "$x1" "nothing: the cycle changed no output"
+    ev_diff tree "EV-DIFF: the window tree before (-) and after (+)" "$t0" "$t1" "nothing: no window changed"
     if diff -q <(sed 1d "$EV_DIR/$x0") <(sed 1d "$EV_DIR/$x1") >/dev/null; then ev_pass "xrandr --query is the same after the cycle"
     else ev_fail "xrandr --query changed across the cycle"; fi
     if diff -q <(sed 1d "$EV_DIR/$t0") <(sed 1d "$EV_DIR/$t1") >/dev/null; then ev_pass "every window is where it was"
@@ -664,13 +669,16 @@ kvm_input() {
     ev_note "input add events through the switches: $(grep -c ' add ' "$HW_STATE/udev-input.log")"
     ev_save by-id-after "EV-STATE: ls -l /dev/input/by-id after" sh -c 'ls -l /dev/input/by-id' >/dev/null || true
     b1=$EV_LAST
-    ev_diff by-id "EV-DIFF: /dev/input/by-id before (-) and after (+): the re-enumeration" "$b0" "$b1"
+    ev_diff by-id "EV-DIFF: /dev/input/by-id before (-) and after (+)" "$b0" "$b1" \
+        "the re-enumerated keyboard's and mouse's links: back, their targets possibly new event nodes; no device missing"
     ev_save ctr-input-after "EV-STATE: ls /dev/input in the desktop after" podman exec desktop ls /dev/input >/dev/null || true
     c1=$EV_LAST
-    ev_diff ctr-input "EV-DIFF: /dev/input in the desktop before (-) and after (+)" "$c0" "$c1"
+    ev_diff ctr-input "EV-DIFF: /dev/input in the desktop before (-) and after (+)" "$c0" "$c1" \
+        "at most the event and mouse nodes the re-enumeration numbered anew; no node missing"
     ev_save xinput-after "EV-STATE: xinput list after" desk xinput list >/dev/null || true
     x1=$EV_LAST
-    ev_diff xinput "EV-DIFF: xinput list before (-) and after (+)" "$x0" "$x1"
+    ev_diff xinput "EV-DIFF: xinput list before (-) and after (+)" "$x0" "$x1" \
+        "the keyboard's and mouse's rows, back with new ids; no device missing"
     ev_save ctr-after "EV-PIDS: the container after" ctr_state >/dev/null || true
     s1=$EV_LAST
     ev_save pids-after "EV-PIDS: Xorg and mwm after" ctr_pids Xorg,mwm >/dev/null || true
@@ -740,7 +748,8 @@ PY
     ev_save snd-plugged "EV-STATE: ls /dev/snd in the desktop, plugged" podman exec desktop ls /dev/snd >/dev/null || true
     ev_save wpctl-plugged "EV-STATE: wpctl status, plugged" desk wpctl status >/dev/null || true
     w1=$EV_LAST
-    ev_diff wpctl-plug "EV-DIFF: wpctl status before (-) and plugged (+): the device" "$w0" "$w1"
+    ev_diff wpctl-plug "EV-DIFF: wpctl status before (-) and plugged (+)" "$w0" "$w1" \
+        "the device's rows (its card, sink and source), the default marker where the default moves to it, and wpctl's own client row"
     d1=$(wp_devices)
     card=$(comm -13 <(sort <<<"$d0") <(sort <<<"$d1"))
     if [ -n "$card" ]; then ev_pass "the device appears in wpctl status: $(tr -s ' ' <<<"$card" | tr '\n' ';')"
@@ -781,7 +790,8 @@ PY
     sleep 3
     ev_save wpctl-unplugged "EV-STATE: wpctl status, unplugged" desk wpctl status >/dev/null || true
     w2=$EV_LAST
-    ev_diff wpctl-unplug "EV-DIFF: wpctl status plugged (-) and unplugged (+)" "$w1" "$w2"
+    ev_diff wpctl-unplug "EV-DIFF: wpctl status plugged (-) and unplugged (+)" "$w1" "$w2" \
+        "the device's rows, gone, the default marker where the default moves back, and wpctl's own client row"
     if [ "$(wp_devices)" = "$d0" ]; then ev_pass "the device left wpctl status: the devices are the ones before the plug"
     else ev_fail "after the unplug wpctl status does not list the devices from before the plug"; fi
     observe "the tone came back on the speakers after the unplug"

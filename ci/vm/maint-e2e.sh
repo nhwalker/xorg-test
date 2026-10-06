@@ -427,7 +427,7 @@ maint_config() {
             mg before S10.3.3 "before-$route-$dir" || { mt_failed S10.3.3 "$route $dir: could not record the state before it"; continue; }
             mg route "$route" "$dir" || { mt_failed S10.3.3 "$route $dir: the change could not be made"; continue; }
             if mt_watch S10.3.3 "$route-$dir" svc S10.3.3 restart; then
-                mg after S10.3.3 "before-$route-$dir" "after-$route-$dir" || mt_failed S10.3.3 "$route $dir: the desktop came back other than whole"
+                mg after S10.3.3 "before-$route-$dir" "after-$route-$dir" "$route-$dir" || mt_failed S10.3.3 "$route $dir: the desktop came back other than whole"
             fi
             # Whatever the screen showed, which image runs and what the
             # client sees are the facts that say why.
@@ -492,7 +492,7 @@ mt_hostterm() {
     mt_close
     vm_ssh 'sudo repo/ci/vm/vm-guest.sh x-up' || { mt_failed S10.3.5 "the desktop is on the screen, but X or mwm does not answer"; return 1; }
     mt_observer
-    mg after S10.3.5 on off || mt_failed S10.3.5 "the desktop came back other than whole after the switch's reboot"
+    mg after S10.3.5 on off host-shell-off || mt_failed S10.3.5 "the desktop came back other than whole after the switch's reboot"
     mg hostterm-after || mt_failed S10.3.5 "the host's checks after the switch could not run"
     mt_op hostterm-refused || mt_failed S10.3.5 "after the switch, 'Host Terminal' did not show its failure text"
 
@@ -847,7 +847,8 @@ maint_docpath() {
     if [ -n "$a" ] && [ -n "$b" ]; then
         ev_copy "$a" labels-host-a "EV-STATE: the same listing on host A, which skipped the restorecon line (copied from its S10.1.3)"
         ev_diff labels-a-b "EV-DIFF: the labels of every installed path, host A (skipped the line, -) against host B (took it, +): where the line made a difference" \
-            "$EV_LAST" "$(basename "$b")"
+            "$EV_LAST" "$(basename "$b")" \
+            "nothing: the rsync-applied labels are already the policy's, so the line changes none (S10.1.3: expected nowhere)"
     else
         ev_note "a host's label listing is missing (host A: ${a:-none}, host B: ${b:-none})"
     fi

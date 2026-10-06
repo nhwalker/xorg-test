@@ -388,8 +388,11 @@ gpu_case gone
 connector gone card0-DP-1 connected      # sysfs names a card whose node is absent
 echo "# a stale config from an earlier boot" > "$G/gone/etc/20-gpu.conf"
 ev_save before "EV-STATE: the config directory before the run: a stale 20-gpu.conf" ls -l "$G/gone/etc" >/dev/null
+s314_b=$EV_LAST
 out=$(ev_save run "xorg-gpu-conf when the card sysfs names has no device node" gpuconf gone) || fail "xorg-gpu-conf exited non-zero"
 ev_save after "EV-STATE: the config directory after: empty" ls -l "$G/gone/etc" >/dev/null
+ev_diff config "EV-DIFF: the config directory before (-) and after (+) the run" "$s314_b" "$EV_LAST" \
+    "the stale 20-gpu.conf, gone, and the listing's total"
 want "the stale 20-gpu.conf is removed" [ ! -e "$G/gone/etc/20-gpu.conf" ]
 want "and the removal is logged" has "$out" "does not exist; removing generated config"
 ev_end

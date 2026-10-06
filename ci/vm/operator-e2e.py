@@ -139,6 +139,10 @@ class Run:
             print(f"== operator({sid}): {text}", flush=True)
 
 
+# The lines a diff of two pid tables (Ctx.pids) is expected to differ in
+# where nothing restarts (Requirements.md S9.3.2).
+NOTHING_PIDS = "nothing: no process of the desktop's restarted, and none came or went"
+
 # What every operator story's evidence.md says about how it was driven.
 INTRO = ("Every pointer and key event went through QEMU's own input devices "
          "(`qemu.log`); the harness only looked at X (xwininfo/xprop from the "
@@ -725,19 +729,29 @@ class Ctx:
         self.st.write(moment, f"$ {cmd}\n" + (out if out.strip() else "(no output)\n"), what)
         return out
 
-    def diff_kept(self, moment, a_name, a, b_name, b, what):
+    def diff_kept(self, moment, a_name, a, b_name, b, what, *, expect):
         """EV-DIFF of two texts already written to the story as a_name and
-        b_name (Ctx.diff writes both sides itself)."""
+        b_name (Ctx.diff writes both sides itself). expect says which lines
+        are expected to differ, "nothing" (or "nothing: why") when none is
+        (Requirements.md S9.3.2: the gate holds the diff to it)."""
         d = "".join(difflib.unified_diff(a.splitlines(True), b.splitlines(True), a_name, b_name))
-        return self.st.write(moment, d or "(no difference)\n", what, ext="diff")
+        return self.st.write(moment, d or f"(no differences between {a_name} and {b_name})\n",
+                             f"{what}; expected to differ: {expect}", ext="diff")
 
-    def diff(self, moment, before, after, what):
+    def diff_named(self, moment, a_name, b_name, what, *, expect):
+        """EV-DIFF of two files the story already holds, by name."""
+        with open(self.st.path(a_name)) as f:
+            a = f.read()
+        with open(self.st.path(b_name)) as f:
+            b = f.read()
+        return self.diff_kept(moment, a_name, a, b_name, b, what, expect=expect)
+
+    def diff(self, moment, before, after, what, *, expect):
         # Rule 1 (Requirements.md, evidence standard): before and after are
         # kept as files beside the diff, never the diff alone.
         b = self.st.write(f"{moment}-before", before, f"the 'before' side of {moment}")
         a = self.st.write(f"{moment}-after", after, f"the 'after' side of {moment}")
-        d = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), b, a))
-        return self.st.write(moment, d or "(no difference)\n", what, ext="diff")
+        return self.diff_kept(moment, b, before, a, after, what, expect=expect)
 
     def pids(self, moment):
         """EV-PIDS: the processes that prove what did and did not restart."""
@@ -1195,9 +1209,8 @@ def client_same(ctx, st, name, before, after):
     """The same container and application before and after: EV-DIFF of the
     two records, then the checks."""
     (b, b_name, b_text), (a, a_name, a_text) = before, after
-    ctx.diff_kept("pids", b_name, b_text, a_name, a_text,
-                  "EV-DIFF: the client container before and after (empty: the same container and "
-                  "application, never restarted)")
+    ctx.diff_kept("client", b_name, b_text, a_name, a_text, "EV-DIFF: the client container before and after",
+                  expect="nothing: the same container and application, never restarted")
     st.check(a["id"] == b["id"] and a["pid"] == b["pid"] and a["started"] == b["started"]
              and a["restarts"] == 0,
              "the same container and application throughout: id, the application's host pid and the "
@@ -1476,12 +1489,16 @@ def s3_9_11(ctx, st):
         mice = m.qmp.cmd("query-mice")
         st.write("query-mice-before", json.dumps(mice, indent=1) + "\n",
                  "EV-QEMU: query-mice after the mouse was plugged: QEMU's mice, which one is current")
+        mice_b = st.last
         usb = [mm for mm in mice if "HID Mouse" in mm.get("name", "")]
         st.check(usb, "QEMU lists the hot-added USB mouse among its mice", json.dumps(mice))
         m.hmp(f"mouse_set {usb[-1]['index']}")
         mice = m.qmp.cmd("query-mice")
         st.write("query-mice-after", json.dumps(mice, indent=1) + "\n",
                  f"EV-QEMU: query-mice after mouse_set {usb[-1]['index']}: the USB mouse current")
+        ctx.diff_named("query-mice", mice_b, st.last, "EV-DIFF: QEMU's mice before and after mouse_set",
+                       expect="at most the 'current' flags: mouse_set makes the USB mouse current (QEMU had made "
+                       "it current already when it was plugged)")
         st.check(any(mm["index"] == usb[-1]["index"] and mm.get("current") for mm in mice),
                  "mouse_set made the hot-added USB mouse QEMU's current mouse")
         # The relative motion starts in the middle of the session's xterm and
@@ -1525,6 +1542,8 @@ def s3_9_12(ctx, st):
     st.check(k0 >= 1 and xorg, "the USB keyboard is plugged in and Xorg runs before the cycles",
              f"{k0} '{USB_KBD}' in xinput, Xorg pid {xorg}")
     st.write("input-baseline", input_state(ctx), "F3.9's common set before the first cycle (the baseline)")
+    ctx.pids("pids-before")
+    pids_b = st.last
     rows = ["cycle  state      host-event-nodes  container-event-nodes  xinput-usb-keyboards",
             f"0      baseline   {h0:<16}  {c0:<21}  {k0}"]
     away_ok = back_ok = True
@@ -1544,8 +1563,12 @@ def s3_9_12(ctx, st):
     st.write("input-final", input_state(ctx), "F3.9's common set after the fifth cycle")
     names1 = sorted(n for n, _ in xi_slaves(ctx))
     ctx.diff("xinput-names", "\n".join(names0) + "\n", "\n".join(names1) + "\n",
-             "EV-DIFF: the names of xinput's slave devices, baseline against after the fifth cycle (empty: no "
-             "device left behind or missing; the ids are new, so the names are what is compared)")
+             "EV-DIFF: the names of xinput's slave devices, baseline against after the fifth cycle",
+             expect="nothing: no device left behind or missing (the ids are new, so the names are what is "
+             "compared)")
+    ctx.pids("pids-after")
+    ctx.diff_named("pids", pids_b, st.last, "EV-DIFF: the desktop's processes before the first cycle and after "
+                   "the fifth", expect=f"{NOTHING_PIDS}: Xorg kept its pid through the five cycles")
     st.check(away_ok, "each of the five removals took the keyboard out of xinput and its nodes off the host "
              "and out of the container")
     st.check(back_ok, "each of the five returns brought the counts back to the baseline",
@@ -1663,6 +1686,7 @@ def s3_11_1(ctx, st):
         st.write("before", input_state(ctx) + audio_devices(ctx),
                  "the whole state before the switch: F3.9's and F4.7's common sets")
         pids = ctx.pids("pids-before")
+        pids_b = st.last
         with ctx.video("kvm-cycle", "EV-VIDEO: the display while the keyboard, tablet and sound card leave "
                        "together and return together: nothing on it moves"):
             away, back, _ = kvm_cycle(ctx, st)
@@ -1670,6 +1694,8 @@ def s3_11_1(ctx, st):
                  "the host and in the container, PipeWire's devices, xinput's keyboard and tablet")
         st.check(back, "with the three added back, every count returned to its value before")
         pids2 = ctx.pids("pids-after")
+        ctx.diff_named("pids", pids_b, st.last, "EV-DIFF: the desktop's processes across the switch",
+                       expect=f"{NOTHING_PIDS}: Xorg and PipeWire kept their pids")
         st.check(ctx.session_pid(pids2, "Xorg") == ctx.session_pid(pids, "Xorg") == xorg
                  and ctx.session_pid(pids2, "pipewire") == pw,
                  "Xorg and PipeWire kept their pids through the switch", f"Xorg {xorg}, pipewire {pw}")
@@ -1750,10 +1776,13 @@ def s3_11_2(ctx, st):
                  "the KVM's tablet and sound card are plugged in beside its keyboard")
         xs0 = ctx.xstate()
         ctx.save_state("tree-before", xs0.text, "EV-STATE: the window tree before the switch")
+        tree_b = st.last
         f310("before", "before the switch")
+        f310_b = st.last
         w0 = windows(xs0)
         xorg, pw = ctx.pid_of("Xorg"), ctx.pid_of("pipewire")
         pids = ctx.pids("pids-before")
+        pids_b = st.last
 
         def away():
             g.sh(f"echo off > {conn}/status", label="force Virtual-1 off with the devices")
@@ -1781,7 +1810,13 @@ def s3_11_2(ctx, st):
             wait_until(lambda: v1().startswith("Virtual-1 connected "), 15, 1)
         xs1 = ctx.xstate()
         ctx.save_state("tree-after", xs1.text, "EV-STATE: the window tree after the switch")
+        ctx.diff_named("tree", tree_b, st.last, "EV-DIFF: the window tree across the switch",
+                       expect="nothing: no window changed")
         f310("after", "after the switch")
+        ctx.diff_named("f310", f310_b, st.last, "EV-DIFF: every connector's sysfs status and xrandr --verbose across "
+                       "the switch", expect="at most Virtual-1's EDID, physical size and the modes its EDID gives (a "
+                       "connector forced off and set back to detect can come back without its EDID); every "
+                       "connector's status and the outputs' positions and current modes must not")
         st.check(ok_away, "with the three deleted back to back, every count dropped")
         st.check(ok_back, "with the three added back, every count returned to its value before")
         d_away, v1_away, w_away = seen.get("away", ("", "", []))
@@ -1793,6 +1828,8 @@ def s3_11_2(ctx, st):
                  "after the return the screen is 2048x768 and Virtual-1 reads connected at 1024x768+0+0", v1())
         st.check(windows(xs1) == w0, "after the return no window moved or resized", f"{len(w0)} windows")
         pids2 = ctx.pids("pids-after")
+        ctx.diff_named("pids", pids_b, st.last, "EV-DIFF: the desktop's processes across the switch",
+                       expect=f"{NOTHING_PIDS}: Xorg and PipeWire kept their pids")
         st.check(ctx.session_pid(pids2, "Xorg") == ctx.session_pid(pids, "Xorg") == xorg
                  and ctx.session_pid(pids2, "pipewire") == pw,
                  "Xorg and PipeWire kept their pids through the switch", f"Xorg {xorg}, pipewire {pw}")
@@ -1852,15 +1889,21 @@ def s7_7_1(ctx, st):
     before = client_record(ctx, "s771", "client-before", "EV-PIDS: the client container before the keyboard "
                            "goes: id, the application's host pid, restart count, start time")
     pids = ctx.pids("pids-before")
+    pids_b = st.last
     ctx.click(*centre(cli))
     ctx.type_line("beforekvm771")
     st.write("input-before", input_state(ctx), "F3.9's common set before the keyboard is removed")
+    input_b = st.last
     try:
         with ctx.video("keyboard-cycle", "EV-VIDEO: the display while the USB keyboard is removed and "
                        "re-added, the client's xterm focused throughout"):
             st.check(kbd_readd(ctx, bound=True), "the USB keyboard went and came back (bound to the display, so "
                      "keys sent to vga0 come through it alone)")
         st.write("input-after", input_state(ctx), "F3.9's common set with the keyboard back")
+        ctx.diff_named("input", input_b, st.last, "EV-DIFF: F3.9's common set before the keyboard left and after it "
+                       "came back", expect="the keyboard's lines, which come back as a new device: its info usb "
+                       "line (its port), its event node's time, its /proc/bus/input/devices block (a new input "
+                       "number and Uniq) and its xinput row; no other device")
         kid = (xi_ids(ctx, USB_KBD) or [None])[-1]
         st.check(kid, "xinput lists the re-added keyboard")
         xi_test_start(ctx, kid, "s771")
@@ -1881,7 +1924,7 @@ def s7_7_1(ctx, st):
                  "keyboard")
         after = client_record(ctx, "s771", "client-after", "EV-PIDS: the client container after the cycle")
         pids2 = ctx.pids("pids-after")
-        same_desktop(ctx, st, pids, pids2)
+        same_desktop(ctx, st, pids, pids2, (pids_b, st.last))
         client_same(ctx, st, "s771", before, after)
     finally:
         with contextlib.suppress(Exception):
@@ -1899,8 +1942,10 @@ def s7_7_2(ctx, st):
     before = client_record(ctx, "s772", "client-before", "EV-PIDS: the client container before the tablet is "
                            "plugged")
     pids = ctx.pids("pids-before")
+    pids_b = st.last
     ctx.click(*xs.parts(term)["drag"])
     st.write("input-before", input_state(ctx), "F3.9's common set before the tablet is plugged")
+    input_b = st.last
     try:
         with ctx.video("tablet", "EV-VIDEO: a tablet plugged in after the client started, then clicking the "
                        "client's window through it: its frame turns the focused colour"):
@@ -1927,6 +1972,10 @@ def s7_7_2(ctx, st):
             img = ctx.shot("after-click", "EV-SHOT: the client's window clicked through the hot-added tablet: its "
                            "frame #41637f")
         st.write("input-after", input_state(ctx), "F3.9's common set with the tablet plugged in")
+        ctx.diff_named("input", input_b, st.last, "EV-DIFF: F3.9's common set before and after the tablet was "
+                       "plugged in", expect="only the tablet's lines: its info usb line, its event and mouse nodes "
+                       "with the by-id and by-path directories' lines (their size and time), its "
+                       "/proc/bus/input/devices block and its xinput row")
         st.write("xinput-test", xit or "(no output)\n", f"EV-STATE: xinput test on the hot-added tablet's own X "
                  f"device (id {tid}) while it clicked")
         st.check(xi_events(xit)[1] >= 1, "the click came through the hot-added tablet: its own X device saw the "
@@ -1938,7 +1987,7 @@ def s7_7_2(ctx, st):
                  "client's xterm")
         after = client_record(ctx, "s772", "client-after", "EV-PIDS: the client container after it was clicked")
         pids2 = ctx.pids("pids-after")
-        same_desktop(ctx, st, pids, pids2)
+        same_desktop(ctx, st, pids, pids2, (pids_b, st.last))
         client_same(ctx, st, "s772", before, after)
     finally:
         with contextlib.suppress(Exception):
@@ -1946,8 +1995,11 @@ def s7_7_2(ctx, st):
         wait_xi(ctx, USB_TABLET, 0, 10)
 
 
-def same_desktop(ctx, st, before, after):
-    """Xorg, mwm and the three audio daemons kept their pids (F7.7's common set)."""
+def same_desktop(ctx, st, before, after, files):
+    """Xorg, mwm and the three audio daemons kept their pids (F7.7's common
+    set): the two tables' diff (files: their names), then the check."""
+    ctx.diff_named("pids", *files, "EV-DIFF: the desktop's processes before and after",
+                   expect=f"{NOTHING_PIDS}: Xorg, mwm and the three audio daemons kept their pids")
     names = ("Xorg", "mwm", "pipewire", "wireplumber", "pipewire-pulse")
     b = {n: ctx.session_pid(before, n) for n in names}
     a = {n: ctx.session_pid(after, n) for n in names}
@@ -1972,6 +2024,7 @@ def s7_7_8(ctx, st):
         x_b = client_record(ctx, "s778", "xterm-before", "EV-PIDS: the xterm client before the switch")
         p_b = client_record(ctx, "s778p", "player-before", "EV-PIDS: the audio client before the switch")
         pids = ctx.pids("pids-before")
+        pids_b = st.last
         ctx.click(*centre(cli))
         wav_name = st.name("through-kvm-1100hz", "wav")
         wav = os.path.abspath(st.path(wav_name))
@@ -2014,6 +2067,8 @@ def s7_7_8(ctx, st):
         x_a = client_record(ctx, "s778", "xterm-after", "EV-PIDS: the xterm client after the switch")
         p_a = client_record(ctx, "s778p", "player-after", "EV-PIDS: the audio client after the switch")
         pids2 = ctx.pids("pids-after")
+        ctx.diff_named("pids", pids_b, st.last, "EV-DIFF: the desktop's processes across the switch",
+                       expect=f"{NOTHING_PIDS}: Xorg kept its pid")
         st.check(ctx.session_pid(pids2, "Xorg") == ctx.session_pid(pids, "Xorg"), "Xorg kept its pid")
         client_same(ctx, st, "s778", x_b, x_a)
         client_same(ctx, st, "s778p", p_b, p_a)
@@ -2048,7 +2103,8 @@ def arrange(ctx, st, who, wid):
         ctx.drag(gx, gy, gx + dx, gy + dy)
     after = ctx.one(wid)
     ctx.shot(f"{tag}-after-move", f"the {who} moved by ({dx:+d},{dy:+d})")
-    ctx.diff(f"{tag}-move", before.text, after.text, "xwininfo of the window: only the position lines change")
+    ctx.diff(f"{tag}-move", before.text, after.text, "xwininfo of the window before and after the drag",
+             expect="only the position lines: Absolute upper-left X and Y, Corners and -geometry's offset")
     moved = (after.ax - before.ax, after.ay - before.ay)
     st.check(abs(moved[0] - dx) <= 1 and abs(moved[1] - dy) <= 1,
              f"{who}: dragging the title bar moved the window with the pointer ({dx:+d},{dy:+d})",
@@ -2075,8 +2131,9 @@ def arrange(ctx, st, who, wid):
         ctx.drag(cx, cy, ex, ey)
     after = ctx.one(wid)
     ctx.shot(f"{tag}-after-resize", f"the {who} resized by its corner")
-    ctx.diff(f"{tag}-resize", before.text, after.text, "xwininfo: width, height and -geometry change, "
-             "the top-left does not")
+    ctx.diff(f"{tag}-resize", before.text, after.text, "xwininfo before and after the corner's drag",
+             expect="Width, Height, Corners and -geometry's size, and the size hints' user and program sizes; "
+             "the top-left (Absolute upper-left X and Y) must not")
     got = (after.cells[0] - before.cells[0], after.cells[1] - before.cells[1]) \
         if before.cells and after.cells else None
     st.check(got == (10, 4), f"{who}: dragging the frame's corner resized it by 10 columns and 4 rows",
@@ -2091,8 +2148,9 @@ def arrange(ctx, st, who, wid):
     ctx.click(*p["min_btn"])
     iconic = ctx.wait_state(wid, "Iconic")
     st.check(iconic, f"{who}: the minimize button iconified it", f"WM_STATE {ctx.one(wid).wm_state}")
-    ctx.diff(f"{tag}-minimize", before.text, iconic.text, "xwininfo/xprop: Map State and WM_STATE "
-             "change, the geometry does not")
+    ctx.diff(f"{tag}-minimize", before.text, iconic.text, "xwininfo/xprop before and after the minimize",
+             expect="Map State (IsViewable to IsUnMapped) and WM_STATE's state (Normal to Iconic); the geometry "
+             "must not")
     icon = ctx.one(iconic.icon) if iconic.icon else None
     st.check(icon is not None and icon.map_state == "IsViewable", f"{who}: its icon is on the screen",
              f"icon window {iconic.icon}")
@@ -2102,7 +2160,7 @@ def arrange(ctx, st, who, wid):
     normal = ctx.wait_state(wid, "Normal")
     st.check(normal, f"{who}: double-clicking the icon restored it")
     ctx.diff(f"{tag}-restore", before.text, normal.text, "xwininfo/xprop before the minimize and after "
-             "the restore: no difference")
+             "the restore", expect="nothing: it came back as it was")
     st.check(normal.rect == before.rect, f"{who}: it came back where it was", f"{before.rect} -> {normal.rect}")
     ctx.shot(f"{tag}-restored", f"the {who} back at {before.geometry}")
 
@@ -2128,7 +2186,7 @@ def arrange(ctx, st, who, wid):
     normal = ctx.wait_state(wid, "Normal")
     st.check(normal, f"{who}: Restore in the icon's window menu restored it")
     ctx.diff(f"{tag}-menu-restore", before.text, normal.text, "xwininfo/xprop before the minimize and "
-             "after Restore: no difference")
+             "after Restore", expect="nothing: it came back as it was")
     st.check(normal.rect == before.rect, f"{who}: and it came back where it was",
              f"{before.rect} -> {normal.rect}")
     ctx.shot(f"{tag}-menu-restored", f"the {who} back at {before.geometry} after Restore in the icon's "
@@ -2141,7 +2199,9 @@ def arrange(ctx, st, who, wid):
     ctx.click(*p["max_btn"])
     big = wait_until(lambda: (lambda i: i if i.w > before.w else None)(ctx.one(wid)), 6, 0.3)
     st.check(big, f"{who}: the maximize button enlarged it")
-    ctx.diff(f"{tag}-maximize", before.text, big.text, "xwininfo: the window grows to the screen")
+    ctx.diff(f"{tag}-maximize", before.text, big.text, "xwininfo before and after the maximize",
+             expect="the geometry lines (Absolute upper-left X and Y, Width, Height, Corners and -geometry) and "
+             "the size hints' user and program sizes: the window fills the screen")
     xs = ctx.xstate()
     frame = xs.frame_of(xs.by_id(wid))
     ctx.shot(f"{tag}-maximized", f"the {who} maximized: frame {frame.w}x{frame.h}+{frame.ax}+{frame.ay}")
@@ -2159,7 +2219,7 @@ def arrange(ctx, st, who, wid):
     st.check(back, f"{who}: the maximize button, pressed again, put it back as it was",
              f"{before.rect} -> {ctx.one(wid).rect}")
     ctx.diff(f"{tag}-unmaximize", before.text, back.text, "xwininfo before the maximize and after the "
-             "second press: no difference")
+             "second press", expect="nothing: it came back as it was")
     ctx.shot(f"{tag}-unmaximized", f"the {who} back at {before.geometry}")
 
 
@@ -2192,7 +2252,8 @@ def s11_1_2(ctx, st):
              "the client's window overlaps the desktop's")
     ctx.save_state("start-tree", xs.text, "the window tree at the start (EV-STATE)")
     ctx.shot("start", "the desktop's xterm and the client container's xterm, overlapping")
-    pids_before = ctx.pids("pids-start")
+    pids_before = ctx.pids("pids-before")
+    pids_b = st.last
     client_pid = ctx.g.client_inspect("mouse")["pid"]
     st.record(f"the client's xterm is host pid {client_pid} in container op-mouse; the desktop's is "
               f"pid {dinfo.pid}")
@@ -2212,8 +2273,10 @@ def s11_1_2(ctx, st):
     ctx.shot("before-raise", "the desktop's window on top of the client's")
     ctx.click(*visible_point(ctx, xs, cli, "client xterm's title bar"))
     xs = ctx.xstate()
-    ctx.diff("raise-tree", tree_before, xs.text, "the window tree: the client xterm's frame moves "
-             "above the desktop's (top-level windows are listed top-most first)")
+    ctx.diff("raise-tree", tree_before, xs.text, "the window tree before and after the click (top-level "
+             "windows are listed top-most first)", expect="the order of the top-level windows: the client "
+             "xterm's frame, with the windows under it, listed above the desktop's; no window comes, goes or "
+             "moves")
     ctx.shot("after-raise", "the client's window now on top")
     st.check(xs.stack_pos(cli) < xs.stack_pos(desk), "button 1 on the client xterm's frame raised it "
              "above the desktop's")
@@ -2249,7 +2312,10 @@ def s11_1_2(ctx, st):
     after = ctx.one(desk.id)
     st.check(not after.gone and after.rect == keep.rect and after.wm_state == "Normal",
              "the desktop's xterm was untouched by the client's Close", f"{keep.rect} -> {after.rect}")
-    pids_after = ctx.pids("pids-end")
+    pids_after = ctx.pids("pids-after")
+    ctx.diff_named("pids", pids_b, st.last, "EV-DIFF: the desktop's processes from the story's start to its end",
+                   expect="the client container's xterm (opmouse), gone with the client the story stopped; "
+                   "Xorg's, mwm's and the session's rows must not")
     st.check(ctx.session_pid(pids_after, "Xorg") == ctx.session_pid(pids_before, "Xorg"),
              "the X server kept its pid throughout")
     st.check(ctx.g.pid_alive(dinfo.pid), f"the desktop's xterm (pid {dinfo.pid}) still runs")
@@ -2266,7 +2332,8 @@ def s11_1_3(ctx, st):
     fx, fy = ctx.free_spot(xs, (300, 200))
     ctx.client_sink("keys", "opkeys", f"40x10+{fx}+{fy}", "keys")
     xs, cli = ctx.wait_client("opkeys")
-    pids_start = ctx.pids("pids-start")
+    pids_start = ctx.pids("pids-before")
+    pids_b = st.last
     ctx.g.desk(["sh", "-c", ": > /tmp/op-kfocus"])
 
     # The last pointer event of the story: focus the desktop's xterm.
@@ -2383,7 +2450,10 @@ def s11_1_3(ctx, st):
                    "the client xterm's sink: the probe lines typed while it had the focus (EV-LOG-CLIENT)")
     ctx.save_state("sink-desktop", "\n".join(ctx.desk_lines("/tmp/op-kfocus")) + "\n",
                    "the tags the desktop xterm's shell wrote while it had the focus")
-    pids_end = ctx.pids("pids-end")
+    pids_end = ctx.pids("pids-after")
+    ctx.diff_named("pids", pids_b, st.last, "EV-DIFF: the desktop's processes before the keys and after Alt+F4",
+                   expect="the session xterm's rows (its xterm and bash: Alt+F4 closed it); Xorg's and mwm's must "
+                   "not")
     for comm in ("Xorg", "mwm"):
         was, now = ctx.session_pid(pids_start, comm), ctx.session_pid(pids_end, comm)
         st.check(was is not None and was == now, f"the session carried on: the same {comm} after Alt+F4",
@@ -2497,12 +2567,13 @@ def s11_1_1(ctx, st):
         step(ctx, st, state)
 
 
-def xorg_kept(ctx, st, state, entry, before):
-    """After a menu entry: the window tree's change (EV-DIFF), and the X
-    server's pid, which only Quit session may change."""
+def xorg_kept(ctx, st, state, entry, before, expect):
+    """After a menu entry: the window tree's change (EV-DIFF), with the lines
+    expected to differ, and the X server's pid, which only Quit session may
+    change."""
     moment = entry.lower().replace(" ", "-")
     ctx.diff(f"{moment}-tree", before.text, ctx.xstate().text,
-             f"`xwininfo -root -tree` before and after '{entry}'")
+             f"`xwininfo -root -tree` before and after '{entry}'", expect=expect)
     now = ctx.session_pid(ctx.pids(f"pids-after-{moment}"), "Xorg")
     st.check(now == state["xorg"], f"the X server kept its pid through '{entry}'",
              f"{state['xorg']} -> {now}")
@@ -2518,7 +2589,9 @@ def menu_new_terminal(ctx, st, state):
     pid = ctx.one(found[1].id).pid
     st.check(pid and ctx.g.pid_alive(pid), "its xterm process runs", f"pid {pid}")
     state["t1_pid"] = pid
-    xorg_kept(ctx, st, state, "New Terminal", before)
+    xorg_kept(ctx, st, state, "New Terminal", before,
+              "the new terminal's frame and windows, the root's child count, the list of top-level windows, and "
+              "where mwm's root-menu window (posted to choose the entry) sits in the stacking; no other window")
 
 
 def menu_host_terminal(ctx, st, state):
@@ -2550,7 +2623,10 @@ def menu_host_terminal(ctx, st, state):
                            "EV-LOG-JOURNAL: sshd accepting the desktop-shell key for this login",
                            label="sshd's journal")
     st.check(journal.strip(), "sshd logged the publickey login behind the window")
-    xorg_kept(ctx, st, state, "Host Terminal", before)
+    xorg_kept(ctx, st, state, "Host Terminal", before,
+              "the host terminal's frame and windows, the root's child count, the list of top-level windows, "
+              "and where mwm's root-menu window (posted to choose the entry) sits in the stacking; no other "
+              "window")
 
 
 def menu_refresh(ctx, st, state):
@@ -2559,17 +2635,22 @@ def menu_refresh(ctx, st, state):
     wids = [c.id for c in before.walk() if c.instance]
     info_before = ctx.info(*wids)
     pids_before = ctx.pids("pids-before-refresh")
+    pids_b = st.last
     ctx.root_menu("Refresh", "refresh")
     time.sleep(1.5)
     after = ctx.xstate()
     info_after = ctx.info(*wids)
-    ctx.diff("refresh-tree", before.text, after.text, "the window tree across Refresh: no difference")
+    ctx.diff("refresh-tree", before.text, after.text, "the window tree across Refresh",
+             expect="at most where mwm's root-menu window (unmapped, override-redirect) sits in the stacking: "
+             "posting the menu to choose Refresh raises it; every other window must not")
     ctx.shot("refresh", "the desktop after Refresh: the same windows in the same places")
     st.check({t.id for t in after.mapped_tops()} == {t.id for t in before.mapped_tops()},
              "Refresh left the same windows on the screen")
     moved = [w for w in wids if info_before[w].rect != info_after[w].rect]
     st.check(not moved, "Refresh moved no window", f"moved: {moved}")
     pids_after = ctx.pids("pids-after-refresh")
+    ctx.diff_named("pids-refresh", pids_b, st.last, "EV-DIFF: the desktop's processes across Refresh",
+                   expect=f"{NOTHING_PIDS}: Refresh only redraws")
     for comm in ("Xorg", "mwm"):
         st.check(ctx.session_pid(pids_after, comm) == ctx.session_pid(pids_before, comm),
                  f"Refresh restarted no {comm}")
@@ -2607,7 +2688,10 @@ def menu_pack_icons(ctx, st, state):
     st.check(set(packed.values()) == set(placed.values()),
              "Pack Icons packed the icons back into the places mwm first gave them",
              f"placed {sorted(placed.values())}, packed {sorted(packed.values())}")
-    xorg_kept(ctx, st, state, "Pack Icons", before)
+    xorg_kept(ctx, st, state, "Pack Icons", before,
+              "the windows the story and Pack Icons change: the two terminals' frames (unmapped: minimized for "
+              "the packing), their icons (mapped, packed into the icon row), mwm's own small windows, and the "
+              "stacking order these bring; no client window comes or goes")
 
 
 def menu_restart_mwm(ctx, st, state):
@@ -2621,6 +2705,7 @@ def menu_restart_mwm(ctx, st, state):
                            '| grep socket: | sort'], check=False).split()
 
     table = ctx.pids("pids-before-restart")
+    pids_b = st.last
     mwm_pid, socks = ctx.session_pid(table, "mwm"), mwm_sockets()
     before = ctx.xstate()
     clients = [c.id for c in before.walk() if c.instance == "xterm"]
@@ -2631,9 +2716,13 @@ def menu_restart_mwm(ctx, st, state):
         renewed = wait_until(lambda: (lambda s: s if s and s != socks else None)(mwm_sockets()), 20, 0.5)
         time.sleep(2)
     after = ctx.xstate(check=False)
-    ctx.diff("restart-tree", before.text, after.text, "the window tree across Restart mwm: the same "
-             "client windows, in frames mwm made again")
+    ctx.diff("restart-tree", before.text, after.text, "the window tree across Restart mwm",
+             expect="mwm's own windows, its frames and icons made again by the restarted mwm (whose new "
+             "connection can be handed the old ids), and the client windows' places under them; every client "
+             "window is there before and after")
     table = ctx.pids("pids-after-restart")
+    ctx.diff_named("pids-restart", pids_b, st.last, "EV-DIFF: the desktop's processes across Restart mwm",
+                   expect=f"{NOTHING_PIDS}: f.restart re-executes mwm in its own process")
     st.check(renewed, "Restart mwm replaced mwm's connection to the X server",
              f"mwm's sockets {socks} -> {mwm_sockets()}")
     st.record(f"mwm pid {mwm_pid} -> {ctx.session_pid(table, 'mwm')}")
@@ -2667,7 +2756,8 @@ def menu_quit_session(ctx, st, state):
              f"Xorg {xorg} -> {ctx.session_pid(table, 'Xorg')}")
     xs = ctx.xstate()
     ctx.diff("quit-session-tree", before.text, xs.text, "`xwininfo -root -tree` before Quit session and "
-             "in the new session: every window new, the session's xterm back")
+             "in the new session", expect="every window: the X session ended and a new one began, its own "
+             "windows and the session's xterm among them")
     img = ctx.shot("after-quit-session", "the desktop back after Quit session: the root colour and the "
                    "session's xterm")
     term = ctx.session_xterm(xs)
@@ -2896,8 +2986,9 @@ def sound_controls(ctx, st, held):
 
     devices = []
 
-    def device_state(slug, what):
-        """F4.7's set at one moment, diffed against the moment before (S7.7.4)."""
+    def device_state(slug, what, expect=""):
+        """F4.7's set at one moment, diffed against the moment before (S7.7.4),
+        with the lines expected to differ."""
         text = audio_devices(ctx)
         name = st.write(f"devices-{slug}", text, f"/dev/snd (host and container), pw-cli ls Device and "
                         f"pactl's sinks, sources and sink-inputs {what} (EV-STATE)")
@@ -2905,7 +2996,7 @@ def sound_controls(ctx, st, held):
             prev_name, prev_text, prev_what = devices[-1]
             ctx.diff_kept(f"devices-{slug}", prev_name, prev_text, name, text,
                           f"EV-DIFF: from {prev_what} to {what}; the sink-inputs line shows which sink "
-                          "the player's stream is on")
+                          "the player's stream is on", expect=expect)
         devices.append((name, text, what))
 
     # EV-LOG-DESKTOP is bounded by this moment (podman logs --since).
@@ -2923,7 +3014,9 @@ def sound_controls(ctx, st, held):
     player = g.client_inspect("player")
     st.write("player-before", json.dumps(player, indent=1, sort_keys=True) + "\n",
              "EV-PIDS: the player container before the operator's commands: id, pid, start time, restarts")
-    pids_before = ctx.pids("pids-start")
+    player_b = st.last
+    pids_before = ctx.pids("pids-before")
+    pids_b = st.last
     pw_before = ctx.session_pid(pids_before, "pipewire")
 
     wav_name = st.name("audio-1100hz", "wav")
@@ -2955,6 +3048,7 @@ def sound_controls(ctx, st, held):
         before = wp_sinks(wpctl(ctx, "status"))
         device_state("before-plug", "before the card is plugged")
         st.write("info-usb-before", m.hmp("info usb"), "QEMU's `info usb` before the card is plugged (EV-QEMU)")
+        usb_b = st.last
         with ctx.video("plug", "the display while the USB card is plugged in (QMP device_add): nothing on "
                        "it changes, and nothing restarts"):
             m.device_add(driver="usb-audio", id="opsnd", audiodev="snd0", bus="xhci.0")
@@ -2963,6 +3057,8 @@ def sound_controls(ctx, st, held):
             new = wait_until(lambda: [i for i in wp_sinks(wpctl(ctx, "status")) if i not in before], 30, 1)
         st.check(new, "the hot-added card shows up as a new output in wpctl status")
         st.write("info-usb-after", m.hmp("info usb"), "QEMU's `info usb` with the card plugged (EV-QEMU)")
+        ctx.diff_named("info-usb", usb_b, st.last, "EV-DIFF: QEMU's info usb across the card's arrival",
+                       expect="only the USB card's line (opsnd), new")
         usb_id = new[0]
         usb_name = node_name(ctx, usb_id)
         held["card"] = usb_name
@@ -2972,7 +3068,10 @@ def sound_controls(ctx, st, held):
         on_plug = stream_sink(ctx)
         st.record(f"on plug-in, before the operator chose anything, the stream went to {on_plug} "
                   f"(WirePlumber {'moved it by itself' if on_plug == usb_name else 'left it where it was'})")
-        device_state("plugged", "with the card plugged, before the operator chose an output")
+        device_state("plugged", "with the card plugged, before the operator chose an output",
+                     "the card's nodes (with the by-id and by-path directories' lines), its Device block, its sink "
+                     "and monitor rows, the state column of the others, and the player's stream, on the card's "
+                     "sink, which took the default")
         if on_plug == usb_name:
             # Already moved: choose the built-in output first, so that both
             # directions of the choice are seen.
@@ -2981,14 +3080,18 @@ def sound_controls(ctx, st, held):
             st.check(wait_until(lambda: stream_sink(ctx) == builtin, 8, 0.5),
                      "wpctl set-default moved the client's stream to the built-in output")
             after("default-builtin", "set-default to the built-in output")
-            device_state("on-builtin", "after set-default to the built-in output")
+            device_state("on-builtin", "after set-default to the built-in output",
+                         "the sinks' and monitors' state columns and the player's stream: moved to the built-in "
+                         "output's sink, now RUNNING, the card's IDLE")
             time.sleep(1)
         command(f"wpctl set-default {usb_id}", M_TO_USB)
         st.check(wait_until(lambda: stream_sink(ctx) == usb_name, 8, 0.5),
                  "wpctl set-default moved the client's stream to the USB card",
                  f"the stream is on {stream_sink(ctx)}, the card is {usb_name}")
         after("default-usb", "set-default to the USB card")
-        device_state("on-usb", "after set-default to the USB card")
+        device_state("on-usb", "after set-default to the USB card",
+                     "the sinks' and monitors' state columns and the player's stream: moved back to the card's "
+                     "sink, now RUNNING, the built-in output's IDLE")
         time.sleep(1)
 
         # Volume and mute on the output the stream now plays from.
@@ -3022,7 +3125,12 @@ def sound_controls(ctx, st, held):
     player_after = g.client_inspect("player")
     st.write("player-after", json.dumps(player_after, indent=1, sort_keys=True) + "\n",
              "EV-PIDS: the player container after every command: the same id, pid, start time and restarts")
-    pids_after = ctx.pids("pids-after-controls")
+    ctx.diff_named("player", player_b, st.last, "EV-DIFF: the player container before and after the operator's "
+                   "commands", expect="nothing: the same container, pid and start time, never restarted")
+    pids_after = ctx.pids("pids-after")
+    ctx.diff_named("pids", pids_b, st.last, "EV-DIFF: the desktop's processes before and after the operator's "
+                   "commands", expect="the rows of the terminal the operator opened from the root menu (its xterm "
+                   "and bash), new; PipeWire's and the other daemons' rows must not")
     st.check(player_after == player, "the player was not restarted: same container, pid, start time, "
              "no restarts", f"{player} -> {player_after}")
     st.check(ctx.session_pid(pids_after, "pipewire") == pw_before, "PipeWire was not restarted by any of it",
@@ -3385,6 +3493,14 @@ def host_terminal(ctx, st, moment):
     if not ctx.wait_gone(t.id):
         ctx.g.desk(["pkill", "-u", "desktop", "-f", "xterm -T host"], check=False)
         ctx.wait_gone(t.id)
+    # A login's user manager (systemd --user and its (sd-pam)) outlives the
+    # login by logind's UserStopDelaySec, 10 s by default. The next story's
+    # process tables are taken once it has gone, so a diff of two of them
+    # does not catch it going (S9.3.2).
+    over = wait_until(lambda: not ctx.g.sh("pgrep -u desktop-shell; true",
+                                           label="desktop-shell's processes on the host").strip(), 30, 1)
+    st.record(f"desktop-shell's processes on the host once the window closed ({moment}): "
+              + ("none, the login's user manager stopped" if over else "still there 30 s on"))
     return what, who, text
 
 
@@ -3511,6 +3627,7 @@ def m_restart_mwm(ctx, st, arg):
         return ctx.g.desk(["sh", "-c", 'for f in /proc/$(pgrep -u desktop -x mwm)/fd/*; do readlink "$f"; done '
                            '| grep socket: | sort'], check=False).split()
     table = ctx.pids(f"pids-before-restart-mwm-{arg}")
+    pids_b = st.last
     xorg, mwm, socks = ctx.session_pid(table, "Xorg"), ctx.session_pid(table, "mwm"), mwm_sockets()
     before = ctx.xstate()
     with ctx.video(f"restart-mwm-{arg}", "Restart mwm chosen from the root menu: the frames go and "
@@ -3520,6 +3637,8 @@ def m_restart_mwm(ctx, st, arg):
         renewed = wait_until(lambda: (lambda s: s if s and s != socks else None)(mwm_sockets()), 20, 0.5)
         time.sleep(2)
     table = ctx.pids(f"pids-after-restart-mwm-{arg}")
+    ctx.diff_named(f"pids-restart-mwm-{arg}", pids_b, st.last, "EV-DIFF: the desktop's processes across "
+                   "Restart mwm", expect=f"{NOTHING_PIDS}: f.restart re-executes mwm in its own process")
     st.check(renewed, "Restart mwm replaced mwm's connection to the X server",
              f"mwm's sockets {socks} -> {mwm_sockets()}")
     st.record(f"Restart mwm ({arg}): mwm pid {mwm} -> {ctx.session_pid(table, 'mwm')}, Xorg pid "

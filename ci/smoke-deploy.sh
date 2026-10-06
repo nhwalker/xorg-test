@@ -228,7 +228,8 @@ ev_end
 
 ev_begin S5.5.3 "Atomic writes" T2
 ev_save cdi-after "EV-STATE: ls -li /etc/cdi after the regeneration" ls -li /etc/cdi >/dev/null || true
-ev_diff cdi "EV-DIFF: /etc/cdi before and after the regeneration: both specs are new inodes" "$cdi_before" "$EV_LAST"
+ev_diff cdi "EV-DIFF: /etc/cdi before and after the regeneration" "$cdi_before" "$EV_LAST" \
+    "both specs' lines: each a new inode, and the audio spec's size too (S5.5.2's override file, read by this regeneration, names a shorter AUDIO_DIR); no other file"
 [ "$(stat -c %i "$DISPLAY_SPEC")" != "$ino_display" ] && [ "$(stat -c %i "$AUDIO_SPEC")" != "$ino_audio" ] \
     || fail "a spec kept its inode across a regeneration: written in place, not renamed over"
 ev_pass "both specs are new inodes (display $ino_display -> $(stat -c %i "$DISPLAY_SPEC"), audio $ino_audio -> $(stat -c %i "$AUDIO_SPEC")): written to a temp file and renamed over"
@@ -296,7 +297,8 @@ else
     ev_save targets-after "EV-STATE: the same directories after it ran: unchanged" \
         sh -c "ls -ld $targets 2>&1; true" >/dev/null || true
     if [ -n "$EV_DIR" ]; then
-        ev_diff targets "EV-DIFF: before and after the labeler; no line may differ" "$before" "$EV_LAST"
+        ev_diff targets "EV-DIFF: the directories' listing before and after the labeler" "$before" "$EV_LAST" \
+            "nothing: on a host without SELinux the labeler changes nothing"
         [ "$(sed 1d "$EV_DIR/$before")" = "$(sed 1d "$EV_DIR/$EV_LAST")" ] \
             || fail "the labeler changed something on a host without SELinux (see the diff)"
         ev_pass "it touched nothing: the directories it would label are as they were"
@@ -343,7 +345,8 @@ ev_begin S5.3.1 "Dirty seat is walked back" T2
 ev_text seat-prep "EV-LOG: seat-prep's output on the staged dirty seat" "$out"
 ev_save after "EV-STATE: the same after seat-prep: no 72-seat rule, the display manager disabled and stopped" \
     seat_state >/dev/null || true
-ev_diff seat "EV-DIFF: the staged dirty seat (-) against what seat-prep left of it (+)" "$s531_staged" "$EV_LAST"
+ev_diff seat "EV-DIFF: the staged dirty seat (-) against what seat-prep left of it (+)" "$s531_staged" "$EV_LAST" \
+    "each of the three lines: the 72-seat rule gone, display-manager.service no longer an alias (not-found), ci-fake-dm.service inactive"
 grep -q 'removing custom seat attachment rule' <<<"$out" || fail "seat rule not handled"
 [ ! -e /etc/udev/rules.d/72-seat-ci-test.rules ] || fail "seat rule file survived"
 ev_pass "seat-prep removed the 72-seat rule and said so: removing custom seat attachment rule"
@@ -498,6 +501,8 @@ journalctl --sync 2>/dev/null || true
 cursor=$(journalctl -q -n 1 -o cat --show-cursor 2>/dev/null | sed -n 's/^-- cursor: //p')
 [ -n "$cursor" ] || fail "could not read a journal cursor to bound seat-prep's second run"
 logind_before=$(systemctl show -p MainPID --value systemd-logind)
+ev_text logind-before "EV-PIDS: systemd-logind's MainPID before the second run" "MainPID=$logind_before"
+logind_b=$EV_LAST
 ev_save restart "EV-STATE: systemctl restart desktop-seat-prep.service, the second run: exit 0" \
     systemctl restart desktop-seat-prep.service >/dev/null \
     || fail "the second run of desktop-seat-prep.service did not exit 0"
@@ -514,8 +519,9 @@ ev_text journal "EV-LOG-JOURNAL: everything desktop-seat-prep.service's own proc
 [ -z "$slice" ] || fail "seat-prep's steady state was not silent: $slice"
 ev_pass "and its process logs nothing at all"
 logind_after=$(systemctl show -p MainPID --value systemd-logind)
-ev_text logind "EV-PIDS: systemd-logind's MainPID before and after the second run (seat-prep restarts logind only when it changed something)" \
-    "before: $logind_before"$'\n'"after:  $logind_after"
+ev_text logind-after "EV-PIDS: systemd-logind's MainPID after the second run" "MainPID=$logind_after"
+ev_diff logind "EV-DIFF: systemd-logind's MainPID across the second run" "$logind_b" "$EV_LAST" \
+    "nothing: seat-prep restarts logind only when it changed the seat, and this run found it converged"
 [ "$logind_after" = "$logind_before" ] || fail "the steady state restarted logind ($logind_before -> $logind_after)"
 ev_pass "it did not restart logind (MainPID $logind_before)"
 ev_end
@@ -692,6 +698,7 @@ ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T2
 wait_x_up "before the audio recovery"
 ev_save pids-before "EV-PIDS: Xorg, mwm and the three audio daemons before pipewire is killed" \
     podman exec desktop ps -o pid,ppid,lstart,comm -C Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+rec_pb=$EV_LAST
 x_rec_before=$(podman exec desktop sh -c 'pgrep -x Xorg; pgrep -x mwm' 2>/dev/null | paste -sd' ' || true)
 [ "$(wc -w <<<"$x_rec_before")" -ge 2 ] || fail "no Xorg and mwm to compare across the audio crash (found: '$x_rec_before')"
 rec_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -729,6 +736,8 @@ ev_save pactl-info "EV-STATE: pactl info over the re-exported socket (PULSE_SERV
 ev_pass "the re-exported socket answers pactl info"
 ev_save pids-after "EV-PIDS: Xorg, mwm and the three audio daemons after the recovery" \
     podman exec desktop ps -o pid,ppid,lstart,comm -C Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+ev_diff pids "EV-DIFF: Xorg, mwm and the three audio daemons across pipewire's crash" "$rec_pb" "$EV_LAST" \
+    "the three audio daemons' rows (new pids and start times: the stack restarted); Xorg's and mwm's must not"
 ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before pipewire was killed" \
     podman logs --since "$rec_since" desktop >/dev/null || true
 x_rec_after=$(podman exec desktop sh -c 'pgrep -x Xorg; pgrep -x mwm' 2>/dev/null | paste -sd' ' || true)
@@ -1032,6 +1041,7 @@ log "X session restart: tty1 is handed back to the session user"
 ev_begin S2.2.3 "tty1 is handed to the session user" T2
 own=$(ev_save tty1-before "EV-STATE: stat -c '%U:%G %a %n' /dev/tty1 in the container, before an X session restart" \
     podman exec desktop stat -c '%U:%G %a %n' /dev/tty1) || fail "no /dev/tty1 in the container"
+tty_b=$(ev_last)
 [ "${own%% *}" = desktop:tty ] || fail "/dev/tty1 is ${own%% *} before the restart, want desktop:tty"
 ev_pass "before: /dev/tty1 is desktop:tty"
 # SIGKILL, mwm dying: a SIGTERM only opens mwm's "Quit Mwm?" confirmation
@@ -1045,6 +1055,8 @@ for _ in $(seq 30); do x_restarted && { ok=1; break; }; sleep 2; done
 [ "$ok" = 1 ] || fail "no new X session within 60 s of killing mwm"
 own=$(ev_save tty1-after "EV-STATE: the same stat once the X session restarted" \
     podman exec desktop stat -c '%U:%G %a %n' /dev/tty1) || fail "no /dev/tty1 after the restart"
+ev_diff tty1 "EV-DIFF: /dev/tty1's owner, group and mode across the X session's restart" "$tty_b" "$(ev_last)" \
+    "nothing: the new session's tty1 is handed to the session user as the first one's was"
 [ "${own%% *}" = desktop:tty ] || fail "/dev/tty1 is ${own%% *} after the restart, want desktop:tty"
 ev_pass "after the X session restarted (Xorg $xpid -> $(first_xorg)): /dev/tty1 is still desktop:tty"
 ev_end
@@ -1056,6 +1068,7 @@ since_term=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sleep 1
 ev_save pids-before "EV-PIDS: desktop-init, Xorg and mwm before mwm gets a SIGTERM" \
     sh -c "ps -o pid,user,lstart,comm -p $initpid; podman exec desktop ps -o pid,user,lstart,comm -C Xorg,mwm" >/dev/null || true
+term_pb=$EV_LAST
 podman exec -u desktop desktop pkill -TERM -u desktop -x mwm || fail "no mwm to send SIGTERM to"
 ev_note "sent mwm SIGTERM, a plain kill's signal, as the session user (Xorg was pid $x_term_before)"
 term_restarted() { local p; p=$(first_xorg); [ -n "$p" ] && [ "$p" != "$x_term_before" ] && x_up; }
@@ -1064,6 +1077,8 @@ for _ in $(seq 20); do term_restarted && { ok=1; break; }; sleep 1; done
 [ "$ok" = 1 ] || fail "a SIGTERM to mwm did not end the session within 20 s (mwm asking 'Quit Mwm?' instead?)"
 ev_save pids-after "EV-PIDS: the same after the session restarted: new Xorg and mwm, the same desktop-init" \
     sh -c "ps -o pid,user,lstart,comm -p $initpid; podman exec desktop ps -o pid,user,lstart,comm -C Xorg,mwm" >/dev/null || true
+ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across mwm's SIGTERM" "$term_pb" "$EV_LAST" \
+    "the Xorg and mwm rows (a new session: new pids and start times); desktop-init's row must not"
 ev_pass "a SIGTERM to mwm ended the session: Xorg $x_term_before -> $(first_xorg), a new mwm, and the display answers"
 [ -d "/proc/$initpid" ] || fail "desktop-init (pid $initpid) did not survive the session's end"
 ev_pass "desktop-init carried on (pid $initpid)"
@@ -1102,8 +1117,11 @@ for d in /run /tmp; do
 done
 ev_pass "first start: /run and /tmp are tmpfs"
 podman exec desktop touch /run/ev-sentinel /tmp/ev-sentinel || fail "could not write the sentinels"
+podman exec desktop sh -c 'test -e /run/ev-sentinel && test -e /tmp/ev-sentinel' || fail "the sentinels are not there"
+# The same command as the listing after the restart, so the diff of the two
+# shows the sentinels and nothing of how they were listed.
 ev_save sentinels-first "EV-STATE: ls -l of a sentinel written in /run and in /tmp" \
-    podman exec desktop ls -l /run/ev-sentinel /tmp/ev-sentinel >/dev/null || fail "the sentinels are not there"
+    podman exec desktop sh -c 'ls -l /run/ev-sentinel /tmp/ev-sentinel 2>&1; true' >/dev/null || true
 sentinels_first=$EV_LAST
 ev_end
 
@@ -1197,8 +1215,11 @@ scratch=$(ev_save scratch "a scratch container of the image with no /dev/dri pas
     || fail "the scratch run of xorg-gpu-conf failed"
 ev_text before "EV-STATE: ls /etc/X11/xorg.conf.d in the scratch container before the run: the stale 20-gpu.conf" \
     "$(sed -n '/^-- before:/,/^-- \/dev\/dri:/p' <<<"$scratch" | sed '1d;$d')"
+s314_before=$EV_LAST
 ev_text after "EV-STATE: ls /etc/X11/xorg.conf.d after the run: no 20-gpu.conf" \
     "$(sed -n '/^-- after:/,$p' <<<"$scratch" | sed '1d')"
+ev_diff conf-d "EV-DIFF: /etc/X11/xorg.conf.d before and after xorg-gpu-conf ran" "$s314_before" "$EV_LAST" \
+    "the stale 20-gpu.conf's line (removed) and the total"
 grep -q '20-gpu.conf' <<<"$(sed -n '/^-- before:/,/^-- \/dev\/dri:/p' <<<"$scratch")" \
     || fail "the stale 20-gpu.conf was not in place before the run"
 grep -q 'does not exist; removing generated config' <<<"$scratch" \
@@ -1262,7 +1283,8 @@ key_old=$EV_LAST
 systemctl restart desktop-host-shell.service || fail "a second run of desktop-host-shell.service failed"
 ev_save key-new "EV-STATE: ssh-keygen -lf of the public key after a second run" \
     ssh-keygen -lf /etc/desktop-container/host-shell-key.pub >/dev/null || fail "no public key after the second run"
-ev_diff key "EV-DIFF: the public key's fingerprint before and after the second run" "$key_old" "$EV_LAST"
+ev_diff key "EV-DIFF: the public key's fingerprint before and after the second run" "$key_old" "$EV_LAST" \
+    "the fingerprint line: a new key, of the same type and comment"
 fp_new=$(ssh-keygen -lf /etc/desktop-container/host-shell-key.pub | awk '{print $2}')
 [ -n "$fp_new" ] && [ "$fp_new" != "$fp_old" ] || fail "the second run kept the same key ($fp_old)"
 ev_pass "a second run writes a different key ($fp_old -> $fp_new)"
@@ -1283,6 +1305,7 @@ ev_save handoff-journal "EV-LOG-JOURNAL: desktop-host-shell.service's journal: t
 cwho=$(ev_save container-before "the container's ssh host after the second run, before any desktop restart: the key the unit handed over" \
     podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) \
     || fail "the running container did not get the new key: its ssh host is refused until desktop.service restarts"
+s574_cb=$(ev_last)
 [ "$(tail -n 1 <<<"$cwho")" = desktop-shell ] || fail "the container's ssh host answered '$cwho'"
 ev_pass "the running container took the new key: its ssh host logs in as desktop-shell with no desktop restart"
 rm -f /tmp/ev-old-key
@@ -1313,7 +1336,8 @@ done
 ev_pass "after the restart: /run and /tmp are tmpfs again"
 ev_save sentinels-restarted "EV-STATE: ls -l of the two sentinels after the restart: gone" \
     podman exec desktop sh -c 'ls -l /run/ev-sentinel /tmp/ev-sentinel 2>&1; true' >/dev/null
-ev_diff sentinels "EV-DIFF: the sentinels before and after the restart" "$sentinels_first" "$EV_LAST"
+ev_diff sentinels "EV-DIFF: the sentinels before and after the restart" "$sentinels_first" "$EV_LAST" \
+    "both sentinels' lines: listed before, 'No such file or directory' after"
 if podman exec desktop sh -c 'test -e /run/ev-sentinel || test -e /tmp/ev-sentinel'; then
     fail "a sentinel survived the restart"
 fi
@@ -1387,7 +1411,8 @@ log "after the restart: both units moved, the toolkit republished, the container
 ev_begin S5.8.2 "Moves with the container" T2
 ev_save started-after "EV-STATE: ActiveEnterTimestamp of the two units after systemctl restart desktop.service" \
     systemctl show -p Id -p ActiveEnterTimestamp desktop.service desktop-session.service >/dev/null || true
-ev_diff started "EV-DIFF: the two units' ActiveEnterTimestamp before and after: both moved" "$started_before" "$EV_LAST"
+ev_diff started "EV-DIFF: the two units' ActiveEnterTimestamp before and after" "$started_before" "$EV_LAST" \
+    "both ActiveEnterTimestamp lines (both units started again); the Id lines stay"
 [ "$(systemctl show -p ActiveEnterTimestampMonotonic --value desktop.service)" -gt "$t_desk" ] \
     || fail "desktop.service did not restart"
 [ "$(systemctl show -p ActiveEnterTimestampMonotonic --value desktop-session.service)" -gt "$t_sess" ] \
@@ -1400,7 +1425,8 @@ ev_end
 ev_begin S7.2.1 "Published at boot, 0755, by rename" T2
 ev_save bin-after "EV-STATE: ls -li and sha256sum of the published toolkit after the restart" \
     sh -c 'ls -lia /var/lib/desktop-container/bin; sha256sum /var/lib/desktop-container/bin/screenshot' >/dev/null || true
-ev_diff bin "EV-DIFF: the toolkit dir before and after the restart's republish" "$bin_before" "$EV_LAST"
+ev_diff bin "EV-DIFF: the toolkit dir before and after the restart's republish" "$bin_before" "$EV_LAST" \
+    "screenshot's line (a new inode and time), the directory's own line and the total, and the .keep that S7.2.2 planted between the two listings (its stale-tool pruned by the republish); the sha256sum line stays"
 [ "$(stat -c %a /var/lib/desktop-container/bin/screenshot)" = 755 ] || fail "the republished screenshot is not 0755"
 ev_pass "the republished screenshot is 0755"
 [ "$(stat -c %i /var/lib/desktop-container/bin/screenshot)" != "$ino_tool" ] || fail "the republish wrote the old file in place"
@@ -1412,7 +1438,8 @@ ev_end
 
 ev_begin S7.2.2 "Stale tools are pruned, dotfiles left alone" T2
 ev_save bin-pruned "EV-STATE: ls -la of the toolkit dir after the restart" ls -la /var/lib/desktop-container/bin >/dev/null || true
-ev_diff bin "EV-DIFF: the toolkit dir with the planted files, then after the republish" "$planted" "$EV_LAST"
+ev_diff bin "EV-DIFF: the toolkit dir with the planted files, then after the republish" "$planted" "$EV_LAST" \
+    "stale-tool's line (pruned), screenshot's (republished: a new time) and the total; .keep's stays"
 [ ! -e /var/lib/desktop-container/bin/stale-tool ] || fail "the unshipped stale-tool survived the republish"
 ev_pass "the unshipped regular file is gone"
 [ -e /var/lib/desktop-container/bin/.keep ] || fail "the dotfile was removed"
@@ -1457,6 +1484,8 @@ ev_begin S5.7.4 "Re-running rotates the key and invalidates the old one" T2
 cwho=$(ev_save container-after "the container's ssh host after desktop.service restarted: the new key" \
     podman exec -u desktop -e HOME=/home/desktop desktop ssh -o ConnectTimeout=5 -o BatchMode=yes host whoami) \
     || fail "the container could not ssh to the host after the restart"
+ev_diff container "EV-DIFF: the container's ssh host login, before the desktop restarted and after" "$s574_cb" "$(ev_last)" \
+    "nothing: the container logs in as desktop-shell with the new key both times"
 [ "$(tail -n 1 <<<"$cwho")" = desktop-shell ] || fail "the container's ssh host answered '$cwho'"
 ev_pass "after desktop.service restarted, the container logs in again (whoami: desktop-shell)"
 ev_end
@@ -1664,7 +1693,8 @@ tail -n +1 -f "$ctr_log" > "$tmp/follow" 2>&1 &
 follower=$!
 sleep 1
 ev_save pids-before "EV-PIDS: every uid-61000 process on the host before the stop" \
-    ps -o pid,ppid,sess,tty,lstart,comm -u 61000 >/dev/null || true
+    sh -c 'ps -o pid,ppid,sess,tty,lstart,comm -u 61000 || echo "(no uid-61000 process left)"' >/dev/null || true
+stop_pb=$EV_LAST
 stop_epoch=$(date +%s)
 stop_t0=$(date +%s.%N)
 # Which processes outlive the SIGTERM, and for how long: desktop-init gives
@@ -1715,6 +1745,8 @@ ev_save unit "EV-STATE: systemctl show of desktop.service after the stop" \
     systemctl show -p Result,ExecMainCode,ExecMainStatus,ActiveState desktop.service >/dev/null || true
 ev_save pids-after "EV-PIDS: every uid-61000 process on the host after the stop" \
     sh -c 'ps -o pid,ppid,sess,tty,lstart,comm -u 61000 || echo "(no uid-61000 process left)"' >/dev/null || true
+ev_diff pids "EV-DIFF: the host's uid-61000 processes across the stop" "$stop_pb" "$EV_LAST" \
+    "every process's row (none is left after the stop), and the '(no uid-61000 process left)' line that says so"
 
 python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 10 else 1)' "${took:-99}" \
     || fail "systemctl stop desktop.service took ${took:-?} s: not within podman's 10 s stop timeout"
@@ -1755,7 +1787,8 @@ wait_x_up "after the stop and start"
 ev_begin S2.5.2 "The X socket is unlinked by the server, not pinned by a mount" T2
 ev_save x11-started "EV-STATE: ls -li /tmp/.X11-unix after the next start" ls -li /tmp/.X11-unix >/dev/null || true
 [ -S /tmp/.X11-unix/X0 ] || fail "no X0 socket after the start"
-ev_diff x11 "EV-DIFF: /tmp/.X11-unix with the desktop running, then after the stop and the next start" "$x11_running" "$EV_LAST"
+ev_diff x11 "EV-DIFF: /tmp/.X11-unix with the desktop running, then after the stop and the next start" "$x11_running" "$EV_LAST" \
+    "X0's line, or nothing: ls shows the socket's inode and minute, and this runner's ext4 can give the new socket the old one's inode within the same minute (its birth time, checked below, shows it new)"
 # Not the inode number: this runner's /tmp is ext4, which hands a freed
 # number to the next file made, so a new X0 can carry the old one's
 # (the first run of this check saw exactly that, 533211 both times).

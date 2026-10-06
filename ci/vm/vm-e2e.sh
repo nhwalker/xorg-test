@@ -328,9 +328,13 @@ ev_qemu_hda() { # <moment> <host t0> <host t1>
 # 37338352192 said why: QEMU's sound card dropped its buffer 18 times, each
 # at a frame of the story's own PNG video, which QEMU compressed in the
 # loop its audio runs in. The video now takes raw frames (qmp-tool.py).
+AW_SCHED_B=""   # the story's sched-before, which audio_window_record's sched-after is diffed against
 audio_window_record() { # <host t0> <host t1> <guest t0>
     ev_save sched-after "EV-STATE: PipeWire's threads and pw-top's batch view after the tone: an ERR count above the one before is an xrun during it" \
         gq audio-sched >/dev/null || true
+    [ -z "$AW_SCHED_B" ] || ev_diff sched "EV-DIFF: PipeWire's threads and pw-top's view before and after the tone" "$AW_SCHED_B" "$EV_LAST" \
+        "at most a node's state and counters in pw-top's view, its ERR column the xruns during the tone; pipewire's threads and their scheduling class and priority must not"
+    AW_SCHED_B=""
     ev_save desktop-log "EV-LOG-DESKTOP: the desktop container's log from the tone's start on (PipeWire's own warnings, xruns among them, land here)" \
         gq desktop-log-since "$3" >/dev/null || true
     local n
@@ -367,11 +371,16 @@ input_import() { # <story> <moment> <when>
     ev_copy "$ART/$1/$IN_XI" "$2-xinput" "EV-STATE: xinput list as the session user, $3 (taken in $1)"; B_XI=$EV_LAST
 }
 input_diffs() { # <moment> <event>
-    ev_diff "$1-info-usb" "EV-DIFF: info usb across $2" "$B_USB" "$IN_USB"
-    ev_diff "$1-host-input" "EV-DIFF: /dev/input on the VM host across $2" "$B_HOST" "$IN_HOST"
-    ev_diff "$1-ctr-input" "EV-DIFF: /dev/input in the container across $2" "$B_CTR" "$IN_CTR"
-    ev_diff "$1-devices" "EV-DIFF: /proc/bus/input/devices across $2" "$B_DEV" "$IN_DEV"
-    ev_diff "$1-xinput" "EV-DIFF: xinput list across $2" "$B_XI" "$IN_XI"
+    ev_diff "$1-info-usb" "EV-DIFF: info usb across $2" "$B_USB" "$IN_USB" \
+        "only the line of the USB device that $2 brings or takes (none for a virtio device: info usb lists USB devices)"
+    ev_diff "$1-host-input" "EV-DIFF: /dev/input on the VM host across $2" "$B_HOST" "$IN_HOST" \
+        "only the event and mouse nodes of the device that $2 brings or takes, and the by-id and by-path directories' lines (their size and time)"
+    ev_diff "$1-ctr-input" "EV-DIFF: /dev/input in the container across $2" "$B_CTR" "$IN_CTR" \
+        "only the event and mouse nodes of the device that $2 brings or takes, and the by-id and by-path directories' lines (their size and time)"
+    ev_diff "$1-devices" "EV-DIFF: /proc/bus/input/devices across $2" "$B_DEV" "$IN_DEV" \
+        "only the block of the device that $2 brings or takes"
+    ev_diff "$1-xinput" "EV-DIFF: xinput list across $2" "$B_XI" "$IN_XI" \
+        "only the rows of the device that $2 brings or takes"
 }
 
 # Kernel input device names (N: Name="...") in a saved
@@ -414,7 +423,9 @@ xi_judge_added() { # <story> <devices before> <devices after> <xinput before> <x
     ev_copy "$src/$3" devices-after "EV-STATE: /proc/bus/input/devices after $7 (taken in $1)"; da=$EV_LAST
     ev_copy "$src/$4" xinput-before "EV-STATE: xinput list before $7 (taken in $1)"; xb=$EV_LAST
     ev_copy "$src/$5" xinput-after "EV-STATE: xinput list after $7 (taken in $1)"; xa=$EV_LAST
-    ev_diff xinput "EV-DIFF: xinput list across $7" "$xb" "$xa"
+    ev_diff devices "EV-DIFF: /proc/bus/input/devices across $7" "$db" "$da" \
+        "only the blocks of the devices that $7 brings"
+    ev_diff xinput "EV-DIFF: xinput list across $7" "$xb" "$xa" "only the rows of the devices that $7 brings"
     ev_copy "$src/$6" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before $7 (taken in $1)"; xl=$EV_LAST
     names=$(comm -13 <(dev_names "$EV_DIR/$db") <(dev_names "$EV_DIR/$da") | sort -u)
     [ -n "$names" ] || fail "no new device in /proc/bus/input/devices across $7"
@@ -442,7 +453,7 @@ xi_judge_removed() { # <story> <xinput before> <xinput after> <xorg log> <name>.
     local src="$ART/$1" xb xa xl nb na name
     ev_copy "$src/$2" xinput-before "EV-STATE: xinput list before the removal (taken in $1)"; xb=$EV_LAST
     ev_copy "$src/$3" xinput-after "EV-STATE: xinput list after the removal, polled until the removed device left or 10 s passed (taken in $1)"; xa=$EV_LAST
-    ev_diff xinput "EV-DIFF: xinput list across the removal" "$xb" "$xa"
+    ev_diff xinput "EV-DIFF: xinput list across the removal" "$xb" "$xa" "only the rows of the devices the removal takes"
     ev_copy "$src/$4" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the removal (taken in $1)"; xl=$EV_LAST
     shift 4
     for name in "$@"; do
@@ -509,11 +520,38 @@ snd_import() { # <story> <moment> <when>
         eval "SB_$k=\$EV_LAST"
     done
 }
-snd_diffs() { # <moment> <event>
-    local k a b
+# The lines each kind is expected to differ in (Requirements.md S9.3.2):
+# across a card's arrival or removal (SND_CHANGE), or across cycles that end
+# where they began (SND_SAME). The default sink and the streams differ by
+# story, and the caller says how.
+declare -A SND_CHANGE=(
+    [USB]="only the USB card's line, plugged in or out (none for a PCI card: info usb lists USB devices)"
+    [HOST]="only the card's control and pcm nodes, the by-id and by-path directories' lines (their size and time), and the time of a pcm node a stream began playing on"
+    [CTR]="only the card's control and pcm nodes, the by-id and by-path directories' lines (their size and time), and the time of a pcm node a stream began playing on"
+    [WP]="the card's device, sink and source rows, the default marker (*) and a volume where the default moves, and the clients that came or went (wpctl's own row, a new pid each run, and a player's)"
+    [PW]="only the card's Device block"
+    [SINKS]="the card's sink row, and the state column (IDLE, RUNNING or SUSPENDED) of the others"
+    [SOURCES]="the card's monitor and capture rows, and the state column (IDLE, RUNNING or SUSPENDED) of the others"
+    [PIDS]="nothing: no audio daemon restarts")
+declare -A SND_SAME=(
+    [USB]="nothing: the card is gone again"
+    [HOST]="the by-id and by-path directories' lines (their size and time: the cycles made and removed nodes in them); no node"
+    [CTR]="the by-id and by-path directories' lines (their size and time: the cycles made and removed nodes in them); no node"
+    [WP]="wpctl's own client row (a new pid each run); no device, sink, source or default"
+    [PW]="nothing: the same devices"
+    [SINKS]="the state column (IDLE, RUNNING or SUSPENDED) at most; no row comes or goes"
+    [SOURCES]="the state column (IDLE, RUNNING or SUSPENDED) at most; no row comes or goes"
+    [PIDS]="nothing: no audio daemon restarted")
+snd_diffs() { # <moment> <event> <change|same> <default sink: the lines expected to differ> <sink-inputs: the same>
+    local k a b want
     for k in $SND_KINDS; do
         eval "b=\$SB_$k a=\$SN_$k"
-        ev_diff "$1-${SND_SLUG[$k]}" "EV-DIFF: ${SND_SLUG[$k]} across $2" "$b" "$a"
+        case $k in
+            DEF) want=$4 ;;
+            INPUTS) want=$5 ;;
+            *) if [ "$3" = same ]; then want=${SND_SAME[$k]}; else want=${SND_CHANGE[$k]}; fi ;;
+        esac
+        ev_diff "$1-${SND_SLUG[$k]}" "EV-DIFF: ${SND_SLUG[$k]} across $2" "$b" "$a" "$want"
     done
 }
 # The three audio daemons' pids on one line, for a before/after comparison.
@@ -1218,6 +1256,7 @@ EV_SIDE=h-
 ev_begin S4.5.1 "Audio survives an X session restart" T3
 ev_save sched-before "EV-STATE: PipeWire's threads with their scheduling class and realtime priority, and pw-top's batch view (each node's ERR column counts its xruns), before the tone" \
     gq audio-sched >/dev/null || true
+AW_SCHED_B=$EV_LAST
 t_cap0=$(date +%s.%N) g_cap0=$(gnow)
 ev_audio_start through-x 1100
 gq tone-start s451 1100 20 - >/dev/null || { audio_capture_stop; fail "could not start the 20 s tone for S4.5.1"; }
@@ -1428,6 +1467,7 @@ log "KVM switch simulation: remove the keyboard and bring it back"
 ev_begin S3.9.6 "The session accepts input after a keyboard cycle" T3
 ev_save pids-before "EV-PIDS: Xorg and mwm in the desktop container before the cycle" \
     gq ctr-pids Xorg,mwm >/dev/null || true
+k_pb=$EV_LAST
 x_pids_before=$(vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | paste -sd' ' || true)
 ev_video_start kvm-cycle
 
@@ -1538,6 +1578,7 @@ vm_ssh 'sudo repo/ci/vm/vm-guest.sh input-sink-check kvmok' \
 ev_pass "after the cycle, the focused xterm's shell read 'kvmok'"
 ev_save pids-after "EV-PIDS: Xorg and mwm in the desktop container after the cycle" \
     gq ctr-pids Xorg,mwm >/dev/null || true
+ev_diff pids "EV-DIFF: Xorg and mwm across the keyboard cycle" "$k_pb" "$EV_LAST" "nothing: Xorg and mwm kept their pids"
 x_pids_after=$(vm_ssh_quick 'sudo podman exec desktop pgrep -x Xorg' 2>/dev/null | paste -sd' ' || true)
 [ -n "$x_pids_before" ] && [ "$x_pids_before" = "$x_pids_after" ] \
     || fail "Xorg's pid changed across the keyboard cycle ($x_pids_before -> $x_pids_after): the session restarted rather than carried on"
@@ -1756,7 +1797,7 @@ for _ in $(seq 30); do
 done
 log "  plugged in: host=$snd_on_host container-nodes=$snd_on_nodes wireplumber-devices=$snd_on_devs"
 snd_set on "with the USB sound card plugged in"
-snd_diffs on "the card's arrival"
+snd_diffs on "the card's arrival" change "the default sink: from the built-in card's to the card's" "nothing: no stream plays"
 ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before the card was plugged in" \
     vm_ssh_quick "sudo podman logs --since '$snd_t0' desktop" >/dev/null || true
 SND_ON_PW=$SN_PW SND_ON_DEF=$SN_DEF
@@ -1775,7 +1816,7 @@ ev_copy "$ART/S4.7.1/$SND_BASE_PW" pw-devices-before "EV-STATE: pw-cli ls Device
 pwb=$EV_LAST
 ev_copy "$ART/S4.7.1/$SND_ON_PW" pw-devices-after "EV-STATE: pw-cli ls Device with the card plugged in (taken in S4.7.1)"
 pwa=$EV_LAST
-ev_diff pw-devices "EV-DIFF: pw-cli ls Device across the card's arrival" "$pwb" "$pwa"
+ev_diff pw-devices "EV-DIFF: pw-cli ls Device across the card's arrival" "$pwb" "$pwa" "only the card's Device block, new"
 new_cards=$(comm -13 <(pw_card_names "$EV_DIR/$pwb") <(pw_card_names "$EV_DIR/$pwa") | paste -sd' ')
 ev_text new-device "the new Device object, quoted whole from pw-cli ls Device: ${new_cards:-none}" \
     "$(for c in $new_cards; do pw_block "$EV_DIR/$pwa" "$c"; done)"
@@ -1806,7 +1847,7 @@ log "  unplugged: host=$snd_off_host container-nodes=$snd_off_nodes wireplumber-
 # default that is one of the sinks left before taking the picture.
 snd_wait_default
 snd_set off "after device_del hotsnd"
-snd_diffs off "the card's removal"
+snd_diffs off "the card's removal" change "the default sink: back from the card's to the built-in card's" "nothing: no stream plays"
 SND_OFF_PW=$SN_PW SND_OFF_DEF=$SN_DEF SND_OFF_SINKS=$SN_SINKS
 [ "$snd_off_host" -lt "$snd_on_host" ] \
     || fail "device_del hotsnd did not remove the card on the VM host ($snd_on_host -> $snd_off_host)"
@@ -1823,7 +1864,7 @@ ev_copy "$ART/S4.7.1/$SND_ON_PW" pw-devices-plugged "EV-STATE: pw-cli ls Device 
 pwa=$EV_LAST
 ev_copy "$ART/S4.7.4/$SND_OFF_PW" pw-devices-unplugged "EV-STATE: pw-cli ls Device after the card was unplugged (taken in S4.7.4)"
 pwo=$EV_LAST
-ev_diff pw-devices "EV-DIFF: pw-cli ls Device across the card's removal" "$pwa" "$pwo"
+ev_diff pw-devices "EV-DIFF: pw-cli ls Device across the card's removal" "$pwa" "$pwo" "only the card's Device block, gone"
 ev_copy "$ART/S4.7.1/$SND_BASE_DEF" default-sink-base "EV-STATE: pactl get-default-sink before the card was plugged in (taken in S4.7.1)"
 ev_copy "$ART/S4.7.1/$SND_ON_DEF" default-sink-plugged "EV-STATE: pactl get-default-sink with the card plugged in (taken in S4.7.1)"
 ev_copy "$ART/S4.7.4/$SND_OFF_DEF" default-sink-unplugged "EV-STATE: pactl get-default-sink after the card was unplugged (taken in S4.7.4)"
@@ -1850,7 +1891,7 @@ ev_copy "$ART/S4.7.1/$SND_BASE_PIDS" pids-before "EV-PIDS: the three audio daemo
 pb=$EV_LAST
 ev_save pids-after "EV-PIDS: the three audio daemons after the plug/unplug cycle" \
     gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
-ev_diff pids "EV-DIFF: the audio daemons across the cycle (empty: none restarted)" "$pb" "$EV_LAST"
+ev_diff pids "EV-DIFF: the audio daemons across the cycle" "$pb" "$EV_LAST" "nothing: no audio daemon restarted"
 ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before the card was plugged in" \
     vm_ssh_quick "sudo podman logs --since '$snd_t0' desktop" >/dev/null || true
 hz=$(freq_for pulse)
@@ -1899,7 +1940,7 @@ for _ in $(seq 15); do
     sleep 1
 done
 snd_set on "with the USB sound card plugged in again"
-snd_diffs on "the card's arrival"
+snd_diffs on "the card's arrival" change "the default sink: from the built-in card's to the card's" "nothing: no stream plays"
 [ -n "$usb_sink" ] || fail "no new sink appeared after the card was plugged in again ($s2_base_devs -> $s2_on_devs alsa devices)"
 [ -n "$builtin_sink" ] || fail "there was no default sink before the card was plugged in: nothing to mute"
 ev_note "the new card's sink: $usb_sink; the built-in card's: $builtin_sink"
@@ -1948,7 +1989,9 @@ gq tone-start longplay 660 15 "$usb_sink" >/dev/null || { audio_capture_stop; fa
 sleep 3
 ev_save sink-inputs-before "EV-STATE: pactl list short sink-inputs with the long stream playing on the new card" \
     gq desk pactl list short sink-inputs >/dev/null || true
+lp_ib=$EV_LAST
 ev_save sinks-before "EV-STATE: pactl list short sinks with the long stream playing" gq desk pactl list short sinks >/dev/null || true
+lp_sb=$EV_LAST
 ev_note "device_del hotsnd2 sent at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), about 3 s into the 15 s stream"
 ev_qemu device-del "EV-QEMU: device_del hotsnd2 under the playing stream, and QEMU's reply (empty: accepted)" \
     "device_del hotsnd2" >/dev/null || { audio_capture_stop; fail "QEMU refused device_del hotsnd2"; }
@@ -1972,7 +2015,11 @@ for _ in $(seq 10); do
     sleep 1
 done
 ev_save sink-inputs-after "EV-STATE: pactl list short sink-inputs after the removal" gq desk pactl list short sink-inputs >/dev/null || true
+ev_diff sink-inputs "EV-DIFF: the long stream across the card's removal" "$lp_ib" "$EV_LAST" \
+    "the long stream's sink: moved from the removed card's to a remaining one (or the stream gone, had it ended)"
 ev_save sinks-after "EV-STATE: pactl list short sinks after the removal" gq desk pactl list short sinks >/dev/null || true
+ev_diff sinks "EV-DIFF: the sinks across the card's removal" "$lp_sb" "$EV_LAST" \
+    "the removed card's sink row, gone, and the state column (IDLE, RUNNING or SUSPENDED) of the others"
 for _ in $(seq 15); do st=$(gq tone-status longplay 2>/dev/null | sed -n 1p || true); [ "${st%% *}" = exited ] && break; sleep 1; done
 ev_save player "EV-LOG-CLIENT: the long player's status (exited and its code, or running) and its stderr" gq tone-status longplay >/dev/null || true
 ev_audio_stop "EV-AUDIO: the machine's output from the stream's start, about 3 s before device_del (see notes), to its end: the tone goes on where the stream was moved to a remaining sink, and stops where the player ended - listen across the removal" 1 0.05 660 \
@@ -1980,7 +2027,7 @@ ev_audio_stop "EV-AUDIO: the machine's output from the stream's start, about 3 s
 vm_ssh_quick 'sudo podman exec desktop pkill -x paplay' >/dev/null 2>&1 || true
 pids_a=$(audio_pids)
 ev_save pids-after "EV-PIDS: the three audio daemons after the removal" gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
-ev_diff pids "EV-DIFF: the audio daemons across the removal (empty: none restarted)" "$pb" "$EV_LAST"
+ev_diff pids "EV-DIFF: the audio daemons across the removal" "$pb" "$EV_LAST" "nothing: no audio daemon restarted"
 export_ok=yes
 ev_save pactl-info "EV-STATE: pactl info from the VM host over the export, after the removal" \
     vm_ssh_quick 'sudo env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info' >/dev/null || export_ok=no
@@ -2033,7 +2080,7 @@ done
 ev_text cycles "EV-STATE: the counter table, one row per plug-in and per removal: sound nodes on the VM host, controlC* nodes in the container, WirePlumber's alsa_card Devices" "$cyc_rows"
 snd_wait_default
 snd_set final "after the fifth cycle"
-snd_diffs final "the five cycles"
+snd_diffs final "the five cycles" same "nothing: five plug and unplug cycles end where they began" "nothing: no stream plays"
 [ "$cyc_in" = yes ] || fail "a plug-in did not raise the container's controlC* nodes and WirePlumber's devices (see the counter table)"
 ev_pass "each of the five plug-ins raised the container's controlC* nodes and WirePlumber's alsa_card devices"
 [ "$cyc_out" = yes ] || fail "a removal did not bring every count back to its baseline (see the counter table)"
@@ -2073,7 +2120,7 @@ else
         sleep 1
     done
     snd_set on "with the $cap_model card plugged in"
-    snd_diffs on "the $cap_model card's arrival"
+    snd_diffs on "the $cap_model card's arrival" change "nothing: the default sink stays the built-in card's" "nothing: no stream plays"
     [ -n "$new_src" ] || fail "no alsa_input source appeared within 30 s of device_add $cap_model"
     ev_pass "the $cap_model card brought a capture source: $new_src"
     snd_keep
@@ -2107,7 +2154,7 @@ else
         sleep 1
     done
     snd_set off "after device_del hotcap"
-    snd_diffs off "the $cap_model card's removal"
+    snd_diffs off "the $cap_model card's removal" change "nothing: the default sink stays the built-in card's" "nothing: no stream plays"
     [ "$gone" = yes ] || fail "the capture source $new_src was still listed 30 s after device_del hotcap"
     ev_pass "the capture source left with the card: $new_src is gone from pactl list short sources"
     ev_end
@@ -2391,7 +2438,7 @@ ev_client_shot client-view x11-client-demo "EV-SHOT-CLIENT: the display as the d
     || fail "the demo pod could not capture the display from inside"
 ev_save pod-log "EV-LOG-CLIENT: kubectl logs x11-client-demo: its xterm's own output" gq pod-logs x11-client-demo >/dev/null || true
 ev_save pod-after "EV-PIDS: the demo pod after it was used" gq pod-state x11-client-demo >/dev/null || true
-ev_diff pod "EV-DIFF: the demo pod before and after (empty: the same container)" "$D_POD_B" "$EV_LAST"
+ev_diff pod "EV-DIFF: the demo pod before and after" "$D_POD_B" "$EV_LAST" "nothing: the same container, restartCount 0"
 pod_same "$D_POD_B" "$EV_LAST" || fail "the demo pod changed or restarted while it was used"
 ev_pass "the same container and xterm before and after, restartCount 0"
 ev_end
@@ -2451,6 +2498,7 @@ for path in pulse pipewire alsa; do
     hz=$(freq_for "$path")
     case $path in pulse) pbin=pacat ;; pipewire) pbin=pw-cat ;; alsa) pbin=aplay ;; esac
     ev_save "streams-before-$path" "EV-STATE: the streams playing before the pod's $path tone" gq stream-apps >/dev/null || true
+    sb=$EV_LAST
     ev_audio_start "cdi-$path" "$hz"
     vm_ssh "sudo repo/ci/vm/vm-guest.sh play-audio-pod $path cdi-verify 3" > "$ART/.player-$path.out" 2>&1 &
     pl=$!
@@ -2472,16 +2520,18 @@ for path in pulse pipewire alsa; do
         || fail "client pod $path audio capture is empty or silent"
     ev_copy "$ART/.player-$path.out" "player-$path" "EV-LOG-CLIENT: the pod's $path player: its command, its own output and its exit status"
     ev_save "streams-after-$path" "EV-STATE: the streams after the $path player ended" gq stream-apps >/dev/null || true
+    ev_diff "streams-$path" "EV-DIFF: the streams before the pod's $path tone and after its player ended" "$sb" "$EV_LAST" \
+        "nothing: no stream plays before the player starts or after it ends"
     [ "$pl_rc" = 0 ] || fail "client pod $path playback failed (see the player's log)"
     [ -n "$during" ] || fail "no stream of the pod's $path player was listed while it played"
     ev_pass "over $path the pod's player played: its stream was listed while it played ($(grep -E "binary \"$pbin\"" <<<"$during" | sed -n 1p)), and the machine's output carried its $hz Hz tone"
 done
 ev_save pod-after "EV-PIDS: the cdi-verify pod after the three paths played" gq pod-state cdi-verify >/dev/null || true
-ev_diff pod "EV-DIFF: the cdi-verify pod before and after (empty: the same container)" "$A_POD_B" "$EV_LAST"
+ev_diff pod "EV-DIFF: the cdi-verify pod before and after" "$A_POD_B" "$EV_LAST" "nothing: the same container, restartCount 0"
 pod_same "$A_POD_B" "$EV_LAST" || fail "the cdi-verify pod changed or restarted while it played"
 ev_save daemons-after "EV-PIDS: the desktop's three audio daemons after the pod played" \
     gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
-ev_diff daemons "EV-DIFF: the audio daemons before and after (empty: none restarted)" "$A_DMN_B" "$EV_LAST"
+ev_diff daemons "EV-DIFF: the audio daemons before and after" "$A_DMN_B" "$EV_LAST" "nothing: no audio daemon restarted"
 [ "$(ev_payload "$EV_DIR/$A_DMN_B")" = "$(ev_out)" ] || fail "an audio daemon restarted while the pod played"
 ev_pass "the same pod (restartCount 0) and the same three audio daemons before and after"
 ev_end
@@ -2511,7 +2561,7 @@ ev_end
 ev_begin S7.6.2 "A client records" T3
 ev_save pod-after "EV-PIDS: the cdi-verify pod's container and its main process's host pid, after it recorded" \
     gq pod-state cdi-verify >/dev/null || true
-ev_diff pod "EV-DIFF: the cdi-verify pod across the recording (empty: the same container, not restarted)" "$pod_before" "$EV_LAST"
+ev_diff pod "EV-DIFF: the cdi-verify pod across the recording" "$pod_before" "$EV_LAST" "nothing: the same container, not restarted"
 pb=$(ev_payload "$EV_DIR/$pod_before")
 pa=$(ev_payload "$EV_DIR/$EV_LAST")
 ev_copy "$ART/S4.6.1/$recwav" recording-660hz "EV-AUDIO-REC: what the cdi-verify pod recorded with parec from the default sink's monitor while a 660 Hz tone played (taken in S4.6.1) - listen for the beep"
@@ -2574,7 +2624,7 @@ ev_audio_check recording "$recwav" 0.5 0.02 660 \
     || fail "the lean client's recording is silent or not 660 Hz"
 ev_pass "the lean client recorded the sink's monitor with only the injected env: its recording carries the 660 Hz tone"
 ev_save pod-after "EV-PIDS: the lean client pod after it played and recorded" gq pod-state x11-testclient >/dev/null || true
-ev_diff pod "EV-DIFF: the lean client pod before and after (empty: the same container)" "$L_POD_B" "$EV_LAST"
+ev_diff pod "EV-DIFF: the lean client pod before and after" "$L_POD_B" "$EV_LAST" "nothing: the same container, restartCount 0"
 pod_same "$L_POD_B" "$EV_LAST" || fail "the lean client pod changed or restarted"
 ev_pass "the same container throughout, restartCount 0"
 ev_end
@@ -2689,9 +2739,12 @@ orientation_ok "$ss_s0" "$ss_s1" "$ss_s2" "$ss_s3" \
     || fail "the client's capture is no closer to the operator's view than a flipped version of it"
 ev_pass "the client's capture matches QEMU's screendump far better than any flipped, mirrored or rotated version (upright $ss_s0; others $ss_s1, $ss_s2, $ss_s3)"
 ev_text pod-before "EV-PIDS: the capturing pod (x11-testclient) before the captures: restart count, container id, start time and main process pid" "$ss_pod_before"
+ss_pb=$EV_LAST
 ss_pod_after=$(vm_ssh 'sudo repo/ci/vm/vm-guest.sh pod-state x11-testclient' 2>&1) \
     || fail "could not read the x11-testclient pod's state: $ss_pod_after"
 ev_text pod-after "EV-PIDS: the same pod after every capture and check" "$ss_pod_after"
+ev_diff pod "EV-DIFF: the capturing pod before and after the captures" "$ss_pb" "$EV_LAST" \
+    "nothing: the same container, not restarted"
 [ "$ss_pod_after" = "$ss_pod_before" ] \
     || fail "the capturing pod changed across the captures (see pod-before and pod-after)"
 ev_pass "the capturing pod was not restarted: same restart count, container id, start time and main process"
@@ -2769,11 +2822,13 @@ J_POD_B=$EV_LAST
 gq journey-xterm journey-1 >/dev/null || fail "could not start the pod's first xterm"
 gqw win-wait journey-1 30 >/dev/null || fail "the journey pod's first xterm never appeared"
 ev_save apps-before "EV-PIDS: the pod's applications before the kill: its first xterm" gq journey-apps >/dev/null || true
+J_APPS_B=$EV_LAST
 grep -q -- '-T journey-1' <<<"$(ev_out)" || fail "the pod's first xterm is not running before the kill"
 ev_shot first-xterm "EV-SHOT: the desktop with the journey pod's first xterm (title journey-1), before the X server is killed"
 ev_client_shot first-xterm-own journey "EV-SHOT-CLIENT: the same moment as the pod sees it: the toolkit's screenshot run in the pod" \
     || fail "the journey pod could not take its own screenshot before the kill"
 ev_save windows-before "EV-STATE: xwininfo -root -tree before the kill, journey-1 among the windows" gq win-tree >/dev/null || true
+J_WIN_B=$EV_LAST
 ev_end
 
 ev_begin S7.8.3 "Socket recreation does not invalidate client mounts" T3
@@ -2784,6 +2839,7 @@ ev_save x11-before "EV-STATE: ls -li /tmp/.X11-unix inside the journey pod befor
 K_X11_B=$EV_LAST
 ev_save x0-before "EV-STATE: /tmp/.X11-unix/X0 in the pod before the kill: its inode and change time" \
     gq journey-stat /tmp/.X11-unix/X0 >/dev/null || true
+K_X0_B=$EV_LAST
 x0_b=$(ev_out)
 ev_end
 
@@ -2798,6 +2854,7 @@ x_old=$(xorg_pid)
 [ -n "$x_old" ] || fail "no Xorg to kill"
 ev_save sched-before "EV-STATE: PipeWire's threads with their scheduling class and realtime priority, and pw-top's batch view (each node's ERR column counts its xruns), before the tone" \
     gq audio-sched >/dev/null || true
+AW_SCHED_B=$EV_LAST
 ev_video_start x-restart
 t_cap0=$(date +%s.%N) g_cap0=$(gnow)
 ev_audio_start through-restart 1100
@@ -2805,8 +2862,10 @@ gq journey-tone through 1100 20 >/dev/null || { audio_capture_stop; fail "could 
 sleep 3
 ev_save streams-before "EV-STATE: pactl list short sink-inputs and source-outputs over the export while the pod plays, before the kill" \
     gq streams >/dev/null || true
+T_STR_B=$EV_LAST
 si_b=$(sink_inputs "$(ev_out)")
 ev_save player-before "EV-PIDS: the pod's applications before the kill: its player" gq journey-apps >/dev/null || true
+T_PLAY_B=$EV_LAST
 pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 sleep 2
 t_kill=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x Xorg' 2>/dev/null | sed -n 1p || true)
@@ -2818,8 +2877,12 @@ x_wait "$x_old" || { audio_capture_stop; fail "no new X session within 60 s of t
 ev_note "a new X session (Xorg $(xorg_pid)) answered at $(gnow)"
 ev_save streams-after "EV-STATE: the sink-inputs and source-outputs once the X session is back, the tone still playing" \
     gq streams >/dev/null || true
+ev_diff streams "EV-DIFF: the streams across the X restart" "$T_STR_B" "$EV_LAST" \
+    "nothing: the pod's stream keeps its sink-input through the X restart"
 si_a=$(sink_inputs "$(ev_out)")
 ev_save player-after "EV-PIDS: the pod's applications once the X session is back: its player" gq journey-apps >/dev/null || true
+ev_diff player "EV-DIFF: the pod's applications across the X restart" "$T_PLAY_B" "$EV_LAST" \
+    "journey-1's row, gone with the X server it lost; the player's row must not"
 pl_a=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 tone_wait through || ev_note "the pod's tone had not ended 40 s after the session came back"
 ev_save player "EV-LOG-CLIENT: the pod's player (paplay): its exit status, how long it played and from when to when, its pid, its output" \
@@ -2836,11 +2899,12 @@ ev_video_stop "EV-VIDEO: the display going down and coming back while the pod's 
 T_VID=$EV_VID
 ev_save pod-after "EV-PIDS: the journey pod's container after the X session came back" gq pod-state journey >/dev/null || true
 T_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across the X restart (no differences: the same container, not restarted)" "$T_POD_B" "$T_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across the X restart" "$T_POD_B" "$T_POD_A" "nothing: the same container, not restarted"
 ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the X session came back" \
     gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
 aud_a=$(pids_of "$(ev_out)" pipewire wireplumber pipewire-pulse)
-ev_diff daemons "EV-DIFF: the daemons across the X restart (Xorg and mwm new, the audio daemons not)" "$T_D_B" "$EV_LAST"
+ev_diff daemons "EV-DIFF: the daemons across the X restart" "$T_D_B" "$EV_LAST" \
+    "the Xorg and mwm rows (a new session: new pids and start times); the audio daemons' rows must not"
 grep -q '^exited 0$' <<<"$player" || fail "the pod's player did not end cleanly: $(echo $player)"
 played=$(awk '/^played/ {print $2}' <<<"$player")
 python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 21.0 else 1)' "${played:-99}" \
@@ -2864,11 +2928,13 @@ ev_end
 ev_begin S7.5.5 "After an X session restart, a client container reconnects without being recreated" T3
 ev_copy "$ART/S7.6.3/$T_POD_A" pod-after "EV-PIDS: the journey pod's container after the X session came back (taken in S7.6.3)"
 J_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across the X restart (no differences: the same container, not restarted)" "$J_POD_B" "$J_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across the X restart" "$J_POD_B" "$J_POD_A" "nothing: the same container, not restarted"
 ev_save xterm1-log "EV-LOG-CLIENT: the pod's first xterm's own output: it lost its X server with the kill (expected)" \
     gq jx cat /tmp/journey-1.log >/dev/null || true
 x1_said=$(ev_out | said)
 ev_save apps-after "EV-PIDS: the pod's applications after the X session came back" gq journey-apps >/dev/null || true
+ev_diff apps "EV-DIFF: the pod's applications across the X restart" "$J_APPS_B" "$EV_LAST" \
+    "journey-1's row, gone with the X server it lost (the listing may then find none: kubectl's 'command terminated with exit code 1' is pgrep finding nothing)"
 x1_left=$(grep -- '-T journey-1' <<<"$(ev_out)" || true)
 gq journey-xterm journey-2 >/dev/null || fail "could not start the pod's second xterm"
 gqw win-wait journey-2 30 >/dev/null || fail "the pod's second xterm never appeared on the new X server"
@@ -2876,6 +2942,8 @@ ev_shot second-xterm "EV-SHOT: the desktop after the X restart, with the journey
 ev_client_shot second-xterm-own journey "EV-SHOT-CLIENT: the same moment as the pod sees it, through the new X server" \
     || fail "the journey pod could not take its own screenshot of the new X server"
 ev_save windows-after "EV-STATE: xwininfo -root -tree after the restart: journey-2 among the windows, journey-1 gone" gq win-tree >/dev/null || true
+ev_diff windows "EV-DIFF: the window tree across the X restart" "$J_WIN_B" "$EV_LAST" \
+    "every window: the new X server gave each its own id, journey-1 is gone and journey-2 is where it was (+640+420), the children counted again"
 ev_copy "$ART/S7.6.3/$T_VID.gif" x-restart "EV-VIDEO: the display going down and coming back across the kill (S7.6.3's recording; its frames are in S7.6.3)"
 [ -z "$x1_left" ] || fail "the pod's first xterm is still running after its X server died: $x1_left"
 ev_pass "the pod's first xterm ended with its X server${x1_said:+, saying: $x1_said}"
@@ -2887,12 +2955,15 @@ ev_end
 ev_begin S7.8.3 "Socket recreation does not invalidate client mounts" T3
 ev_copy "$ART/S7.6.3/$T_POD_A" pod-after-x "EV-PIDS: the journey pod's container after the X session came back (taken in S7.6.3)"
 K_POD_AX=$EV_LAST
-ev_diff pod-x "EV-DIFF: the journey pod across the X restart (no differences: the same container)" "$K_POD_BX" "$K_POD_AX"
+ev_diff pod-x "EV-DIFF: the journey pod across the X restart" "$K_POD_BX" "$K_POD_AX" "nothing: the same container"
 ev_save x11-after "EV-STATE: ls -li /tmp/.X11-unix inside the journey pod after the X session came back" \
     gq jx ls -li /tmp/.X11-unix >/dev/null || true
-ev_diff x11 "EV-DIFF: /tmp/.X11-unix in the pod across the X restart" "$K_X11_B" "$EV_LAST"
+ev_diff x11 "EV-DIFF: /tmp/.X11-unix in the pod across the X restart" "$K_X11_B" "$EV_LAST" \
+    "X0's line: its time, or its inode too (the restarted X server made the socket again, and the filesystem can hand it the old inode number)"
 ev_save x0-after "EV-STATE: /tmp/.X11-unix/X0 in the pod after the X session came back: its inode and change time" \
     gq journey-stat /tmp/.X11-unix/X0 >/dev/null || true
+ev_diff x0 "EV-DIFF: X0 in the pod across the X restart" "$K_X0_B" "$EV_LAST" \
+    "its change time, or its inode too (the restarted X server made the socket again, and the filesystem can hand it the old inode number)"
 x0_a=$(ev_out)
 ev_save xdpyinfo "EV-STATE: xdpyinfo from the journey pod through its /tmp/.X11-unix mount, after the X restart" \
     gq jx xdpyinfo >/dev/null || fail "xdpyinfo from the pod failed after the X restart"
@@ -2916,6 +2987,7 @@ ev_save audio-before "EV-STATE: ls -li /run/desktop-audio inside the journey pod
 K_AUD_B=$EV_LAST
 ev_save pulse-before "EV-STATE: /run/desktop-audio/pulse in the pod before the kill: its inode and change time" \
     gq journey-stat /run/desktop-audio/pulse >/dev/null || true
+K_PULSE_B=$EV_LAST
 pu_b=$(ev_out)
 ev_end
 
@@ -2932,8 +3004,10 @@ gq journey-tone doomed 880 20 >/dev/null || { audio_capture_stop; fail "could no
 sleep 3
 ev_save streams-before "EV-STATE: pactl list short sink-inputs and source-outputs while the pod plays, before the kill" \
     gq streams >/dev/null || true
+S_STR_B=$EV_LAST
 [ -n "$(sink_inputs "$(ev_out)")" ] || { audio_capture_stop; fail "no sink-input for the pod's player before the kill"; }
 ev_save player-before "EV-PIDS: the pod's applications before the kill: its player" gq journey-apps >/dev/null || true
+T_PLAY_B=$EV_LAST
 sleep 1
 t_kill_a=$(vm_ssh_quick 'date +%s.%N; sudo podman exec -u desktop desktop pkill -u desktop -x pipewire' 2>/dev/null | sed -n 1p || true)
 ev_note "pipewire (pid $pw_old) killed at $t_kill_a, about 4 s into the pod's 20 s tone"
@@ -2969,15 +3043,18 @@ done
 ev_note "a new pipewire (pid ${pw_new:-none}), the pod's pactl info answering: $ok, at $(gnow)"
 [ "$ok" = yes ] || fail "within 60 s of the kill there was no new pipewire the pod could reach"
 ev_save daemons-after "EV-PIDS: the three audio daemons after the recovery" gq ctr-pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
-ev_diff daemons "EV-DIFF: the audio daemons across the kill (the stack restarted)" "$S_D_B" "$EV_LAST"
+ev_diff daemons "EV-DIFF: the audio daemons across the kill" "$S_D_B" "$EV_LAST" \
+    "all three audio daemons' rows (new pids and start times: the stack restarted)"
 ev_save pactl-info "EV-STATE: pactl info from the journey pod after the recovery" gq jx pactl info >/dev/null || true
 ev_audio_start after-recovery 770
 gq journey-tone recovered 770 4 >/dev/null || { audio_capture_stop; fail "could not start the pod's tone after the recovery"; }
 sleep 2
 ev_save streams-after "EV-STATE: the sink-inputs and source-outputs while the pod plays again after the recovery" gq streams >/dev/null || true
+ev_diff streams "EV-DIFF: the streams across the audio restart" "$S_STR_B" "$EV_LAST" \
+    "the pod's stream: a new sink-input and client (its next player, after the stack restarted), on the same sink"
 si_n=$(sink_inputs "$(ev_out)")
 tone_wait recovered || true
-ev_save player-after "EV-LOG-CLIENT: the pod's next player after the recovery: its exit status, times, pid and output" \
+ev_save next-player "EV-LOG-CLIENT: the pod's next player after the recovery: its exit status, times, pid and output" \
     gq journey-tone-status recovered >/dev/null || true
 player2=$(ev_out)
 ev_audio_stop "EV-AUDIO (after): the machine's output while the journey pod played 770 Hz after PipeWire came back: one 4 s beep" 2 0.05 770 \
@@ -2987,7 +3064,7 @@ grep -q '^exited 0$' <<<"$player2" || fail "the pod's player after the recovery 
 ev_pass "after the recovery the same pod's next player was heard at 770 Hz and exited 0 (sink-input $si_n)"
 ev_save pod-after "EV-PIDS: the journey pod's container after the recovery" gq pod-state journey >/dev/null || true
 S_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across the audio restart (no differences: the same container)" "$S_POD_B" "$S_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across the audio restart" "$S_POD_B" "$S_POD_A" "nothing: the same container"
 pod_same "$S_POD_B" "$S_POD_A" || fail "the journey pod's container changed across the audio restart"
 ev_pass "the pod is the same container, restartCount 0: it recovered without being recreated"
 ev_end
@@ -2995,12 +3072,15 @@ ev_end
 ev_begin S7.8.3 "Socket recreation does not invalidate client mounts" T3
 ev_copy "$ART/S7.6.4/$S_POD_A" pod-after-audio "EV-PIDS: the journey pod's container after PipeWire came back (taken in S7.6.4)"
 K_POD_AA=$EV_LAST
-ev_diff pod-audio "EV-DIFF: the journey pod across the audio restart (no differences: the same container)" "$K_POD_BA" "$K_POD_AA"
+ev_diff pod-audio "EV-DIFF: the journey pod across the audio restart" "$K_POD_BA" "$K_POD_AA" "nothing: the same container"
 ev_save audio-after "EV-STATE: ls -li /run/desktop-audio inside the journey pod after PipeWire came back" \
     gq jx ls -li /run/desktop-audio >/dev/null || true
-ev_diff audio "EV-DIFF: /run/desktop-audio in the pod across the audio restart" "$K_AUD_B" "$EV_LAST"
+ev_diff audio "EV-DIFF: /run/desktop-audio in the pod across the audio restart" "$K_AUD_B" "$EV_LAST" \
+    "the three entries (pipewire-0, its lock, pulse): new inodes and times, made again by the restarted stack"
 ev_save pulse-after "EV-STATE: /run/desktop-audio/pulse in the pod after the recovery: its inode and change time" \
     gq journey-stat /run/desktop-audio/pulse >/dev/null || true
+ev_diff pulse "EV-DIFF: the pulse socket in the pod across the audio restart" "$K_PULSE_B" "$EV_LAST" \
+    "its inode and change time: a new socket, made by the restarted stack"
 pu_a=$(ev_out)
 ev_save pactl-info "EV-STATE: pactl info from the journey pod through its /run/desktop-audio mount, after the audio restart" \
     gq jx pactl info >/dev/null || fail "pactl info from the pod failed after the audio restart"
@@ -3032,11 +3112,13 @@ gq journey-held-start >/dev/null || fail "could not start the held screenshot"
 sleep 2
 ev_save held-before "EV-PIDS: the held screenshot before the restart: alive, the executable it runs and that file's inode, beside the toolkit file's own inode" \
     gq journey-held-state >/dev/null || true
+R_HELD_B=$EV_LAST
 held_b=$(ev_out)
 grep -q '^alive yes' <<<"$held_b" || fail "the held screenshot is not running before the restart: $(echo $held_b)"
 gq journey-loop-start >/dev/null || fail "could not start the screenshot loop"
 sleep 2
 ev_save loop-before "EV-PIDS: the screenshot loop's shell in the pod before the restart" gq jx pgrep -f shot-loop.sh >/dev/null || true
+R_LOOP_B=$EV_LAST
 loop_b=$(ev_out | sed -n 1p)
 ev_end
 
@@ -3052,6 +3134,7 @@ gq journey-tone cutoff 550 30 >/dev/null || fail "could not start the pod's 30 s
 sleep 3
 ev_save apps-before "EV-PIDS: the pod's applications before the restart: xterms, the player, the screenshot loop and the held screenshot" \
     gq journey-apps >/dev/null || true
+D_APPS_B=$EV_LAST
 apps_b=$(ev_out)
 grep -q -- '-T journey-3' <<<"$apps_b" && grep -q paplay <<<"$apps_b" \
     || fail "the pod's xterm and player are not both running before the restart: $(echo $apps_b)"
@@ -3073,8 +3156,11 @@ ev_end
 ev_begin S7.8.2 "Toolkit republish under a running client is harmless" T3
 ev_save held-after "EV-PIDS: the held screenshot after the restart: still alive, its executable the replaced file, (deleted), with the old inode, while the toolkit file has a new one" \
     gq journey-held-state >/dev/null || true
+ev_diff held "EV-DIFF: the held screenshot across the restart" "$R_HELD_B" "$EV_LAST" \
+    "its executable, now '(deleted)', and the toolkit file's inode, new (the republish replaced the file); the held process itself must not"
 held_a=$(ev_out)
 ev_save loop-after "EV-PIDS: the screenshot loop's shell after the restart" gq jx pgrep -f shot-loop.sh >/dev/null || true
+ev_diff loop "EV-DIFF: the screenshot loop's shell across the restart" "$R_LOOP_B" "$EV_LAST" "nothing: the loop runs on as one process"
 loop_a=$(ev_out | sed -n 1p)
 gq journey-loop-stop >/dev/null || true
 ev_save loop-log "EV-LOG-CLIENT: the screenshot loop's log across the restart: guest time, try, exit status, the tool's output" \
@@ -3084,13 +3170,14 @@ ev_save held-release "EV-LOG-CLIENT: the held screenshot, released after the res
     gqw journey-held-release >/dev/null || true
 rel=$(ev_out)
 ev_save tools-after "EV-STATE: ls -li \$DESKTOP_TOOLS_BIN inside the journey pod after the restart" gq journey-tools-ls >/dev/null || true
-ev_diff tools "EV-DIFF: the toolkit in the pod across the restart (each republished file has a new inode)" "$R_TOOLS_B" "$EV_LAST"
+ev_diff tools "EV-DIFF: the toolkit in the pod across the restart" "$R_TOOLS_B" "$EV_LAST" \
+    "each republished file's line: a new inode and time (replaced by rename); its size stays"
 ev_save desktop-log "EV-LOG-DESKTOP: the restarted desktop container's publish lines (podman logs desktop)" \
     gq desktop-publish-log >/dev/null || true
 dlog=$(ev_out)
 ev_save pod-after "EV-PIDS: the journey pod's container after the restart" gq pod-state journey >/dev/null || true
 R_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across the restart (no differences: the same container)" "$R_POD_B" "$R_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across the restart" "$R_POD_B" "$R_POD_A" "nothing: the same container"
 grep -q 'published screenshot' <<<"$dlog" || fail "the restarted desktop did not log 'published screenshot'"
 ! grep -qE 'Text file busy|ETXTBSY|publish-tools failed' <<<"$dlog" \
     || fail "the republish hit an error: $(grep -m2 -E 'Text file busy|ETXTBSY|publish-tools failed' <<<"$dlog")"
@@ -3120,10 +3207,11 @@ ev_end
 ev_begin S7.8.1 "A desktop.service restart does not recreate client pods" T3
 ev_copy "$ART/S7.8.2/$R_POD_A" pod-after "EV-PIDS: the journey pod's container after the restart (taken in S7.8.2)"
 D_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across the restart (no differences: the same container)" "$D_POD_B" "$D_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across the restart" "$D_POD_B" "$D_POD_A" "nothing: the same container"
 ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the restart" \
     gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
-ev_diff daemons "EV-DIFF: the desktop's daemons across the restart (all new)" "$D_D_B" "$EV_LAST"
+ev_diff daemons "EV-DIFF: the desktop's daemons across the restart" "$D_D_B" "$EV_LAST" \
+    "every row: Xorg, mwm and the three audio daemons all new (the container restarted)"
 ev_save xterm3-log "EV-LOG-CLIENT: the pod's xterm journey-3: what it said when the restart took its X server (expected)" \
     gq jx cat /tmp/journey-3.log >/dev/null || true
 x3_said=$(ev_out | said)
@@ -3131,6 +3219,8 @@ ev_save player-cut "EV-LOG-CLIENT: the pod's 30 s player that the restart cut of
     gq journey-tone-status cutoff >/dev/null || true
 cut=$(ev_out)
 ev_save apps-after "EV-PIDS: the pod's applications after the restart" gq journey-apps >/dev/null || true
+ev_diff apps "EV-DIFF: the pod's applications across the restart" "$D_APPS_B" "$EV_LAST" \
+    "the rows of the X clients and the player that the restart ended; the listing may then find none (kubectl's 'command terminated with exit code 1' is pgrep finding nothing)"
 apps_a=$(ev_out)
 gq journey-xterm journey-4 >/dev/null || fail "could not start the pod's xterm journey-4"
 gqw win-wait journey-4 30 >/dev/null || fail "the pod's new xterm never appeared after the restart"
@@ -3202,7 +3292,7 @@ ev_audio_stop "EV-AUDIO: the machine's output from before desktop.service starte
     || fail "the early pod's tone was not heard once the audio stack was up"
 ev_save pod-after "EV-PIDS: the early pod's container once the desktop was up" gq pod-state early >/dev/null || true
 F_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the early pod across the desktop's start (no differences: the same container)" "$F_POD_B" "$F_POD_A"
+ev_diff pod "EV-DIFF: the early pod across the desktop's start" "$F_POD_B" "$F_POD_A" "nothing: the same container"
 a_fail=$(grep -c 'paplay exited' <<<"$at" || true)
 [ "$done_rc" = 0 ] && grep -q 'paplay played the tone' <<<"$at" \
     || fail "the early pod's player never played its tone: rc '${done_rc:-none}'"
@@ -3230,7 +3320,7 @@ ev_save x-tries "EV-LOG-CLIENT: the early pod's xterm tries: the failures while 
 xt=$(ev_out)
 ev_copy "$ART/S7.6.5/$F_POD_A" pod-after "EV-PIDS: the early pod's container once the desktop was up (taken in S7.6.5)"
 E_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the early pod across the desktop's start (no differences: the same container)" "$E_POD_B" "$E_POD_A"
+ev_diff pod "EV-DIFF: the early pod across the desktop's start" "$E_POD_B" "$E_POD_A" "nothing: the same container"
 x_fail=$(grep -c 'xterm exited' <<<"$xt" || true)
 last=$(grep 'try [0-9]*: xterm' <<<"$xt" | tail -1)
 [ "${x_fail:-0}" -ge 1 ] || fail "the early pod's xterm never had to retry: the desktop was not down when it started"
@@ -3299,7 +3389,8 @@ ev_save sinks-on "EV-STATE: pactl list short sinks with the USB card plugged in 
 ev_save player-on "EV-PIDS: the pod's applications with its stream on the USB card" gq journey-apps >/dev/null || true
 u_pl_on=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 snd_set on "with the USB card plugged in and the default, the pod's tone playing on it"
-snd_diffs on "the USB card's arrival"
+snd_diffs on "the USB card's arrival" change "the default sink: from the built-in card's to the USB card's" \
+    "the pod's stream, started after the 'base' set, playing on the USB card's sink"
 tone_wait usb774 journey 30 || ev_note "the pod's tone had not ended 30 s after the card arrived"
 ev_save player "EV-LOG-CLIENT: the pod's player (paplay): its exit status, how long it played and from when to when, its pid, its output" \
     gq journey-tone-status usb774 >/dev/null || true
@@ -3312,11 +3403,11 @@ ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played a 20 
 ev_video_stop "EV-VIDEO: the display while the USB card arrives under the pod's tone (index.txt and the notes give the times)"
 ev_save pod-after "EV-PIDS: the journey pod's container after the USB card arrived" gq pod-state journey >/dev/null || true
 U_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across the card's arrival (no differences: the same container, not restarted)" "$U_POD_B" "$U_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across the card's arrival" "$U_POD_B" "$U_POD_A" "nothing: the same container, not restarted"
 ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the USB card arrived" \
     gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
 u_dmn_a=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
-ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the card's arrival (no differences: none restarted)" "$U_D_B" "$EV_LAST"
+ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the card's arrival" "$U_D_B" "$EV_LAST" "nothing: none restarted"
 [ "$u_on" = yes ] || fail "the pod's stream (sink-input $u_si) never sat on the USB card's sink $u_sink"
 ev_pass "with the USB card the default, the pod's existing stream, sink-input $u_si, moved onto its sink $u_sink"
 grep -q '^exited 0$' <<<"$u_player" || fail "the pod's player did not end cleanly: $(echo $u_player)"
@@ -3368,7 +3459,7 @@ ev_audio_stop "EV-AUDIO: the machine's output while the pod's new player played 
 gq desk pactl set-sink-mute "$u_builtin" 0 >/dev/null || true
 ev_save pod-after "EV-PIDS: the journey pod's container after its new player ended" gq pod-state journey >/dev/null || true
 W_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across its new player (no differences: the same container)" "$W_POD_B" "$W_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across its new player" "$W_POD_B" "$W_POD_A" "nothing: the same container"
 grep -q '^exited 0$' <<<"$w_player" || fail "the pod's player for $u_sink did not end cleanly: $(echo $w_player)"
 [ -n "$w_on" ] || fail "no stream sat on the USB card's sink while the player that named it played"
 ev_pass "the new player, PULSE_SINK=$u_sink paplay (pid $(awk '/^pid / {print $2}' <<<"$w_player")), played to the USB card by name: its sink-input $w_on sat on that sink (index $w_idx), and it exited 0"
@@ -3393,11 +3484,13 @@ ev_audio_start removal 880
 gq journey-tone usb775 880 20 >/dev/null || { audio_capture_stop; fail "could not start the pod's 20 s tone"; }
 sleep 4
 ev_save streams-before "EV-STATE: the streams with the pod's tone playing, before the USB card is removed" gq streams >/dev/null || true
+V_STR_B=$EV_LAST
 v_ls=$(ev_out)
 v_si=$(sink_inputs "$v_ls")
 v_on_usb=no
 [ -n "$v_si" ] && [ "$(si_sink "$v_ls" "$v_si")" = "$(sink_idx "$u_sink")" ] && v_on_usb=yes
 ev_save sinks-before "EV-STATE: pactl list short sinks before the removal (index, then name)" gq desk pactl list short sinks >/dev/null || true
+V_SINKS_B=$EV_LAST
 ev_save player-before "EV-PIDS: the pod's applications before the removal: its player" gq journey-apps >/dev/null || true
 v_pl_b=$(awk '$2 == "paplay" {print $1; exit}' <<<"$(ev_out)")
 t_unplug=$(gnow)
@@ -3417,9 +3510,14 @@ for _ in $(seq 10); do
 done
 ev_note "the pod's stream after the removal: ${v_out:-neither moved nor ended within 10 s}, at $(gnow)"
 ev_save streams-after "EV-STATE: the streams after the removal" gq streams >/dev/null || true
+ev_diff streams "EV-DIFF: the streams across the USB card's removal" "$V_STR_B" "$EV_LAST" \
+    "the pod's stream: moved from the USB card's sink to the built-in card's"
 ev_save sinks-after "EV-STATE: pactl list short sinks after the removal" gq desk pactl list short sinks >/dev/null || true
+ev_diff sinks "EV-DIFF: the sinks across the USB card's removal" "$V_SINKS_B" "$EV_LAST" \
+    "the USB card's sink row, gone, and the built-in card's state (RUNNING: the stream moved onto it)"
 snd_set off "after the USB card's removal"
-snd_diffs off "the USB card's removal"
+snd_diffs off "the USB card's removal" change "the default sink: back from the USB card's to the built-in card's" \
+    "the pod's stream, started after the 'plugged' set, playing on the built-in card's sink, where it moved when the card left"
 tone_wait usb775 journey 30 || ev_note "the pod's tone had not ended 30 s after the removal"
 ev_save player "EV-LOG-CLIENT: the pod's player (paplay): its exit status, how long it played and from when to when, its pid, its output" \
     gq journey-tone-status usb775 >/dev/null || true
@@ -3449,11 +3547,11 @@ ev_audio_stop "EV-AUDIO: the machine's output while the same pod played its next
     || v_next_heard=no
 ev_save pod-after "EV-PIDS: the journey pod's container after the USB card's removal and its next tone" gq pod-state journey >/dev/null || true
 V_POD_A=$EV_LAST
-ev_diff pod "EV-DIFF: the journey pod across the card's removal (no differences: the same container, not restarted)" "$V_POD_B" "$V_POD_A"
+ev_diff pod "EV-DIFF: the journey pod across the card's removal" "$V_POD_B" "$V_POD_A" "nothing: the same container, not restarted"
 ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the removal" \
     gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
 v_dmn_a=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
-ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the removal (no differences: none restarted)" "$V_D_B" "$EV_LAST"
+ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the removal" "$V_D_B" "$EV_LAST" "nothing: none restarted"
 [ "$v_on_usb" = yes ] || fail "the pod's stream (sink-input ${v_si:-?}) was not on the USB card's sink before the removal"
 ev_pass "before the removal the pod's stream, sink-input $v_si, played on the USB card's sink $u_sink"
 [ -n "$v_out" ] || fail "10 s after the removal the pod's stream had neither moved to the built-in card nor ended"
@@ -3508,7 +3606,7 @@ else
         sleep 1
     done
     snd_set on "with the $cap_model card plugged in"
-    snd_diffs on "the $cap_model card's arrival"
+    snd_diffs on "the $cap_model card's arrival" change "nothing: the default sink stays the built-in card's" "nothing: no stream plays"
     [ -n "$r_src" ] || fail "no alsa_input source appeared within 30 s of device_add $cap_model"
     ev_pass "the $cap_model card brought a capture source: $r_src"
     rec=$(ev_save recorder "EV-LOG-CLIENT: parecord from $r_src for 3 s, a new process in the journey pod (SIGINT ends it, so the WAV is finished): its command, its output, its exit status and the file" \
@@ -3529,15 +3627,15 @@ else
         sleep 1
     done
     snd_set off "after device_del s777cap"
-    snd_diffs off "the $cap_model card's removal"
+    snd_diffs off "the $cap_model card's removal" change "nothing: the default sink stays the built-in card's" "nothing: no stream plays"
     ev_video_stop "EV-VIDEO: the display while the capture card arrives and leaves, the journey pod recording from it (index.txt and the notes give the times)"
     ev_save pod-after "EV-PIDS: the journey pod's container after it recorded from the card and the card left" gq pod-state journey >/dev/null || true
     R_POD_A=$EV_LAST
-    ev_diff pod "EV-DIFF: the journey pod across the capture card's arrival and removal (no differences: the same container)" "$R_POD_B" "$R_POD_A"
+    ev_diff pod "EV-DIFF: the journey pod across the capture card's arrival and removal" "$R_POD_B" "$R_POD_A" "nothing: the same container"
     ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the capture card left" \
         gq ctr-pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
     r_dmn_a=$(pids_of "$(ev_out)" Xorg mwm pipewire wireplumber pipewire-pulse)
-    ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the capture card's arrival and removal (no differences)" "$R_D_B" "$EV_LAST"
+    ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons across the capture card's arrival and removal" "$R_D_B" "$EV_LAST" "nothing: none restarted"
     grep -q '^parecord exited 0$' <<<"$rec" || fail "the pod's parecord from $r_src did not exit 0: $(grep '^parecord exited' <<<"$rec")"
     ev_pass "the pod, running since before the card arrived, opened $r_src with parecord, which exited 0"
     [ "$rfacts_ok" = yes ] || fail "the pod's recording from $r_src holds less than 2 s of its 3: $rfacts"

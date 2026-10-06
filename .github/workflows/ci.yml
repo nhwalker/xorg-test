@@ -98,7 +98,8 @@ jobs:
           ev_text found "EV-STATE: every shell script git tracks under image/ and deploy/host/usr/local/, found by its #! line (script-list.py found)" "$found"
           a=$EV_LAST
           ev_text listed "EV-STATE: the scripts the shellcheck step names under image/ and deploy/host/usr/local/, its globs expanded (script-list.py listed)" "$listed"
-          ev_diff lists "EV-DIFF: the scripts found against the scripts the shellcheck step names (empty: every shipped script is shellchecked)" "$a" "$EV_LAST"
+          ev_diff lists "EV-DIFF: the scripts found against the scripts the shellcheck step names" "$a" "$EV_LAST" \
+            "nothing: every shipped script is shellchecked"
           if python3 ci/script-list.py check; then
             ev_pass "the shellcheck step names every one of the $(grep -c . <<<"$found") shipped shell scripts, and nothing else there"
           else
@@ -263,6 +264,10 @@ jobs:
             "every block, paragraph or entry the harness reads with ci/doc-blocks.py is in the document; no fenced block of README.md, deploy/README.md or deploy/HOST-REQUIRES.md is typed into ci/'s shell or Python or the workflows unless an ALLOW entry pins its digest and the lines typed; in a story that runs what a document gives, every recorded step is the document's or named harness-only, and each substitution is named a placeholder"
           rule S9.3.1 "Every story emits its named evidence on pass and on fail" \
             "every story the harness begins is one Requirements.md defines, and the evidence check fails each of five incomplete story directories and passes a complete one"
+          rule S9.3.2 "Before/after pairs are diffed, not eyeballed" \
+            "every diff the harness writes (ev_diff, ev_diff_paths, Ctx.diff and the like) says which lines are expected to differ, and the gate's pair check fails each of four planted story directories (a pair with no diff, a diff that states no expectation, one expected to differ in nothing that differs, one that names neither file) and passes a pair diffed with its expectation"
+          rule S9.3.3 "\"No restart\" is measured" \
+            "every check in the harness that can pass saying a container or process lived through an event is in a story that diffs two states, and the gate's survival check fails each of two planted claims left unmeasured (nothing kept; only a pid kept for a container) and passes five (a container's id and restart count, a process's pid, a pair a diff compares, a check that something did not survive, a failing check)"
           ev_failures
           exit "$f"
       - name: helm lint + template assertions (and S7.3.3's static half)
