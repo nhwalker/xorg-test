@@ -30,6 +30,7 @@ next story runs, so one red run shows every operator regression at once. The
 exit status is non-zero if any story failed.
 """
 import argparse
+import codecs
 import contextlib
 import difflib
 import json
@@ -3108,6 +3109,69 @@ def sound_persistence(ctx, st):
     st.record(f"after the desktop restarted: default output {d2}, its volume '{v2}'")
 
 
+def window_text(ctx, wid, label):
+    """The text an xterm shows: dragged over from its first row to its last,
+    which xterm copies into CUT_BUFFER0 as well as PRIMARY, read back with
+    the observer's xprop (S11.2.1 reads the same buffer)."""
+    info = ctx.one(wid)
+    base, inc = info.base or (19, 4), info.inc or (6, 13)
+    ctx.drag(info.ax + base[0] - 1, info.ay + 2 + inc[1] // 2, info.ax + info.w - 3, info.ay + info.h - 3)
+    out = ctx.g.xprobe("xprop -root CUT_BUFFER0 2>&1; true", label=label)
+    m = re.search(r'= "(.*)"\s*$', out, re.S)
+    return codecs.decode(m.group(1), "unicode_escape") if m else ""
+
+
+def s5_7_8(ctx, st):
+    """The Host Terminal entry's failure path, as the operator meets it (S5.7.8's
+    T3 half, S3.6.4's failure path). The host's trust entry for desktop-shell
+    is moved aside, so the key the container holds is refused: the wrapper
+    keeps the window open with the reason, the enablement command, the common
+    causes and "Press Enter to close", and Enter closes it."""
+    ak = "/etc/ssh/authorized_keys.d/desktop-shell"
+    aside = "/etc/ssh/authorized_keys.d/.ev-desktop-shell"
+    ctx.save_cmd("sshd-auth", "sshd -T 2>/dev/null | grep -iE '^(passwordauthentication|kbdinteractiveauthentication|"
+                 "pubkeyauthentication|authenticationmethods|authorizedkeysfile) '",
+                 "EV-STATE: the host sshd's effective authentication settings (sshd -T)", label="sshd -T")
+    epoch = ctx.g.sh("date +%s", label="the host's clock").strip()
+    ctx.g.sh(f"mv {ak} {aside}", label="move the host's trust entry for desktop-shell aside")
+    st.record(f"the host's trust entry {ak} moved aside: the key the container holds is refused")
+    win = None
+    try:
+        xs, _ = ctx.root_menu("Host Terminal", "host-terminal-fails")
+        found = ctx.new_xterm(xs)
+        st.check(found, "'Host Terminal' opened an xterm")
+        xs, t = found
+        win = t.id
+        text = wait_until(lambda: (lambda x: x if "Press Enter to close" in x else None)(
+            window_text(ctx, win, "observer: the Host Terminal window's text, through CUT_BUFFER0")), 20, 1)
+        text = text or window_text(ctx, win, "observer: the Host Terminal window's text, once more")
+        ctx.shot("host-terminal-fails", "the Host Terminal window after ssh host was refused: the reason, the "
+                 "enablement command, the common causes and 'Press Enter to close', the window still open")
+        ctx.save_state("window-text", text + "\n", "EV-STATE: the Host Terminal window's text, selected and "
+                       "read back through CUT_BUFFER0")
+        st.check("host-terminal: ssh to the host failed (exit 255)." in text,
+                 "the window says ssh to the host failed, with ssh's exit code (255)", text[-300:])
+        st.check("systemctl start desktop-host-shell.service" in text,
+                 "it gives the enablement command: systemctl start desktop-host-shell.service")
+        st.check("Other common causes:" in text, "it lists the other common causes")
+        st.check(text.rstrip().endswith("Press Enter to close."), "it ends 'Press Enter to close.', waiting")
+        time.sleep(3)
+        xs = ctx.xstate()
+        st.check(xs.by_id(win) is not None and xs.mapped(xs.frame_of(xs.by_id(win))),
+                 "the window is still open seconds after ssh failed")
+        ctx.click(*xs.parts(xs.by_id(win))["drag"])
+        ctx.chord("ret")
+        st.check(ctx.wait_gone(win), "Enter closes it")
+        win = None
+        ctx.save_cmd("sshd-journal", f"journalctl -u sshd --since @{epoch} -o short-precise --no-pager | "
+                     "grep -i desktop-shell || echo '(no line naming desktop-shell)'",
+                     "EV-LOG-JOURNAL: sshd on the refused login", label="sshd's journal")
+    finally:
+        ctx.g.sh(f"mv {aside} {ak}", label="put the trust entry back")
+        if win is not None:
+            ctx.g.desk(["pkill", "-u", "desktop", "-f", "xterm -T host"], check=False)
+
+
 STORIES = [
     ("S3.3.3", "Root window colour and initial xterm", s3_3_3),
     ("S3.3.2", "Screensaver and DPMS are off, so the screen never blanks", s3_3_2),
@@ -3126,6 +3190,7 @@ STORIES = [
     ("S11.2.1", "Text moves between applications by selection and paste, across containers", s11_2_1),
     ("S11.1.1", "Every root-menu action does what its label says when chosen with the mouse", s11_1_1),
     ("S11.3.1", "The operator can set the volume, mute, and choose the output from the desktop", s11_3_1),
+    ("S5.7.8", "The menu wrapper keeps its window open on failure", s5_7_8),
     # Last: it declares a two-monitor layout and restarts the desktop twice.
     ("S3.11.2", "Composite cycle with the video link down at the same time", s3_11_2),
 ]

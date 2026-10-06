@@ -110,7 +110,7 @@ diagnostics() {
     ls -Zd /tmp/.X11-unix /run/desktop-audio /var/lib/desktop-container/bin 2>/dev/null || true
     systemctl status desktop-selinux.service --no-pager -l  2>/dev/null | head -20 || true
     echo "---- diagnostics: recent SELinux denials ----"
-    ausearch -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
+    ausearch --input-logs -m avc -ts recent 2>/dev/null | tail -20  || echo "(none / ausearch unavailable)" 
     if command -v k3s >/dev/null; then
         echo "---- diagnostics: k3s state ----"
         k3s kubectl get nodes,pods -A -o wide 2>/dev/null || true
@@ -378,9 +378,13 @@ phase_deploy() {
     ev_pass "its report ends 'done: 0 FAIL(s)'"
     ev_end
 
-    log pd "HOST audio: HDA device visible, pulse socket reachable from the host"
-    podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop \
-        sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
+    if [ "${EV_PROFILE:-}" = soundless ]; then
+        log pd "HOST audio: no sound card on this VM (the soundless profile): no ALSA device to look for"
+    else
+        log pd "HOST audio: HDA device visible, pulse socket reachable from the host"
+        podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop \
+            sh -c 'wpctl status | grep -qi alsa' || fail "no ALSA device in wireplumber"
+    fi
     # S5.6.7 asks that nothing from here to its own story was denied; this
     # is where "here" starts (ausearch -ts takes a time of day).
     ev_t0=$(date +%H:%M:%S)
@@ -470,8 +474,8 @@ phase_deploy() {
         env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
         || fail "the host cannot connect to the relabeled pulse socket"
     ev_pass "an unconfined host process connects to the relabeled pulse socket"
-    avc=$(ev_save avc-since-host-checks "EV-STATE: ausearch -m avc -ts $ev_t0 - every SELinux denial since the host checks began; none" \
-        sh -c "ausearch -m avc -ts $ev_t0 2>&1 || true") || true
+    avc_control
+    avc=$(avc_search avc-since-host-checks "$ev_t0" "every SELinux denial since the host checks began; none") || true
     if grep -q 'type=AVC' <<<"$avc"; then
         fail "SELinux denied something while the host used the relabeled sockets and toolkit (see the ausearch output)"
     fi
@@ -603,8 +607,8 @@ phase_deploy() {
     grep -q ':container_t:' <<<"$lbl" || fail "the probe did not run as container_t: $(echo $lbl)"
     grep -q XDPYINFO_OK <<<"$lbl" || fail "the confined probe could not open :0"
     ev_pass "a client runs confined, as $(grep -o '[a-z_]*:[a-z_]*:container_t:[^[:space:]]*' <<<"$lbl" | sed -n 1p), and opens :0"
-    avc=$(ev_save avc "EV-STATE: ausearch -m avc -ts $s712_t0: SELinux's denials since the probes began" \
-        sh -c "ausearch -m avc -ts $s712_t0 2>&1 || true") || true
+    avc_control
+    avc=$(avc_search avc "$s712_t0" "SELinux's denials since the probes began") || true
     ! grep -q 'scontext=[^ ]*:container_t:' <<<"$avc" \
         || fail "SELinux denied a confined client: $(grep -m1 'scontext=[^ ]*:container_t:' <<<"$avc")"
     ev_pass "no AVC denial since the probes began has a container_t subject"
@@ -687,6 +691,29 @@ deploy_proof() {
 # Restores the shipped (empty) monitors.conf and the connector's forced status
 # before returning, so nothing downstream - the screendumps, the testpattern
 # comparison, phase2's client pods - sees a display this function set up.
+# A search for SELinux denials, and its control. ausearch reads its standard
+# input instead of the audit log when that is a pipe (audit-userspace
+# src/ausearch.c: is_pipe(0), unless --input-logs), and this script runs over
+# ssh with no terminal, its stdin one: without --input-logs every search here
+# read an empty pipe and found no denial, whatever the log held (the
+# maintainer journey's S10.5.3 showed it: 31 AVC records in audit.log,
+# "<no matches>"). The control finds auditd's own start record, which every
+# audit log has, so a search that cannot read the log fails the story rather
+# than passing it.
+avc_search() { # <moment> <since HH:MM:SS> <what>: the denials since then, kept and printed
+    ev_save "$1" "EV-STATE: ausearch --input-logs -m avc -ts $2: $3" \
+        sh -c "ausearch --input-logs -m avc -ts $2 2>&1 || true"
+}
+avc_control() {
+    local out
+    ev_note "this script's standard input is a $(stat -L -c %F /proc/self/fd/0): ausearch without --input-logs would read it instead of the audit log"
+    out=$(ev_save avc-control "EV-STATE: the control: ausearch --input-logs -m DAEMON_START, auditd's own start records: the search reads the audit log" \
+        sh -c 'ausearch --input-logs -m DAEMON_START 2>&1 || true') || true
+    grep -q 'type=DAEMON_START' <<<"$out" \
+        || fail "ausearch --input-logs found no DAEMON_START record: the denial search cannot read the audit log"
+    ev_pass "the denial search reads the audit log: it finds auditd's own start record"
+}
+
 dpy_dims() {
     podman exec -u desktop -e DISPLAY=:0 desktop \
         sh -c "xdpyinfo | awk '/dimensions:/{print \$2; exit}'"
@@ -5184,7 +5211,205 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-checks|deploy-tail|deploy-reboot|deploy-proof|session-groups|mwm-exit|standalone|seat-tags|host-audio}" in
+# --- batch 8: a soundless host, then a card (S2.4.6, S4.7.10, S7.7.9) -----------
+# The soundless shard's VM boots without intel-hda: no sound card at all, so
+# the audio stack's first start has nothing to align its group to. The host
+# side renumbered the host's audio group to SL_GID before the tree was
+# applied: on a stock VM the host and the image agree on 63, and a check of
+# the alignment could not fail. A usb-audio card plugged in later gets nodes
+# on SL_GID, and the container's audio group keeps the image's gid until the
+# stack starts again, when desktop-init's audio supervisor re-aligns it.
+#
+# A client started before any card exists (S7.7.9) is a podman client of
+# the test image, given desktop.local/audio=all: it tries once a second
+# until the default sink is a card's and paplay plays its tone, then holds.
+# pipewire-pulse keeps a "Dummy Output" (auto_null) while there is no other
+# sink, and paplay into that succeeds without a sound, so a try needs a sink
+# that is not auto_null first.
+SL_GID=1063
+SL_CLIENT="ev-soundless-player"
+SL_HZ=550
+SL_IMAGE=localhost/desktop-testclient:latest
+SL_LOOP='n=0
+while :; do
+    if pactl list short sinks 2>/dev/null | grep -v auto_null | grep -q . && paplay /tmp/tone.wav; then
+        echo "played at $(date -u +%T) after $n failed tries"
+        break
+    fi
+    n=$((n + 1))
+    echo "try $n at $(date -u +%T): sinks: $(pactl list short sinks 2>&1 | cut -f2 | tr "\n" " ")"
+    sleep 1
+done
+exec sleep infinity'
+sl_node() { ls /dev/snd/controlC* 2>/dev/null | sed -n 1p; }
+sl_node_up() { [ -n "$(sl_node)" ]; }
+sl_ctr_gid() { podman exec desktop getent group audio | cut -d: -f3; }
+sl_cards() { # alsa_card Devices in PipeWire, as snd_probe counts them
+    local n
+    n=$(podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop \
+        sh -c 'pw-cli ls Device 2>/dev/null | grep -c "device.name = \"alsa_card"' 2>/dev/null || true)
+    echo "${n:-0}"
+}
+sl_card_up() { [ "$(sl_cards)" -ge 1 ]; }
+# The client's log is read whole, then searched: `podman logs | grep -q` under
+# pipefail fails on podman's SIGPIPE once grep has its match.
+sl_clog() { podman logs "$SL_CLIENT" 2>&1 || true; }
+sl_played() { local l; l=$(sl_clog); grep -q '^played at ' <<<"$l"; }
+sl_inspect() { podman inspect "$SL_CLIENT" --format '{{.Id}} pid={{.State.Pid}} started={{.State.StartedAt}} restarts={{.RestartCount}} status={{.State.Status}}'; }
+sl_wpctl() { podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop wpctl status; }
+# The align-device-groups rows of every narrow (audio-only) pass in the log:
+# a final-state table with the audio row alone, then id desktop.
+sl_narrow_rows() {
+    awk '/^align-device-groups: final state:$/ {
+             if ((getline a) > 0 && (getline b) > 0 && a ~ /^align-device-groups:   audio: / && b ~ /^align-device-groups: desktop user:/) print a
+         }' <<<"$1"
+}
+
+soundless() { # before|plugged|realign|played|after
+    [ "${EV_PROFILE:-}" = soundless ] || fail "the soundless steps need the VM booted without a sound card (EV_PROFILE=soundless)"
+    local log since rows node ngid cgid c0 c1 n_lines old d0 p0 p1 cm
+    case "${1:-}" in
+        before)
+            log sl "a soundless host: no card, the host's audio group on $SL_GID, the image's in the container"
+            ev_begin S2.4.6 "Audio gid is re-aligned before every audio start" T3
+            ev_save snd-host "EV-STATE: ls -ln /dev/snd on the host: no card's nodes" sh -c 'ls -ln /dev/snd 2>&1 || true' >/dev/null || true
+            sl_node_up && fail "the host has a sound card ($(sl_node)): the VM was to boot without one"
+            ev_pass "the host has no sound card: no /dev/snd/controlC*"
+            ev_save group-host "EV-STATE: getent group audio on the host (renumbered to $SL_GID before the tree was applied)" getent group audio >/dev/null || true
+            [ "$(getent group audio | cut -d: -f3)" = "$SL_GID" ] || fail "the host's audio group is not gid $SL_GID: $(getent group audio)"
+            ev_pass "the host's audio group is gid $SL_GID"
+            cgid=$(sl_ctr_gid)
+            ev_save group-container "EV-STATE: getent group audio in the container: the image's gid, nothing having aligned it" podman exec desktop getent group audio >/dev/null || true
+            [ -n "$cgid" ] && [ "$cgid" != "$SL_GID" ] || fail "the container's audio group is '${cgid:-absent}', not the image's own gid"
+            ev_pass "the container's audio group is gid $cgid, the image's: it differs from the host's $SL_GID"
+            log=$(podman logs desktop 2>&1 | tr -d '\r')
+            ev_text align-boot "EV-LOG-DESKTOP: every align-device-groups line since the container started: the boot pass, then the audio supervisor's pass before the first audio start" \
+                "$(grep '^align-device-groups:' <<<"$log" || echo '(none)')"
+            rows=$(sl_narrow_rows "$log")
+            grep -q "^align-device-groups:   audio: container gid $cgid, no device nodes$" <<<"$rows" \
+                || fail "no audio-only alignment pass found no nodes before the first audio start: ${rows:-none}"
+            grep -q '^align-device-groups: audio: no device nodes present, skipping$' <<<"$log" \
+                || fail "align-device-groups did not log 'audio: no device nodes present, skipping'"
+            ev_pass "the audio supervisor's pass before the first audio start found nothing to align: 'audio: no device nodes present, skipping', its table '$(sed -n 1p <<<"$rows" | sed 's/^align-device-groups: *//')'"
+            ev_save wpctl-before "EV-STATE: wpctl status with no card" sl_wpctl >/dev/null || true
+            [ "$(sl_cards)" = 0 ] || fail "PipeWire lists a card on a soundless host"
+            ev_pass "PipeWire lists no card"
+            ev_end
+            log sl "a client started before any card exists: it tries until a card's sink is the default"
+            ev_begin S7.7.9 "A client that started on a soundless host plays once a card arrives, without restarting" T3
+            gen_tone "$SL_HZ" /tmp/sl-tone.wav 6
+            podman image exists "$SL_IMAGE" || podman load -q -i /tmp/images-testclient.tar >/dev/null || fail "could not load $SL_IMAGE"
+            podman rm -f "$SL_CLIENT" >/dev/null 2>&1 || true
+            podman create --name "$SL_CLIENT" --device desktop.local/audio=all "$SL_IMAGE" sh -c "$SL_LOOP" >/dev/null \
+                || fail "could not create the client"
+            podman cp /tmp/sl-tone.wav "$SL_CLIENT:/tmp/tone.wav" || fail "could not copy the tone into the client"
+            podman start "$SL_CLIENT" >/dev/null || fail "the client did not start"
+            ev_text client-command "EV-STATE: the client: podman create --name $SL_CLIENT --device desktop.local/audio=all $SL_IMAGE sh -c <the loop below>, a ${SL_HZ} Hz tone copied in" "$SL_LOOP"
+            sleep 4
+            ev_save client-before "EV-PIDS: the client as it started: id, pid, start, restarts, status" sl_inspect >/dev/null || fail "no client to inspect"
+            sl_inspect > /run/ev-sl-client
+            # F7.7's common set: Xorg, mwm and the audio daemons, before and after.
+            ev_save daemons-before "EV-PIDS: Xorg, mwm and the three audio daemons before the card arrives" \
+                ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+            echo "$EV_LAST" > /run/ev-sl-daemons
+            ev_save client-log-early "EV-LOG-CLIENT: the client's first tries, with no card's sink to play to" podman logs "$SL_CLIENT" >/dev/null || true
+            clog=$(sl_clog)
+            grep -q '^try 1 at ' <<<"$clog" || fail "the client logged no failed try with no card"
+            ! sl_played || fail "the client played with no card"
+            ev_pass "the client runs and keeps trying: no card's sink yet"
+            ev_end
+            ;;
+        plugged)
+            log sl "the card plugged in: nodes on the host's gid, the container's group not yet aligned"
+            ev_begin S2.4.6 "Audio gid is re-aligned before every audio start" T3
+            wait_for 30 1 "the card's nodes on the host" sl_node_up
+            node=$(sl_node)
+            ev_save snd-host-plugged "EV-STATE: ls -ln /dev/snd on the host with the card plugged in" ls -ln /dev/snd >/dev/null || true
+            ev_save acl "EV-STATE: getfacl of $node on the host: any ACL logind's uaccess gave the active session's user" \
+                sh -c "getfacl -p $node 2>&1 || true" >/dev/null || true
+            ngid=$(stat -c %g "$node")
+            [ "$ngid" = "$SL_GID" ] || fail "$node is on gid $ngid, not the host's audio group $SL_GID"
+            ev_pass "the card's control node $node is on gid $ngid, the host's audio group"
+            ev_save snd-container-plugged "EV-STATE: ls -ln /dev/snd in the container: the same nodes, through the live bind mount" \
+                podman exec desktop ls -ln /dev/snd >/dev/null || true
+            podman exec desktop test -e "$node" || fail "the container does not see $node"
+            cgid=$(sl_ctr_gid)
+            [ "$cgid" != "$SL_GID" ] || fail "the container's audio group is already $SL_GID before any restart"
+            ev_pass "the container sees $node; its audio group is still gid $cgid until the stack starts again"
+            ev_note "PipeWire Devices named alsa_card with the card plugged in and the stack not restarted: $(sl_cards)"
+            ev_end
+            ;;
+        realign)
+            log sl "the stack restarted: the supervisor aligns the audio group before the start"
+            ev_begin S2.4.6 "Audio gid is re-aligned before every audio start" T3
+            node=$(sl_node)
+            old=$(sl_ctr_gid)
+            n_lines=$(podman logs desktop 2>&1 | wc -l)
+            podman exec -u desktop desktop pkill -u desktop -x pipewire || true
+            ev_note "pipewire killed at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), the audio group then gid $old"
+            wait_for 45 1 "the container's audio group on gid $SL_GID" sh -c "[ \"\$(podman exec desktop getent group audio | cut -d: -f3)\" = $SL_GID ]"
+            wait_for 45 1 "the export answering again" audio_reachable
+            since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) | tr -d '\r')
+            ev_text log-realign "EV-LOG-DESKTOP: podman logs desktop from pipewire's kill on: the stack's exit, the alignment, the new start" "$since"
+            grep -qE "^align-device-groups: audio: gid $old -> $SL_GID \\(from /dev/snd/controlC[0-9]+\\)$" <<<"$since" \
+                || fail "no 'audio: gid $old -> $SL_GID' line from the alignment before the new start"
+            ev_pass "before the new start the supervisor's pass logged '$(grep -m1 '^align-device-groups: audio: gid ' <<<"$since" | sed 's/^align-device-groups: //')'"
+            grep -q 'desktop-init: audio stack exited (rc=[0-9]*); restarting in 3s' <<<"$since" \
+                || fail "desktop-init did not log the audio stack's restart"
+            cgid=$(sl_ctr_gid)
+            ngid=$(stat -c %g "$node")
+            ev_text gids-after "EV-STATE: the container's audio group and the host node's gid after the restart" \
+                "container: $(podman exec desktop getent group audio)"$'\n'"host: $(stat -c '%g %A %n' "$node")"
+            [ "$cgid" = "$ngid" ] || fail "the container's audio group is gid $cgid, the host's node $ngid"
+            ev_pass "the container's audio group now equals the host node's gid: $cgid"
+            wait_for 45 1 "PipeWire to list the card" sl_card_up
+            ev_save wpctl-after "EV-STATE: wpctl status after the restart: the card" sl_wpctl >/dev/null || true
+            ev_pass "PipeWire lists the card after the restart ($(sl_cards) alsa_card Device)"
+            ev_end
+            ev_begin S4.7.10 "A card that arrives after a soundless boot is openable" T3
+            ev_save wpctl "EV-STATE: wpctl status after the stack's next start: the card and its sink" sl_wpctl >/dev/null || true
+            ev_save sinks "EV-STATE: pactl list short sinks as the session user: the card's sink, no auto_null" \
+                podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop pactl list short sinks >/dev/null || true
+            sl_card_up || fail "PipeWire does not list the card"
+            ev_pass "after the stack's next start PipeWire lists the card that arrived after the soundless boot"
+            ev_end
+            ;;
+        played)
+            log sl "the client, never restarted, plays once the card's sink is the default"
+            ev_begin S7.7.9 "A client that started on a soundless host plays once a card arrives, without restarting" T3
+            wait_for 60 1 "the client's tone to have played" sl_played
+            ev_save client-log "EV-LOG-CLIENT: the client's whole log: its failed tries, then the play" podman logs "$SL_CLIENT" >/dev/null || true
+            c0=$(podman logs "$SL_CLIENT" 2>&1 | grep -c '^try ' || true)
+            ev_pass "the client played its tone after $c0 failed tries: $(podman logs "$SL_CLIENT" 2>&1 | grep '^played at ')"
+            ev_end
+            ;;
+        after)
+            ev_begin S7.7.9 "A client that started on a soundless host plays once a card arrives, without restarting" T3
+            ev_save client-after "EV-PIDS: the client after it played: id, pid, start, restarts, status" sl_inspect >/dev/null || true
+            c0=$(cat /run/ev-sl-client 2>/dev/null || true)
+            c1=$(sl_inspect)
+            [ -n "$c0" ] && [ "$c1" = "$c0" ] || fail "the client is not the same container and process: $c0 -> $c1"
+            grep -q ' restarts=0 status=running$' <<<"$c1" || fail "the client restarted or stopped: $c1"
+            ev_pass "the same container and process throughout, never restarted, still running: $c1"
+            ev_save daemons-after "EV-PIDS: Xorg, mwm and the three audio daemons after the client played" \
+                ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+            d0=$(cat /run/ev-sl-daemons 2>/dev/null || true)
+            [ -n "$d0" ] || fail "the daemons' table from before the card is missing"
+            ev_diff daemons "EV-DIFF: Xorg, mwm and the audio daemons before the card arrived (-) and after the client played (+): the audio daemons are new, the stack having restarted to align to the card; Xorg and mwm are not" "$d0" "$EV_LAST"
+            for cm in Xorg mwm; do
+                p0=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$d0") p1=$(awk -v c="$cm" '$NF == c {print $1}' "$EV_DIR/$EV_LAST")
+                [ -n "$p0" ] && [ "$p0" = "$p1" ] || fail "$cm is not the same process across the card's arrival: ${p0:-none} -> ${p1:-none}"
+            done
+            ev_pass "Xorg and mwm are the same processes across the card's arrival and the audio stack's restart"
+            podman rm -f -t 2 "$SL_CLIENT" >/dev/null 2>&1 || true
+            rm -f /run/ev-sl-client /run/ev-sl-daemons
+            ev_end
+            ;;
+        *) fail "soundless: before, plugged, realign, played or after" ;;
+    esac
+}
+
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|rec-source|journey-rec|journey-file|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|split-cleanup|pod-windows|stream-apps|pod-logs|layout-declare|layout-roundtrip|layout-unplug|layout-restore|autodetect|monitors-set|deploy-checks|deploy-tail|deploy-reboot|deploy-proof|session-groups|mwm-exit|standalone|seat-tags|host-audio|soundless}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -5225,6 +5450,7 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     mwm-exit) verify_mwm_exit ;;
     standalone) standalone_desktop "${2:-}" ;;
     seat-tags) seat_tags "${2:-}" ;;
+    soundless) soundless "${2:-}" ;;
     host-audio) host_audio "${2:-}" ;;
     deploy-proof) deploy_proof ;;
     hotplug-probe) hotplug_probe ;;

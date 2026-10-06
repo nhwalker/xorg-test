@@ -284,6 +284,18 @@ EOF
 ln -sf /etc/systemd/system/ci-fake-dm.service /etc/systemd/system/display-manager.service
 systemctl daemon-reload
 systemctl start display-manager.service
+# S5.3.1's T2 half: what the stock VM has none of - a seat rule and a running
+# display manager - staged, and what seat-prep leaves of them.
+seat_state() {
+    ls /etc/udev/rules.d/ | grep -E '^72-seat-' || echo "(no 72-seat-*.rules)"
+    echo "display-manager.service: $(systemctl is-enabled display-manager.service 2>&1)"
+    echo "ci-fake-dm.service: $(systemctl is-active ci-fake-dm.service 2>&1)"
+}
+ev_begin S5.3.1 "Dirty seat is walked back" T2
+ev_save staged "EV-STATE: the staged dirty seat: a 72-seat rule, and a display manager (ci-fake-dm.service, aliased as display-manager.service) enabled and running" \
+    seat_state >/dev/null || true
+s531_staged=$EV_LAST
+ev_end
 out=$("$SEATPREP")
 # S5.3.5: the tree is not applied yet, so logind's drop-in is absent, and
 # this run changes the seat: the warning must say so.
@@ -294,16 +306,26 @@ ev_text seat-prep "the dirty-seat run's output: a seat rule and a running displa
 grep -q 'WARNING: logind drop-in missing' <<<"$out" || fail "seat-prep changed the seat with the logind drop-in absent and did not warn"
 ev_pass "seat-prep changed the seat and warned 'logind drop-in missing'"
 ev_end
-echo "$out" | grep -q 'removing custom seat attachment rule' || fail "seat rule not handled"
-echo "$out" | grep -q 'disabling display manager' || fail "display manager not handled"
+ev_begin S5.3.1 "Dirty seat is walked back" T2
+ev_text seat-prep "EV-LOG: seat-prep's output on the staged dirty seat" "$out"
+ev_save after "EV-STATE: the same after seat-prep: no 72-seat rule, the display manager disabled and stopped" \
+    seat_state >/dev/null || true
+ev_diff seat "EV-DIFF: the staged dirty seat (-) against what seat-prep left of it (+)" "$s531_staged" "$EV_LAST"
+grep -q 'removing custom seat attachment rule' <<<"$out" || fail "seat rule not handled"
 [ ! -e /etc/udev/rules.d/72-seat-ci-test.rules ] || fail "seat rule file survived"
+ev_pass "seat-prep removed the 72-seat rule and said so: removing custom seat attachment rule"
+grep -q 'disabling display manager' <<<"$out" || fail "display manager not handled"
 if systemctl is-active --quiet ci-fake-dm.service; then
     fail "fake display manager still running after seat-prep"
 fi
+ev_pass "seat-prep disabled and stopped the display manager, and said so: disabling display manager"
 rm -f /etc/systemd/system/display-manager.service /etc/systemd/system/ci-fake-dm.service
 systemctl daemon-reload
 out2=$("$SEATPREP" | grep -v 'fuser not available' || true)
+ev_text second-run "EV-LOG: seat-prep run again on the converged seat (its fuser notice aside): no output" "${out2:-(no output)}"
 [ -z "$out2" ] || fail "seat-prep second run not silent: $out2"
+ev_pass "run again on the converged seat, seat-prep says nothing: it changed nothing"
+ev_end
 
 # --- apply the tree and boot the desktop -------------------------------------
 log "ensure sshd exists for the host-terminal path"

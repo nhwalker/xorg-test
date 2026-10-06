@@ -779,6 +779,8 @@ jobs:
     #   operator  the person at the display, through QEMU's devices (E11)
     #   k8s       k3s + a cdi-device-plugin release per capability, with
     #             confined client pods wired up by CDI
+    #   soundless a second machine, booted with no sound card: a card that
+    #             arrives later, and a client that waited for it
     # SELinux stays enforcing throughout - nothing here calls setenforce.
     needs: images
     runs-on: ubuntu-latest
@@ -788,7 +790,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [core, operator, k8s]
+        shard: [core, operator, k8s, soundless]
     steps:
       - uses: actions/checkout@v4
       - name: enable kvm access
