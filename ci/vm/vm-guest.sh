@@ -1991,6 +1991,72 @@ verify_postmortem() {
     log al "verify-postmortem passed"
 }
 
+# oci_spec_path prints the path of the desktop container's OCI runtime spec:
+# the config.json podman wrote and crun started the container from, with the
+# mounts, masked paths and device-cgroup entries exactly as it got them.
+oci_spec_path() {
+    local p
+    p=$(podman inspect desktop --format '{{.OCIConfigPath}}' 2>/dev/null) || p=
+    if [ -z "$p" ] || [ ! -f "$p" ]; then
+        p=$(podman inspect desktop --format '{{.StaticDir}}' 2>/dev/null)/config.json || return 1
+    fi
+    [ -f "$p" ] || return 1
+    printf '%s\n' "$p"
+}
+
+# spec_sys prints what an OCI spec puts at /sys and below: one
+# "mount <destination> <type> <source> <options>" line per mount, then a
+# "masked <path>" and a "readonly <path>" line per such path.
+spec_sys() { # <config.json>
+    python3 -c '
+import json, sys
+spec = json.load(open(sys.argv[1]))
+def under(p):
+    return p == "/sys" or p.startswith("/sys/")
+for m in spec.get("mounts", []):
+    if under(m.get("destination", "")):
+        print("mount", m["destination"], m.get("type") or "-", m.get("source") or "-",
+              ",".join(m.get("options") or []) or "-")
+linux = spec.get("linux", {})
+for p in linux.get("maskedPaths") or []:
+    if under(p):
+        print("masked", p)
+for p in linux.get("readonlyPaths") or []:
+    if under(p):
+        print("readonly", p)
+' "$1"
+}
+
+# spec_devices prints an OCI spec's device-cgroup list in order, one
+# "allow|deny <type> <major>:<minor> <access>" line per entry (* for any).
+spec_devices() { # <config.json>
+    python3 -c '
+import json, sys
+spec = json.load(open(sys.argv[1]))
+def num(v):
+    return "*" if v is None or v < 0 else str(v)
+for d in spec.get("linux", {}).get("resources", {}).get("devices") or []:
+    print("allow" if d.get("allow") else "deny", d.get("type") or "a",
+          num(d.get("major")) + ":" + num(d.get("minor")), d.get("access") or "-")
+' "$1"
+}
+
+# The names of the capabilities in a hex mask (CapEff and friends), one per
+# line, from linux/capability.h's numbering. No capsh needed.
+cap_names() { # <hex mask>
+    local names=(CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER FSETID KILL SETGID SETUID
+        SETPCAP LINUX_IMMUTABLE NET_BIND_SERVICE NET_BROADCAST NET_ADMIN NET_RAW
+        IPC_LOCK IPC_OWNER SYS_MODULE SYS_RAWIO SYS_CHROOT SYS_PTRACE SYS_PACCT
+        SYS_ADMIN SYS_BOOT SYS_NICE SYS_RESOURCE SYS_TIME SYS_TTY_CONFIG MKNOD LEASE
+        AUDIT_WRITE AUDIT_CONTROL SETFCAP MAC_OVERRIDE MAC_ADMIN SYSLOG WAKE_ALARM
+        BLOCK_SUSPEND AUDIT_READ PERFMON BPF CHECKPOINT_RESTORE)
+    local i
+    for i in "${!names[@]}"; do
+        [ $(( (0x$1 >> i) & 1 )) = 0 ] || echo "${names[$i]}"
+    done
+    [ $(( 0x$1 >> ${#names[@]} )) = 0 ] || echo "(bits above $(( ${#names[@]} - 1 )) set: 0x$1)"
+}
+
 verify_privileges() {
     # The container must be running with LESS than --privileged, and stay that
     # way. Without this, restoring --privileged would be invisible: everything
@@ -2061,40 +2127,240 @@ verify_privileges() {
     ev_end
     log vp "  CapEff=$capeff - none of the 13 forbidden capabilities present"
 
-    # And the device cgroup really is bounded: a node outside the allowlist
-    # must be unreachable. /dev/mem is major 1, which nothing here grants.
-    # Tested by trying to CREATE and read it, so a missing node cannot pass
-    # for a denied one.
-    log vp "a device outside the allowlist is unreachable"
-    if podman exec desktop sh -c \
-        'mknod /tmp/memprobe c 1 1 2>/dev/null && dd if=/tmp/memprobe of=/dev/null bs=1 count=1 2>/dev/null'
-    then
-        podman exec desktop rm -f /tmp/memprobe 2>/dev/null || true
-        fail "the container read /dev/mem (major 1): the device cgroup is not bounded"
-    fi
-    podman exec desktop rm -f /tmp/memprobe 2>/dev/null || true
-    log vp "  /dev/mem denied by the device cgroup"
+    # S6.1.3: and what IS there is exactly what the quadlet adds back after
+    # DropCapability=ALL - nothing podman or a drop-in slipped in.
+    ev_begin S6.1.3 "Granted set is exactly what the quadlet lists" T3
+    ev_save quadlet-caps "EV-CONFIG: the installed quadlet's capability lines (/etc/containers/systemd/desktop.container)" \
+        grep -E '^(DropCapability|AddCapability)=' /etc/containers/systemd/desktop.container >/dev/null || true
+    want=$(sed -n 's/^AddCapability=//p' /etc/containers/systemd/desktop.container | tr ' ' '\n' | sed '/^$/d' | sort)
+    ev_text want "EV-STATE: the names the quadlet adds back, sorted" "$want"
+    caps_want=$EV_LAST
+    have=$(cap_names "$capeff" | sort)
+    ev_text have "EV-STATE: CapEff=$capeff of desktop-init, decoded bit by bit, sorted" "$have"
+    ev_diff caps "EV-DIFF: the quadlet's list against CapEff (no differences: exactly the granted set)" "$caps_want" "$EV_LAST"
+    [ -n "$want" ] && [ "$have" = "$want" ] \
+        || fail "CapEff=$capeff decodes to '$(echo $have)', and the quadlet adds back '$(echo $want)'"
+    ev_pass "CapEff=$capeff decodes to exactly the $(wc -l <<<"$have") the quadlet adds back: $(echo $have)"
+    ev_end
+
+    # S6.1.4: the device cgroup really is bounded. A node outside the
+    # allowlist (/dev/mem's 1:1) must be unreachable, and a node of each of
+    # the five allowed majors reachable. In the container's own /dev: podman
+    # mounts Tmpfs= nodev, so under /tmp every node is refused whatever the
+    # device cgroup says, and a denial there proves nothing. Each node is
+    # made with mknod and opened with dd (count=0 reads nothing); the error
+    # text says which of the two the device cgroup refused.
+    log vp "the device cgroup admits the five majors and nothing else"
+    ev_begin S6.1.4 "Device cgroup is bounded" T3
+    # The rules themselves: the quadlet's flags, and the device list of the
+    # OCI spec crun ran the container from. Under cgroup v2 crun compiles that
+    # list into a BPF program, which the kernel does not show as a list (and
+    # podman inspect has no field for the rules), so the spec is the readable
+    # form.
+    ev_save cgroup-rules "EV-CONFIG: the quadlet's device-cgroup rules (its --device-cgroup-rule flags)" \
+        grep -o -- '--device-cgroup-rule="[^"]*"' /etc/containers/systemd/desktop.container >/dev/null || true
+    spec=$(oci_spec_path) \
+        || fail "could not find the desktop container's OCI spec (podman inspect's OCIConfigPath, or config.json in its StaticDir)"
+    devs=$(ev_save spec-devices "EV-STATE: the device list of the container's OCI spec ($spec), in order, which crun compiles into the cgroup v2 BPF program beside its own built-in allowances for standard nodes such as /dev/null (not listed here): deny everything, then the DRM nodes the quadlet adds as devices, then the quadlet's five rules" \
+        spec_devices "$spec") \
+        || fail "could not read the device list of the OCI spec $spec"
+    for major in 13 116 226 4 5; do
+        awk -v m="$major:*" '$1 == "allow" && $2 == "c" && $3 == m && $4 ~ /r/ && $4 ~ /w/ {f = 1} END {exit !f}' <<<"$devs" \
+            || fail "the OCI spec's device list does not allow c $major:* for reading and writing: the quadlet's rule did not reach it"
+    done
+    ev_pass "the OCI spec's device list carries the quadlet's five rules: c 13:*, 116:*, 226:*, 4:* and 5:*, read and write"
+    # One real minor per allowed major, read off the host's own nodes: an
+    # evdev node, an ALSA control, a DRM render node (card0 if none), tty2
+    # and ptmx - none of which an open with no read disturbs.
+    probes="mem 1 1"
+    for f in /dev/input/event0 /dev/snd/controlC0 /dev/dri/renderD128 /dev/tty2 /dev/ptmx; do
+        [ "$f" != /dev/dri/renderD128 ] || [ -c "$f" ] || f=/dev/dri/card0
+        [ -c "$f" ] || { ev_note "no $f on this host to take a minor from"; continue; }
+        probes="$probes
+$(basename "$f") $((0x$(stat -c %t "$f"))) $((0x$(stat -c %T "$f")))"
+    done
+    probe_out=$(ev_save probes "EV-STATE: mknod and open, as container root, in the container's own /dev: one line per node, with the error text where refused" \
+        podman exec -i desktop sh -c '
+            while read -r name major minor; do
+                n=/dev/cgprobe-$name
+                rm -f "$n"
+                if ! out=$(mknod "$n" c "$major" "$minor" 2>&1); then
+                    echo "$name $major:$minor mknod refused: $out"; continue
+                fi
+                if out=$(dd if="$n" of=/dev/null bs=1 count=0 2>&1); then
+                    echo "$name $major:$minor opened"
+                else
+                    echo "$name $major:$minor open refused: $out"
+                fi
+                rm -f "$n"
+            done' <<<"$probes") || true
+    mem=$(grep '^mem 1:1 ' <<<"$probe_out" || true)
+    grep -q 'refused: .*Operation not permitted' <<<"$mem" \
+        || fail "/dev/mem (1:1) was not refused by the device cgroup: ${mem:-no result}"
+    ev_pass "the device cgroup refuses /dev/mem: $mem"
+    for major in 13 116 226 4 5; do
+        line=$(awk -v m="$major" 'split($2, a, ":") && a[1] == m' <<<"$probe_out")
+        [ -n "$line" ] || fail "no node of allowed major $major was probed"
+        grep -q ' opened$' <<<"$line" || fail "a node of allowed major $major was refused: $line"
+        ev_pass "a node of allowed major $major is reachable: $line"
+    done
+    ev_end
+    log vp "  /dev/mem refused by the device cgroup; majors 13, 116, 226, 4 and 5 reachable"
 
     # /sys read-only. This is the sixth of the grants --privileged bundles and
     # the only one nothing else here would notice: a writable /sys is how a
     # container reaches host tunables (sysfs writes to kernel objects it does
     # not own), and the desktop never needs it - Xorg reads DRM through
-    # /dev/dri, not through sysfs writes. The quadlet's Mount= makes /sys a
-    # NON-recursive ro bind, so there is no /sys/fs/cgroup (or any other
-    # host sysfs submount) in the container at all; the mount itself is the
-    # thing to check. Read it from the container's OWN mount namespace: under
-    # --pid=host, /proc/1/mounts is the HOST's mount table (whose /sys is
-    # legitimately rw) - reading it here failed this assertion for two runs
-    # while the container's /sys was already ro, which the in-container
-    # preflight had been reporting all along.
-    log vp "/sys is read-only"
-    sysopts=$(podman exec desktop sh -c 'awk "\$2==\"/sys\"{print \$4}" "/proc/$(cat /run/desktop-init.pid)/mounts"' 2>/dev/null || true)
+    # /dev/dri, not through sysfs writes. Read it from the container's OWN
+    # mount namespace: under --pid=host, /proc/1/mounts is the HOST's mount
+    # table (whose /sys is legitimately rw) - reading it here failed this
+    # assertion for two runs while the container's /sys was already ro, which
+    # the in-container preflight had been reporting all along.
+    #
+    # Non-recursive: the quadlet's Mount= binds /sys without its submounts, so
+    # none of the host's (securityfs, bpf, pstore, selinuxfs, its cgroup2 ...)
+    # comes along. Podman still mounts its own there, from the OCI spec it
+    # starts the container with: a read-only cgroup2 at /sys/fs/cgroup and
+    # empty read-only tmpfs masks over its masked paths (/sys/firmware,
+    # /sys/fs/selinux) - run 37328302222 found exactly those three. So every
+    # mount under the container's /sys must be one the spec accounts for, in
+    # the form the spec gives it, and none of the host's own may be there.
+    log vp "/sys is read-only, and none of the host's mounts under it is in the container"
+    ev_begin S6.1.5 "/sys is read-only and non-recursive" T3
+    sys_mounts=$(ev_save sys-mounts "EV-STATE: the container's own mount table (desktop-init's /proc/<pid>/mounts) filtered to /sys and below" \
+        podman exec desktop sh -c 'awk "\$2 == \"/sys\" || \$2 ~ \"^/sys/\"" "/proc/$(cat /run/desktop-init.pid)/mounts"') || true
+    sysopts=$(awk '$2 == "/sys" {print $4}' <<<"$sys_mounts")
     [ -n "$sysopts" ] \
         || fail "could not read the container's /sys mount options from the init process's mount table"
     case ",$sysopts," in
         *,ro,*) log vp "  /sys mounted ro ($sysopts)" ;;
         *) fail "/sys is mounted '$sysopts', want ro - a writable /sys is one of the six grants --privileged bundles and nothing here needs it" ;;
     esac
+    ev_pass "/sys is mounted ro ($sysopts) in the container's own mount table"
+    spec=$(oci_spec_path) \
+        || fail "could not find the desktop container's OCI spec (podman inspect's OCIConfigPath, or config.json in its StaticDir)"
+    spec_sys=$(ev_save spec-sys "EV-CONFIG: what the container's OCI spec ($spec, the file crun started it from) puts at /sys and below: its mounts (destination, type, source, options), then its masked and read-only paths" \
+        spec_sys "$spec") \
+        || fail "could not read the /sys entries of the OCI spec $spec"
+    host_sys=$(ev_save host-sys "EV-STATE: the VM host's own mounts under /sys (its /proc/self/mounts): what a recursive bind would have carried into the container" \
+        awk '$2 ~ "^/sys/"' /proc/self/mounts) || true
+    masks=
+    while read -r path type opts; do
+        [ -n "$path" ] || continue
+        case ",$opts," in
+            *,ro,*) ;;
+            *) fail "$path ($type) under the container's /sys is mounted '$opts', not ro" ;;
+        esac
+        if [ "$path" = /sys/fs/cgroup ]; then
+            grep -Eq '^mount /sys/fs/cgroup cgroup2? ' <<<"$spec_sys" \
+                || fail "a $type is mounted at /sys/fs/cgroup in the container, and the OCI spec mounts nothing there"
+            [ "$type" = cgroup2 ] || fail "/sys/fs/cgroup in the container is a $type, want the spec's cgroup2"
+            ev_pass "/sys/fs/cgroup holds the container's own cgroup2, as its OCI spec asks, read-only ($opts)"
+        elif grep -qxF "masked $path" <<<"$spec_sys"; then
+            [ "$type" = tmpfs ] || fail "$path is one of the OCI spec's masked paths, but is mounted as $type, not podman's tmpfs mask"
+            masks="$masks $path"
+        elif grep -qxF "readonly $path" <<<"$spec_sys"; then
+            ev_pass "$path is one of the OCI spec's read-only paths, bound onto itself read-only ($type, $opts)"
+        else
+            fail "$path ($type) is mounted under the container's /sys, and the OCI spec neither mounts, masks nor write-protects it: a host submount came along"
+        fi
+    done < <(awk '$2 ~ "^/sys/" {print $2, $3, $4}' <<<"$sys_mounts")
+    if [ -n "$masks" ]; then
+        # shellcheck disable=SC2086 # one argument per masked path
+        mask_ls=$(ev_save masks "EV-STATE: podman's masks under /sys, listed inside the container: empty directories" \
+            podman exec desktop sh -c 'for d; do echo "$d: $(ls -A "$d" | wc -l) entries"; done' sh $masks) || true
+        for m in $masks; do
+            grep -qxF "$m: 0 entries" <<<"$mask_ls" \
+                || fail "podman's mask over $m is not empty: $(grep -F "$m: " <<<"$mask_ls" || echo 'no listing')"
+        done
+        ev_pass "podman's masks over$masks are empty read-only tmpfs mounts, as the OCI spec's masked paths ask"
+    fi
+    # The host's own: none of them may be in the container. At /sys/fs/cgroup
+    # the container has its own cgroup2, checked above; a host cgroup2 carried
+    # in would make it two there.
+    carried=
+    n_host=0
+    while read -r _ path type _; do
+        [ -n "$path" ] || continue
+        n_host=$((n_host + 1))
+        n=$(awk -v p="$path" -v t="$type" '$2 == p && $3 == t' <<<"$sys_mounts" | wc -l)
+        if [ "$path" = /sys/fs/cgroup ] && [ "$type" = cgroup2 ]; then
+            [ "$n" -le 1 ] || carried="$carried $path ($type)"
+        elif [ "$n" -gt 0 ]; then
+            carried="$carried $path ($type)"
+        fi
+    done <<<"$host_sys"
+    [ "$n_host" -gt 0 ] || fail "the VM host shows no mounts under /sys, so their absence from the container proves nothing"
+    [ -z "$carried" ] || fail "the host's own mounts under /sys reached the container:$carried"
+    ev_pass "none of the VM host's $n_host mounts under /sys ($(awk '{print $3}' <<<"$host_sys" | sort -u | paste -sd' ')) is in the container: the bind is non-recursive"
+    ev_save sys-fs "EV-STATE: /sys/fs inside the container, and how many entries /sys/fs/cgroup (the container's own cgroup tree) and /sys/fs/selinux (podman's mask) hold there" \
+        podman exec desktop sh -c 'ls -la /sys/fs; for d in /sys/fs/cgroup /sys/fs/selinux; do echo "$d: $(ls -A "$d" 2>/dev/null | wc -l) entries"; done' >/dev/null || true
+    ev_text cgroupns "EV-STATE: desktop-init's cgroup namespace and the VM host's (pid 1): if they differ, /sys/fs/cgroup in the container shows only the container's own cgroup subtree" \
+        "desktop-init (host pid $initpid): $(readlink "/proc/$initpid/ns/cgroup" 2>&1)
+host pid 1: $(readlink /proc/1/ns/cgroup 2>&1)"
+    ev_end
+
+    # S6.2.1: the host's pids are visible (the init pid check above) but
+    # container root, which has no CAP_KILL and no CAP_SYS_PTRACE, can neither
+    # signal a host process of another uid nor read pid 1's environ or
+    # memory. A process of the same uid it can signal: with no user namespace
+    # container root is host uid 0, and kill(2) needs no capability between
+    # processes of one uid.
+    log vp "container root cannot reach host processes beyond its own uid"
+    ev_begin S6.2.1 "Host pid namespace, bounded by capability" T3
+    # setpriv execs in place, so $! is the sleep itself, running as rocky.
+    setpriv --reuid="$(id -u rocky)" --regid="$(id -g rocky)" --clear-groups sleep 300 &
+    other=$!
+    sleep 0.5
+    ev_save other-proc "EV-PIDS: the host process of another uid the probe aims at: rocky's sleep" \
+        ps -o pid,uid,user,comm -p "$other" >/dev/null || true
+    ev_save proc-head "EV-STATE: ls /proc inside the container: the host's pids" \
+        podman exec desktop sh -c 'ls /proc | grep -E "^[0-9]+$" | sort -n | head -5; echo "($(ls /proc | grep -cE "^[0-9]+$") pids)"' >/dev/null || true
+    k=$(ev_save kill-other "EV-STATE: kill -0 $other (rocky's sleep) from container root, and its exit status" \
+        podman exec desktop sh -c "kill -0 $other 2>&1; echo rc=\$?") || true
+    e=$(ev_save environ-1 "EV-STATE: reading /proc/1/environ (the host's systemd) from container root, and its exit status" \
+        podman exec desktop sh -c 'cat /proc/1/environ 2>&1 > /dev/null; echo rc=$?') || true
+    m=$(ev_save mem-1 "EV-STATE: reading /proc/1/mem from container root, and its exit status" \
+        podman exec desktop sh -c 'dd if=/proc/1/mem of=/dev/null bs=1 count=1 2>&1; echo rc=$?') || true
+    kill "$other" 2>/dev/null || true
+    grep -q 'Operation not permitted' <<<"$k" && ! grep -q '^rc=0$' <<<"$k" \
+        || fail "container root could signal a host process of another uid: $(echo $k)"
+    ev_pass "kill -0 on another uid's host process: $(grep -v '^rc=' <<<"$k" | head -1)"
+    grep -qE 'Permission denied|Operation not permitted' <<<"$e" && ! grep -q '^rc=0$' <<<"$e" \
+        || fail "container root could read pid 1's environ: $(echo $e)"
+    ev_pass "pid 1's environ is refused: $(grep -v '^rc=' <<<"$e" | head -1)"
+    grep -qE 'Permission denied|Operation not permitted' <<<"$m" && ! grep -q '^rc=0$' <<<"$m" \
+        || fail "container root could read pid 1's memory: $(echo $m)"
+    ev_pass "pid 1's memory is refused: $(grep -v '^rc=' <<<"$m" | head -1)"
+    ev_end
+
+    # S6.2.2: the host's network namespace, not a copy of it.
+    ev_begin S6.2.2 "Host network namespace" T3
+    ns_host=$(readlink /proc/self/ns/net)
+    ns_ctr=$(podman exec desktop readlink /proc/self/ns/net 2>/dev/null || true)
+    ev_text netns "EV-STATE: readlink /proc/self/ns/net on the VM host, then inside the container" "host: $ns_host
+container: $ns_ctr"
+    if_h=$(awk -F: 'NR > 2 {gsub(/ /, "", $1); print $1}' /proc/net/dev | sort)
+    if_c=$(podman exec desktop sh -c "awk -F: 'NR > 2 {gsub(/ /, \"\", \$1); print \$1}' /proc/net/dev | sort" 2>/dev/null || true)
+    ev_text ifaces-host "EV-STATE: the interface names in the VM host's /proc/net/dev" "$if_h"
+    if_host=$EV_LAST
+    ev_text ifaces-ctr "EV-STATE: the interface names in the container's /proc/net/dev (the image may not ship ip)" "$if_c"
+    ev_diff ifaces "EV-DIFF: the interface names, host against container (no differences)" "$if_host" "$EV_LAST"
+    [ -n "$ns_ctr" ] && [ "$ns_ctr" = "$ns_host" ] || fail "the container's network namespace is $ns_ctr, the host's $ns_host"
+    ev_pass "the container's network namespace is the host's: $ns_host"
+    [ -n "$if_c" ] && [ "$if_c" = "$if_h" ] || fail "the container's interfaces ($(echo $if_c)) differ from the host's ($(echo $if_h))"
+    ev_pass "and it lists the host's interfaces: $(echo $if_h)"
+    ev_end
+
+    # S6.2.3, the SELinux half: label=disable runs the desktop as spc_t. The
+    # AppArmor half is the runner's (smoke-deploy.sh): Rocky has no AppArmor.
+    ev_begin S6.2.3 "SELinux separation off for the desktop, AppArmor unconfined" T3
+    lbl=$(ev_save ps-z "EV-STATE: the SELinux label of desktop-init on the VM host (ps -o label)" ps -o label,pid,comm -p "$initpid") || true
+    ev_save inspect-security "EV-STATE: podman inspect desktop: ProcessLabel, AppArmorProfile and the security options" \
+        podman inspect desktop --format 'ProcessLabel={{.ProcessLabel}} AppArmorProfile={{.AppArmorProfile}} SecurityOpt={{json .HostConfig.SecurityOpt}}' >/dev/null || true
+    grep -q ':spc_t:' <<<"$lbl" || fail "desktop-init does not run as spc_t: $(echo $lbl)"
+    ev_pass "desktop-init runs as $(awk 'NR == 2 {print $1}' <<<"$lbl")"
+    ev_end
 
     # rtkit is masked, so PipeWire's realtime priorities have to come from
     # RLIMIT_RTPRIO instead. Nothing else in this suite would notice if they
@@ -2124,6 +2390,19 @@ verify_privileges() {
     # the one that matters.
     pwpid=$(podman exec desktop sh -c 'pgrep -x pipewire | head -1' 2>/dev/null || true)
     [ -n "$pwpid" ] || fail "no pipewire process in the container to check RLIMIT_RTPRIO on"
+    ev_end
+    # S4.3.1: all three of the quadlet's --ulimit values on PipeWire itself.
+    ev_begin S4.3.1 "Rlimits reach PipeWire by inheritance" T3
+    limits=$(ev_save pw-limits "EV-STATE: /proc/<pipewire>/limits (pid $pwpid): realtime priority 95, locked memory 67108864 bytes, nice 31, soft and hard" \
+        cat "/proc/$pwpid/limits") || true
+    for spec in "Max realtime priority:95" "Max locked memory:67108864" "Max nice priority:31"; do
+        name=${spec%%:*} want=${spec##*:}
+        got=$(awk -v n="$name" 'index($0, n) == 1 {sub(n, ""); print $1, $2}' <<<"$limits")
+        [ "$got" = "$want $want" ] || fail "PipeWire's $name is '$got' (soft hard), want $want $want"
+        ev_pass "PipeWire's $name: $want, soft and hard"
+    done
+    ev_end
+    ev_begin S4.3.2 "PipeWire holds SCHED_FIFO above priority 1 without rtkit" T3
     # /proc/PID/limits column layout: Name (3 words here) Soft Hard Units.
     lim=$(podman exec desktop sh -c \
         "awk '/^Max realtime priority/{print \$5}' /proc/$pwpid/limits" 2>/dev/null || true)
@@ -2529,6 +2808,311 @@ tone_status() { # <tag>
     podman exec desktop cat "/tmp/$1.log" 2>/dev/null || true
 }
 
+# --- batch 4: the running session, X server and audio daemons -------------------
+# The X session as it runs, read where it runs (Requirements.md S2.3.1,
+# S3.2.4, S3.3.1, S3.8.5).
+verify_runtime() {
+    log rt "the session, the X server and the udev database as they run"
+    wait_for 30 2 "an X session" session_up
+    local xorg sid tty env_out keys want extra missing
+    xorg=$(podman exec desktop pgrep -x Xorg | sed -n 1p || true)
+    [ -n "$xorg" ] || fail "no Xorg to read"
+
+    # S2.3.1: setsid -c made the session its own process session, with tty1
+    # as its controlling tty; env -i made its environment exactly
+    # run_session's list. The leader is startx (start-session execs it).
+    ev_begin S2.3.1 "The session is its own process session on tty1" T3
+    read -r sid tty <<<"$(ps -o sess=,tty= -p "$xorg")"
+    ev_save session-procs "EV-PIDS: every process of the X session's process session, with its session id and tty (ps -s <sid>)" \
+        ps -o pid,ppid,sess,tty,user,args -s "$sid" >/dev/null || true
+    [ "$tty" = tty1 ] || fail "Xorg's controlling tty is '$tty', want tty1"
+    ev_pass "Xorg (pid $xorg) is in process session $sid, with tty1 as its controlling tty"
+    [ "$(ps -o comm= -p "$sid" 2>/dev/null)" = startx ] \
+        || fail "the session's leader, pid $sid, is '$(ps -o comm= -p "$sid" 2>/dev/null)', not startx"
+    [ "$(ps -o sess= -p "$sid" | tr -d ' ')" = "$sid" ] || fail "pid $sid does not lead its own process session"
+    ev_pass "the session's leader is startx, pid $sid, leading its own process session"
+    env_out=$(ev_save leader-environ "EV-STATE: the session leader's environment (tr '\\0' '\\n' < /proc/$sid/environ)" \
+        sh -c "tr '\\0' '\\n' < /proc/$sid/environ") || true
+    keys=$(sed -n 's/=.*//p' <<<"$env_out" | sort)
+    want=$(printf '%s\n' DESKTOP_DISPLAY DESKTOP_SESSION_TAG DESKTOP_VT HOME LOGNAME PATH PWD SHELL SHLVL USER XDG_RUNTIME_DIR XDG_SESSION_TYPE | sort)
+    extra=$(comm -13 <(echo "$want") <(echo "$keys") | paste -sd' ')
+    missing=$(comm -23 <(echo "$want") <(echo "$keys") | paste -sd' ')
+    [ -z "$extra" ] && [ -z "$missing" ] \
+        || fail "the session leader's environment is not run_session's list plus PWD and SHLVL: extra '$extra', missing '$missing'"
+    ev_pass "its environment is exactly run_session's ten variables plus PWD and SHLVL, with no container variable: $(echo $keys)"
+    ev_end
+
+    # S3.2.4: -nolisten tcp, and nothing on 6000-6063 on the host's network,
+    # which the container shares.
+    ev_begin S3.2.4 "Xorg does not listen on TCP" T3
+    local ss_out args
+    ss_out=$(ev_save ss "EV-STATE: ss -ltnp on the VM host (the container shares its network): every TCP listener" ss -ltnp) || true
+    args=$(ev_save xorg-args "EV-STATE: Xorg's command line" ps -o args= -p "$xorg") || true
+    grep -q -- '-nolisten tcp' <<<"$args" || fail "Xorg runs without -nolisten tcp: $args"
+    ev_pass "Xorg runs with -nolisten tcp"
+    ! awk 'NR > 1 {n = split($4, a, ":"); p = a[n] + 0; if (p >= 6000 && p <= 6063) found = 1} END {exit !found}' <<<"$ss_out" \
+        || fail "something listens in the X range 6000-6063: $(awk 'NR > 1 && $4 ~ /:60[0-6][0-9]$/' <<<"$ss_out")"
+    ev_pass "nothing listens on TCP 6000-6063 on the host"
+    ev_end
+
+    # S3.3.1: xhost +local: is in force, so a client of any uid, with the
+    # socket and no cookie, connects.
+    ev_begin S3.3.1 "Local access control is open" T3
+    local xh probe
+    xh=$(ev_save xhost "EV-STATE: xhost as the session user on :0" podman exec -u desktop -e DISPLAY=:0 desktop xhost) || true
+    grep -qx 'LOCAL:' <<<"$xh" || fail "xhost does not list LOCAL: $(echo $xh)"
+    ev_pass "xhost lists LOCAL:"
+    probe=$(ev_save stranger "EV-STATE: a confined client of uid 4321 (no passwd entry, no cookie, no XAUTHORITY), given only desktop.local/display=all, runs xdpyinfo" \
+        podman run --rm --user 4321:4321 --device desktop.local/display=all \
+        localhost/desktop-container:latest sh -c 'id; printenv XAUTHORITY || echo NO_XAUTHORITY; xdpyinfo > /dev/null && echo XDPYINFO_OK') || true
+    grep -q XDPYINFO_OK <<<"$probe" || fail "a client of uid 4321 with no cookie could not open :0: $(echo $probe)"
+    ev_pass "a client of uid 4321, with no cookie, opens :0"
+    ev_end
+
+    # S3.8.5: the host's udev database, mounted ro, populated, and used.
+    ev_begin S3.8.5 "The host udev database is mounted read-only and used" T3
+    local udev_mnt n_data
+    udev_mnt=$(ev_save udev-mount "EV-STATE: /run/udev in the container's own mount table (desktop-init's /proc/<pid>/mounts)" \
+        podman exec desktop sh -c 'awk "\$2 == \"/run/udev\"" "/proc/$(cat /run/desktop-init.pid)/mounts"') || true
+    n_data=$(podman exec desktop sh -c 'ls /run/udev/data | wc -l' 2>/dev/null || echo 0)
+    ev_text udev-data "EV-STATE: the number of entries in the container's /run/udev/data" "$n_data"
+    ev_save preflight "EV-LOG-DESKTOP: the container preflight's udev lines (podman logs desktop)" \
+        sh -c "podman logs desktop 2>&1 | grep -E 'preflight: (PASS|WARN|FAIL): (host udev|no foreign seat|foreign seat)'" >/dev/null || true
+    case ",$(awk '{print $4}' <<<"$udev_mnt")," in
+        *,ro,*) ;;
+        *) fail "/run/udev is not mounted ro in the container: $udev_mnt" ;;
+    esac
+    ev_pass "/run/udev is mounted ro: $(awk '{print $4}' <<<"$udev_mnt")"
+    [ "${n_data:-0}" -gt 0 ] || fail "the container's /run/udev/data is empty"
+    ev_pass "and it holds the host's database: $n_data entries in /run/udev/data"
+    # Read whole, then searched: `podman logs | grep -q` under pipefail fails
+    # on podman's SIGPIPE once grep has its match.
+    local dlog
+    dlog=$(podman logs desktop 2>&1 || true)
+    grep -q 'preflight: PASS: host udev database mounted at /run/udev' <<<"$dlog" \
+        || fail "the preflight did not pass its udev line"
+    ev_pass "the container's preflight reports PASS: host udev database mounted at /run/udev"
+    # The database is the host's, not a udevd's of the container's own. Under
+    # --pid=host the host's systemd-udevd is in the container's process list
+    # too, so the mount namespaces say whose each udevd is.
+    local init_pid ctr_mnt udevds p
+    init_pid=$(podman exec desktop cat /run/desktop-init.pid 2>/dev/null || true)
+    ctr_mnt=$(readlink "/proc/${init_pid:-0}/ns/mnt" 2>/dev/null || true)
+    [ -n "$ctr_mnt" ] || fail "could not read the container's mount namespace (desktop-init pid '${init_pid}')"
+    udevds=$(for p in $(pgrep -x systemd-udevd; pgrep -x udevd); do
+        printf '%s %s %s\n' "$p" "$(readlink "/proc/$p/ns/mnt" 2>/dev/null)" "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+    done)
+    ev_text udevds "EV-PIDS: every udevd process on the VM host (pid, mount namespace, command line), against the container's mount namespace, desktop-init's: $ctr_mnt" \
+        "${udevds:-(no udevd process)}"
+    if grep -qF " $ctr_mnt " <<<"$udevds"; then
+        fail "a udevd runs in the container's mount namespace: $udevds"
+    fi
+    ev_pass "no udevd runs in the container's mount namespace ($ctr_mnt): $(grep -c . <<<"$udevds" || true) udevd process(es) on the host, none in it"
+    ev_end
+    log rt "verify-runtime passed"
+}
+
+# The active VT, from the kernel ("tty1").
+active_vt() { cat /sys/class/tty/tty0/active; }
+# Switch the console to VT n (chvt where kbd is installed, else VT_ACTIVATE).
+switch_vt() { # <n>
+    if command -v chvt >/dev/null; then chvt "$1"; return; fi
+    python3 -c 'import fcntl, os, sys; fd = os.open("/dev/tty0", os.O_RDWR); fcntl.ioctl(fd, 0x5606, int(sys.argv[1])); fcntl.ioctl(fd, 0x5607, int(sys.argv[1]))' "$1"
+}
+
+# A killed X server, from everything around it (Requirements.md S2.3.2,
+# S2.3.3, S3.2.5). Set up before the kill, the things that must go with the
+# session and the things that must not:
+#   - a sleep carrying the session's DESKTOP_SESSION_TAG, as one started from
+#     the session's xterm would: it must die with the session;
+#   - a sleep from `podman exec` without the tag, and a uid-61000 sleep on the
+#     host: both must live, with PipeWire and the host's desktop-session-lead;
+#   - the console on tty2: the new session must take tty1 back itself.
+# The host records the display across the kill (EV-VIDEO) and after it.
+verify_session_restart() {
+    log sr "a killed X server: what goes with the session, what stays, and the VT"
+    wait_for 30 2 "an X session" session_up
+    local xorg sid tag mwm init pw lead t_kill t_clean n_lines
+    xorg=$(podman exec desktop pgrep -x Xorg | sed -n 1p || true)
+    [ -n "$xorg" ] || fail "no Xorg to kill"
+    sid=$(ps -o sess= -p "$xorg" | tr -d ' ')
+    tag=$(tr '\0' '\n' < "/proc/$sid/environ" | sed -n 's/^DESKTOP_SESSION_TAG=//p')
+    [ -n "$tag" ] || fail "the session leader $sid carries no DESKTOP_SESSION_TAG"
+    mwm=$(podman exec desktop pgrep -u desktop -x mwm | sed -n 1p || true)
+    [ -n "$mwm" ] || fail "no mwm in the session"
+    init=$(podman exec desktop cat /run/desktop-init.pid)
+    pw=$(pipewire_pid)
+    lead=$(systemctl show -p MainPID --value desktop-session.service)
+    [ "${lead:-0}" != 0 ] || fail "desktop-session.service has no main process to watch"
+    # The probes. The host's sleep has its own stdio: holding this ssh
+    # session's, a failure here kept the session open until it ended
+    # (run 37330812438: ten minutes). In the image, sleep is coreutils-single's
+    # shebang script, so its command line reads
+    # "/usr/bin/coreutils --coreutils-prog-shebang=sleep /usr/bin/sleep 600":
+    # the probes are matched by how their command lines end.
+    podman exec -d -u desktop -e DESKTOP_SESSION_TAG="$tag" desktop sleep 600
+    podman exec -d -u desktop desktop sleep 601
+    setpriv --reuid=61000 --regid=61000 --clear-groups sleep 602 </dev/null >/dev/null 2>&1 &
+    sleep 1
+    local tagged untagged hostside
+    tagged=$(pgrep -u 61000 -f '(^|/)sleep 600$' | sed -n 1p || true)
+    untagged=$(pgrep -u 61000 -f '(^|/)sleep 601$' | sed -n 1p || true)
+    hostside=$(pgrep -u 61000 -f '(^|/)sleep 602$' | sed -n 1p || true)
+    [ -n "$tagged" ] && [ -n "$untagged" ] && [ -n "$hostside" ] \
+        || fail "the probe sleeps did not all start: tagged '$tagged', untagged '$untagged', host '$hostside'"
+
+    ev_begin S2.3.3 "Session cleanup is scoped by session id and session tag, never by uid" T3
+    ev_text roles "EV-STATE: what the uid-61000 listings below must show" "the session: leader $sid (startx), Xorg $xorg, mwm $mwm, tag $tag - must go
+sleep 600, pid $tagged: podman exec WITH the session's tag, standing in for one started from the session's xterm - must go
+sleep 601, pid $untagged: podman exec without the tag - must stay
+sleep 602, pid $hostside: a uid-61000 process on the host - must stay
+pipewire, pid $pw: the audio tree - must stay
+desktop-session-lead, pid $lead: the host's login session - must stay"
+    ev_save uid61000-before "EV-PIDS: every uid-61000 process on the host before Xorg is killed, with its session id" \
+        ps -u 61000 -o pid,ppid,sess,tty,args >/dev/null || true
+    u_before=$EV_LAST
+    ev_end
+    ev_begin S3.2.5 "The session activates its VT, so the operator sees it" T3
+    ev_text vt-before "EV-STATE: the active VT before (/sys/class/tty/tty0/active)" "$(active_vt)"
+    [ "$(active_vt)" = tty1 ] || fail "the active VT is $(active_vt) before the test, not tty1"
+    switch_vt 2
+    sleep 1
+    ev_text vt-switched "EV-STATE: the active VT after switching the console to tty2" "$(active_vt)"
+    [ "$(active_vt)" = tty2 ] || fail "the console did not switch to tty2: $(active_vt)"
+    ev_pass "the console was on tty2 when Xorg was killed"
+    ev_end
+
+    ev_begin S2.3.2 "The session restarts after Xorg exits, and the operator gets the desktop back" T3
+    ev_save pids-before "EV-PIDS: desktop-init, Xorg and mwm before the kill" \
+        ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg,$mwm" >/dev/null || true
+    p_before=$EV_LAST
+    n_lines=$(podman logs desktop 2>&1 | wc -l)
+    t_kill=$(date +%s.%N)
+    podman exec -u desktop desktop pkill -u desktop -x Xorg || true
+    ev_note "Xorg (pid $xorg) killed at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), the console on tty2"
+    # Gone: no process left in the old session or carrying the old tag.
+    t_clean=""
+    for _ in $(seq 40); do
+        if [ -z "$(ps -o pid= -s "$sid" 2>/dev/null)" ] && [ -z "$(grep -lzxF "DESKTOP_SESSION_TAG=$tag" /proc/[0-9]*/environ 2>/dev/null)" ]; then
+            t_clean=$(date +%s.%N); break
+        fi
+        sleep 0.25
+    done
+    xn() { local p; p=$(podman exec desktop pgrep -x Xorg 2>/dev/null | sed -n 1p || true); [ -n "$p" ] && [ "$p" != "$xorg" ] && session_up; }
+    wait_for 45 1 "a new X session (a new Xorg and mwm)" xn
+    wait_for 15 1 "the display to answer" x_answers
+    ev_note "a new Xorg and mwm up, the display answering, at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    local xorg2 mwm2
+    xorg2=$(podman exec desktop pgrep -x Xorg | sed -n 1p || true)
+    mwm2=$(podman exec desktop pgrep -u desktop -x mwm | sed -n 1p || true)
+    ev_save pids-after "EV-PIDS: desktop-init, Xorg and mwm after the restart" \
+        ps -o pid,ppid,sess,lstart,comm -p "$init,$xorg2,$mwm2" >/dev/null || true
+    ev_diff pids "EV-DIFF: desktop-init, Xorg and mwm across the restart (Xorg and mwm new, desktop-init the same)" "$p_before" "$EV_LAST"
+    ev_save log "EV-LOG-DESKTOP: podman logs desktop from the kill on" \
+        sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
+    local since
+    since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) || true)
+    grep -q 'desktop-init: session exited (rc=[0-9]*); restarting in 3s' <<<"$since" \
+        || fail "desktop-init did not log 'session exited (rc=N); restarting in 3s' after the kill"
+    ev_pass "desktop-init logged the session's exit and its restart in 3 s"
+    [ -n "$xorg2" ] && [ "$xorg2" != "$xorg" ] && [ -n "$mwm2" ] && [ "$mwm2" != "$mwm" ] \
+        || fail "Xorg and mwm are not new: Xorg $xorg -> $xorg2, mwm $mwm -> $mwm2"
+    [ "$(podman exec desktop cat /run/desktop-init.pid)" = "$init" ] || fail "desktop-init changed: $init -> $(podman exec desktop cat /run/desktop-init.pid)"
+    ev_pass "a new session: Xorg $xorg -> $xorg2, mwm $mwm -> $mwm2, under the same desktop-init ($init); the display answers"
+    ev_end
+
+    ev_begin S2.3.3 "Session cleanup is scoped by session id and session tag, never by uid" T3
+    ev_save uid61000-after "EV-PIDS: every uid-61000 process on the host after the restart" \
+        ps -u 61000 -o pid,ppid,sess,tty,args >/dev/null || true
+    ev_diff uid61000 "EV-DIFF: the host's uid-61000 processes across the kill: the old session and the tagged sleep gone, the rest unchanged" "$u_before" "$EV_LAST"
+    [ -n "$t_clean" ] || fail "10 s after the kill, processes of the old session ($sid) or its tag ($tag) were still running"
+    local took
+    took=$(awk -v a="$t_kill" -v b="$t_clean" 'BEGIN {printf "%.2f", b - a}')
+    python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 6.0 else 1)' "$took" \
+        || fail "the old session's processes took $took s to go, more than the 6 s TERM-then-KILL allows"
+    ev_pass "no process of the old session ($sid) or with its tag remained $took s after the kill"
+    for p in "$mwm" "$tagged"; do
+        ! kill -0 "$p" 2>/dev/null || fail "pid $p, which belonged to the old session, is still running"
+    done
+    ev_pass "the old mwm ($mwm) and the tagged sleep ($tagged) are gone"
+    for p in "$untagged" "$hostside" "$pw" "$lead"; do
+        kill -0 "$p" 2>/dev/null || fail "pid $p, outside the session, was killed with it"
+    done
+    ev_pass "the untagged podman-exec sleep ($untagged), the host's uid-61000 sleep ($hostside), PipeWire ($pw) and desktop-session-lead ($lead) all kept running"
+    ev_end
+    kill "$untagged" "$hostside" 2>/dev/null || true
+
+    ev_begin S3.2.5 "The session activates its VT, so the operator sees it" T3
+    ev_text vt-after "EV-STATE: the active VT after the new session came up" "$(active_vt)"
+    [ "$(active_vt)" = tty1 ] || fail "after the restart the active VT is $(active_vt), not tty1: the new session did not take its VT"
+    ev_pass "the new session switched the console back to tty1 by itself"
+    ev_end
+    log sr "verify-session-restart passed"
+}
+x_answers() { podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo >/dev/null 2>&1; }
+
+# Each daemon's own exit restarts the whole stack (Requirements.md S2.4.2;
+# what PipeWire's exit leaves alone is S4.5.2's). The host plays a tone
+# through the result.
+verify_audio_restarts() {
+    log ar "pipewire, wireplumber, then pipewire-pulse, each alone: each takes the stack down and back"
+    ev_begin S2.4.2 "Any daemon exiting restarts the whole stack" T3
+    local victim before after n_lines b a since
+    for victim in pipewire wireplumber pipewire-pulse; do
+        wait_for 30 2 "the audio export" audio_reachable
+        before=$(audio_trio)
+        ev_save "pids-before-$victim" "EV-PIDS: the three audio daemons before $victim is killed" \
+            ctr_pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+        b=$EV_LAST
+        n_lines=$(podman logs desktop 2>&1 | wc -l)
+        podman exec -u desktop desktop pkill -u desktop -x "$victim" || true
+        ev_note "$victim killed at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+        trio_new() { a=$(audio_trio); [ -n "$a" ] && all_new "$before" "$a" && audio_reachable; }
+        wait_for 45 1 "three new audio daemons and the export answering" trio_new
+        after=$(audio_trio)
+        ev_save "pids-after-$victim" "EV-PIDS: the three audio daemons after the stack came back" \
+            ctr_pids pipewire,wireplumber,pipewire-pulse >/dev/null || true
+        ev_diff "pids-$victim" "EV-DIFF: the audio daemons across $victim's exit (all three new)" "$b" "$EV_LAST"
+        ev_save "log-$victim" "EV-LOG-DESKTOP: podman logs desktop from $victim's kill on" \
+            sh -c "podman logs desktop 2>&1 | tail -n +$((n_lines + 1))" >/dev/null || true
+        since=$(podman logs desktop 2>&1 | tail -n +$((n_lines + 1)) || true)
+        grep -q "start-audio: $victim exited" <<<"$since" \
+            || fail "start-audio did not log '$victim exited'"
+        grep -q 'desktop-init: audio stack exited (rc=[0-9]*); restarting in 3s' <<<"$since" \
+            || fail "desktop-init did not log the audio stack's restart after $victim's exit"
+        ev_pass "killing $victim alone: start-audio logged '$victim exited', the stack restarted, all three daemons new ($before -> $after), the export answers"
+    done
+    ev_end
+    log ar "verify-audio-restarts passed"
+}
+# "pipewire=P wireplumber=W pipewire-pulse=Q" (empty unless all three run).
+audio_trio() {
+    local pw wp pp
+    pw=$(podman exec desktop pgrep -x pipewire 2>/dev/null | sed -n 1p || true)
+    wp=$(podman exec desktop pgrep -x wireplumber 2>/dev/null | sed -n 1p || true)
+    pp=$(podman exec desktop pgrep -x pipewire-pulse 2>/dev/null | sed -n 1p || true)
+    [ -n "$pw" ] && [ -n "$wp" ] && [ -n "$pp" ] && echo "pipewire=$pw wireplumber=$wp pipewire-pulse=$pp"
+}
+all_new() { # <trio before> <trio after>: every daemon's pid changed
+    local d
+    for d in pipewire wireplumber pipewire-pulse; do
+        [ "$(tr ' ' '\n' <<<"$1" | grep "^$d=")" != "$(tr ' ' '\n' <<<"$2" | grep "^$d=")" ] || return 1
+    done
+}
+
+# S2.4.7: the unprivileged rocky user on the VM host reaches the export.
+# Prints what the evidence needs; plays <hz> for <seconds>.
+play_as_rocky() { # <hz> <seconds>
+    gen_tone "${1:?hz}" /tmp/rocky.wav "${2:-3}"
+    chmod 644 /tmp/rocky.wav
+    echo "== id"; runuser -u rocky -- id
+    echo "== ls -l /run/desktop-audio"; ls -l /run/desktop-audio
+    echo "== pactl info, as rocky"
+    runuser -u rocky -- env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info || { echo "pactl info failed: $?"; return 1; }
+    echo "== paplay, as rocky"
+    runuser -u rocky -- env PULSE_SERVER=unix:/run/desktop-audio/pulse paplay /tmp/rocky.wav; echo "paplay exited $?"
+}
+
 # --- operator stories (E11) -------------------------------------------------------
 # ci/vm/operator-e2e.py drives the desktop the way the operator does - every
 # pointer and key event through QEMU's devices - and LOOKS at X from here: a
@@ -2838,7 +3422,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|xi-id|xi-test-start|xi-test-read|xi-test-stop|tone-start|tone-status|journey-start|jx|jx-in|journey-xterm|journey-apps|win-up|win-wait|win-tree|client-shot|journey-put|journey-tone|journey-tone-status|streams|journey-stat|journey-tools-ls|journey-noise|journey-shot-size|journey-held-start|journey-held-state|journey-held-release|journey-loop-start|journey-loop-stop|journey-loop-log|desktop-publish-log|audio-sched|desktop-log-since|x-up|journey-cleanup|verify-postmortem|verify-audio-x|verify-runtime|verify-session-restart|verify-audio-restarts|play-as-rocky|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -2858,6 +3442,10 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     verify-audio-lifecycle) verify_audio_lifecycle ;;
     verify-postmortem) verify_postmortem ;;
     verify-audio-x) verify_audio_x_restart ;;
+    verify-runtime) verify_runtime ;;
+    verify-session-restart) verify_session_restart ;;
+    verify-audio-restarts) verify_audio_restarts ;;
+    play-as-rocky) play_as_rocky "${2:-}" "${3:-}" ;;
     layout-declare) layout_declare ;;
     layout-roundtrip) layout_roundtrip ;;
     layout-unplug) layout_unplug ;;
