@@ -92,7 +92,9 @@
   S9.3.5  each recording (ev_video_start to ev_video_stop in the shell, a
           `with ctx.video(...)` block in the Python) marks its event
           (ev_mark, .mark, or a function that marks), the recorders name
-          the event frames on the gif's line, the gate's video check fails
+          the event frames on the gif's line, the shell files a video in
+          another story only through ev_video_copy, whose line names them
+          too, the gate's video check fails
           a video that names no event frame or one its frames lack, and the
           gate fails a story its document asks to record (EV-VIDEO in its
           own lines or its feature's common set) that holds no video;
@@ -3445,6 +3447,8 @@ def rule_s936(root, rep):
 # --- S9.3.5: every recording names its event frames ---------------------------------
 
 VIDEO_START = re.compile(r"\bev_video_start\b(?!\s*\(\))")
+COPY_VIDEO = re.compile(r"\b(?:ev_copy|cp)\s[^\n]*\.(?:gif|mp4)\b")
+FILE_VIDEO = re.compile(r"\bev_video_(?:copy|cite)\s")
 VIDEO_STOP = re.compile(r"\bev_video_stop\b(?!\s*\(\))")
 EV_MARK = re.compile(r"\bev_mark\s")
 
@@ -3463,10 +3467,27 @@ def called_names(node):
 def rule_s935(root, rep):
     """S9.3.5: each recording marks its event and names its event frames, and
     the gate holds every story whose event changes the screen to a video."""
-    spans = 0
+    spans = filed = 0
     for rel in shell_files(root):
         lines = read(os.path.join(root, rel)).split("\n")
         code = [code_of(l) for l in lines]
+        # A video filed in another story is ev_video_copy's copy (ev_video_cite
+        # calls it), whose line names the recording's event frames and where
+        # they are; a gif copied any other way names none.
+        funcs = shell_functions("\n".join(lines))
+        own = {n for name, first, body in funcs if name == "ev_video_copy" for n in range(first, first + len(body))}
+        helpers = {n for name, first, body in funcs if name in ("ev_video_copy", "ev_video_cite")
+                   for n in range(first, first + len(body))}
+        for i, l in enumerate(code):
+            filed += bool(FILE_VIDEO.search(l)) and i + 1 not in helpers
+            if not COPY_VIDEO.search(l):
+                continue
+            if i + 1 in own:
+                rep.ok("S9.3.5", rel, i + 1, "ev_video_copy's own copy, whose line names the recording's event frames")
+            else:
+                rep.flag("S9.3.5", rel, i + 1, lines[i].strip()[:120],
+                         "a video filed by copying it: its line names no event frames",
+                         "ev_video_copy <moment> <what>, whose line names the recording's event frames and where they are")
         for i, l in enumerate(code):
             if not VIDEO_START.search(l) or re.search(r"\bev_video_start\s*\(\)", l):
                 continue
@@ -3587,7 +3608,8 @@ def rule_s935(root, rep):
         else:
             rep.flag("S9.3.5", "ci/evlib.py", 0, "gate", f"the gate's video check flagged {flagged or 'nothing'}, "
                      "want only S9.8.2", "the gate must hold each story whose event changes the screen to a video")
-    return (f"S9.3.5: {spans} recording(s) in the harness, {len(cases)} planted story directories and a planted "
+    return (f"S9.3.5: {spans} recording(s) in the harness, {filed} place(s) that file one in another story, "
+            f"{len(cases)} planted story directories and a planted "
             f"document judged; {len(rep.violations('S9.3.5'))} violation(s)")
 
 
@@ -3673,6 +3695,9 @@ PLANTS = {
         ('ci/vm/r3.py', 'def s(ctx):\n    with ctx.video("drag", "a drag"):\n        ctx.drag(1, 2, 3, 4)\n', True),
         ('ci/vm/r4.py', 'def cycle(ctx):\n    ctx.mark("device_del kbd")\n\n\ndef s(ctx):\n'
                         '    with ctx.video("cycle", "a cycle"):\n        cycle(ctx)\n', False),
+        ('ci/r5.sh', '#!/bin/bash\nev_copy "$ART/S7.6.3/$V.gif" restart "EV-VIDEO: the restart (S7.6.3\'s recording)"\n', True),
+        ('ci/r6.sh', '#!/bin/bash\nev_video_copy() { # <moment> <what>\n    cp "$EV_VID_DIR/$EV_VID.gif" "$EV_DIR/$1.gif"\n}\n'
+                     'ev_video_copy restart "EV-VIDEO: the restart"\n', False),
     ],
     "S9.3.6": [
         ('ci/t1.sh', '#!/bin/bash\nprobe() { ssh -p 22 rocky@127.0.0.1 true; }\n', True),

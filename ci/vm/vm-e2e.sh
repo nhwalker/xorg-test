@@ -318,19 +318,22 @@ ev_video_stop() { # <what> [another story whose marks count]...
         ev_note "the frames in $EV_VID/ could not be assembled into a gif"
     fi
 }
-# The recording ev_video_stop just kept, filed as well under a story of the
-# guest's whose event it holds (S9.3.5: each story whose event changes the
-# screen holds its video): a copy of the gif, its line naming the event frames
-# and where the frames are.
-ev_video_cite() { # <story> <title> <what>
+# The recording ev_video_stop kept last, filed as well in the open story
+# (S9.3.5: each story whose event changes the screen holds its video): a copy
+# of the gif, its line naming the event frames and where the frames are.
+ev_video_copy() { # <moment> <what>
     local name
+    [ -n "$EV_DIR" ] && [ -n "$EV_VID_DIR" ] && [ -s "$EV_VID_DIR/$EV_VID.gif" ] || return 0
+    name=$(ev_name "$1" gif)
+    cp "$EV_VID_DIR/$EV_VID.gif" "$EV_DIR/$name"
+    ev_attach "$name" "$2 ($EV_VID_STORY's recording: its frames are in $EV_VID_STORY/$EV_VID/); $EV_VID_EVENTS"
+}
+# The same, under a story of the guest's whose event it holds, opened and
+# closed here.
+ev_video_cite() { # <story> <title> <what>
     [ -n "$EV_VID_DIR" ] && [ -s "$EV_VID_DIR/$EV_VID.gif" ] || return 0
     ev_begin "$1" "$2" T3
-    if [ -n "$EV_DIR" ]; then
-        name=$(ev_name "${EV_VID#*-}" gif)
-        cp "$EV_VID_DIR/$EV_VID.gif" "$EV_DIR/$name"
-        ev_attach "$name" "$3 ($EV_VID_STORY's recording: its frames are in $EV_VID_STORY/$EV_VID/); $EV_VID_EVENTS"
-    fi
+    ev_video_copy "${EV_VID#*-}" "$3"
     ev_end
 }
 
@@ -2984,7 +2987,6 @@ ev_audio_stop "EV-AUDIO: the machine's output while the journey pod played a 20 
     15 0.05 1100 --max-gap 0.1 --span 19.6 20.6 ${mark:+--mark "$mark"} || heard=no
 audio_window_record "$t_cap0" "$t_cap1" "$g_cap0"
 ev_video_stop "EV-VIDEO: the display going down and coming back while the pod's tone plays (index.txt and the notes give the times)"
-T_VID=$EV_VID
 ev_save pod-after "EV-PIDS: the journey pod's container after the X session came back" gq pod-state journey >/dev/null || true
 T_POD_A=$EV_LAST
 ev_diff pod "EV-DIFF: the journey pod across the X restart" "$T_POD_B" "$T_POD_A" "nothing: the same container, not restarted"
@@ -3032,7 +3034,7 @@ ev_client_shot second-xterm-own journey "EV-SHOT-CLIENT: the same moment as the 
 ev_save windows-after "EV-STATE: xwininfo -root -tree after the restart: journey-2 among the windows, journey-1 gone" gq win-tree >/dev/null || true
 ev_diff windows "EV-DIFF: the window tree across the X restart" "$J_WIN_B" "$EV_LAST" \
     "every window: the new X server gave each its own id, journey-1 is gone and journey-2 is where it was (+640+420), the children counted again"
-ev_copy "$ART/S7.6.3/$T_VID.gif" x-restart "EV-VIDEO: the display going down and coming back across the kill (S7.6.3's recording; its frames are in S7.6.3)"
+ev_video_copy x-restart "EV-VIDEO: the display going down and coming back across the kill"
 [ -z "$x1_left" ] || fail "the pod's first xterm is still running after its X server died: $x1_left"
 ev_pass "the pod's first xterm ended with its X server${x1_said:+, saying: $x1_said}"
 ev_pass "the pod's second xterm appeared on the new X server, and the pod's own screenshot reached it"
