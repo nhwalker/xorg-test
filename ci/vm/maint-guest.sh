@@ -470,10 +470,10 @@ mt_judge() { # <command> <comment> <exit status> <output file>
         "loginctl list-sessions")
             mt_shows "$f" 'desktop[[:space:]]+seat0[[:space:]]+tty1' "desktop's session on seat0, tty1" ;;
         "podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf")
-            mt_shows "$f" 'Driver[[:space:]]+"(modesetting|nvidia)"' "the X driver chosen, modesetting or nvidia" ;;
+            mt_shows "$f" '^[[:space:]]*Driver[[:space:]]+"(modesetting|nvidia)"' "the X driver chosen, modesetting or nvidia" ;;
         "podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf")
             if mt_layout_declared; then
-                mt_shows "$f" 'Section "Monitor"' "the declared layout's Monitor sections"
+                mt_shows "$f" '^Section "Monitor"' "the declared layout's Monitor sections"
             elif [ "$rc" != 0 ] && grep -q 'No such file' "$f"; then
                 printf 'PASS\tno layout is declared, and the file is not there (the comment: "if declared")\n'
             else
@@ -498,7 +498,7 @@ mt_judge() { # <command> <comment> <exit status> <output file>
             if [ "$rc" = 0 ]; then mt_shows "$f" 'done: 0 FAIL' "0 FAILs"; else printf 'FAIL\texited %s: a FAIL\n' "$rc"; fi ;;
         "systemctl cat desktop.service")
             mt_shows "$f" '^# /run/systemd/generator/desktop\.service' "the unit as quadlet generated it, from /run/systemd/generator" \
-                'ExecStart=/usr/bin/podman run' "its podman run" ;;
+                '^ExecStart=/usr/bin/podman run' "its podman run" ;;
         "systemctl is-enabled getty@tty1.service")
             mt_shows "$f" '^masked$' "masked" ;;
         "systemctl get-default")
@@ -777,7 +777,7 @@ mt_layout_pinned() {
     ev_save geometry-after "EV-STATE: xrandr --query with the layout pinned" xr >/dev/null || true
     while read -r name mode pos _; do
         geom="${mode%%@*}$pos"
-        grep -q "\"$name\"" <<<"$gen" || fail "30-monitors.conf does not name $name"
+        gen_grep_text -q "\"$name\"" "$gen" || fail "30-monitors.conf does not name $name"
         xr_is "$name" connected "$geom" || fail "$name is not at the captured geometry $geom: $(xr_line "$name")"
         ev_pass "$name is named in 30-monitors.conf and sits at the captured geometry: $(xr_line "$name")"
     done < "$MT/captured-outputs"

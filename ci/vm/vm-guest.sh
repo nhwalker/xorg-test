@@ -225,7 +225,7 @@ phase_deploy() {
     log pd "stub CDI spec resolved (no NVIDIA in the VM; marker on the init process)"
     ev_begin S5.4.1 "Stub on a GPU-less host, resolvable by podman" T3
     ev_copy /etc/cdi/nvidia.yaml nvidia-cdi-spec "EV-CONFIG: /etc/cdi/nvidia.yaml as desktop-cdi-refresh wrote it on this GPU-less VM: the stub, whose only edit is NVIDIA_CDI_STUB=1"
-    grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
+    gen_grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml || fail "stub CDI spec not written"
     ev_pass "with no toolkit and no NVIDIA hardware, desktop-cdi-refresh wrote the stub spec"
     # /proc/1 is the HOST's systemd under --pid=host; the CDI env edits land
     # on the container's init process, whose (host) pid desktop-init records.
@@ -237,9 +237,9 @@ phase_deploy() {
     ev_end
 
     log pd "the tree's oneshot wrote both client CDI specs"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "desktop-client-cdi did not write a usable display spec"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "desktop-client-cdi did not write a usable audio spec"
 
     log pd "the desktop published its toolkit and the watcher advertised it"
@@ -251,7 +251,7 @@ phase_deploy() {
     wait_for 30 1 "tools CDI spec" test -s /etc/cdi/desktop-tools.yaml
     [ -s /var/lib/desktop-container/bin/screenshot ] \
         || fail "the desktop did not publish screenshot into /var/lib/desktop-container/bin"
-    grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
+    gen_grep -q 'kind: desktop.local/tools' /etc/cdi/desktop-tools.yaml \
         || fail "desktop-tools-cdi.path did not advertise the toolkit after the desktop published"
     ev_begin S7.2.5 "Advertised only after provisioning" T3
     ev_copy /tmp/ev-cdi-before-start.txt cdi-before-first-start "EV-STATE: ls -l --full-time /etc/cdi right after the tree was applied, before the desktop's first start: no desktop-tools.yaml"
@@ -302,7 +302,7 @@ phase_deploy() {
     ev_pass "xorg-gpu-conf logged 'decision: modesetting driver on $card'"
     gpuconf=$(ev_save config "EV-CONFIG: /etc/X11/xorg.conf.d/20-gpu.conf in the running container" \
         podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf) || fail "no 20-gpu.conf in the container"
-    grep -qF "Option     \"kmsdev\" \"$card\"" <<<"$gpuconf" || fail "20-gpu.conf does not name $card as kmsdev"
+    gen_grep_text -qF "Option     \"kmsdev\" \"$card\"" "$gpuconf" || fail "20-gpu.conf does not name $card as kmsdev"
     ev_pass "20-gpu.conf names $card as kmsdev, with the modesetting driver"
     ev_end
 
@@ -623,18 +623,18 @@ phase_deploy() {
         src=$(first_of ls "$EV_ROOT/S7.1.1/"*"-$f.txt")
         [ -z "$src" ] || ev_copy "$src" "$f" "EV-STATE: the $f client's env and mounts, as S7.1.1 ran it (copied here)"
     done
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml || fail "display spec kind wrong"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml || fail "audio spec kind wrong"
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml || fail "display spec kind wrong"
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml || fail "audio spec kind wrong"
     ev_pass "the two specs carry the kinds desktop.local/display and desktop.local/audio"
-    if grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' /etc/cdi/desktop-display.yaml \
-        || grep -qE 'DISPLAY=|X11-unix' /etc/cdi/desktop-audio.yaml; then
+    if gen_grep -qE 'PULSE_SERVER|PIPEWIRE_REMOTE|desktop-audio' /etc/cdi/desktop-display.yaml \
+        || gen_grep -qE 'DISPLAY=|X11-unix' /etc/cdi/desktop-audio.yaml; then
         fail "the specs are not disjoint: one carries the other's edits"
     fi
     ev_pass "disjoint: neither spec carries the other's env or mount"
-    grep -q 'hostPath: /tmp/.X11-unix$' /etc/cdi/desktop-display.yaml \
-        && grep -q 'hostPath: /run/desktop-audio$' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'hostPath: /tmp/.X11-unix$' /etc/cdi/desktop-display.yaml \
+        && gen_grep -q 'hostPath: /run/desktop-audio$' /etc/cdi/desktop-audio.yaml \
         || fail "the specs do not mount the two directories"
-    grep -q '"rbind", "rw"' /etc/cdi/desktop-display.yaml && grep -q '"rbind", "rw"' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q '"rbind", "rw"' /etc/cdi/desktop-display.yaml && gen_grep -q '"rbind", "rw"' /etc/cdi/desktop-audio.yaml \
         || fail "the spec mounts are not rbind rw"
     ev_pass "each mounts its directory (not a socket file), rbind and rw"
     printf 'cdiVersion: 0.5.0\nkind: desktop.local/display\ndevices: []\n' > /etc/cdi/desktop.yaml
@@ -969,11 +969,11 @@ EOF
         podman logs desktop 2>&1 | grep xorg-monitor-conf >&2 || true
         fail "the declared layout generated no /etc/X11/xorg.conf.d/30-monitors.conf"
     fi
-    echo "$out" | grep -q 'Option      "Enable" "true"' \
+    gen_grep_text -q 'Option      "Enable" "true"' "$out" \
         || fail "outputs were not forced enabled"
-    echo "$out" | grep -q 'Modeline "1024x768_60.00"' \
+    gen_grep_text -q 'Modeline "1024x768_60.00"' "$out" \
         || fail "no derived timing for the declared mode"
-    echo "$out" | grep -q 'Virtual 2048 768' \
+    gen_grep_text -q 'Virtual 2048 768' "$out" \
         || fail "framebuffer not pinned to the declared extents"
     ev_pass "the generated config forces both outputs enabled, carries a derived 1024x768_60.00 Modeline and pins the framebuffer at 2048x768"
     ev_save sysfs "EV-STATE: every DRM connector's status in sysfs: Virtual-2 is disconnected" \
@@ -1884,7 +1884,7 @@ deploy_tail() {
     systemctl daemon-reload
     c=$(ev_save unit "EV-CONFIG: systemctl cat desktop.service with the drop-in in place: the unit quadlet generated" \
         systemctl cat desktop.service) || fail "systemctl cat desktop.service failed"
-    grep -q 'localhost/desktop-container:ev-pinned' <<<"$c" || fail "the generated desktop.service does not carry the drop-in's image"
+    gen_grep_text -q 'localhost/desktop-container:ev-pinned' "$c" || fail "the generated desktop.service does not carry the drop-in's image"
     ev_pass "the generated desktop.service carries the drop-in's image"
     systemctl restart desktop.service
     desk_back
@@ -2680,9 +2680,9 @@ phase2() {
     # phase-deploy's desktop-client-cdi.service wrote them and the tree is
     # still applied - only the quadlet unit was removed above.
     log p2 "both client CDI specs are on the node"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "/etc/cdi/desktop-display.yaml missing or malformed before k3s install"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "/etc/cdi/desktop-audio.yaml missing or malformed before k3s install"
 
     # Everything downstream rests on CRI-O scanning /etc/cdi. That IS the
@@ -5196,9 +5196,9 @@ verify_teardown() {
     cdi_a=$(ls -l --time-style=full-iso /etc/cdi)
     ev_text cdi-after "EV-STATE: ls -l --time-style=full-iso /etc/cdi after the uninstall" "$cdi_a"
     ev_diff cdi "EV-DIFF: /etc/cdi before and after the uninstall (no differences: the host's specs untouched)" "$cdi_bf" "$EV_LAST"
-    grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
+    gen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml \
         || fail "helm uninstall removed the host display spec - it is host state"
-    grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
+    gen_grep -q 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml \
         || fail "helm uninstall removed the host audio spec - it is host state"
     [ "$cdi_a" = "$cdi_b" ] || fail "/etc/cdi changed with the uninstall (see the diff)"
     ev_pass "/etc/cdi is unchanged, every spec in it with the same size and time: the specs are the host's, not the charts'"

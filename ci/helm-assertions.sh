@@ -8,9 +8,13 @@
 # the plugin is the single piece that lets them name a CDI device.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# gen_grep_text: the rendered chart read without its comment lines, so a
+# comment that names what is asserted cannot answer it (Requirements.md S9.1.2).
+# shellcheck source=ci/evidence.sh
+. ci/evidence.sh
 
-ck() { echo "$2" | grep -q "$1" && echo "PASS: $3" || { echo "FAIL: $3"; exit 1; }; }
-nk() { echo "$2" | grep -q "$1" && { echo "FAIL: $3"; exit 1; } || echo "PASS: $3"; }
+ck() { if gen_grep_text -q -- "$1" "$2"; then echo "PASS: $3"; else echo "FAIL: $3"; exit 1; fi; }
+nk() { if gen_grep_text -q -- "$1" "$2"; then echo "FAIL: $3"; exit 1; else echo "PASS: $3"; fi; }
 
 DP=$(helm template p charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all --set count=10)
 DPA=$(helm template a charts/cdi-device-plugin --set cdiDevice=desktop.local/audio=all --set count=10)
@@ -51,22 +55,31 @@ helm template p charts/cdi-device-plugin --set cdiDevice=missing-equals >/dev/nu
 # The resource names are a contract between the plugin releases, the CDI
 # generator and every client manifest; nothing at template time would catch
 # them drifting apart, so read them back from the rendered chart.
-DISPLAY_RES=$(sed -n 's/.*value: "\(desktop\.local\/display\)"$/\1/p' <<<"$DP")
+DISPLAY_RES=$(sed -n 's/^[[:space:]]*value: "\(desktop\.local\/display\)"$/\1/p' <<<"$DP")
 DISPLAY_RES=${DISPLAY_RES%%$'\n'*}
-AUDIO_RES=$(sed -n 's/.*value: "\(desktop\.local\/audio\)"$/\1/p' <<<"$DPA")
+AUDIO_RES=$(sed -n 's/^[[:space:]]*value: "\(desktop\.local\/audio\)"$/\1/p' <<<"$DPA")
 AUDIO_RES=${AUDIO_RES%%$'\n'*}
 [ -n "$DISPLAY_RES" ] && [ -n "$AUDIO_RES" ] \
     || { echo "FAIL: could not read the advertised resource names from the chart"; exit 1; }
 echo "PASS: plugin advertises $DISPLAY_RES and $AUDIO_RES"
 
-# The generator is the other end of that contract: the kinds it writes must
-# be exactly the resources the manifests request.
+# The generator is the other end of that contract: the kinds in the specs it
+# writes must be exactly the resources the manifests request. Read from specs
+# it generates, not from its source (Requirements.md S9.1.2): it runs as it
+# ships, with only its output directory moved to a scratch one and its host
+# config file pointed at one that does not exist.
 GEN=deploy/host/usr/local/libexec/desktop-client-cdi
-for kindvar in DISPLAY_KIND AUDIO_KIND; do
-    k=$(sed -n "s/^$kindvar=\"\(.*\)\"\$/\1/p" "$GEN")
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+sed -e "s|^CDI_DIR=/etc/cdi\$|CDI_DIR=$T/cdi|" -e "s|^CONF=.*|CONF=$T/no-client-cdi.conf|" "$GEN" > "$T/gen"
+grep -qx "CDI_DIR=$T/cdi" "$T/gen" && grep -qx "CONF=$T/no-client-cdi.conf" "$T/gen" \
+    || { echo "FAIL: desktop-client-cdi's output directory or config could not be moved to a scratch one"; exit 1; }
+bash "$T/gen" >/dev/null || { echo "FAIL: desktop-client-cdi did not run"; exit 1; }
+for spec in desktop-display.yaml desktop-audio.yaml; do
+    k=$(sed -n 's/^kind: //p' "$T/cdi/$spec")
     case "$k" in
-        "$DISPLAY_RES"|"$AUDIO_RES") echo "PASS: generator $kindvar=$k matches an advertised resource" ;;
-        *) echo "FAIL: generator $kindvar=$k is not advertised by any plugin release"; exit 1 ;;
+        "$DISPLAY_RES"|"$AUDIO_RES") echo "PASS: the generated $spec's kind, $k, is an advertised resource" ;;
+        *) echo "FAIL: the generated $spec's kind, ${k:-none}, is not advertised by any plugin release"; exit 1 ;;
     esac
 done
 

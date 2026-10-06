@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Requirements.md E9, the test-suite rules a read of the tree can hold.
 
+  S9.1.2  an assertion over a generated artefact (a CDI spec, 20-gpu.conf or
+          30-monitors.conf, a unit as systemctl cat or quadlet's dry run
+          prints it, a rendered chart) reads it so that a comment cannot
+          answer it: a pattern anchored at the line's start, a whole line
+          (-x), or ci/evidence.sh's comment-blind gen_grep / gen_grep_text,
+          which the rule runs to show they find a line and not a comment;
+          a helper that greps what it is given is judged where a caller
+          gives it a generated artefact;
   S9.1.3  the desktop's processes are found through /run/desktop-init.pid,
           never /proc/1 or a lookup by name;
   S9.1.5  no reader that stops early (grep -q/-m/-l, head, sed q, awk exit,
@@ -56,6 +64,7 @@ import importlib.util
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 
@@ -1668,12 +1677,18 @@ def retypes(root, rel, blocks):
 
 def shell_functions(text):
     """(name, first line, lines) for each top-level function: from
-    `name() {` to the next line that is `}`."""
+    `name() {` to the next line that is `}`, or the one line of a function
+    that opens and closes on it."""
     lines = text.split("\n")
     out, i = [], 0
     while i < len(lines):
-        m = re.match(r"^([A-Za-z_][\w-]*)\s*\(\)\s*\{", lines[i])
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*\(\)\s*\{(.*)$", lines[i])
         if not m:
+            i += 1
+            continue
+        rest = m.group(2)
+        if re.search(r"\}\s*(?:#.*)?$", rest) and rest.count("{") < rest.count("}"):
+            out.append((m.group(1), i + 1, lines[i:i + 1]))
             i += 1
             continue
         j = i
@@ -1923,7 +1938,382 @@ def rule_s926(root, rep):
             f"there; {len(rep.violations('S9.2.6'))} violation(s)")
 
 
-RULES = {"S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
+# A generated artefact, by its path: a CDI spec, an Xorg config the
+# container writes, a unit quadlet generates.
+GEN_PATH = re.compile(r"(?:^|/)(?:etc/cdi/[\w.${}-]+\.ya?ml|(?:20-gpu|30-monitors)\.conf|run/systemd/generator\b)")
+# A command whose output is one: a unit as systemd has it, quadlet's dry
+# run, a rendered chart.
+GEN_COMMAND = re.compile(r"\bsystemctl\s+(?:--[\w=-]+\s+)*cat\b|-dryrun\b|\bhelm\s+template\b")
+# ci/evidence.sh's readers that drop comment lines first.
+COMMENT_BLIND = {"gen_grep", "gen_grep_text"}
+COMMENT_FILTER = re.compile(r"\bgrep\s+(?:-\w*v\w*|--invert-match)\b.*\^\[?\[?:?(?:space:\]\]\*)?#|\bgen_uncommented\b")
+MATCHERS = {"grep", "egrep", "fgrep"}
+# Functions that run a command after arguments of their own.
+S912_RUNNERS = {"want": 1, "ev_check": 1, "ev_save": 2, "wait_for": 3, "run": 0}
+# Helpers that read a file they are given with patterns they are given, and
+# are not comment-blind: (input argument, pattern arguments). A helper the
+# rule finds that is neither comment-blind nor here is a violation.
+PATTERN_HELPERS = {"mt_shows": (1, "pairs")}
+
+
+def top_alternatives(pat, ere):
+    """A pattern's top-level alternatives."""
+    out, cur, depth, k = [], "", 0, 0
+    while k < len(pat):
+        c = pat[k]
+        if c == "\\" and k + 1 < len(pat):
+            if not ere and pat[k + 1] == "|" and depth == 0:
+                out.append(cur)
+                cur, k = "", k + 2
+                continue
+            if not ere and pat[k + 1] in "()":
+                depth += 1 if pat[k + 1] == "(" else -1
+            cur += pat[k:k + 2]
+            k += 2
+            continue
+        if c == "[":
+            j = pat.find("]", k + 2)
+            j = len(pat) - 1 if j < 0 else j
+            cur += pat[k:j + 1]
+            k = j + 1
+            continue
+        if ere and c in "()":
+            depth += 1 if c == "(" else -1
+        if ere and c == "|" and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+        k += 1
+    out.append(cur)
+    return out
+
+
+def pattern_anchored(pat, opts):
+    """A grep pattern that a comment line cannot match: the whole line (-x),
+    or every alternative anchored at the line's start."""
+    if opts & {"-x", "--line-regexp"}:
+        return True
+    if opts & {"-F", "--fixed-strings"}:
+        return False
+    ere = bool(opts & {"-E", "-P", "--extended-regexp", "--perl-regexp"})
+    return all(re.sub(r"^\(+", "", a).startswith("^") for a in top_alternatives(pat, ere))
+
+
+def grep_words(words):
+    """(options, patterns, operands, here-strings, redirected inputs) of a
+    grep's arguments."""
+    opts, pats, ops, here, redir, k, ended = set(), [], [], [], [], 0, False
+    while k < len(words):
+        w = words[k]
+        if w.startswith("<<<"):
+            here.append(w[3:])
+        elif w == "<" and k + 1 < len(words):
+            k += 1
+            redir.append(words[k])
+        elif re.match(r"^\d*>", w) or w in (">", ">>", "2>&1", "&>"):
+            if w in (">", ">>", "&>"):
+                k += 1
+        elif not ended and w == "--":
+            ended = True
+        elif not ended and w.startswith("--") and len(w) > 2:
+            name, _, val = w.partition("=")
+            if name in ("--regexp", "--file", "--max-count", "--after-context", "--before-context", "--context"):
+                if not val:
+                    k += 1
+                    val = words[k] if k < len(words) else ""
+                if name == "--regexp":
+                    pats.append(val)
+            opts.add(name)
+        elif not ended and w.startswith("-") and len(w) > 1:
+            j = 1
+            while j < len(w):
+                c = w[j]
+                if c in "efmABC":
+                    arg = w[j + 1:]
+                    if not arg:
+                        k += 1
+                        arg = words[k] if k < len(words) else ""
+                    if c == "e":
+                        pats.append(arg)
+                    opts.add("-" + c)
+                    break
+                opts.add("-" + c)
+                j += 1
+        else:
+            ops.append(w)
+        k += 1
+    if not pats and ops and "-f" not in opts:
+        pats.append(ops.pop(0))
+    return opts, pats, ops, here, redir
+
+
+def pipelines(cg, toks):
+    """Each pipeline of a command's tokens: its simple commands, in order."""
+    cur, pipe = [], []
+    for t in toks:
+        if t == "|":
+            pipe.append(cur)
+            cur = []
+        elif t in cg.OPS or t in ("()", "{", "}"):        # a function's head and braces end a command too
+            if cur:
+                pipe.append(cur)
+            if pipe:
+                yield pipe
+            cur, pipe = [], []
+        else:
+            cur.append(t)
+    if cur:
+        pipe.append(cur)
+    if pipe:
+        yield pipe
+
+
+def run_word(words):
+    """A simple command's verb and arguments, past the wrappers and the
+    harness's runners."""
+    k = 0
+    while k < len(words):
+        w = words[k]
+        if w in PREFIXES or re.match(r"^[A-Za-z_]\w*=", w) or w in ("if", "then", "!", "while", "until", "do", "else", "elif"):
+            k += 1
+        elif w in S912_RUNNERS:
+            k += 1 + S912_RUNNERS[w]
+        else:
+            return os.path.basename(w), words[k + 1:]
+    return "", []
+
+
+def substitutions(text):
+    """(name, body) for each NAME=$( ... ) in a text, the body balanced."""
+    out = []
+    for m in re.finditer(r"(?:^|[\s;&|(])(?:local\s+|export\s+)?([A-Za-z_]\w*)=\$\(", text):
+        d, e = 1, m.end()
+        while e < len(text) and d:
+            if text[e] == "(":
+                d += 1
+            elif text[e] == ")":
+                d -= 1
+            e += 1
+        out.append((m.group(1), text[m.end():e - 1]))
+    return out
+
+
+def quoted_commands(cg, toks, depth=0):
+    """A command's tokens, and those of each quoted string in it that runs
+    grep or sed (sh -c, ssh, a runner's command); not an evidence
+    description (EV-...), which only names one."""
+    yield toks
+    if depth > 2:
+        return
+    for t in toks:
+        if re.search(r"\s", t) and re.search(r"\b(?:grep|sed)\b", t) and not re.match(r"^\s*EV-", t):
+            try:
+                sub = cg.tokens(t)
+            except ValueError:
+                continue
+            yield from quoted_commands(cg, sub, depth + 1)
+
+
+def path_holders(text):
+    """A file's variables that name a generated artefact: a path."""
+    return {m.group(1) for m in re.finditer(r"(?:^|[\s;])(?:local\s+|export\s+|readonly\s+)?([A-Za-z_]\w*)=[\"']?([^\s\"';]+)",
+                                            text, re.M) if GEN_PATH.search(m.group(2))}
+
+
+# A substitution whose result is already free of comment lines: it keeps
+# only lines an anchored pattern picks, or drops the comments itself.
+CLEAN_BODY = re.compile(r"\bgrep\b[^|]*?\s(?:-\w*x\w*\s|(?:-e\s+)?['\"]\^)|\bsed\s+-n\s+['\"](?:s(.)\^|/\^)"
+                        r"|\bgen_(?:grep|grep_text|uncommented)\b")
+
+
+# A command that prints a file's content.
+CONTENT_READER = r"\b(?:cat|head|tail|sed|awk|tac|nl|less)\b[^|;&]*?"
+
+
+def generated_text(body, paths, texts):
+    """Whether a command substitution's output is a generated artefact's
+    text, comment lines and all: a generated file's content, a command that
+    prints one, or a variable that holds one."""
+    if CLEAN_BODY.search(body):
+        return False
+    refs = "|".join([GEN_PATH.pattern] + [rf"\$\{{?{v}\b" for v in paths])
+    return bool(re.search(CONTENT_READER + f"(?:{refs})", body) or GEN_COMMAND.search(body)
+                or any(re.search(rf"\$\{{?{v}\b", body) for v in texts))
+
+
+def is_generated(word, paths, texts):
+    return bool(GEN_PATH.search(word) or GEN_COMMAND.search(word)
+                or any(re.search(rf"\$\{{?{v}\b", word) for v in paths | texts))
+
+
+def scoped_states(cg, root, rel, text, src):
+    """(line, tokens, paths, texts, function) for each logical command: the
+    variables that name a generated artefact (paths), and those that hold
+    one's text at that point (texts), followed line by line in each
+    function and at the top level, where an assignment sets or clears one."""
+    paths = path_holders(text)
+    owner = {} if src is not None else {first + k: name for name, first, body in shell_functions(text)
+                                         for k in range(len(body))}
+    state, aliases = {}, {}
+    for n, line, toks in cg.logical_commands(os.path.join(root, rel), source=text):
+        if toks is None:
+            continue
+        al = aliases.setdefault(owner.get(n, "<top>"), {})
+        for m in re.finditer(r"(?:^|[\s;&|(])(?:local\s+)?([A-Za-z_]\w*)=[\"']?\$\{?(\d)\}?[\"']?(?=\s|;|$)", line):
+            al[m.group(1)] = int(m.group(2))
+        st = state.setdefault(owner.get(n, "<top>"), {})
+        top = state.setdefault("<top>", {})
+        texts = {v for v, g in {**top, **st}.items() if g}
+        for m in re.finditer(r"(?:^|[\s;&|(])local((?:\s+[A-Za-z_]\w*)+)\s*(?:$|[;&|)])", line):
+            for v in m.group(1).split():
+                st[v] = False
+        for m in re.finditer(r"(?:^|[\s;&|(])(?:local\s+|export\s+)?([A-Za-z_]\w*)=(?!\$\()(\S*)", line):
+            st[m.group(1)] = bool(re.fullmatch(r"[\"']?\$\{?(\w+)\}?[\"']?", m.group(2))
+                                  and re.sub(r"[^\w]", "", m.group(2)) in texts)
+        for name, body in substitutions(line):
+            st[name] = generated_text(body, paths, texts)
+        texts = {v for v, g in {**top, **st}.items() if g}
+        yield n, toks, paths, texts, owner.get(n), al
+
+
+CASE_LABEL = re.compile(r'^\s*"[^"]+"(?:\|"[^"]+")*\)\s*$')
+
+
+# ci/evidence.sh's comment-blind readers, run: on a spec whose only mention
+# of a line is a comment they find nothing, on one that has the line they
+# find it, and a plain grep (the control) is fooled by the comment.
+BLIND_CHECK = r"""
+. "$1/ci/evidence.sh"
+t=$(mktemp -d)
+printf '# kind: desktop.local/display\ncdiVersion: 0.5.0\n' > "$t/comment"
+printf '# a comment\nkind: desktop.local/display\n' > "$t/line"
+r=""
+gen_grep -q 'kind: desktop.local/display' "$t/comment" && r="$r gen_grep-matched-a-comment"
+gen_grep -q 'kind: desktop.local/display' "$t/line" || r="$r gen_grep-missed-the-line"
+gen_grep_text -q 'kind: desktop.local/display' "$(cat "$t/comment")" && r="$r gen_grep_text-matched-a-comment"
+gen_grep_text -q 'kind: desktop.local/display' "$(cat "$t/line")" || r="$r gen_grep_text-missed-the-line"
+[ "$(gen_grep -c . "$t/line")" = 1 ] || r="$r gen_grep-counted-a-comment"
+grep -q 'kind: desktop.local/display' "$t/comment" || r="$r the-control-was-not-fooled"
+rm -rf "$t"
+echo "${r:-ok}"
+"""
+
+
+def rule_s912(root, rep):
+    """S9.1.2: an assertion over a generated artefact reads it so that a
+    comment cannot answer it: an anchored pattern, a whole line, or a
+    comment-blind read."""
+    cg = client_guard()
+    seen = blind = 0
+    run = subprocess.run(["bash", "-c", BLIND_CHECK, "e9-guard", root], capture_output=True, text=True)
+    verdict = run.stdout.strip() or f"no verdict ({run.stderr.strip()[:120]})"
+    if verdict != "ok":
+        rep.flag("S9.1.2", "ci/evidence.sh", 0, "gen_grep",
+                 f"gen_grep and gen_grep_text, run on a spec whose only mention of a line is a comment and on one "
+                 f"that has it, are not comment-blind: {verdict}", "drop comment lines in gen_uncommented")
+    else:
+        rep.ok("S9.1.2", "ci/evidence.sh", 0, "gen_grep and gen_grep_text, run, find a line in a spec that has it "
+               "and nothing in one whose only mention is a comment; a plain grep finds the comment")
+    fix = ("anchor the pattern at the line's start (^...) or match the whole line (-x); or read the artefact "
+           "with gen_grep / gen_grep_text (ci/evidence.sh), which drop its comment lines")
+    sources = [(rel, read(os.path.join(root, rel)), None, 0) for rel in shell_files(root)]
+    sources += [(rel, text, text, first - 1) for rel, first, text, _ in workflow_runs(root)]
+    helpers = {}                                   # (file, function) -> (line, input arguments, patterns, options)
+    for rel, text, src, base in sources:
+        for n, toks, paths, texts, fn, al in scoped_states(cg, root, rel, text, src):
+            for tl in quoted_commands(cg, toks):
+                for pipe in pipelines(cg, tl):
+                    for i, words in enumerate(pipe):
+                        verb, args = run_word(words)
+                        upstream = " ".join(pipe[i - 1]) if i else ""
+                        if verb in COMMENT_BLIND:
+                            blind += bool(args) and is_generated(args[-1], paths, texts)
+                            continue
+                        if any(COMMENT_FILTER.search(" ".join(p)) for p in pipe[:i]):
+                            continue
+                        if verb == "sed":
+                            if not any(re.match(r"^-\w*n", a) for a in args):
+                                continue
+                            script = next((a for a in args if not a.startswith("-")), "")
+                            rest = args[args.index(script) + 1:] if script in args else []
+                            if not (any(is_generated(a, paths, texts) for a in rest)
+                                    or (upstream and is_generated(upstream, paths, texts))):
+                                continue
+                            seen += 1
+                            m = re.match(r"^s(.)(.*?)\1|^/(.*?)/", script)
+                            regex = (m.group(2) if m and m.group(2) is not None else (m.group(3) if m else "")) or ""
+                            if regex and not regex.startswith("^"):
+                                rep.flag("S9.1.2", rel, base + n, f"sed {script}",
+                                         f"sed -n over a generated artefact with an unanchored address: {script[:80]}",
+                                         "anchor it at the line's start (^...)")
+                            continue
+                        if verb not in MATCHERS:
+                            continue
+                        opts, pats, ops, here, redir = grep_words(args)
+                        if opts & {"-v", "--invert-match"}:
+                            continue
+                        opts |= {"egrep": {"-E"}, "fgrep": {"-F"}}.get(verb, set())
+                        inputs = ops + here + redir
+                        # an input the function was given: $1, an alias of it, or echo'd into the pipe
+                        given = inputs + (pipe[i - 1][1:] if i and pipe[i - 1] and pipe[i - 1][0] in ("echo", "printf") else [])
+                        pos = sorted({int(m.group(1)) if m.group(1).isdigit() else al[m.group(1)]
+                                      for m in (re.fullmatch(r"\$\{?(\w+)\}?", w) for w in given)
+                                      if m and (m.group(1).isdigit() or m.group(1) in al)})
+                        if pos and fn and src is None:
+                            helpers.setdefault((rel, fn), (base + n, pos, pats, opts))
+                            continue
+                        if not (any(is_generated(w, paths, texts) for w in inputs)
+                                or (upstream and is_generated(upstream, paths, texts))):
+                            continue
+                        seen += 1
+                        if pats and all(pattern_anchored(p, opts) for p in pats):
+                            continue
+                        rep.flag("S9.1.2", rel, base + n, f"{verb} {' '.join(sorted(opts))} {' | '.join(pats)}",
+                                 f"{verb} over a generated artefact with a pattern a comment line could match: "
+                                 f"{' | '.join(pats)[:90]}", fix)
+    # A helper that greps what it is given: where a caller gives it a
+    # generated artefact, it is comment-blind, its own pattern anchored, or
+    # (PATTERN_HELPERS) the caller's patterns are.
+    flagged = set()
+    for rel, text, src, base in sources:
+        if src is not None:
+            continue
+        lines = text.split("\n")
+        for n, toks, paths, texts, fn, al in scoped_states(cg, root, rel, text, src):
+            for pipe in pipelines(cg, toks):
+                for words in pipe:
+                    verb, args = run_word(words)
+                    if (rel, verb) not in helpers:
+                        continue
+                    hline, pos, hpats, hopts = helpers[(rel, verb)]
+                    gen = any(k - 1 < len(args) and is_generated(args[k - 1], paths, texts) for k in pos)
+                    if not gen:
+                        # the output of the command a case label names
+                        label = next((l for l in reversed(lines[max(0, n - 4):n - 1]) if CASE_LABEL.match(l)), "")
+                        gen = bool(label) and bool(re.search(CONTENT_READER + "(?:" + GEN_PATH.pattern + ")", label)
+                                                   or GEN_COMMAND.search(label))
+                    if not gen:
+                        continue
+                    seen += 1
+                    if verb in PATTERN_HELPERS:
+                        at, kind = PATTERN_HELPERS[verb]
+                        loose = [p for p in args[at::2] if not pattern_anchored(p, {"-E"})]
+                        if loose:
+                            rep.flag("S9.1.2", rel, n, f"{verb} {' | '.join(loose)}",
+                                     f"{verb} over a generated artefact with a pattern a comment line could match: "
+                                     f"{' | '.join(loose)[:90]}", "anchor the pattern at the line's start (^...)")
+                    elif not (hpats and all(not re.search(r"\$\{?\d", p) and pattern_anchored(p, hopts) for p in hpats)):
+                        if (rel, verb) not in flagged:
+                            flagged.add((rel, verb))
+                            rep.flag("S9.1.2", rel, hline, f"helper {verb}",
+                                     f"{verb} greps what it is given without dropping comment lines, and line {n} "
+                                     f"gives it a generated artefact", "read with gen_grep / gen_grep_text")
+    return (f"S9.1.2: {seen + blind} read(s) of a generated artefact by a test: {blind} comment-blind (gen_grep, "
+            f"gen_grep_text), {seen} judged by their pattern; {len(rep.violations('S9.1.2'))} violation(s)")
+
+
+RULES = {"S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
 
 # --- the self-test --------------------------------------------------------------------
 
@@ -1991,6 +2381,18 @@ PLANTS = {
                      "[ ! -e /etc/plant.conf ] || fail \"the plant is still there\"\n", False),
         ("ci/r6.sh", "#!/bin/bash\nset -e\n[ ! -e /etc/plant6.conf ] || fail \"the plant6 is still there\"\n"
                      "echo 'x=1' > /etc/plant6.conf\nrm -f /etc/plant6.conf\n", True),
+    ],
+    "S9.1.2": [
+        ("ci/p1.sh", "#!/bin/bash\nset -e\ngrep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml\n", True),
+        ("ci/p2.sh", "#!/bin/bash\nset -e\ngrep -qE '^kind: desktop\\.local/display$' /etc/cdi/desktop-display.yaml\n"
+                     "grep -qx 'kind: desktop.local/audio' /etc/cdi/desktop-audio.yaml\n", False),
+        ("ci/p3.sh", "#!/bin/bash\nset -e\nmon=$(cat \"$T/30-monitors.conf\")\necho \"$mon\" | grep -q 'Option \"Enable\"'\n", True),
+        ("ci/p4.sh", "#!/bin/bash\nset -e\ngen_grep -q 'kind: desktop.local/display' /etc/cdi/desktop-display.yaml\n"
+                     "mon=$(cat \"$T/30-monitors.conf\")\ngen_grep_text -q 'Option \"Enable\"' \"$mon\"\n", False),
+        ("ci/p5.sh", "#!/bin/bash\nset -e\nhas() { grep -qF \"$2\" \"$1\"; }\nhas /etc/cdi/desktop-display.yaml 'DISPLAY=:0'\n", True),
+        ("ci/p6.sh", "#!/bin/bash\nset -e\nout=$(ls -l /etc/X11/xorg.conf.d)\ngrep -q 20-gpu.conf <<<\"$out\"\n", False),
+        ("ci/p7.sh", "#!/bin/bash\nset -e\nc=$(systemctl cat desktop.service)\ngrep -q 'Image=x' <<<\"$c\"\n", True),
+        ("ci/p8.sh", "#!/bin/bash\nset -e\nr=$(sed -n 's/.*value: \"\\(x\\)\"$/\\1/p' <<<\"$(helm template a b)\")\n", True),
     ],
     "S9.2.6": [
         ("ci/d1.sh", "#!/bin/bash\nset -e\nrsync -a --chown=root:root deploy/host/ /\nsystemctl daemon-reload\n", True),
@@ -2064,7 +2466,7 @@ def self_test(root, rules):
                     f.write("**S9.1.5 A story**\n**S9.3.1 Another**\n")
                 with open(os.path.join(d, "README.md"), "w") as f:
                     f.write(PLANT_README)
-                for support in ["ci/evlib.py", "ci/doc-blocks.py"] + CDI_GENERATORS:
+                for support in ["ci/evlib.py", "ci/doc-blocks.py", "ci/evidence.sh"] + CDI_GENERATORS:
                     os.makedirs(os.path.dirname(os.path.join(d, support)), exist_ok=True)
                     with open(os.path.join(root, support)) as src, open(os.path.join(d, support), "w") as dst:
                         dst.write(src.read())

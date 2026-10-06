@@ -25,7 +25,7 @@ want() { # <claim> <cmd...>: a check that must hold
 ok_if() { # <claim> <condition, as shell text>: for negations and && chains
     if eval "$2"; then ok "$1"; else fail "NOT: $1"; fi
 }
-has()   { grep -qF -- "$2" <<<"$1"; }     # <text> <fixed string>
+has()   { gen_grep_text -qF -- "$2" "$1"; }     # <text> <fixed string>, its comment lines aside
 stamp() { while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S.%3N)" "$l"; done; }
 now()   { date +%s.%N; }
 since() { # <t0> <t1> -> seconds between them, "?" if either is missing
@@ -370,7 +370,7 @@ ev_text second-sysfs "EV-STATE: the fabricated connectors (cat <sysfs>/card*-*/s
 out=$(ev_save second "xorg-gpu-conf with card0's connector disconnected and card1's connected" gpuconf second) \
     || fail "xorg-gpu-conf exited non-zero"
 ev_copy "$G/second/etc/20-gpu.conf" second-config "EV-CONFIG: the 20-gpu.conf it wrote"
-want "card1, whose connector is connected, becomes kmsdev" grep -qF "Option     \"kmsdev\" \"$G/second/dev/dri/card1\"" "$G/second/etc/20-gpu.conf"
+want "card1, whose connector is connected, becomes kmsdev" gen_grep -qF "Option     \"kmsdev\" \"$G/second/dev/dri/card1\"" "$G/second/etc/20-gpu.conf"
 want "and the decision is logged" has "$out" "decision: modesetting driver on $G/second/dev/dri/card1"
 gpu_case none
 : > "$G/none/dev/dri/card0"
@@ -378,7 +378,7 @@ connector none card0-DP-1 disconnected
 ev_text none-sysfs "EV-STATE: the fabricated connectors: none connected" "$(statuses none)"
 out=$(ev_save none "xorg-gpu-conf with no connected connector" gpuconf none) || fail "xorg-gpu-conf exited non-zero"
 ev_copy "$G/none/etc/20-gpu.conf" none-config "EV-CONFIG: the 20-gpu.conf it wrote"
-want "no connected connector: card0 becomes kmsdev" grep -qF "Option     \"kmsdev\" \"$G/none/dev/dri/card0\"" "$G/none/etc/20-gpu.conf"
+want "no connected connector: card0 becomes kmsdev" gen_grep -qF "Option     \"kmsdev\" \"$G/none/dev/dri/card0\"" "$G/none/etc/20-gpu.conf"
 want "and it says it defaulted" has "$out" "no connected connector found in sysfs; defaulting to $G/none/dev/dri/card0"
 ev_end
 

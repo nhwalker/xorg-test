@@ -158,7 +158,7 @@ unit_has_x_driver() { grep -qE '^ExecStart=.*nvidia_drv\.so'; }
 # $1: a CDI spec; the driver version its versioned library paths carry.
 spec_version() {
     local v
-    v=$(grep -m1 -oE 'libnvidia-glcore\.so\.[0-9][0-9.]*' "$1" 2>/dev/null)
+    v=$(gen_grep -m1 -oE 'libnvidia-glcore\.so\.[0-9][0-9.]*' "$1" 2>/dev/null)
     v=${v%%$'\n'*}
     printf '%s' "${v#libnvidia-glcore.so.}"
 }
@@ -290,7 +290,7 @@ no_xdriver() {
     story_begin S3.1.2 "NVIDIA nodes without the X driver fall back to modesetting" T4
     ev_copy "$SPEC" spec-real "EV-CONFIG: /etc/cdi/nvidia.yaml as this host's toolkit generated it"
     real_f=$EV_LAST
-    if grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
+    if gen_grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
         staged=yes
         say "This host's toolkit injects nvidia_drv.so. The stories are about an older toolkit that does not. The script can stage that: a copy of the spec with the X driver's mounts dropped, and nvidia-ctk set aside so nothing regenerates it, both undone at the end."
         yes_no "Stage it?" || { ev_abort "not staged: this toolkit injects the X driver and the tester declined the staging"; return 1; }
@@ -298,7 +298,7 @@ no_xdriver() {
         ctk_aside || { ev_abort "could not set nvidia-ctk aside"; return 1; }
         undo_later "$(ctk_back_cmd); cp -a '$keep' '$SPEC'; systemctl restart desktop-cdi-refresh.service; systemctl restart desktop.service"
         n=$(spec_without_xdriver "$keep" "$SPEC")
-        if [ "${n:-0}" -lt 1 ] || grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
+        if [ "${n:-0}" -lt 1 ] || gen_grep -q 'hostPath: .*nvidia_drv\.so' "$SPEC"; then
             ev_abort "the X driver's mounts could not be dropped from the spec (dropped ${n:-0})"; return 1
         fi
         ev_note "harness-only staging: the spec without the X driver's $n mount(s), as an older toolkit writes it"
@@ -511,7 +511,7 @@ stale_spec() {
         journalctl --no-pager -o short-precise -u desktop-cdi-refresh.service --since "$jr" >/dev/null || true
     ev_copy "$SPEC" spec-regenerated "EV-CONFIG: the spec after the remedy"
     ev_diff remedy "EV-DIFF: the stale spec (-) against the regenerated one (+)" "$stale" "$EV_LAST"
-    if ! grep -q "$ver-gone" "$SPEC" && ! spec_is_stub; then ev_pass "the remedy regenerated a real spec"
+    if ! gen_grep -q "$ver-gone" "$SPEC" && ! spec_is_stub; then ev_pass "the remedy regenerated a real spec"
     else ev_fail "after the remedy the spec is still stale or the stub"; fi
     if wait_desktop 60; then ev_pass "after the remedy alone the desktop is back"
     else
