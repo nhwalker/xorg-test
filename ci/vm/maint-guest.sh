@@ -1546,8 +1546,8 @@ mt_seat_diagnose() {
     sleep 3
     ev_save udev-after "EV-STATE: udevadm info -q property of each staged event node, after the remedy" \
         sh -c 'for e in $(cat '"$MT"'/seat-events); do echo "== $e"; udevadm info -q property -n "$e"; done' >/dev/null || true
-    ev_diff udev "EV-DIFF: udevadm info of the staged nodes, staged (-) and after the remedy (+)" "$(mt_get S10.5.2-udev-before)" "$EV_LAST" \
-        "the seat1 tag on each staged node: TAGS, every tag udev has given the node, keeps it; CURRENT_TAGS and ID_SEAT lose it where the staging had taken effect when the staged listing was read; the order of a node's DEVLINKS"
+    ev_diff udev "EV-DIFF: udevadm info of the staged nodes, before the staging (-) and after the remedy (+); the staged state is the entry's check above" "$(mt_get S10.5.2-udev-before)" "$EV_LAST" \
+        "TAGS, which keeps every tag udev has given a node, now with the staging's seat1; ID_SEAT and CURRENT_TAGS the same, the seat given back; the order of a node's DEVLINKS"
     if grep -q 'ID_SEAT=seat1' "$EV_DIR/$EV_LAST"; then ev_fail "a staged node is still tagged ID_SEAT=seat1"; else ev_pass "no staged node is tagged for seat1 any more"; fi
     ev_save xorg-lines "EV-LOG-XORG: the Xorg log's device removal and addition lines" \
         podman exec desktop grep -E 'config/udev: (Adding|removing) input device|Device removed|Adding input device' "$XORG_LOG" >/dev/null || true

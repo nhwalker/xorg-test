@@ -3493,6 +3493,14 @@ def host_terminal(ctx, st, moment):
     if not ctx.wait_gone(t.id):
         ctx.g.desk(["pkill", "-u", "desktop", "-f", "xterm -T host"], check=False)
         ctx.wait_gone(t.id)
+    # A login's user manager (systemd --user and its (sd-pam)) outlives the
+    # login by logind's UserStopDelaySec, 10 s by default. The next story's
+    # process tables are taken once it has gone, so a diff of two of them
+    # does not catch it going (S9.3.2).
+    over = wait_until(lambda: not ctx.g.sh("pgrep -u desktop-shell; true",
+                                           label="desktop-shell's processes on the host").strip(), 30, 1)
+    st.record(f"desktop-shell's processes on the host once the window closed ({moment}): "
+              + ("none, the login's user manager stopped" if over else "still there 30 s on"))
     return what, who, text
 
 

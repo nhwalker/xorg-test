@@ -2396,9 +2396,8 @@ seat_tags() { # attach|fix
         attach)
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is already there"
             ev_save rules-before "EV-STATE: ls -l /etc/udev/rules.d before: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
-            s386_rb=$EV_LAST
             ev_save udev-before "EV-STATE: udevadm info of the USB keyboard ($sys) and its event node ($ev) before" kbd_udev "$sys" >/dev/null || true
-            b=$EV_LAST s386_ub=$EV_LAST
+            b=$EV_LAST
             loginctl attach seat1 "$sys" || fail "loginctl attach seat1 $sys failed"
             udevadm settle --timeout=15 || true
             ev_save rule "EV-CONFIG: the rule loginctl attach wrote" \
@@ -2439,11 +2438,13 @@ seat_tags() { # attach|fix
                 || fail "seat-prep did not log removing the 72-seat-* rule at the desktop's restart"
             ev_pass "seat-prep logged: $(grep -m1 -o 'seat-prep: removing custom seat attachment rule [^ ]*' <<<"$j")"
             ev_save rules-after "EV-STATE: ls -l /etc/udev/rules.d after seat-prep: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
-            ev_diff rules "EV-DIFF: /etc/udev/rules.d before the attach and after seat-prep" "$s386_rb" "$EV_LAST" \
+            # The "before" files are the attach step's: a guest run of its
+            # own, so they are found by their names (ev_named).
+            ev_diff rules "EV-DIFF: /etc/udev/rules.d before the attach and after seat-prep" "$(ev_named rules-before)" "$EV_LAST" \
                 "nothing: no 72-seat-* rule before the attach, and none once seat-prep removed the one it wrote"
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is still there after seat-prep"
             ev_save udev-after "EV-STATE: udevadm info of the keyboard after seat-prep" kbd_udev "$sys" >/dev/null || true
-            ev_diff udev "EV-DIFF: udevadm info of the keyboard before the attach and after seat-prep" "$s386_ub" "$EV_LAST" \
+            ev_diff udev "EV-DIFF: udevadm info of the keyboard before the attach and after seat-prep" "$(ev_named udev-before)" "$EV_LAST" \
                 "only the TAGS lines, which keep seat1 (udev's TAGS keep every tag a device has had; CURRENT_TAGS, its present ones, are as before); ID_SEAT must not"
             ev_save tagged-after "EV-STATE: every udev database entry tagged for a seat other than seat0, after seat-prep: none" \
                 foreign_entries >/dev/null || true
