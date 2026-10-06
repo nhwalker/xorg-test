@@ -62,13 +62,19 @@ mt_logs() { # <since epoch> <the window>
 # EV-PIDS: the desktop's processes in the container, the container itself, the
 # host login session and every uid-61000 process on the host. The lines
 # mt_pids_moved compares ("<what> <id> [<started>]") go to
-# $MT/pids-<story>-<moment>.
+# $MT/pids-<story>-<moment>. A pid, and a monotonic start time, name one
+# thing for one boot only: a fresh boot runs the same steps in the same order
+# and can hand out the same pids (desktop-init was pid 2010, and
+# desktop-session's MainPID 2012, in both boots around S10.3.5's reboot on one
+# run), so each is written with the boot it was seen in, as <id>@<boot>.
 mt_pids() { # <moment> <when>
+    local boot
     mkdir -p "$MT"
+    boot=$(cut -c1-8 /proc/sys/kernel/random/boot_id)
     {
-        podman exec desktop ps -o comm=,pid= -C "$S737_COMMS" 2>/dev/null | awk '{print $1, $2}' || true
+        podman exec desktop ps -o comm=,pid= -C "$S737_COMMS" 2>/dev/null | awk -v b="$boot" '{print $1, $2 "@" b}' || true
         echo "container $(podman inspect --format '{{.Id}}' desktop 2>/dev/null || echo none)"
-        echo "desktop-session $(systemctl show -p MainPID --value desktop-session.service) $(systemctl show -p ActiveEnterTimestampMonotonic --value desktop-session.service)"
+        echo "desktop-session $(systemctl show -p MainPID --value desktop-session.service)@$boot $(systemctl show -p ActiveEnterTimestampMonotonic --value desktop-session.service)@$boot"
     } > "$MT/pids-$EV_STORY-$1"
     ev_save "pids-$1" "EV-PIDS: $2: the desktop's processes in the container (ps), the container (podman inspect), the host login session (systemctl show, loginctl) and every uid-61000 process on the host (ps -u 61000)" \
         sh -c 'echo "== in the container"; podman exec desktop ps -o pid,ppid,lstart,comm -C '"$S737_COMMS"' 2>&1 || echo "(no desktop container running)"
@@ -90,10 +96,10 @@ mt_pids_moved() { # <moment before> <moment after>
     ev_pass "every desktop process ($S737_COMMS) and the container itself are new: no pid and no container id is the same $1 and $2"
     s0=$(awk '$1 == "desktop-session" {print $2, $3}' "$a")
     s1=$(awk '$1 == "desktop-session" {print $2, $3}' "$b")
-    [ -n "${s1%% *}" ] && [ "${s1%% *}" != 0 ] || fail "there is no host login session $2 (desktop-session.service MainPID ${s1%% *})"
+    [ -n "${s1%%@*}" ] && [ "${s1%%@*}" != 0 ] || fail "there is no host login session $2 (desktop-session.service MainPID ${s1%%@*})"
     [ "${s0%% *}" != "${s1%% *}" ] && [ "${s0#* }" != "${s1#* }" ] \
-        || fail "the host login session did not move with the container: desktop-session.service (MainPID, started) $s0 $1, $s1 $2"
-    ev_pass "the host login session moved with it: desktop-session.service's MainPID ${s0%% *} -> ${s1%% *}, and it started again"
+        || fail "the host login session did not move with the container: desktop-session.service (MainPID, started, each @boot) $s0 $1, $s1 $2"
+    ev_pass "the host login session moved with it: desktop-session.service's MainPID ${s0%% *} -> ${s1%% *} (pid@boot), and it started again"
 }
 
 # No getty on any VT now, and none started since <epoch>: a login prompt on
