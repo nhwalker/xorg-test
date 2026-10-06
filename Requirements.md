@@ -59,7 +59,7 @@ renumbering.
 | Tier | Runs where | Can see | Today |
 |---|---|---|---|
 | **T0 static** | any machine, no root | files only | `ci.yml` `static`: go fmt/vet/test, shellcheck, `py_compile` of the VM harness, `ci/monitor-layout-tests.sh`, ARG-scoping check, helm/kubeconform |
-| **T1 script-unit** | any machine, no root, or a scratch container of the image | one script with fabricated inputs | *does not exist yet* — see Appendix A for the refactors it needs |
+| **T1 script-unit** | any machine, no root, or a scratch container of the image | one script with fabricated inputs | `ci.yml` `static`: `ci/script-unit-tests.sh`, for the scripts an Appendix A override or a fake on `PATH` already reaches; the scripts that need more (Appendix A) are still to come |
 | **T2 build-smoke** | ubuntu runner, root, podman, systemd, **no sound card, no SELinux**; KMS not guaranteed (the Azure runners usually expose a Hyper-V DRM device, and X then really runs, per `ci/smoke-deploy.sh`) | the deploy tree booting a real container | `ci.yml` `build-smoke` + `ci/smoke-deploy.sh` |
 | **T3 VM e2e** | Rocky 9 KVM guest, virtio GPU/input/HDA, **SELinux enforcing**, k3s + CRI-O | real Xorg on a real KMS device, hotplug via QEMU, confined clients, a capturable display and audio backend | `ci.yml` `images` → `vm` (shards `core`, `operator`, `k8s`, each its own VM) → `ci/vm/vm-e2e.sh` + `ci/vm/vm-guest.sh` + `ci/vm/operator-e2e.py` |
 | **T4 hardware** | a provisioned physical host | NVIDIA, physical KVM switch, real monitors/EDID, USB audio, a person | manual checklist (Appendix C); to become a guided script that prompts the tester for each physical action and gathers the evidence itself |
@@ -90,7 +90,8 @@ that files its evidence under another story's directory names it as
 Reference shorthand: `smoke` = `ci/smoke-deploy.sh`; `guest:<fn>` =
 `ci/vm/vm-guest.sh` function; `e2e` = `ci/vm/vm-e2e.sh`; `dryrun` = the
 "deploy tree quadlet dry-run + CDI spec checks" step of `ci.yml`;
-`layout-tests` = `ci/monitor-layout-tests.sh`; `operator-e2e:<fn>` = a
+`layout-tests` = `ci/monitor-layout-tests.sh`; `script-unit` =
+`ci/script-unit-tests.sh`; `operator-e2e:<fn>` = a
 story function in `ci/vm/operator-e2e.py`, whose evidence is under
 `artifacts/<story>/`.
 
@@ -214,7 +215,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `ci/build-bases.sh` reuses a GHCR base whose tag is the hash of its inputs and rebuilds only on a miss.
 - Acceptance: unchanged inputs → "reused cached base"; a changed input → a different tag and a rebuild; and the tag `base-rebuild.yml` pushes for the same inputs equals `content_tag`'s (it computes the hash with its own inline copy).
 - Evidence: the script's stdout for both cases; the two computed tags (EV-STATE).
-- Tier: T1 · Coverage: ❌ no test; `ci/build-bases.sh` runs in `ci.yml` "base images (content-addressed GHCR cache)" on every build, but nothing asserts the reuse or the rebuild on a changed input.
+- Tier: T1 · Coverage: ✅ `script-unit` runs `ci/build-bases.sh` in a copy of its inputs against a fake registry (a fake `podman` first on `PATH`): an empty registry gives three misses and three builds; with those refs in it all three are reused and nothing is built; a changed input (`Containerfile.base`) gets a new tag and a rebuild while the other two are reused. `base-rebuild.yml`'s own push step, run on the same inputs, pushes exactly the tags `build-bases.sh` pulls. Each run's stdout, the third run's `podman` calls and both tag lists are under `artifacts/S1.1.3/` (artifact `evidence-static`).
 
 **S1.1.4 Build ARGs are global**
 - Requirement: every `ARG` in every `Containerfile*` precedes the first `FROM`.
@@ -370,7 +371,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `session-postmortem` runs on nonzero exit, never on exit 0; it prints the Xorg log tail and a `LIKELY CAUSE` verdict for each known signature, and a distinct line when no Xorg log exists.
 - Acceptance: T1 with a fabricated log per signature and with no log; T2/T3 the real `postmortem:` lines after Xorg is killed with SIGKILL, and none after a clean end (Quit session, `rc=0`). "Never on exit 0" is `desktop-init`'s doing (it calls the script only for a nonzero exit), so only T2/T3 can prove it.
 - Evidence: T1 the script's stdout per case (EV-STATE); T2 EV-LOG-DESKTOP slice containing `postmortem:` lines.
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: ❌ the T2/T3 half is not saved: the real `postmortem:` lines after Xorg is killed with SIGKILL, and none after a clean end. The T1 half is: `script-unit` runs the postmortem on fabricated Xorg logs, one per known signature (each gets the log's tail and its `LIKELY CAUSE`), one with no known signature (the tail, no verdict), none at all (its own line), and with `SERVICE_RESULT=success` (silent), under `artifacts/S2.3.5/` (artifact `evidence-static`).
 
 **S2.3.6 mwm exit ends the session and it restarts**
 - Requirement: "Quit session" (or mwm dying) ends the X session and desktop-init starts a fresh one; the operator sees the desktop return.
@@ -402,13 +403,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `start-audio` waits up to 10 s for `$XDG_RUNTIME_DIR/pipewire-0` before launching wireplumber.
 - Acceptance: T1 with a fake `pipewire` that binds after 2 s; T3 wireplumber alive after boot and after a stack restart.
 - Evidence: T1 stdout with timestamps; T3 EV-PIDS.
-- Tier: T1/T3 · Coverage: ❌ no T1 test and no evidence saved; wireplumber is shown alive after boot (`guest:phase_deploy`) and after a stack restart (`e2e` "audio hotplug") only as a side effect.
+- Tier: T1/T3 · Coverage: ❌ the T3 EV-PIDS is not saved: wireplumber is shown alive after boot (`guest:phase_deploy`) and after a stack restart (`e2e` "audio hotplug") only as a side effect. The T1 half is: `script-unit` runs `start-audio` with fake daemons first on `PATH`; with a `pipewire` that binds after 2 s, wireplumber starts once the socket exists, and with one that never binds it starts after the bounded wait (about 10 s). The timestamped stdout and each fake's own log are under `artifacts/S2.4.4/` (artifact `evidence-static`).
 
 **S2.4.5 A daemon ignoring SIGTERM is escalated**
 - Requirement: survivors not exited 5 s after TERM are KILLed; `start-audio` always returns.
 - Acceptance: T1 fake daemon trapping TERM: exit within ~6 s, `ignored SIGTERM; killing` logged.
 - Evidence: stdout with timestamps.
-- Tier: T1 · Coverage: ❌.
+- Tier: T1 · Coverage: ✅ `script-unit` runs `start-audio` with fake daemons: when pipewire-pulse exits (status 7) and wireplumber ignores SIGTERM, start-audio names the first exit, TERMs the survivors, logs `ignored SIGTERM; killing` and KILLs the holdout after its 5 s of grace, then returns the first exit's status; none of the three daemons outlives it. The timestamped stdout and each fake's log are under `artifacts/S2.4.5/` (artifact `evidence-static`).
 
 **S2.4.6 Audio gid is re-aligned before every audio start**
 - Requirement: `align-device-groups.sh audio` runs before each stack start, so a card that appears after a soundless boot is openable.
@@ -616,7 +617,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: one line per enabled output; refuses non-root; fails cleanly when the desktop is down; its output through the generator reproduces the geometry.
 - Acceptance: T3 with the two-output layout live: the two expected lines; T1 canned `xrandr` text; T3 desktop stopped → exit 1 with the hint.
 - Evidence: the tool's stdout (EV-STATE); the generator's output from it (EV-CONFIG); `xrandr` after applying it (EV-DIFF vs the original).
-- Tier: T1/T3 · Coverage: ❌.
+- Tier: T1/T3 · Coverage: ❌ the T3 half is not saved (the live two-output layout, the desktop stopped, `xrandr` after applying the block). The T1 half is: `script-unit` runs `desktop-monitors-capture` on canned `xrandr` text (`DESKTOP_XRANDR_CMD`): a non-root caller is refused (exit 2); the capture prints one line per enabled output, the rotated output's panel size restored with `rotate=left`; a failing query exits 1 with the hint; and the block, through the generator, gives back xrandr's framebuffer and positions. The canned text, each run's output and the generated config are under `artifacts/S3.4.12/` (artifact `evidence-static`).
 
 ### F3.5 Rendering and theme
 
@@ -1273,7 +1274,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: empty `shell-user` → exit 0, nothing written; missing `shell-user` → exit 1 with a hint (the tree ships the file: re-apply it, or use the quadlet's off-switch to turn the feature off), nothing written; account missing → exit 1 with the sysusers hint.
 - Acceptance: T1 with a temp `DIR` or T2 before the tree is applied.
 - Evidence: stdout and exit codes; `ls` of the dir after.
-- Tier: T1/T2 · Coverage: ❌.
+- Tier: T1/T2 · Coverage: ✅ `script-unit` runs `desktop-host-shell-setup` against a scratch directory (`DESKTOP_CONTAINER_DIR`, `HOST_SHELL_AK_DIR`): a missing `shell-user` exits 1 with the hint, an empty one exits 0, an unknown account exits 1 with the sysusers hint, and no case writes anything. Each case's output and exit status, and `ls -laR` of its directory after, are under `artifacts/S5.7.5/` (artifact `evidence-static`).
 
 **S5.7.6 The sshd drop-in keeps stock key logins working**
 - Requirement: ordinary users' home-dir keys still work.
@@ -1291,7 +1292,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: on `ssh host` failure, `host-terminal` prints the exit code, the enablement command and the common causes, waits for Enter, exits with ssh's code; on success exits 0 at once.
 - Acceptance: T1 with a fake `ssh`.
 - Evidence: stdout and exit codes for both cases; T3 EV-SHOT (see S5.7.7).
-- Tier: T1 · Coverage: ❌.
+- Tier: T1 · Coverage: ❌ the T3 EV-SHOT the evidence names (the window showing the failure and "Press Enter to close", shared with S5.7.7) is not taken. The rest is asserted, its evidence saved: `script-unit` runs `host-terminal` with a fake `ssh`; on success it exits 0 at once with stdin held open; on failure it prints the exit code, the enablement command and the common causes, waits for Enter and exits with ssh's code (255). Output and exit codes are under `artifacts/S5.7.8/` (artifact `evidence-static`).
 
 ### F5.8 Host login session (`desktop-session.service`)
 
@@ -2169,13 +2170,13 @@ them without root or a container. Defaults must remain the production paths.
 | `image/xorg/align-device-groups.sh` | node globs under `/dev` | `DEV_ROOT` prefix | S3.2.2 |
 | `image/xorg/ensure-vt-devices.sh` | `/dev` | `DEV_ROOT` | S3.2.3 |
 | `image/xorg/preflight-check.sh` | all of the above plus `/run/udev`, the pid file, `/proc/self/mounts`, `/etc/desktop-container` | one `PREFLIGHT_ROOT` prefix, or `podman run` with mounts omitted | S5.11.2 |
-| `image/session/session-postmortem` | Xorg log glob | `POSTMORTEM_XLOG_GLOB` | S2.3.5 |
-| `image/session/start-audio` | daemons by name | already PATH-overridable | S2.4.4, S2.4.5 |
+| `image/session/session-postmortem` | Xorg log glob | **built**: `POSTMORTEM_XLOG_GLOB` | S2.3.5 |
+| `image/session/start-audio` | daemons by name | `PATH` (used: fake daemons) | S2.4.4, S2.4.5 |
 | `image/session/host-shell-setup.sh` | `SRC`, `DHOME` | export the existing variables | S5.7.7 |
-| `image/session/host-terminal` | `ssh` by name | already PATH-overridable | S5.7.8 |
+| `image/session/host-terminal` | `ssh` by name | `PATH` (used: a fake `ssh`) | S5.7.8 |
 | `image/tools/publish-tools.sh` | `SRC`, `DEST` | export the existing variables | S7.2.2, S7.2.3 |
-| `deploy/host/usr/local/libexec/desktop-host-shell-setup` | `/etc/desktop-container`, `/etc/ssh/authorized_keys.d` | `DIR`, `AK_DIR` | S5.7.5 |
-| `deploy/host/usr/local/bin/desktop-monitors-capture` | `podman exec … xrandr --query` | `DESKTOP_XRANDR_CMD` | S3.4.12 |
+| `deploy/host/usr/local/libexec/desktop-host-shell-setup` | `/etc/desktop-container`, `/etc/ssh/authorized_keys.d` | **built**: `DESKTOP_CONTAINER_DIR`, `HOST_SHELL_AK_DIR` | S5.7.5 |
+| `deploy/host/usr/local/bin/desktop-monitors-capture` | `podman exec … xrandr --query` | **built**: `DESKTOP_XRANDR_CMD` | S3.4.12 |
 | `deploy/host/usr/local/libexec/desktop-selinux` | takes paths as args already | — | S5.6.4–S5.6.6 |
 | `deploy/host/usr/local/libexec/desktop-tools-cdi` | `TOOLS_DIR` via `client-cdi.conf` | also honour an env override | S5.5.4 |
 | `deploy/host/usr/local/libexec/desktop-cdi-refresh` | `/proc/modules` (the loaded-`nvidia` trigger of the no-downgrade rule) | `CDI_PROC_MODULES` | S5.4.2 (module half) |
@@ -2194,8 +2195,11 @@ Probe tooling the client-side and hotplug stories need, and where it stands:
 | `gdm` (AppStream) | S10.1.5 | a second VM profile, booted to `graphical.target` before the tree is applied |
 | `edid-decode` | S8.2.3 | T4 host |
 
-Proposed job: add `script-unit` to `ci.yml` `static` (no root), covering
-S1.1.3, S2.3.5, S2.4.4, S2.4.5, S3.1.x, S3.4.12, S5.7.5, S5.7.7, S5.7.8.
+The `script-unit` step of `ci.yml` `static` covers S1.1.3, S2.3.5, S2.4.4,
+S2.4.5, S3.4.12, S5.7.5 and S5.7.8 so far. S3.1.x need the `xorg-gpu-conf.sh`
+overrides above; S5.7.7, S3.2.2 and S3.2.3 need root or a scratch container of
+the image, since they install files as the session user or create groups and
+device nodes.
 
 ## Appendix B — Suggested new VM e2e phases
 
@@ -2294,16 +2298,16 @@ moves to ✅ only when a CI run has saved its evidence, which the
 
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
-| E1 Image build | 14 | 4 | 0 | 10 | 0 |
-| E2 Boot & supervision | 25 | 3 | 1 | 21 | 0 |
+| E1 Image build | 14 | 5 | 0 | 9 | 0 |
+| E2 Boot & supervision | 25 | 4 | 1 | 20 | 0 |
 | E3 Display & session | 62 | 20 | 1 | 38 | 3 |
 | E4 Audio | 23 | 4 | 0 | 18 | 1 |
-| E5 Deploy tree | 50 | 10 | 1 | 38 | 1 |
+| E5 Deploy tree | 50 | 11 | 1 | 37 | 1 |
 | E6 Privileges | 9 | 2 | 0 | 7 | 0 |
 | E7 Client contract & journeys | 40 | 7 | 1 | 32 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **55** | **4** | **186** | **6** |
+| **Total** | **251** | **58** | **4** | **183** | **6** |
 
 Regenerate after editing with:
 
