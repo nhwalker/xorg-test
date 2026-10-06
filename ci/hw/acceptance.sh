@@ -93,6 +93,9 @@ media() { # <EV-PHOTO|EV-PHONEVIDEO|EV-AUDIO-REC> <moment> <what>
 }
 
 # --- the desktop ---------------------------------------------------------------
+# The desktop image's own X tools: xrandr, xdpyinfo and glxinfo, and with them
+# xinput, xwininfo and xprop (xorg-x11-server-utils and xorg-x11-utils, the
+# packages its xrandr and xdpyinfo resolve to on Rocky 9).
 xq()   { podman exec -u desktop -e DISPLAY=:0 desktop "$@"; }
 desk() { podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop -e DISPLAY=:0 desktop "$@"; }
 probe() { podman run --rm --device desktop.local/display=all "$PROBE_IMG" "$@"; }
@@ -515,7 +518,6 @@ video_cycle() { # <story> <title> <what the tester does>
     wait_desktop 30 || say "the desktop is not up"
     grep -qE '^[^#[:space:]]+[[:space:]]+[0-9]+x[0-9]+' /etc/desktop-container/monitors.conf \
         || { say "$story needs a declared layout: run S8.2.3 first and keep its capture."; return 1; }
-    have_probe || { say "$story reads the window tree through the probe image ($PROBE_IMG): build it from Containerfile.testclient (Appendix A) and load it."; return 1; }
     ev_begin "$story" "$2" T4
     if [ "$story" = S3.4.5 ]; then
         podman exec desktop grep -q 'Driver *"nvidia"' /etc/X11/xorg.conf.d/20-gpu.conf \
@@ -525,7 +527,7 @@ video_cycle() { # <story> <title> <what the tester does>
     ev_copy /etc/desktop-container/monitors.conf layout "EV-CONFIG: the declared layout (monitors.conf)"
     ev_save xrandr-before "EV-STATE: xrandr --query before" xq xrandr --query >/dev/null || true
     x0=$EV_LAST
-    ev_save tree-before "EV-STATE: xwininfo -root -tree before (the probe image)" probe xwininfo -root -tree >/dev/null || true
+    ev_save tree-before "EV-STATE: xwininfo -root -tree before" xq xwininfo -root -tree >/dev/null || true
     t0=$EV_LAST
     lines=$(xorg_lines)
     say "Start the phone video now, with the monitor in frame, and keep it running. When you press Enter: within 10 s, $how. Stay that way for $secs s while the script records the connectors, then undo it when this terminal says so (or when $secs s have passed). Then wait 20 s for the picture."
@@ -543,7 +545,7 @@ video_cycle() { # <story> <title> <what the tester does>
     else ev_note "no connector read disconnected during the cycle (the KVM may emulate the monitor)"; fi
     ev_save xrandr-after "EV-STATE: xrandr --query after" xq xrandr --query >/dev/null || true
     x1=$EV_LAST
-    ev_save tree-after "EV-STATE: xwininfo -root -tree after" probe xwininfo -root -tree >/dev/null || true
+    ev_save tree-after "EV-STATE: xwininfo -root -tree after" xq xwininfo -root -tree >/dev/null || true
     t1=$EV_LAST
     ev_diff xrandr "EV-DIFF: xrandr --query before (-) and after (+): empty" "$x0" "$x1"
     ev_diff tree "EV-DIFF: the window tree before (-) and after (+): empty" "$t0" "$t1"
@@ -858,7 +860,7 @@ The T4 stories (Requirements.md Appendix C). Pairs are one run writing both.
   S5.4.3           NVIDIA host: a stale spec (staged), README.md's remedy
   S8.2.3           desktop-monitors-capture pasted as it is; the EDIDs
   S8.2.2 S3.4.5    a KVM switch cycle with a declared layout (S3.4.5: on an
-                   NVIDIA desktop); needs S8.2.3's layout and the probe image
+                   NVIDIA desktop); needs S8.2.3's layout
   S3.10.8          a monitor's cable pulled and put back; the same needs
   S8.2.1           ten KVM switches: typing after the first and the last
   S8.3.1 S4.7.12   a USB headset or DAC, a client playing throughout; the
