@@ -524,8 +524,10 @@ def container_cases():
     ]
 
 
-STUB_SPEC = "/etc/cdi/nvidia.yaml"
-CONVERGER = "deploy/host/usr/local/libexec/desktop-cdi-refresh"
+# The spec the container case resolves nvidia.com/gpu=all through. Not
+# STUB_SPEC, above: that is the stub's text, which the host cases stage.
+NVIDIA_SPEC = "/etc/cdi/nvidia.yaml"
+CONVERGER = os.path.join(ROOT, "deploy/host/usr/local/libexec/desktop-cdi-refresh")
 
 
 def cmd_container(image):
@@ -544,25 +546,25 @@ def cmd_container(image):
                 # case requests resolves to it, and NVIDIA_CDI_STUB=1 reaches
                 # the container the way it reaches the desktop, as a CDI edit
                 # (Requirements.md S9.2.1: no -e that duplicates one).
-                made_stub = not os.path.exists(STUB_SPEC)
+                made_stub = not os.path.exists(NVIDIA_SPEC)
                 if made_stub:
                     c = run(["sudo", CONVERGER])
                     w.write(f"{case['id']}-converger", f"$ sudo {CONVERGER}\n# exit {c.returncode}\n{c.stdout}{c.stderr}",
                             f"EV-STATE: {case['id']}: the converger writes the stub CDI spec this case resolves its device to")
-                spec = run(["sudo", "cat", STUB_SPEC])
+                spec = run(["sudo", "cat", NVIDIA_SPEC])
                 if "NVIDIA_CDI_STUB=1" not in spec.stdout:
-                    raise RuntimeError(f"{STUB_SPEC} is not the stub ({case['id']} cannot be staged): {spec.stdout[:200]}")
-                w.write(f"{case['id']}-spec", spec.stdout, f"EV-CONFIG: {case['id']}: {STUB_SPEC}, the stub")
+                    raise RuntimeError(f"{NVIDIA_SPEC} is not the stub ({case['id']} cannot be staged): {spec.stdout[:200]}")
+                w.write(f"{case['id']}-spec", spec.stdout, f"EV-CONFIG: {case['id']}: {NVIDIA_SPEC}, the stub")
             try:
                 r = run(cmd)
             finally:
                 if made_stub:
-                    run(["sudo", "rm", "-f", STUB_SPEC])
+                    run(["sudo", "rm", "-f", NVIDIA_SPEC])
             if made_stub:
-                gone = not os.path.exists(STUB_SPEC)
-                w.check(gone, f"{case['id']}: the stub CDI spec this case wrote is removed again ({STUB_SPEC})")
+                gone = not os.path.exists(NVIDIA_SPEC)
+                w.check(gone, f"{case['id']}: the stub CDI spec this case wrote is removed again ({NVIDIA_SPEC})")
                 if not gone:
-                    raise RuntimeError(f"{STUB_SPEC} is still there after {case['id']}")
+                    raise RuntimeError(f"{NVIDIA_SPEC} is still there after {case['id']}")
             shown = " ".join(c if re.fullmatch(r"[\w@%+=:,./-]+", c) else "'" + c.replace("'", "'\\''") + "'" for c in cmd)
             w.write(case["id"], f"# staged: {case['what']}\n$ {shown}\n# exit {r.returncode}\n{r.stdout}{r.stderr}",
                     f"EV-LOG-DESKTOP: {case['id']}: {case['what']}: the podman run command and the preflight block")
