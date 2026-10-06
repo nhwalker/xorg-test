@@ -2320,23 +2320,30 @@ seat_tags() { # attach|fix
             ev_save tagged-attached "EV-STATE: every udev database entry tagged for a seat other than seat0, after loginctl attach seat1: the keyboard's input device and the devices under it" \
                 foreign_entries >/dev/null || true
             ev_pass "loginctl attach seat1 tagged the keyboard: $ev reads ID_SEAT=seat1 ($(foreign_tags | paste -sd' ' -) in the udev database)"
-            systemctl restart desktop.service
-            desk_back
-            pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
-            ev_text preflight "EV-LOG-DESKTOP: the container preflight's seat line, the desktop restarted with the keyboard on seat1" "${pf:-(none)}"
+            # Both preflights while the desktop runs. seat-prep runs before
+            # every desktop start, so a restart undoes the tag before the
+            # container's preflight, one of desktop-init's start oneshots,
+            # could see it: the container's is run in the running desktop.
+            pf=$(ev_save host-preflight "EV-STATE: desktop-preflight with the keyboard on seat1, the desktop running" desktop-preflight) || true
+            grep -q 'FAIL: custom seat attachment rules present (/etc/udev/rules.d/72-seat-' <<<"$pf" \
+                || fail "desktop-preflight does not name the seat rule: $(grep -i 'seat' <<<"$pf" | tr '\n' ' ')"
+            ev_pass "desktop-preflight names the rule: $(grep -m1 -o 'FAIL: custom seat attachment rules present ([^)]*)' <<<"$pf")"
+            pf=$(ev_save preflight "EV-LOG-DESKTOP: the container preflight run in the running desktop (podman exec desktop /usr/local/bin/preflight-check.sh), its seat line" \
+                sh -c 'podman exec desktop /usr/local/bin/preflight-check.sh 2>&1 | tr -d "\r" | grep "^preflight: .*seat" || true') || true
             grep -q '^preflight: WARN: devices tagged for a non-default seat (E:ID_SEAT=seat1' <<<"$pf" \
                 || fail "the preflight did not warn about the seat1 tag: ${pf:-no seat line}"
-            ev_pass "the preflight warns: $pf"
+            ev_pass "the preflight warns: $(grep -m1 '^preflight: WARN: devices tagged' <<<"$pf")"
             ;;
         fix)
-            desk_down
+            # The desktop restarted: seat-prep (PartOf=desktop.service) runs
+            # again before the start and undoes the attachment.
             j0=$(ev_since)
-            systemctl restart desktop-seat-prep.service \
-                || fail "desktop-seat-prep failed: $(journalctl --no-pager -o cat -u desktop-seat-prep.service --since "$j0" | tail -5)"
-            j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -u desktop-seat-prep from its restart, the desktop stopped" \
+            systemctl restart desktop.service
+            desk_back
+            j=$(ev_save seat-prep-journal "EV-LOG-JOURNAL: journalctl -u desktop-seat-prep from the desktop's restart: seat-prep runs before every desktop start" \
                 journalctl --no-pager -o short-iso -u desktop-seat-prep.service --since "$j0") || true
             grep -q 'seat-prep: removing custom seat attachment rule /etc/udev/rules.d/72-seat-' <<<"$j" \
-                || fail "seat-prep did not log removing the 72-seat-* rule"
+                || fail "seat-prep did not log removing the 72-seat-* rule at the desktop's restart"
             ev_pass "seat-prep logged: $(grep -o 'seat-prep: removing custom seat attachment rule [^ ]*' <<<"$j" | head -n1)"
             ev_save rules-after "EV-STATE: ls -l /etc/udev/rules.d after seat-prep: no 72-seat-* rule" ls -l /etc/udev/rules.d >/dev/null || true
             [ -z "$(ls /etc/udev/rules.d/72-seat-*.rules 2>/dev/null)" ] || fail "a 72-seat-*.rules is still there after seat-prep"
@@ -2346,10 +2353,8 @@ seat_tags() { # attach|fix
             ! udevadm info -q property -n "$ev" | grep -q '^ID_SEAT=' || fail "$ev still carries $(udevadm info -q property -n "$ev" | grep '^ID_SEAT=')"
             [ -z "$(foreign_tags)" ] || fail "the udev database still has a foreign seat tag: $(foreign_entries | paste -sd' ' -)"
             ev_pass "the rule is gone and udev re-read the keyboard: $ev has no ID_SEAT, and no device in the udev database is tagged for another seat"
-            systemctl start desktop.service
-            desk_back
             pf=$(podman logs desktop 2>&1 | tr -d '\r' | grep '^preflight: .*seat' || true)
-            ev_text preflight-after "EV-LOG-DESKTOP: the container preflight's seat line after seat-prep, the desktop started again" "${pf:-(none)}"
+            ev_text preflight-after "EV-LOG-DESKTOP: the container preflight's seat line at that start, after seat-prep" "${pf:-(none)}"
             grep -qx 'preflight: PASS: no foreign seat tags in the udev database' <<<"$pf" \
                 || fail "the preflight does not pass the seat check after seat-prep: ${pf:-no seat line}"
             ev_pass "the preflight passes: $pf"
