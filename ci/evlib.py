@@ -39,6 +39,11 @@ a run's evidence against the document:
                                        the same for a workflow other than
                                        ci.yml: only the stories whose Coverage
                                        line names it ("(workflow `NAME`)")
+    evlib.py video-events FRAMES [--skew S] [--host TL]... [--guest TL]...
+                                       a recording's event frames: the marks
+                                       the timelines hold within it and the
+                                       frames where the screen changes; prints
+                                       the sentence for its index line
 
 Standard library only: it runs on the CI runner and inside the Rocky guest.
 """
@@ -108,6 +113,11 @@ class StoryWriter:
     def note(self, text):
         self._append("notes.tsv", stamp(), text)
         self.log("note", text)
+
+    def mark(self, label):
+        """An event a recording running now should name the frame of (S9.3.5):
+        a "mark" line of the timeline, which the recorder reads when it stops."""
+        self.log("mark", label)
 
     def name(self, moment, ext):
         counter = self._p(".hn" if self.side else ".n")
@@ -323,6 +333,10 @@ def check_dir(d):
 #           source word in its name (pulse, paplay, pipewire, pw-play, alsa,
 #           aplay, recording) comes with that source's pitch from the
 #           evidence standard
+#   S9.3.5  each video (a .gif or .mp4 in the index) names its event frames on
+#           its line in the index ("event frames: frame-NNNN.png ..."), and
+#           each frame it names is in its frames directory (the gif's own
+#           name, or "its frames are in <story>/<dir>/" for a copy)
 #   S9.3.6  every line of the story's timeline (both sides') starts with an
 #           ISO UTC timestamp, and each file in the index has its "file" line
 #           in its side's timeline
@@ -541,12 +555,198 @@ def timeline_problems(d):
     return problems
 
 
+# --- EV-VIDEO's event frames (S9.3.5) -----------------------------------------
+#
+# Both recorders (qmp-tool.py video for the shell, Ctx.video for the Python)
+# keep each frame's time in index.txt and, from the raw frames, the share of
+# each frame's rows that differ from the frame before it in changes.txt. When
+# a recording stops, video_events() names its event frames: the frame taken at
+# or after each "mark" line of the timeline that falls within the recording
+# (ev_mark, StoryWriter.mark: the harness's own word for when the event was
+# set off), and the frames where the screen first and last changes.
+
+FRAME_LINE = re.compile(r"^(frame-\d{4}\.png) (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)")
+MARK_LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z) (\S+)\s+mark\s+(.*?)\s*$")
+EVENT_FRAMES = re.compile(r"\bevent frames:(.*)$")
+FRAME_NAME = re.compile(r"\bframe-\d{4}\.png\b")
+FRAMES_IN = re.compile(r"\bits frames are in (S\d+\.\d+\.\d+/[^/\s]+)/")
+VIDEO = (".gif", ".mp4")
+
+
+def when(ts):
+    """A writer's ISO UTC timestamp as seconds since the epoch."""
+    ts = ts.rstrip("Z")
+    fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in ts else "%Y-%m-%dT%H:%M:%S"
+    return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc).timestamp()
+
+
+def hms(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%H:%M:%S.%f")[:-3] + "Z"
+
+
+def ppm_rows(path):
+    """A binary PPM's (P6) size and its rows of pixels, each as bytes."""
+    with open(path, "rb") as f:
+        data = f.read()
+    fields, pos = [], 0
+    while len(fields) < 4:
+        while data[pos:pos + 1].isspace():
+            pos += 1
+        if data[pos:pos + 1] == b"#":                  # a comment, to the line's end
+            pos = data.index(b"\n", pos) + 1
+            continue
+        start = pos
+        while pos < len(data) and not data[pos:pos + 1].isspace():
+            pos += 1
+        fields.append(data[start:pos])
+    if fields[0] != b"P6":
+        raise ValueError(f"{path}: not a binary PPM")
+    w, h = int(fields[1]), int(fields[2])
+    stride = w * 3 * (2 if int(fields[3]) > 255 else 1)
+    px = data[pos + 1:]
+    return (w, h), [px[i * stride:(i + 1) * stride] for i in range(h)]
+
+
+def frame_changes(paths):
+    """For each frame, the share of its rows that differ from the frame
+    before it: 1.0 where its size changed, None for the first frame and for
+    one that cannot be read. paths: the raw PPM frames, in order."""
+    out, prev = [], None
+    for p in paths:
+        try:
+            size, rows = ppm_rows(p)
+        except (OSError, ValueError, IndexError):
+            out.append(None)
+            prev = None
+            continue
+        if prev is None:
+            out.append(None)
+        elif size != prev[0]:
+            out.append(1.0)
+        else:
+            out.append(sum(1 for a, b in zip(rows, prev[1]) if a != b) / max(1, size[1]))
+        prev = (size, rows)
+    return out
+
+
+def write_changes(frames, ppms):
+    """changes.txt beside the frames: each frame (by its PNG name) and the
+    share of its rows that differ from the frame before it."""
+    with open(os.path.join(frames, "changes.txt"), "w") as f:
+        for p, c in zip(ppms, frame_changes(ppms)):
+            f.write(f"{os.path.basename(p)[:-4]}.png {'-' if c is None else f'{c:.4f}'}\n")
+
+
+def video_events(frames, host=(), guest=(), skew=0.0):
+    """A recording's event frames: each "mark" line of the timelines that
+    falls within it, as the first frame taken at or after the mark, and the
+    frames where the screen first and last changes (changes.txt). The host's
+    clock stamps the frames and the host's timelines; the guest's timelines
+    are on the guest's clock, `skew` seconds ahead of the host's. Writes
+    events.txt beside the frames and returns the sentence for the video's
+    line in the index, "event frames: ..."."""
+    idx = []
+    try:
+        for line in open(os.path.join(frames, "index.txt"), errors="replace"):
+            m = FRAME_LINE.match(line)
+            if m:
+                idx.append((m.group(1), when(m.group(2))))
+    except OSError:
+        pass
+    if not idx:
+        return "event frames: none: the recording holds no frame"
+    first, last = idx[0][1], idx[-1][1]
+    marks = []
+    for paths, shift in ((host, 0.0), (guest, skew)):
+        for p in paths:
+            try:
+                text = open(p, errors="replace").read()
+            except OSError:
+                continue
+            for line in text.split("\n"):
+                m = MARK_LINE.match(line)
+                if m:
+                    marks.append((when(m.group(1)) - shift, m.group(2), m.group(3)))
+    named, outside = [], []
+    for t, sid, label in sorted(marks):
+        if first - 0.5 <= t <= last:
+            frame, ft = next((f, ft) for f, ft in idx if ft >= t)
+            named.append((frame, ft, t, sid, label))
+        elif first - 10 <= t <= last + 10:
+            # A near miss: the recording started late or stopped early.
+            outside.append((t, sid, label))
+    changed, rows = [], {}
+    try:
+        for line in open(os.path.join(frames, "changes.txt")):
+            f = line.split()
+            if len(f) == 2 and f[1] != "-":
+                rows[f[0]] = float(f[1])
+                if float(f[1]) > 0:
+                    changed.append(f[0])
+    except (OSError, ValueError):
+        rows = None
+    parts = [f"{frame} ({hms(ft)}): {label} ({sid})" for frame, ft, _, sid, label in named]
+    if rows is None:
+        parts.append("the frames' changes were not measured")
+    elif not changed:
+        parts.append(f"no frame differs from the one before it ({len(idx)} frames)")
+    else:
+        top = max(changed, key=lambda f: rows[f])
+        parts.append(f"the screen changes in {len(changed)} of {len(idx)} frames: first {changed[0]}, "
+                     f"most {top} ({100 * rows[top]:.0f}% of its rows), last {changed[-1]}")
+    lines = ["The recording's event frames (Requirements.md S9.3.5): the frame taken at or after each mark the",
+             "timelines hold within it, and the frames where the screen changes (changes.txt).", ""]
+    if guest:
+        lines += [f"The guest's clock ran {skew:+.3f} s from the host's when the recording started; its marks are",
+                  "moved onto the host's clock, which stamps the frames.", ""]
+    lines += [f"mark {hms(t)} {sid}: {label} -> {frame} ({hms(ft)})" for frame, ft, t, sid, label in named]
+    lines += [f"mark {hms(t)} {sid}: {label} -> outside the recording ({hms(first)} to {hms(last)})"
+              for t, sid, label in outside]
+    lines += ["", "frames whose rows differ from the frame before (share of rows):"]
+    lines += [f"{f} {rows[f]:.4f}" for f in changed] if rows else ["none"]
+    try:
+        with open(os.path.join(frames, "events.txt"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+    if not named and not changed:
+        return "event frames: none: no mark fell within the recording, and " + parts[-1]
+    return "event frames: " + "; ".join(parts)
+
+
+def video_problems(d, files):
+    """S9.3.5 for one story directory."""
+    problems = []
+    for _, name, what in files:
+        if not name.lower().endswith(VIDEO):
+            continue
+        m = EVENT_FRAMES.search(what)
+        named = FRAME_NAME.findall(m.group(1)) if m else []
+        if not named:
+            problems.append(f"{name}: its line in the index names no event frame "
+                            "(\"event frames: frame-NNNN.png ...\")")
+            continue
+        src = FRAMES_IN.search(what)
+        frames = os.path.join(os.path.dirname(os.path.normpath(d)), src.group(1)) if src \
+            else os.path.join(d, name.rsplit(".", 1)[0])
+        missing = sorted({n for n in named if not os.path.isfile(os.path.join(frames, n))})
+        if missing:
+            problems.append(f"{name}: the event frames it names are not all in "
+                            f"{src.group(1) if src else name.rsplit('.', 1)[0]}/: {', '.join(missing)}")
+    return problems
+
+
+def has_video(d):
+    return any(n.lower().endswith(VIDEO) for _, n, _ in read_files(d))
+
+
 def discipline(d):
     """[(rule, problem)]: what in a story's directory the F9.3 rules find."""
     files = read_files(d)
     out = [("S9.3.2", p) for p in pair_problems(d, files)]
     out += [("S9.3.3", p) for p in survival_problems(d, files)]
     out += [("S9.3.4", p) for p in audio_problems(files)]
+    out += [("S9.3.5", p) for p in video_problems(d, files)]
     out += [("S9.3.6", p) for p in timeline_problems(d)]
     return out
 
@@ -557,20 +757,28 @@ MARKS = ("✅", "🟡", "❌", "🔧")
 
 
 def parse_requirements(path):
-    """{story: {title, tier, coverage, mark}} using the document's own
+    """{story: {title, tier, coverage, mark, video}} using the document's own
     counting rule (Appendix D): weakest mark wins; a line whose only mark is
-    🔧 counts as 🔧."""
+    🔧 counts as 🔧. `video` is whether the story asks for EV-VIDEO, in its
+    own lines or in its feature's common set (the text between a ### heading
+    and its first story): S9.3.5's stories whose event changes the screen."""
     stories, cur = {}, None
+    feature_video = in_feature = False
     head = re.compile(r"^\*\*(S\d+\.\d+\.\d+)\s+(.*?)\*\*\s*$")
     tierline = re.compile(r"^- Tier:\s*(.*?)\s*·\s*Coverage:\s*(.*)$")
     for line in open(path, encoding="utf-8"):
+        if line.startswith("### ") or line.startswith("## "):
+            cur, in_feature, feature_video = None, line.startswith("### "), False
+            continue
         m = head.match(line.strip())
         if m:
-            cur = m.group(1)
-            stories[cur] = {"title": m.group(2), "tier": "", "coverage": "", "mark": ""}
+            cur, in_feature = m.group(1), False
+            stories[cur] = {"title": m.group(2), "tier": "", "coverage": "", "mark": "", "video": feature_video}
             continue
-        if line.startswith("## "):
-            cur = None
+        if in_feature and "EV-VIDEO" in line:
+            feature_video = True
+        if cur and "EV-VIDEO" in line:
+            stories[cur]["video"] = True
         if cur:
             t = tierline.match(line.strip())
             if t:
@@ -664,6 +872,10 @@ def cmd_gate(args):
         if s["mark"] == "✅" and not passed:
             errors.append(f"{sid}: marked ✅ in Requirements.md but this run has "
                           + ("no evidence for it" if not dirs else "no passing evidence for it"))
+        # S9.3.5: a story run in a VM whose event changes the screen holds a video.
+        if s.get("video") and "T3" in s["tier"] and dirs and not any(has_video(d) for d in dirs):
+            errors.append(f"{sid}: S9.3.5: Requirements.md asks it for EV-VIDEO (its event changes the "
+                          "screen), but its evidence holds no video")
         if s["mark"] in ("❌", "🟡") and passed:
             upgrades.append(sid)
         rows.append((sid, s["mark"], ", ".join(sorted({os.path.relpath(d, os.path.commonpath([d] + list(args.roots))) for d in dirs})) or "-",
@@ -698,6 +910,11 @@ def cmd_gate(args):
     return 1 if errors else 0
 
 
+def cmd_video_events(args):
+    print(video_events(args.frames, args.host, args.guest, args.skew))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -712,8 +929,14 @@ def main(argv=None):
     g.add_argument("--workflow", help="gate only the stories whose Coverage line names this "
                    "workflow (\"(workflow `maintainer.yml`)\"), for that workflow's own runs")
     g.add_argument("roots", nargs="+")
+    v = sub.add_parser("video-events")
+    v.add_argument("frames")
+    v.add_argument("--skew", type=float, default=0.0, help="seconds the guest's clock runs ahead of the host's")
+    v.add_argument("--host", action="append", default=[], help="a timeline on the host's clock")
+    v.add_argument("--guest", action="append", default=[], help="a timeline on the guest's clock")
     args = ap.parse_args(argv)
-    return {"render": cmd_render, "check": cmd_check, "gate": cmd_gate}[args.cmd](args)
+    return {"render": cmd_render, "check": cmd_check, "gate": cmd_gate,
+            "video-events": cmd_video_events}[args.cmd](args)
 
 
 if __name__ == "__main__":
