@@ -1459,8 +1459,8 @@ because "it works" without "and nothing restarted" is not the claim.
 **S7.1.2 Confined clients work under enforcing**
 - Requirement: no `label=disable`, no `--privileged` on any client; a static guard keeps it that way.
 - Acceptance: `guest:phase_deploy` probes; a static check finds no `--privileged` or `label=disable` on any `podman run`/`podman create` command or client manifest under `ci/` and `examples/` (a plain grep would match the log and failure messages that name `--privileged` when describing the desktop container).
-- Evidence: `getenforce`; `ps -Z` of a probe; `ausearch -m avc -ts recent` (empty) (EV-STATE); the grep output.
-- Tier: T3/T0 · Coverage: ❌ no static guard and no evidence saved; `guest:phase_deploy`'s podman probes run without `label=disable` or `--privileged` and pass under enforcing.
+- Evidence: `getenforce`; a probe's own SELinux label (`/proc/self/attr/current`, what `ps -Z` shows); `ausearch -m avc` since the probes began (no denial with a `container_t` subject) (EV-STATE); the static guard's verdict.
+- Tier: T3/T0 · Coverage: ✅ the T0 half: `ci/client-guard.py`, run by the static job, reads every `podman run` and `podman create` under `ci/` and `examples/` as the shell would (continuations, quoting, heredoc bodies skipped) and every argv list the Python there builds, and finds none passing `--privileged` or `label=disable`, and no client manifest asking for `privileged: true` or `spc_t`; its self-test first shows that it flags each kind of violation and passes a mere mention. The guard's whole verdict is under `artifacts/S7.1.2/` (artifact `evidence-static`). The T3 half: `guest:phase_deploy` finds SELinux `Enforcing` on the VM host, a confined display client labelled `container_t` that opens `:0`, and no AVC denial with a `container_t` subject since the probes began; `getenforce`, the probe's label with `xdpyinfo`'s verdict, and `ausearch -m avc` since the probes began are under `artifacts/S7.1.2/` (artifact `evidence-vm-core`).
 
 > **`podman exec` does not get a device's env.** podman applies the edits
 > when the container starts, to the process it starts with: an exec session
@@ -1509,19 +1509,19 @@ because "it works" without "and nothing restarted" is not the claim.
 - Requirement: three releases → three resources at 10; a requesting pod gets env + sockets; a control pod gets nothing.
 - Acceptance: `guest:phase2`, `guest:verify_cdi`.
 - Evidence: `kubectl get node -o jsonpath=allocatable` (EV-STATE); the verifier and control pods' `env`/`mountinfo` (EV-DIFF between them); plugin logs (EV-LOG-CLIENT).
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:phase2` and `guest:verify_cdi` assert the three allocatable resources and the injected edits, but the control pod is checked only for `DISPLAY` and the X socket, not the audio env or mount.
+- Tier: T3 · Coverage: ✅ `guest:phase2` and `guest:verify_cdi`: the three releases make `desktop.local/display`, `audio` and `tools` allocatable at 10 each. The verifier pod, whose manifest declares nothing but its request, gets `DISPLAY=:0`, `PULSE_SERVER` and `PIPEWIRE_REMOTE`; its X socket is mounted writable and `xdpyinfo` opens `:0`, and its audio sockets are mounted writable and `pactl info` answers. The control pod, the same image and manifest without the request, gets no `DISPLAY`, `PULSE_SERVER` or `PIPEWIRE_REMOTE` and no `/tmp/.X11-unix` or `/run/desktop-audio` mount. `artifacts/S7.3.1/` (artifact `evidence-vm-k8s`) holds the node's allocatable resources, the three plugins' logs, both pods' environments and mounts, and the control pod's against the verifier's as diffs.
 
 **S7.3.2 Split holds in pods**
 - Requirement: display-only has display, no audio, no toolkit; audio-only plays, has no display and cannot `xdpyinfo`.
 - Acceptance: `guest:verify_split`.
 - Evidence: per pod `env`, `mountinfo`, `xdpyinfo` exit (EV-STATE); EV-AUDIO from audio-only.
-- Tier: T3 · Coverage: ❌ evidence not saved (no audio is captured from `audio-only`); `guest:verify_split` asserts the split, but its only check that `audio-only` can play is `pactl info` connecting.
+- Tier: T3 · Coverage: ✅ `guest:verify_split`: the display-only pod has `DISPLAY=:0` and `xdpyinfo` opens it, with no `PULSE_SERVER`, `PIPEWIRE_REMOTE` or `DESKTOP_TOOLS_BIN` and no audio or toolkit mount. The audio-only pod has `PULSE_SERVER` and `PIPEWIRE_REMOTE`, `pactl info` answers over them and its 440 Hz tone is heard at the machine's output, while it has no `DISPLAY`, no `/tmp/.X11-unix` mount, and `xdpyinfo` fails. `artifacts/S7.3.2/` (artifact `evidence-vm-k8s`) holds each pod's environment, mounts and `xdpyinfo` verdict, the audio-only pod's `pactl info`, and its capture with its verdict and level plot.
 
 **S7.3.3 Pods are confined and declare no securityContext**
 - Requirement: `container_t`; manifests carry no `securityContext`, `volumes`, `env`, or CDI annotation.
 - Acceptance: `guest:phase2`, `ci/helm-assertions.sh`.
 - Evidence: `/proc/self/attr/current` from the pod (EV-STATE); the manifests (EV-CONFIG).
-- Tier: T0/T3 · Coverage: ❌ evidence not saved; `ci/helm-assertions.sh` checks all four omissions only on the example, `cdi-verify` and `testclient` manifests (the narrow fixtures and `testpattern` only for `securityContext`), and `guest:phase2` reads `container_t` from one pod.
+- Tier: T0/T3 · Coverage: ✅ the T0 half: `ci/helm-assertions.sh`, run by the static job, checks all eight client manifests (the example, `cdi-verify`, `testclient`, `display-only`, `audio-only`, `testpattern`, `journey` and `early`): each requests a `desktop.local` resource and declares no `securityContext`, `volumes`, `volumeMounts`, `env`, CDI annotation or privilege. The assertions' output and the eight manifests as committed are under `artifacts/S7.3.3/` (artifact `evidence-static`). The T3 half: the demo pod runs as `container_t`, and the API server holds no `securityContext` for it beyond its empty default; the manifest as applied, the pod as the API server holds it and the pod's own label are under `artifacts/S7.3.3/` (artifact `evidence-vm-k8s`).
 
 **S7.3.4 A lean non-desktop image works**
 - Requirement: an image with no X server and no window manager, running no audio daemon of its own (no `pipewire`, `wireplumber` or `pipewire-pulse` process), opens the display and plays all three paths with injected env only. (The lean image does carry the daemon packages, pulled in as dependencies of `pipewire-utils` and `pipewire-alsa`; nothing starts them.)
@@ -1537,15 +1537,15 @@ because "it works" without "and nothing restarted" is not the claim.
 
 **S7.3.6 Teardown seam**
 - Requirement: `helm uninstall` withdraws the resources; host specs and the desktop survive; existing client pods that were already running keep their windows (they hold their mounts).
-- Acceptance: `guest:verify_teardown` (display, audio); ❌ extend to `tools`; ❌ a running client pod keeps working through the uninstall.
+- Acceptance: `guest:verify_teardown` for the display, audio and tools releases, with a client pod running through the uninstall.
 - Evidence: allocatable before/after (EV-DIFF); `ls -l /etc/cdi` unchanged; EV-SHOT of the client window still present; the client pod's `restartCount` (EV-PIDS).
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_teardown` covers the display and audio releases (resources withdrawn, host specs and the desktop kept), but not `tools`, and no running client pod is watched through the uninstall.
+- Tier: T3 · Coverage: ✅ `guest:verify_teardown`: `helm uninstall` of the display, audio and tools releases leaves none of the three resources allocatable and their daemonsets gone; `/etc/cdi` is unchanged, every spec the same size and time; `desktop.service` stays active with its X socket. A client pod running through the uninstall is the same container (`restartCount` 0), keeps its window on the screen and opens `:0` with `xdpyinfo` afterwards. `artifacts/S7.3.6/` (artifact `evidence-vm-k8s`) holds the allocatable resources and `/etc/cdi` before and after with the diffs, the client pod and its windows before and after with the diff, and the screen after the uninstall.
 
 **S7.3.7 The desktop survives CRI-O and k3s arriving**
 - Requirement: `desktop.service` active and `X0` present after the runtime install.
 - Acceptance: `guest:phase2`.
 - Evidence: EV-PIDS of Xorg/mwm/pipewire before and after the install (unchanged); EV-SHOT.
-- Tier: T3 · Coverage: ❌ no pid proof and no EV-PIDS saved: `guest:phase2` asserts only that `desktop.service` is active and the `X0` socket file exists, which a restarted desktop also passes.
+- Tier: T3 · Coverage: ✅ `guest:phase2`: desktop-init, Xorg, mwm and the audio daemons have the same pids and start times before and after CRI-O and k3s are installed, `desktop.service` is active and the X socket is there; `e2e` shoots the desktop after. `artifacts/S7.3.7/` (artifact `evidence-vm-k8s`) holds the processes before and after (`ps -o pid,ppid,lstart,comm`) with their empty diff, and the screenshot.
 
 ### F7.4 Screenshot delivery as the toolkit's proof
 
@@ -1567,19 +1567,19 @@ the client window; EV-SHOT-CLIENT from inside the client; EV-LOG-CLIENT;
 - Requirement: `podman run --device desktop.local/display=all <img> xterm` puts an xterm on the desktop; the user can click into it and type; the text appears in that window.
 - Acceptance: window present in `xwininfo -root -tree` with the client's title; QMP click at its centre + typed text; the client-side sink file has the text.
 - Evidence: common set; EV-SHOT with the typed text visible inside the client's window.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no client-side screenshot, no `podman inspect` before and after); asserted in part by `operator-e2e:s11_1_3` and `operator-e2e:s11_2_1`, which type and paste into podman client xterms and read the client-side sinks, but no story clicks a client window and then types into it.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_5_1`: a podman client of the desktop image (`podman run --device desktop.local/display=all`) opens a sink xterm titled `s751app`, which `xwininfo -root -tree` lists under its title. With the session's xterm focused first, a click at the client's centre and a typed line land in its sink, read inside its own container; its own capture (the toolkit's screenshot) is of the whole screen; it is the same container and application before and after, `restartCount` 0. `artifacts/S7.5.1/` (artifact `evidence-vm-operator`) holds the window tree, the client before and after (id, the application's host pid, restart count, start time) with the diff, the sink file, the screen with the typed line, the client's own capture, and its log.
 
 **S7.5.2 The same under kubernetes**
 - Requirement: S7.5.1 for `examples/x11-client-pod.yaml`.
-- Acceptance: as S7.5.1 against the demo pod.
+- Acceptance: as S7.5.1 against the demo pod, its window found as the pod's own X client rather than by its title: EL's `/etc/bashrc` retitles an xterm whose shell is interactive at the first prompt, so the demo's `-title` does not last.
 - Evidence: common set.
-- Tier: T3 · Coverage: ❌ evidence not saved and no interaction: `guest:phase2` only waits for the demo pod to run, and `e2e` checks the screendump taken then (`desktop-k3s-client.png`) only for being non-blank.
+- Tier: T3 · Coverage: ✅ `e2e` with `guest:pod_windows`: the demo pod's xterm, found as the pod's own X client (`screenshot --list-clients` gives each client's resource base and pid; the window is the one X allocated from it), is on the screen; a QMP click at its centre and a typed line run in the pod's shell, and `/tmp/s752` holds the word; it is the same container and xterm before and after, `restartCount` 0. `artifacts/S7.5.2/` (artifact `evidence-vm-k8s`) holds the pod before and after with the diff, its X client and windows, the window tree, the QMP commands, the file the line wrote, the screen with the typed line, the pod's own capture (with its image's screenshot binary: the demo requests no toolkit), and its log.
 
 **S7.5.3 A client window gets decoration, focus and keyboard**
 - Requirement: a client window has an mwm frame, takes focus on click (frame turns the active colour) and receives keystrokes.
 - Acceptance: pixel sample of the frame before/after the click; sink text.
 - Evidence: EV-SHOT pair with sampled frame colours; sink file; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence incomplete (no sink file for the window that was clicked); asserted in part by `operator-e2e:s3_5_3`, which samples a podman client's frame colour before and after a click (`artifacts/S3.5.3/`), while keystrokes reach client windows only in `operator-e2e:s11_1_3` and `operator-e2e:s11_2_1`.
+- Tier: T3 · Coverage: ✅ `operator-e2e:s7_5_3`: a podman client's sink xterm sits in an mwm frame with a title bar. With the session's xterm focused, the client's frame is the inactive `#22262d`; a click at its centre turns it the active `#41637f` and the session xterm's inactive, and the keys typed next land in the client's sink; it is the same container and application before and after, `restartCount` 0. `artifacts/S7.5.3/` (artifact `evidence-vm-operator`) holds the window tree with the frame, the screens before and after the click (the sampled colours are in the checks), the sink file, the screen with the typed line, the client before and after with the diff, and its log.
 
 **S7.5.4 A client started before the desktop is up works once it is, without restarting**
 - Requirement: a pod started while `desktop.service` is stopped is admitted (specs are host state), its app retries the display, and when the desktop comes up its window appears, `restartCount` 0.
@@ -1603,7 +1603,7 @@ the client window; EV-SHOT-CLIENT from inside the client; EV-LOG-CLIENT;
 - Requirement: three client pods hold live connections and all three windows are on screen.
 - Acceptance: `guest:verify_concurrency` with each pod's window at its own position, three client windows found in `xwininfo -root -tree`, and `screenshot --list-clients` run while all three are connected.
 - Evidence: EV-SHOT with three windows; `screenshot --list-clients`; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ evidence incomplete (`screenshot --list-clients` is not run for these pods); `guest:verify_concurrency` asserts three live X connections but not three windows on screen (all three xterms open at `+200+200`, so `concurrent-clients.png` cannot show them apart).
+- Tier: T3 · Coverage: ✅ `guest:verify_concurrency`: three pods' xterms, placed at three places on the right of the screen and each found as its pod's own X client, are on the screen with none covering another, while `screenshot --list-clients` lists their connections; the three pods are the same containers throughout, `restartCount` 0. `artifacts/S7.5.7/` (artifact `evidence-vm-k8s`) holds each pod before and after with the diffs, `screenshot --list-clients`, each pod's X client and windows, the window tree, and the screen with the three windows.
 
 ### F7.6 Client application journeys: audio
 
@@ -1615,7 +1615,7 @@ EV-LOG-CLIENT (the player's output), EV-AUDIO with spectrogram, EV-TIMELINE.
 - Requirement: a pod with `desktop.local/audio` plays via pulse, PipeWire-native and ALSA, and each is heard.
 - Acceptance: `guest:play_audio_pod` × 3 with frequency checks.
 - Evidence: common set; three EV-AUDIO captures.
-- Tier: T3 · Coverage: ❌ evidence incomplete (no sink-input listing, pids or spectrograms; only the WAVs `artifacts/audio-cdi-*.wav` are saved); asserted by `guest:play_audio_pod` × 3 with frequency checks.
+- Tier: T3 · Coverage: ✅ `e2e` with `guest:play_audio_pod` × 3: the cdi-verify pod, with only the injected env, plays 440 Hz over pulse (`paplay`), 880 Hz over PipeWire (`pw-play`) and 1320 Hz over ALSA (`aplay`), and each is heard at the machine's output at its pitch. Each player's stream is listed while it plays, found by its client's executable (`paplay` and `pw-play` run as `pacat` and `pw-cat`). The pod and the three audio daemons are the same before and after. `artifacts/S7.6.1/` (artifact `evidence-vm-k8s`) holds, per path, the streams before, during and after (pactl's short lists, and each playing stream's client: its name, executable and pid), the player's output, and the capture with its verdict and level plot; and the pod and the daemons before and after with the diffs.
 
 **S7.6.2 A client records**
 - Requirement: a pod records the sink monitor and the recording carries the tone.
@@ -1645,7 +1645,7 @@ EV-LOG-CLIENT (the player's output), EV-AUDIO with spectrogram, EV-TIMELINE.
 - Requirement: the testclient image plays all three paths and records via the injected env alone.
 - Acceptance: `e2e` lean-client loop for playback; for recording, a `parec` loopback recorded in the lean client, pulled out and analysed.
 - Evidence: three EV-AUDIO; EV-AUDIO-REC; EV-PIDS (`restartCount` or `StartedAt` and the app's pid, before and after).
-- Tier: T3 · Coverage: ❌ the lean client never records, and its playback WAVs (`artifacts/audio-testclient-*.wav`) are saved without spectrograms; playback is asserted by `e2e` "cdi: a LEAN non-desktop image" with `check-audio.py`.
+- Tier: T3 · Coverage: ✅ `e2e` "cdi: a LEAN non-desktop image": the testclient pod plays 440, 880 and 1320 Hz over pulse, PipeWire and ALSA with only the injected env, each heard at its pitch, and records the default sink's monitor with `parec` while a 660 Hz tone plays; the recording, copied out of the VM, carries 660 Hz. The pod is the same container throughout, `restartCount` 0. `artifacts/S7.6.6/` (artifact `evidence-vm-k8s`) holds the three captures (taken in S7.3.4) with their verdicts and level plots, the recording with its verdict and level plot, and the pod before and after with the diff.
 
 ### F7.7 Hotplug continuity for running client applications
 
@@ -2304,10 +2304,10 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | E4 Audio | 23 | 16 | 0 | 6 | 1 |
 | E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
-| E7 Client contract & journeys | 40 | 19 | 1 | 20 | 0 |
+| E7 Client contract & journeys | 40 | 31 | 1 | 8 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **155** | **4** | **86** | **6** |
+| **Total** | **251** | **167** | **4** | **74** | **6** |
 
 Regenerate after editing with:
 
