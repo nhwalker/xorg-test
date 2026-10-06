@@ -6,8 +6,8 @@ Description=Provision host-shell key material for the desktop container
 # dedicated desktop-shell account (created by sysusers.d). Pulled in by
 # desktop.container's [Unit] Wants= - the off-switch for the whole Host
 # Terminal feature lives THERE, not here. Re-running this unit mid-uptime
-# rotates the key; the running container keeps the old (now useless) copy
-# until desktop.service restarts.
+# rotates the key and hands the new one to a running desktop (the script's
+# last step), so Host Terminal keeps working without a desktop restart.
 Before=desktop.service
 # The container reaches the host over loopback ssh; keep sshd running while
 # the desktop is deployed. (Started per boot - whether sshd is *enabled* on

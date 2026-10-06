@@ -16,15 +16,15 @@
 #
 # So: declare the layout instead of detecting it. Every output named in the
 # config is forced ENABLED at a fixed mode and position whether or not the
-# driver thinks anything is plugged in, and the framebuffer is pinned at the
-# layout's extents. Xorg then has no reason to change geometry when a
-# connector comes and goes, because it never consults the connector to decide
-# what the geometry should be.
+# driver thinks anything is plugged in, so the screen starts at the layout's
+# extents. Xorg then has no reason to change geometry when a connector comes
+# and goes, because it never consults the connector to decide what the
+# geometry should be.
 #
 # Config (host-provided, mounted read-only at /etc/desktop-container):
 #
 #     # global, all optional
-#     virtual 3840x1080             # override the computed framebuffer size
+#     virtual 3840x1080             # the Screen's Virtual, instead of the extents
 #     nvidia-connected DFP-0,DFP-1  # NVIDIA ConnectedMonitor (see below)
 #     nvidia-edid DFP-0=/etc/desktop-container/edid-dfp0.bin
 #
@@ -283,8 +283,8 @@ if [ -f "$GPU_CONF" ] && grep -q "Identifier[[:space:]]*\"$DEVICE_ID\"" "$GPU_CO
 fi
 log "driver from $GPU_CONF: $driver (Device \"$DEVICE_ID\" present: $have_device)"
 
-# The Screen section carries the pinned framebuffer size, and it can only
-# exist if there is a Device to attach it to: a Screen referencing a Device
+# The Screen section carries the Virtual size, and it can only exist if
+# there is a Device to attach it to: a Screen referencing a Device
 # section that was never written is a hard Xorg config error, and refusing to
 # start is a worse outcome than the diagnosis xorg-gpu-conf.sh already logged.
 if [ "$have_device" = no ]; then
@@ -381,12 +381,17 @@ if [ "$have_device" = yes ]; then
             printf '    Option      "CustomEDID" "%s:%s"\n' "${e%%=*}" "${e#*=}"
         done
     fi
-    # The framebuffer, pinned. Every enabled output above already sums to
-    # exactly this, so it changes nothing at startup - it is here for the case
-    # where an output does NOT come up: the screen is still allocated at full
-    # size, so re-establishing that output later is a mode set and not a
-    # screen resize. A resize is what moves every window on a desktop whose
-    # window manager (mwm) has never heard of RandR.
+    # Virtual: the layout's extents, or the config's `virtual`. On modesetting
+    # (xserver 1.20) it does not hold the screen's size: when the server
+    # starts, RandR 1.2 sizes the screen to the outputs that came up
+    # (xf86RandR12CreateScreenResources), and RandR can grow it later up to
+    # the driver's own limit, Virtual or not. It caps the modes probed at
+    # start, none larger than it. What keeps the geometry is the Enable on
+    # every output above: they are all up from the start, so the screen starts
+    # at the whole layout and a connector event resizes nothing - a resize is
+    # what moves every window on a desktop whose window manager (mwm) has
+    # never heard of RandR. The NVIDIA driver handles Virtual itself; CI does
+    # not check what it does with it.
     printf '    SubSection "Display"\n'
     printf '        Virtual %s %s\n' "$virt_w" "$virt_h"
     printf '    EndSubSection\n'

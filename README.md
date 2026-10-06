@@ -62,9 +62,16 @@ The desktop image is built in two stages with separate Containerfiles:
   iteration works completely offline:
 
 ```sh
-podman build -t localhost/desktop-container-base:latest -f Containerfile.base .
-podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+sudo podman build -t localhost/desktop-container-base:latest -f Containerfile.base .
+sudo podman build -t localhost/screenshot-base:latest -f Containerfile.screenshot.base .
+sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
+sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
 ```
+
+The desktop image's tools stage copies the screenshot tool out of
+`localhost/screenshot:latest`, so that image is built first, on a base of its
+own. As root: `desktop.service` runs from root's podman storage, and an image
+built in a user's own storage never reaches it.
 
 Nothing in the `deploy/` tree builds or pulls images — provisioning puts a
 prebuilt image in podman's storage. `ci/build-bases.sh` is the reference for
@@ -101,8 +108,15 @@ sudo rsync -a --chown=root:root deploy/host/ /
 sudo systemctl daemon-reload
 sudo systemd-sysusers
 sudo systemd-tmpfiles --create
+# a running sshd reads the tree's sshd_config.d drop-in only when it starts or reloads
+sudo systemctl try-reload-or-restart sshd
 sudo systemctl start desktop.service
 ```
+
+The sshd line is for Host Terminal (see "Host terminal from the desktop"):
+its key is trusted through the tree's `sshd_config.d` drop-in, which an sshd
+already running when the tree arrived has not read. It reloads sshd if it is
+running and does nothing if it is not.
 
 See `deploy/README.md` for the full contents, the host prerequisites
 (`deploy/HOST-REQUIRES.md`), the per-host drop-in overrides, and the
@@ -121,10 +135,12 @@ Seat handover — the host must stop claiming the devices the container needs:
 2. `desktop-seat-prep.service` makes that baseline true again at every boot,
    whatever the host has drifted to: it deletes
    `/etc/udev/rules.d/72-seat-*.rules` (created by `loginctl attach`) and
-   re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems so all
-   devices fall back to default `seat0` tagging (custom multi-seat splits
-   would otherwise hide devices from the container's libinput, which reads
-   the host udev database's seat tags); disables and
+   re-triggers udev for the `drm`/`input`/`sound`/`graphics` subsystems, then
+   for every device still tagged for a seat (a keyboard's LEDs copy their
+   parent's tag), so all devices fall back to default `seat0` tagging
+   (custom multi-seat splits would otherwise hide devices from the
+   container's libinput, which reads the host udev database's seat tags);
+   disables and
    stops whatever `display-manager.service` resolves to; re-asserts the
    default target and the getty mask; then verifies nothing still holds the
    VT or DRM master before `desktop.service` starts.
@@ -292,11 +308,15 @@ One thing holds the geometry:
      of `Enable` is `ConnectedMonitor`, which needs its *display device*
      names (`DFP-0`, not the RandR name `DP-0`) and so is opt-in via
      `nvidia-connected`; `nvidia-edid` feeds it a saved EDID the same way.
-   - Both paths pin the framebuffer with `Virtual` at the layout's extents.
-     That changes nothing at startup — the enabled outputs already sum to it
-     — and everything if an output fails to come up: restoring it later is
-     then a mode set rather than a screen resize, and a resize is what moves
-     every window on a desktop whose window manager has never heard of RandR.
+   - Both paths also write `Virtual` at the layout's extents. On modesetting
+     that does not hold the screen's size: when the server starts, RandR 1.2
+     sizes the screen to the outputs that came up, and RandR can grow it later
+     up to the driver's own limit, `Virtual` or not. What holds the geometry
+     there is `Enable`: every declared output is up from the start, so the
+     screen starts at the whole layout and a connector event resizes nothing —
+     a resize is what moves every window on a desktop whose window manager has
+     never heard of RandR. (The NVIDIA driver implements RandR itself; CI does
+     not check what it does with `Virtual`.)
 That config is authoritative at server **start**, and nothing re-asserts it
 afterwards. Nothing in this session watches RandR at all — mwm predates it and
 no desktop environment runs here — so a layout that something else moves stays
@@ -318,9 +338,11 @@ them: the derived timings against `cvt(1)`, both driver paths, and the config
 rejections (`ci/monitor-layout-tests.sh`). The VM e2e proves the load-bearing claim
 itself. QEMU's virtio-vga is booted with `max_outputs=2`, and virtio-gpu
 reports connector status straight from whether QEMU has that scanout enabled —
-under `-display none` it never enables the second one, so the guest has a
-permanently **disconnected** `Virtual-2`: a monitor-shaped hole, with no DDC
-emulation involved. The e2e declares a two-monitor layout across both
+under `-display none` nothing enables the second one, so the guest has a
+**disconnected** `Virtual-2`: a monitor-shaped hole, with no DDC emulation
+involved. (A VNC server bound to that head is how the later monitor stories
+plug a monitor in, `HotpluggingTestHelp.md` §4.3.1; nothing talks to it
+during the layout test.) The e2e declares a two-monitor layout across both
 connectors and asserts that `xrandr` reports
 
 ```
@@ -328,7 +350,7 @@ Virtual-2 disconnected 1024x768+1024+0
 ```
 
 — an output scanning out at its declared position with nothing plugged into
-it, on a screen pinned to the full 2048x768. It then forces `Virtual-1`'s
+it, on a screen spanning the full 2048x768. It then forces `Virtual-1`'s
 connector down under the running server and asserts the geometry does not
 move. "Monitor was never there" is a strict superset of the hard part
 of "monitor went away".
@@ -471,16 +493,20 @@ To change any of it, edit the file in `image/session/` and rebuild the
 application layer — offline, so no base rebuild and no network:
 
 ```sh
-podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
 sudo systemctl restart desktop.service
 ```
 
-For faster iteration, edit `/home/desktop/.mwmrc` inside the running
-container and pick **"Restart mwm"** from the root menu; `f.restart` re-reads
-the menus and bindings in place. Resources are **not** re-read by
-`f.restart`, so an `~/.Xdefaults` change needs a new X session
-(`systemctl restart desktop-session.service` in the container). Either way
-the edit lives only in the container's writable layer — nothing mounts a
+The build is root's for the same reason as above, and it needs the base and
+the screenshot tool's image in root's storage (built as above, or loaded
+there with `podman load`).
+
+For faster iteration, edit `/home/desktop/.mwmrc` or `~/.Xdefaults` inside
+the running container and pick **"Restart mwm"** from the root menu:
+`f.restart` starts mwm again in the same X session, and the new mwm reads its
+menus, bindings and resources afresh. Every client reads `~/.Xdefaults` as it
+starts, so the next xterm has the change too; one already open keeps its
+colours. Either way the edit lives only in the container's writable layer — nothing mounts a
 persistent `/home/desktop`, so `podman rm`/recreate or a k8s pod restart
 drops it. Land the real change in the repo file.
 
@@ -825,9 +851,10 @@ What that sets up:
 
 - a per-boot ed25519 keypair in `/etc/desktop-container/` — **root-only
   on the host** (no non-root host user can read it) and mounted read-only
-  into the container, where a boot script installs a `desktop`-owned copy
+  into the container, where a script installs a `desktop`-owned copy
   and generates the `ssh host` client config (loopback, fixed user,
-  `NoHostAuthenticationForLocalhost`);
+  `NoHostAuthenticationForLocalhost`) at every container start, and again
+  when the host makes a key while the desktop runs;
 - a restricted `authorized_keys` entry for `desktop-shell`, root-owned under
   `/etc/ssh/authorized_keys.d` (not in the account's home):
   `from="127.0.0.1,::1"`, no port/agent/X11 forwarding;
@@ -962,26 +989,31 @@ podman exec desktop pgrep -u desktop -x mwm    # the session, in one probe
 loginctl list-sessions                         # desktop on seat0/tty1 (host session)
 podman exec desktop cat /etc/X11/xorg.conf.d/20-gpu.conf   # nvidia vs modesetting
 podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf  # fixed layout, if declared
-DISPLAY=:0 xrandr                              # display up, modes listed
-DISPLAY=:0 glxinfo -B                          # GPU mode: "NVIDIA"; else llvmpipe
+podman exec -u desktop -e DISPLAY=:0 desktop xrandr      # display up, modes listed
+podman exec -u desktop -e DISPLAY=:0 desktop glxinfo -B  # GPU mode: "NVIDIA"; else llvmpipe
 fgconsole                                      # VT 1 active
 podman exec desktop ps -o user= -C Xorg        # "desktop", not root (rootless X)
 podman logs desktop | grep align               # gid alignment log
-podman exec -u desktop desktop wpctl status    # sound devices present
+podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop wpctl status  # sound devices present
 # audio, one per protocol (repeat from host and from a scratch container):
 pw-play      /usr/share/sounds/alsa/Front_Center.wav   # PIPEWIRE_REMOTE set
 paplay       /usr/share/sounds/alsa/Front_Center.wav   # PULSE_SERVER set
 aplay        /usr/share/sounds/alsa/Front_Center.wav   # via the ALSA drop-in
 ```
 
+The X and PipeWire probes run in the container. `xrandr` and `glxinfo`
+are the image's; the documented host packages do not install them.
+`wpctl` must reach the session's PipeWire, which it finds through
+`XDG_RUNTIME_DIR`, and `podman exec` does not set that.
+
 Input hotplug: unplug/replug a keyboard; it should re-appear in the session
 (uevents arrive because the container shares the host network namespace).
 Audio hotplug: plug in a USB headset or DAC; a new `controlC*` must appear in
 the container (`podman exec desktop ls /dev/snd`) and the device must show up
-in `podman exec -u desktop desktop wpctl status`.
+in `podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 desktop wpctl status`.
 
 Video, on a host that declared a layout ("Fixed monitor layout" above): switch
-the KVM away and back. `DISPLAY=:0 xrandr` must report the same geometry
+the KVM away and back. `podman exec -u desktop -e DISPLAY=:0 desktop xrandr` must report the same geometry
 throughout, and no window may have moved. `podman logs desktop | grep xorg-monitor-conf` says what was configured at
 boot.
 

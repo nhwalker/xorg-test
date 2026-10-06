@@ -43,13 +43,15 @@ jobs:
       - name: go fmt/vet/test (cdi-device-plugin)
         working-directory: cdi-device-plugin
         run: |
-          test -z "$(gofmt -l .)"
+          unformatted=$(gofmt -l .) || { echo "FAIL: gofmt could not read the sources"; exit 1; }
+          [ -z "$unformatted" ] || { echo "FAIL: gofmt would reformat: $unformatted"; exit 1; }
           go vet ./...
           go test ./...
       - name: go fmt/vet/test (screenshot)
         working-directory: screenshot
         run: |
-          test -z "$(gofmt -l .)"
+          unformatted=$(gofmt -l .) || { echo "FAIL: gofmt could not read the sources"; exit 1; }
+          [ -z "$unformatted" ] || { echo "FAIL: gofmt would reformat: $unformatted"; exit 1; }
           go vet ./...
           go test ./...
       - name: shellcheck (error severity)
@@ -60,24 +62,68 @@ jobs:
         # invocation below fails with command-not-found, which says so.
         run: |
           shellcheck --version
-          shellcheck -S error ci/*.sh ci/vm/*.sh \
+          shellcheck -S error ci/*.sh ci/vm/*.sh ci/hw/*.sh \
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/start-audio \
             image/session/session-postmortem image/init/desktop-init \
-            image/session/host-terminal image/tools/publish-tools.sh \
+            image/session/host-terminal image/session/xinitrc.desktop \
+            image/tools/publish-tools.sh \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
             deploy/host/usr/local/libexec/desktop-client-cdi \
             deploy/host/usr/local/libexec/desktop-tools-cdi \
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
             deploy/host/usr/local/libexec/desktop-selinux \
+            deploy/host/usr/local/libexec/desktop-session-lead \
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight \
             deploy/host/usr/local/bin/desktop-monitors-capture
+      - name: every shipped script is shellchecked (S1.2.6's list)
+        # The step above names its scripts by hand. Every shell script git
+        # tracks under image/ and deploy/host/usr/local/ (found by its #!
+        # line) must be among them; the self-test first shows the check
+        # names a script taken out of the step.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/script-list.py)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S1.2.6 "All shipped scripts are executable and shellcheck-clean" T0
+          rc=0
+          ev_save self-test "EV-STATE: script-list.py self-test: the check run against the shellcheck step with one listed script taken out, which it must name" \
+            python3 ci/script-list.py self-test >/dev/null || rc=1
+          [ "$rc" = 0 ] && ev_pass "the check names a script taken out of the step" || ev_fail "the check did not name a script taken out of the step"
+          found=$(python3 ci/script-list.py found) || rc=1
+          listed=$(python3 ci/script-list.py listed) || rc=1
+          ev_text found "EV-STATE: every shell script git tracks under image/ and deploy/host/usr/local/, found by its #! line (script-list.py found)" "$found"
+          a=$EV_LAST
+          ev_text listed "EV-STATE: the scripts the shellcheck step names under image/ and deploy/host/usr/local/, its globs expanded (script-list.py listed)" "$listed"
+          ev_diff lists "EV-DIFF: the scripts found against the scripts the shellcheck step names" "$a" "$EV_LAST" \
+            "nothing: every shipped script is shellchecked"
+          if python3 ci/script-list.py check; then
+            ev_pass "the shellcheck step names every one of the $(grep -c . <<<"$found") shipped shell scripts, and nothing else there"
+          else
+            ev_fail "the shellcheck step's list and the shipped shell scripts differ (see the diff)"; rc=1
+          fi
+          ev_end
+          ev_failures
+          exit "$rc"
+      - name: monitors.conf's global keywords agree, three ways (S10.3.2's static half)
+        # The keywords monitors.conf documents and README.md names, the ones
+        # xorg-monitor-conf.sh accepts, and the ones the container's
+        # preflight skips when it reads output names: one set. The
+        # self-test first plants a keyword in README.md that nothing
+        # accepts, which the check must name.
+        env:
+          EV_SOURCE: "ci.yml static (ci/layout-keywords.py)"
+        run: |
+          python3 ci/layout-keywords.py self-test
+          python3 ci/layout-keywords.py check --evidence artifacts
       - name: python syntax (VM harness, evidence library)
         # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py ci/evlib.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/e9-guard.py ci/script-list.py ci/pr-mutations.py ci/preflight-rows.py ci/doc-blocks.py ci/layout-keywords.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the
@@ -89,6 +135,26 @@ jobs:
           EV_ROOT: artifacts
           EV_SOURCE: "ci.yml static (ci/monitor-layout-tests.sh)"
         run: ci/monitor-layout-tests.sh
+      - name: script unit tests (T1)
+        # Host and image scripts driven on the runner through their test
+        # overrides (Requirements.md, Appendix A) and fakes first on PATH:
+        # build-bases.sh against a fake registry, start-audio with fake
+        # daemons, the postmortem on fabricated Xorg logs, host-terminal with
+        # a fake ssh, desktop-host-shell-setup on a scratch directory and
+        # desktop-monitors-capture on canned xrandr. Root only through sudo,
+        # for the capture tool, which refuses anything else.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/script-unit-tests.sh)"
+        run: ci/script-unit-tests.sh
+      - name: the hardware acceptance script's helpers (canned input)
+        # ci/hw/acceptance.sh runs on a physical host, by hand (the T4
+        # stories, Appendix C); what it parses or rewrites from that host - a
+        # CDI spec, xrandr's and wpctl's output, the container log's size -
+        # is checked here on canned input, so a broken helper costs this step
+        # and not a tester's afternoon. It keeps no story's evidence: a T4
+        # story's evidence comes from the hardware.
+        run: ci/hw/acceptance-tests.sh
       - name: build args stay global (multi-stage ARG scoping)
         # An ARG declared before the first FROM is global and usable in every
         # FROM line; one declared AFTER a FROM belongs to that stage alone and
@@ -129,10 +195,145 @@ jobs:
           else ev_fail "an ARG follows the first FROM (see the check's output)"; fi
           ev_end
           exit "$rc"
-      - name: helm lint + template assertions
+      - name: no client runs privileged or unconfined (S7.1.2's static guard)
+        # Every podman run/create under ci/ and examples/, read as the shell
+        # reads it, and every client manifest there: none may ask for
+        # --privileged or label=disable (privileged: true, spc_t). A grep
+        # cannot do this - the log lines and failure messages that NAME
+        # --privileged would match - so the guard tokenizes, and its
+        # self-test first shows it flags a violation and passes a mention.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/client-guard.py)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S7.1.2 "Confined clients work under enforcing" T0
+          rc=0
+          ev_save guard "client-guard.py --self-test: its self-test, then every podman run/create command and client manifest under ci/ and examples/ it judged" \
+            python3 ci/client-guard.py --self-test >/dev/null || rc=$?
+          if [ "$rc" = 0 ]; then ev_pass "no podman run/create under ci/ and examples/ passes --privileged or label=disable, no client manifest asks for privileged: true or spc_t, and the self-test flags each"
+          else ev_fail "a client asks for --privileged or label=disable, or the guard's self-test failed (see its output)"; fi
+          ev_end
+          exit "$rc"
+      - name: the test suite keeps its own rules (E9's static guard)
+        # Requirements.md E9's rules that a read of the tree can hold, each
+        # its own story: ci/e9-guard.py reads ci/'s shell and Python and the
+        # workflows' run blocks. Each rule's self-test first judges planted
+        # files, a violation flagged and an allowed form passed, and requires
+        # each of its ALLOW entries (the tree's documented exceptions) to
+        # still excuse something; then every finding in the tree is printed,
+        # allowed or not.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/e9-guard.py)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          f=0
+          rule() { # <story> <title> <what the tree holds to>
+            local rc=0
+            ev_begin "$1" "$2" T0
+            ev_save guard "ci/e9-guard.py --rule $1 --self-test: the rule's self-test, then each finding in the tree, allowed (with the reason) or a violation, and the rule's summary" \
+              python3 ci/e9-guard.py --rule "$1" --self-test >/dev/null || rc=$?
+            if [ "$rc" = 0 ]; then ev_pass "$3; the self-test flags each planted violation and passes each allowed form"
+            else ev_fail "a violation of $1 in the tree, or the rule's self-test failed (see the guard's output)"; f=1; fi
+            ev_end
+          }
+          rule S9.1.1 "Every assertion has been seen to fail" \
+            "its static half: each tree guard the static job runs (client-guard, e9-guard, script-list, layout-keywords, pr-mutations) runs with its self-test, which plants what its checks must catch; the static job runs no other checker; every e9-guard rule plants a violation it must flag and a form it must pass, and so does client-guard's self-test"
+          rule S9.1.2 "Assert generated output, not source text" \
+            "each read a test makes of a generated artefact (a CDI spec, 20-gpu.conf or 30-monitors.conf, a unit as systemctl cat or quadlet's dry run prints it, a rendered chart) is comment-blind (ci/evidence.sh's gen_grep, which the guard runs against a comment) or anchored at the line's start, so no comment can answer it"
+          rule S9.1.3 "Read the container's init, never /proc/1" \
+            "no test reaches the desktop's processes through /proc/1 or by name: each such read in ci/ is one the guard's ALLOW list names (a client's own pid 1, the host's on purpose, a refusal under test)"
+          rule S9.1.4 "Poll log lines; read live state once" \
+            "every read of a container log, the journal or a pod log in ci/'s shell whose text an assertion reads is polled: through ci/evidence.sh's log_wait, in a polling loop or a function a poller runs, or after a poll of the same log, which is how an absence is read"
+          rule S9.1.5 "No early-exiting reader on a live pipeline under pipefail" \
+            "no reader that stops early (grep -q/-m/-l, head, sed q, awk exit, read, cmp, a loop or python that breaks) reads a live pipeline under pipefail in ci/'s shell or a workflow's run block"
+          rule S9.2.1 "Nothing weakens the system under test" \
+            "no setenforce; no --privileged or label=disable on a podman run, create or exec; no -e or -v that duplicates an edit of a CDI device the container requests; an -e of a CDI variable into a client only from its own pid 1; no write under /etc/containers/systemd but the documented procedures the ALLOW list names"
+          rule S9.2.2 "Narrow fixtures stay narrow" \
+            "each *-only pod requests exactly one desktop.local resource, and no client pod declares more than its requests"
+          rule S9.2.3 "Failures are diagnosable from the job log" \
+            "every failure says why in the job log, its message last: each fail() that ends a script prints its message, diagnostics it also keeps in the story, and the message again; a script under errexit reports a command that fails unhandled through an ERR trap (run against handled and unhandled failures); a count of failures is repeated before the script or step fails on it; a check in a workflow step says why it failed; ev_save prints a failed command's output to the log (run); operator-e2e.py prints the diagnostics it keeps"
+          rule S9.2.4 "Probes yield integers, or fail" \
+            "each counter read from the guest is an integer, or a failed read that fails or retries, before it is compared: never a stand-in number"
+          rule S9.2.5 "Restore what you changed" \
+            "each write under /etc in ci/'s shell and the workflows is one the guard's registry names: put back, or undone by the product, with a check of the restore after the write; or one that needs none (a scratch file, the shipped file itself, a container's own file, a VM discarded after the run)"
+          rule S9.2.6 "Documented procedures are run from the document" \
+            "every block, paragraph or entry the harness reads with ci/doc-blocks.py is in the document; no fenced block of README.md, deploy/README.md or deploy/HOST-REQUIRES.md is typed into ci/'s shell or Python or the workflows unless an ALLOW entry pins its digest and the lines typed; in a story that runs what a document gives, every recorded step is the document's or named harness-only, and each substitution is named a placeholder"
+          rule S9.3.1 "Every story emits its named evidence on pass and on fail" \
+            "every story the harness begins is one Requirements.md defines, and the evidence check fails each of five incomplete story directories and passes a complete one"
+          rule S9.3.2 "Before/after pairs are diffed, not eyeballed" \
+            "every diff the harness writes (ev_diff, ev_diff_paths, Ctx.diff and the like) says which lines are expected to differ, and the gate's pair check fails each of four planted story directories (a pair with no diff, a diff that states no expectation, one expected to differ in nothing that differs, one that names neither file) and passes a pair diffed with its expectation"
+          rule S9.3.3 "\"No restart\" is measured" \
+            "every check in the harness that can pass saying a container or process lived through an event is in a story that diffs two states, and the gate's survival check fails each of two planted claims left unmeasured (nothing kept; only a pid kept for a container) and passes five (a container's id and restart count, a process's pid, a pair a diff compares, a check that something did not survive, a failing check)"
+          rule S9.3.4 "Audio evidence is audible and visible" \
+            "every recording the harness names is judged and pictured where it is named (check-audio.py --report --plot, or the helpers that run it), and the gate's audio check fails each of five planted recordings (no plot, no verdict, a plot and verdict that do not name it, a name that says nothing of what to hear, a pulse tone at pipewire's pitch) and passes a tone and a voice sample with theirs"
+          rule S9.3.5 "Video covers every dynamic step" \
+            "every recording in the harness (ev_video_start to ev_video_stop, a with ctx.video block) marks its event, both recorders name the event frames on the gif's line (evlib.video_events: the frame at or after each mark, and where the screen changes), the gate's video check fails each of three planted videos (no event frame named, a frame its frames lack, event frames none) and passes two (its own frames, a copy citing another story's), and the gate fails a story its document asks to record that holds no video"
+          rule S9.3.6 "The timeline is the spine" \
+            "ci/evidence.sh wraps podman and kubectl so each call is a line of the timeline, ev_log stamps each line and keeps it to one, every ssh, scp, socat or nc in the shell is logged first or kept by ev_save, the Python's ssh and QMP go through the classes that log them, nothing else writes a timeline, and the gate's timeline check fails a line with no timestamp and a file in the index with no line in the timeline and passes a story written through StoryWriter"
+          ev_failures
+          exit "$f"
+      - name: the pull request names the mutations its new assertions failed on (S9.1.1)
+        # ci/pr-mutations.py's self-test, always; on a pull request, then the
+        # check itself: the assertions the pull request adds to the test
+        # suite, and its description's Mutations section. The description
+        # reaches the script through the environment, never the script's text.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/e9-guard.py, ci/pr-mutations.py)"
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          rc=0
+          ev_begin S9.1.1 "Every assertion has been seen to fail" T0
+          ev_save mutations-self-test "ci/pr-mutations.py --self-test: the check on planted descriptions and diffs: new assertions with no Mutations section, with an empty one, with one that names a mutation, and a diff that adds none" \
+            python3 ci/pr-mutations.py --self-test >/dev/null || rc=$?
+          if [ "$rc" = 0 ]; then ev_pass "pr-mutations.py's self-test judges each planted description and diff as it must"
+          else ev_fail "pr-mutations.py's self-test judged a planted case wrongly (see its output)"; fi
+          if [ -n "$BASE_SHA" ]; then
+            printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+            git fetch -q --depth=1 origin "$BASE_SHA"
+            git diff "$BASE_SHA" HEAD -- ci .github/workflows > "$RUNNER_TEMP/pr.diff"
+            ev_copy "$RUNNER_TEMP/pr-body.md" pr-body "EV-STATE: this pull request's description, as the run received it"
+            prc=0
+            ev_save mutations "ci/pr-mutations.py check: the assertions this pull request adds to the test suite, and the mutations its description names" \
+              python3 ci/pr-mutations.py check "$RUNNER_TEMP/pr-body.md" "$RUNNER_TEMP/pr.diff" >/dev/null || prc=$?
+            if [ "$prc" = 0 ]; then ev_pass "this pull request's description names the mutations its new assertions were seen to fail on, or it adds none"
+            else ev_fail "this pull request adds assertions to the test suite and its description names no mutation (see pr-mutations.py's output)"; rc=1; fi
+          else
+            ev_note "not a pull request ($GITHUB_EVENT_NAME): there is no description to read"
+          fi
+          ev_end
+          ev_failures
+          exit "$rc"
+      - name: helm lint + template assertions (and S7.3.3's static half)
+        # The chart's golden assertions, then every client manifest's: each
+        # requests a desktop.local resource and declares nothing of its own.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/helm-assertions.sh)"
         run: |
           helm lint charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all
-          ci/helm-assertions.sh
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S7.3.3 "Pods are confined and declare no securityContext" T0
+          rc=0
+          ev_save assertions "ci/helm-assertions.sh: the chart's assertions, then each client manifest's: a desktop.local request, and no securityContext, volumes, volumeMounts, env, CDI annotation or privilege" \
+            ci/helm-assertions.sh >/dev/null || rc=$?
+          for m in examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml \
+                   ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml ci/vm/testpattern-pod.yaml \
+                   ci/vm/journey-pod.yaml ci/vm/early-pod.yaml; do
+            ev_copy "$m" "manifest-$(basename "$m" .yaml)" "EV-CONFIG: $m, as committed"
+          done
+          if [ "$rc" = 0 ]; then ev_pass "all eight client manifests request a desktop.local resource and declare no securityContext, volumes, volumeMounts, env, CDI annotation or privilege"
+          else ev_fail "ci/helm-assertions.sh failed (see its output)"; fi
+          ev_end
+          exit "$rc"
       - name: kubeconform (k8s schema validation)
         # The client manifests are plain YAML (a resource request, no
         # chart), so they are validated directly, not via helm template.
@@ -143,7 +344,7 @@ jobs:
           ./kubeconform -strict -summary \
             examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml \
             ci/vm/testclient-pod.yaml ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml \
-            ci/vm/testpattern-pod.yaml
+            ci/vm/testpattern-pod.yaml ci/vm/journey-pod.yaml ci/vm/early-pod.yaml
 
       - name: upload evidence
         if: always()
@@ -241,7 +442,148 @@ jobs:
           ev_save pipewire-confs "EV-STATE: the PipeWire config files the image ships (ls /usr/share/pipewire)" \
             img 'ls -l /usr/share/pipewire' >/dev/null || true
           ev_end
-          [ "$f" = 0 ]
+          [ "$f" = 0 ] || { ev_failures; exit 1; }
+      - name: the built image's contents (S1.1.5, S1.1.6, S1.2.1, S1.2.2, S1.2.5, S1.2.6, S1.2.7, S1.2.8)
+        # Read out of the images this job just built, in scratch containers
+        # of them (no desktop-init, so nothing is renumbered or published);
+        # each story keeps what it read.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (image contents)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          img() { sudo podman run --rm --network=none localhost/desktop-container:latest sh -c "$1"; }
+          f=0
+          check() { ev_check "$@" || f=1; }             # <claim> <cmd...>: record it and go on
+          same() { [ -n "$1" ] && [ "$1" = "$2" ]; }    # two values, equal and not empty
+
+          ev_begin S1.1.5 "Rocky repos fill gaps only" T2
+          vendors=$(ev_save rpm-vendors "EV-STATE: rpm -qa --qf '%{NAME} %{VENDOR}' in the base image (localhost/desktop-container-base:latest), sorted" \
+            sudo podman run --rm --network=none localhost/desktop-container-base:latest \
+              sh -c "rpm -qa --qf '%{NAME} %{VENDOR}\n' | sort") || f=1
+          check "glibc's vendor is Red Hat, Inc. (UBI's)" grep -qx 'glibc Red Hat, Inc\.' <<<"$vendors"
+          check "xorg-x11-server-Xorg's vendor is Rocky Enterprise Software Foundation" \
+            grep -qx 'xorg-x11-server-Xorg Rocky Enterprise Software Foundation' <<<"$vendors"
+          ev_note "the two rows the acceptance names, as rpm printed them: $(grep -E '^(glibc|xorg-x11-server-Xorg) ' <<<"$vendors" | sed 's/.*/"&"/' | paste -sd' ')"
+          ev_end
+
+          ev_begin S1.1.6 "The client toolkit is staged from the screenshot image" T2
+          staged=$(ev_save staged "EV-STATE: ls -l and sha256sum of the staged /usr/libexec/desktop-tools/screenshot, in a scratch container of the image" \
+            img 'ls -l /usr/libexec/desktop-tools/screenshot && sha256sum /usr/libexec/desktop-tools/screenshot') || f=1
+          check "the staged binary is -rwxr-xr-x (0755)" grep -qE '^-rwxr-xr-x[.+]? .* /usr/libexec/desktop-tools/screenshot$' <<<"$staged"
+          src=$(ev_save source "EV-STATE: sha256sum of /screenshot in localhost/screenshot:latest, the default TOOLS_IMAGE (copied out of a created, never started, container)" \
+            sudo sh -c 'c=$(podman create localhost/screenshot:latest) && podman cp "$c:/screenshot" - | tar -xO | sha256sum; podman rm -f "$c" >/dev/null') || f=1
+          sha_src=$(awk '$2=="-"{print $1}' <<<"$src")
+          check "it is byte-identical to the screenshot image's /screenshot (sha256 ${sha_src:-unread})" \
+            same "$(awk '$2=="/usr/libexec/desktop-tools/screenshot"{print $1}' <<<"$staged")" "$sha_src"
+          # TOOLS_IMAGE is a build argument: a build given another image must
+          # stage that image's /screenshot. A scratch image holding a marker
+          # file stands in for it. Both builds skip the layer cache: one run's
+          # cache lookup failed inside podman ("checking if cached image exists
+          # from a previous build: getting top layer info: layer not known"),
+          # an error about the runner's storage, not about the image.
+          other=$(mktemp -d)
+          printf 'not the screenshot tool: a marker staged from TOOLS_IMAGE=localhost/ci-other-tools\n' > "$other/screenshot"
+          printf 'FROM scratch\nCOPY screenshot /screenshot\n' > "$other/Containerfile"
+          if ev_save build-other "EV-STATE: a scratch image whose /screenshot is a marker file, then the desktop image rebuilt with --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest" \
+               sudo sh -c "podman build --no-cache --network=none --pull=never -t localhost/ci-other-tools:latest '$other' && podman build --no-cache --network=none --pull=never --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest -t localhost/desktop-container:ci-other-tools -f Containerfile ." >/dev/null; then
+            other_sums=$(ev_save staged-other "EV-STATE: sha256sum of the file that build staged, then of the marker" \
+              sudo sh -c "podman run --rm --network=none localhost/desktop-container:ci-other-tools sha256sum /usr/libexec/desktop-tools/screenshot; sha256sum '$other/screenshot'") || f=1
+            check "built with TOOLS_IMAGE=localhost/ci-other-tools, the image stages that image's /screenshot (the marker)" \
+              same "$(awk '$2=="/usr/libexec/desktop-tools/screenshot"{print $1}' <<<"$other_sums")" \
+                   "$(awk -v m="$other/screenshot" '$2==m{print $1}' <<<"$other_sums")"
+          else
+            ev_fail "the desktop image builds with --build-arg TOOLS_IMAGE=localhost/ci-other-tools:latest"; f=1
+          fi
+          sudo podman rmi -f localhost/desktop-container:ci-other-tools localhost/ci-other-tools:latest >/dev/null 2>&1 || true
+          rm -r "$other"
+          ev_end
+
+          ev_begin S1.2.1 "Session user identity" T2
+          ident=$(ev_save identity "EV-STATE: id desktop, getent passwd desktop and getent group video input audio render tty desktop, in a scratch container of the image" \
+            img 'id desktop; getent passwd desktop; getent group video input audio render tty desktop') || f=1
+          idline=$(grep '^uid=' <<<"$ident" || true)
+          check "uid 61000, primary group desktop with gid 61000" grep -q '^uid=61000(desktop) gid=61000(desktop) ' <<<"$idline"
+          sups=$(sed -n 's/^uid=.* groups=//p' <<<"$idline" | tr ',' '\n' | grep -vx '61000(desktop)' \
+                 | sed 's/^[0-9]*(\(.*\))$/\1/' | sort | paste -sd' ')
+          check "its supplementary groups are exactly audio input render tty video (found: ${sups:-none})" \
+            test "$sups" = "audio input render tty video"
+          check "its home is /home/desktop" grep -q '^desktop:x:61000:61000:[^:]*:/home/desktop:' <<<"$ident"
+          ev_end
+
+          ev_begin S1.2.2 "Session dotfiles come from /etc/skel" T2
+          sums=$(ev_save image-sums "EV-STATE: sha256sum of the session user's .mwmrc and .Xdefaults, in a scratch container of the image" \
+            img 'cd /home/desktop && sha256sum .mwmrc .Xdefaults') || f=1
+          repo=$(ev_save repo-sums "EV-STATE: sha256sum of the repo files they are copied from" \
+            sha256sum image/session/mwmrc image/session/Xdefaults) || f=1
+          for pair in ".mwmrc image/session/mwmrc" ".Xdefaults image/session/Xdefaults"; do
+            set -- $pair
+            check "/home/desktop/$1 is byte-identical to $2" \
+              same "$(awk -v n="$1" '$2==n{print $1}' <<<"$sums")" "$(awk -v n="$2" '$2==n{print $1}' <<<"$repo")"
+          done
+          ev_end
+
+          ev_begin S1.2.5 "pipewire-pulse export drop-in installed" T2
+          dropin=$(ev_save drop-in "EV-CONFIG: /etc/pipewire/pipewire-pulse.conf.d/10-desktop-audio-export.conf, in a scratch container of the image" \
+            img 'cat /etc/pipewire/pipewire-pulse.conf.d/10-desktop-audio-export.conf') || f=1
+          addrs=$(sed -n '/server\.address = \[/,/\]/p' <<<"$dropin")
+          check "its server.address list serves \"unix:native\"" grep -qE '^[[:space:]]*"unix:native"' <<<"$addrs"
+          check "and \"unix:/run/desktop-audio/pulse\"" grep -qE '^[[:space:]]*"unix:/run/desktop-audio/pulse"' <<<"$addrs"
+          ev_end
+
+          ev_begin S1.2.7 "Image carries no NVIDIA userspace" T2
+          nv=$(ev_save find "EV-STATE: find /usr/lib64 /usr/lib -name '*nvidia*', in a scratch container of the image (empty)" \
+            img "find /usr/lib64 /usr/lib -name '*nvidia*'") || f=1
+          check "no file under /usr/lib64 or /usr/lib has nvidia in its name" test -z "$nv"
+          rpms=$(ev_save rpm "EV-STATE: rpm -qa | grep -i nvidia, in a scratch container of the image (empty)" \
+            img 'rpm -qa | grep -i nvidia; true') || f=1
+          check "and no installed package does" test -z "$rpms"
+          ev_end
+
+          ev_begin S1.2.8 "Entry point and stop signal" T2
+          cfg=$(ev_save inspect "EV-STATE: podman image inspect --format '{{.Config.StopSignal}} {{.Config.Cmd}}' of the image" \
+            sudo podman image inspect --format '{{.Config.StopSignal}} {{.Config.Cmd}}' localhost/desktop-container:latest) || f=1
+          check "STOPSIGNAL is SIGTERM" grep -q '^SIGTERM ' <<<"$cfg"
+          check "CMD is /usr/local/bin/desktop-init, alone" grep -q ' \[/usr/local/bin/desktop-init\]$' <<<"$cfg"
+          ev_end
+
+          ev_begin S1.2.6 "All shipped scripts are executable and shellcheck-clean" T2
+          modes=$(ev_save modes "EV-STATE: stat -c '%a %U:%G %n' of every file under /usr/local/bin and of /etc/X11/xinit/xinitrc.desktop, in a scratch container of the image" \
+            img "find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f -exec stat -c '%a %U:%G %n' {} +") || f=1
+          odd=$(ev_save not-0755 "EV-STATE: find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755, in a scratch container of the image (empty)" \
+            img 'find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755') || f=1
+          check "find read the image's scripts: $(grep -c . <<<"$modes") files under /usr/local/bin and xinitrc.desktop" test -n "$modes"
+          check "every one of them is mode 0755" test -z "$odd"
+          ev_end
+          [ "$f" = 0 ] || { ev_failures; exit 1; }
+      - name: align-device-groups' branches (S3.2.2's T1 half)
+        # Each branch in a scratch container of the image just built, with
+        # its own /etc/group and a node fabricated for it: renumber, a gid
+        # another group holds (and 60000 too), a missing group, a root-group
+        # node, no node, the boot path already aligned, the narrow form and
+        # an unknown name.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/align-groups-tests.sh)"
+        run: ci/align-groups-tests.sh
+      - name: host-shell-setup's cases (S5.7.7's T1 half)
+        # The container side of the Host Terminal in scratch containers of
+        # the image: no key material, a key with no or an empty shell-user,
+        # and both, with the preflight's host-shell row in each.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/host-shell-setup-tests.sh)"
+        run: ci/host-shell-setup-tests.sh
+      - name: every row of the container preflight fires (S5.11.2)
+        # preflight-check.sh in scratch containers of the image: the image
+        # alone (none of the quadlet's devices or mounts), then one case per
+        # remaining row. The rows are read from the script, so one added
+        # later fails this until a case stages it.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/preflight-rows.py container)"
+        run: python3 ci/preflight-rows.py container
       - name: deploy tree quadlet dry-run + CDI spec checks
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts
@@ -332,7 +674,31 @@ jobs:
           ev_check "no rule was split apart (no lone 'rwm' or 'c' argument)" \
             bash -c '! grep -qxE "rwm|c" <<<"$1"' _ "$args" || f=1
           ev_end
-          [ "$f" = 0 ] || exit 1
+          # S5.2.3, S5.2.4: the unit's directives and the container's mounts,
+          # read per section of the generated unit by ci/unit-directives.py
+          # (quadlet copies the source's comments, so text alone proves nothing).
+          printf '%s\n' "$out" > "$tmp/generated.service"
+          src=deploy/host/etc/containers/systemd/desktop.container
+          for story in "S5.2.3|Every unit directive is emitted" "S5.2.4|Volumes, tmpfs and the /sys mount are emitted"; do
+            ev_begin "${story%%|*}" "${story#*|}" T2
+            ev_text generated-unit "EV-CONFIG: the generated unit the checks below read (the one S5.2.1 keeps)" "$out"
+            [ "${story%%|*}" = S5.2.4 ] && ev_copy "$src" source "EV-CONFIG: the source desktop.container, whose Volume=, Tmpfs=, Mount= and AddDevice= lines are each looked for in ExecStart"
+            res=$(python3 ci/unit-directives.py "${story%%|*}" "$tmp/generated.service" "$src") \
+              || { ev_fail "ci/unit-directives.py ran to the end"; f=1; }
+            [ -n "$res" ] || { ev_fail "ci/unit-directives.py made at least one check"; f=1; }
+            while IFS=$'\t' read -r verdict claim; do
+              [ -n "$verdict" ] || continue
+              if [ "$verdict" = PASS ]; then ev_pass "$claim"; else ev_fail "$claim"; f=1; fi
+            done <<<"$res"
+            ev_end
+          done
+          # S6.2.4's quadlet half; its runtime half (the container's stop
+          # signal) is in the deploy smoke.
+          ev_begin S6.2.4 "Not systemd mode" T2
+          ev_text argv "EV-STATE: ExecStart split into its arguments (as S5.2.2 keeps it)" "$args"
+          ev_check "ExecStart carries --systemd=false as one argument" grep -qx -- '--systemd=false' <<<"$args" || f=1
+          ev_end
+          [ "$f" = 0 ] || { ev_failures; exit 1; }
           # Unit directives, asserted as DIRECTIVES rather than as strings that
           # appear somewhere. Every one of these also exists verbatim in the
           # source .container, and quadlet copies the source's comments into
@@ -356,9 +722,11 @@ jobs:
           # GPU-less runner: the converger must write the stub, and podman
           # must resolve AddDevice against it end-to-end.
           sudo deploy/host/usr/local/libexec/desktop-cdi-refresh
-          sudo grep -q NVIDIA_CDI_STUB /etc/cdi/nvidia.yaml
+          sudo grep -qE '^[[:space:]]*-[[:space:]]*NVIDIA_CDI_STUB=1$' /etc/cdi/nvidia.yaml \
+            || { echo "FAIL: desktop-cdi-refresh wrote no stub: /etc/cdi/nvidia.yaml has no NVIDIA_CDI_STUB=1 env line"; exit 1; }
           sudo podman run --rm --device nvidia.com/gpu=all \
-            localhost/desktop-container:latest sh -c 'test "$NVIDIA_CDI_STUB" = 1'
+            localhost/desktop-container:latest sh -c 'test "$NVIDIA_CDI_STUB" = 1' \
+            || { echo "FAIL: a container given nvidia.com/gpu=all does not see the stub's NVIDIA_CDI_STUB=1"; exit 1; }
           # Client CDI specs: the whole sharing mechanism, checked against a
           # real runtime rather than by reading YAML. Each device must grant
           # its own capability and ONLY its own -- the split is a property of
@@ -372,7 +740,8 @@ jobs:
               grep -q " /tmp/.X11-unix " /proc/self/mountinfo || exit 1
               ! printenv PULSE_SERVER || { echo "leaked PULSE_SERVER"; exit 1; }
               ! printenv PIPEWIRE_REMOTE || { echo "leaked PIPEWIRE_REMOTE"; exit 1; }
-              ! grep -q " /run/desktop-audio " /proc/self/mountinfo || { echo "leaked audio mount"; exit 1; }'
+              ! grep -q " /run/desktop-audio " /proc/self/mountinfo || { echo "leaked audio mount"; exit 1; }' \
+            || { echo "FAIL: display alone: the display device does not grant DISPLAY=:0 and the X socket directory, or grants audio"; exit 1; }
           # audio alone: both audio env vars + the audio dir, and NO display.
           sudo podman run --rm --device desktop.local/audio=all \
             localhost/desktop-container:latest sh -c '
@@ -380,42 +749,52 @@ jobs:
               test "$PIPEWIRE_REMOTE" = /run/desktop-audio/pipewire-0 || exit 1
               grep -q " /run/desktop-audio " /proc/self/mountinfo || exit 1
               ! printenv DISPLAY || { echo "leaked DISPLAY"; exit 1; }
-              ! grep -q " /tmp/.X11-unix " /proc/self/mountinfo || { echo "leaked X11 mount"; exit 1; }'
+              ! grep -q " /tmp/.X11-unix " /proc/self/mountinfo || { echo "leaked X11 mount"; exit 1; }' \
+            || { echo "FAIL: audio alone: the audio device does not grant PULSE_SERVER, PIPEWIRE_REMOTE and /run/desktop-audio, or grants the display"; exit 1; }
           # both together: the union, which is what a full desktop client asks for.
           sudo podman run --rm --device desktop.local/display=all --device desktop.local/audio=all \
             localhost/desktop-container:latest sh -c '
               test "$DISPLAY" = :0 || exit 1
               test "$PULSE_SERVER" = unix:/run/desktop-audio/pulse || exit 1
               grep -q " /tmp/.X11-unix " /proc/self/mountinfo || exit 1
-              grep -q " /run/desktop-audio " /proc/self/mountinfo || exit 1'
+              grep -q " /run/desktop-audio " /proc/self/mountinfo || exit 1' \
+            || { echo "FAIL: display and audio together do not grant both devices' environment and mounts"; exit 1; }
           # ...and a container WITHOUT any device gets none of it, so the
           # checks above cannot pass on something baked into the image.
           sudo podman run --rm localhost/desktop-container:latest sh -c '
               ! printenv DISPLAY || exit 1
               ! printenv PULSE_SERVER || exit 1
-              ! grep -q " /tmp/.X11-unix " /proc/self/mountinfo || exit 1'
+              ! grep -q " /tmp/.X11-unix " /proc/self/mountinfo || exit 1' \
+            || { echo "FAIL: a container with no device sees DISPLAY, PULSE_SERVER or the X socket directory: the checks above could pass on the image alone"; exit 1; }
           # The DISPLAY override is the one input clients cannot discover
           # for themselves; a silently ignored conf would be a live break.
           sudo install -d /etc/desktop-container
           echo 'DISPLAY_VALUE=:7' | sudo tee /etc/desktop-container/client-cdi.conf >/dev/null
           sudo deploy/host/usr/local/libexec/desktop-client-cdi
           sudo podman run --rm --device desktop.local/display=all \
-            localhost/desktop-container:latest sh -c 'test "$DISPLAY" = :7'
+            localhost/desktop-container:latest sh -c 'test "$DISPLAY" = :7' \
+            || { echo "FAIL: DISPLAY_VALUE=:7 in /etc/desktop-container/client-cdi.conf did not reach a display client"; exit 1; }
           sudo rm -f /etc/desktop-container/client-cdi.conf
           sudo deploy/host/usr/local/libexec/desktop-client-cdi
+          sudo podman run --rm --device desktop.local/display=all \
+            localhost/desktop-container:latest sh -c 'test "$DISPLAY" = :0' \
+            || { echo "FAIL: with the override removed, the default :0 is not back"; exit 1; }
           # seat-prep: converges the runner's seat state and must be
           # idempotent (second run silent, exit 0)
           sudo deploy/host/usr/local/libexec/seat-prep.sh
-          [ "$(sudo systemctl is-enabled getty@tty1.service || true)" = masked ]
-          [ "$(systemctl get-default)" = multi-user.target ]
+          getty=$(sudo systemctl is-enabled getty@tty1.service || true)
+          [ "$getty" = masked ] || { echo "FAIL: seat-prep left getty@tty1.service '$getty', not masked"; exit 1; }
+          target=$(systemctl get-default || true)
+          [ "$target" = multi-user.target ] || { echo "FAIL: seat-prep left the default target '$target', not multi-user.target"; exit 1; }
           second=$(sudo deploy/host/usr/local/libexec/seat-prep.sh | grep -v 'fuser not available' || true)
-          [ -z "$second" ]
+          [ -z "$second" ] || { echo "FAIL: seat-prep's second run was not silent: $second"; exit 1; }
           # host-shell: sysusers account, fresh key, root-owned restricted trust
           sudo systemd-sysusers "$PWD/deploy/host/etc/sysusers.d/desktop-container.conf"
           sudo install -Dm644 deploy/host/etc/desktop-container/shell-user /etc/desktop-container/shell-user
           sudo deploy/host/usr/local/libexec/desktop-host-shell-setup
           sudo grep -q 'from="127.0.0.1,::1".*desktop-container-host-shell' \
-            /etc/ssh/authorized_keys.d/desktop-shell
+            /etc/ssh/authorized_keys.d/desktop-shell \
+            || { echo "FAIL: desktop-host-shell-setup wrote no key for desktop-shell restricted to the loopback (from=\"127.0.0.1,::1\")"; exit 1; }
           # host-preflight (debug tool): must run to completion and correctly
           # report this partially-applied runner - quadlet not installed
           # (FAIL) but the pieces the step applied green (stub CDI spec,
@@ -430,7 +809,7 @@ jobs:
           ev_check "it passes the desktop-shell account this step created" grep -q 'PASS: desktop-shell account exists' <<<"$pf" || f=1
           ev_check "it passes the default target seat-prep set (multi-user.target)" grep -q 'PASS: default target is multi-user.target' <<<"$pf" || f=1
           ev_end
-          [ "$f" = 0 ]
+          [ "$f" = 0 ] || { ev_failures; exit 1; }
 
       - name: neutralize host AppArmor unix-chkpwd profile
         # Ubuntu's path-attached unix-chkpwd profile confines the CONTAINER's
@@ -531,6 +910,8 @@ jobs:
     #   operator  the person at the display, through QEMU's devices (E11)
     #   k8s       k3s + a cdi-device-plugin release per capability, with
     #             confined client pods wired up by CDI
+    #   soundless a second machine, booted with no sound card: a card that
+    #             arrives later, and a client that waited for it
     # SELinux stays enforcing throughout - nothing here calls setenforce.
     needs: images
     runs-on: ubuntu-latest
@@ -540,7 +921,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [core, operator, k8s]
+        shard: [core, operator, k8s, soundless]
     steps:
       - uses: actions/checkout@v4
       - name: enable kvm access
@@ -600,7 +981,8 @@ jobs:
       - name: every shard passed
         run: |
           echo "vm shards: ${{ needs.vm.result }}"
-          [ "${{ needs.vm.result }}" = success ]
+          [ "${{ needs.vm.result }}" = success ] \
+            || { echo "FAIL: the VM shards' result is ${{ needs.vm.result }}; each failed shard's job log ends with why"; exit 1; }
 
   coverage-gate:
     # Requirements.md says every story leaves reviewable evidence. This reads

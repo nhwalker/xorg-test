@@ -1,0 +1,276 @@
+# The maintainer's journeys (Requirements.md E10). Each shard boots its own
+# stock Rocky 9 VM (ci/vm/vm-e2e.sh maint-<journey>), nothing installed and
+# nothing deployed, and drives the documents' own procedures on it
+# (ci/vm/maint-e2e.sh), read out of the documents and run as written:
+#   maint-docpath  deploy/HOST-REQUIRES.md's package line, then
+#                  deploy/README.md's Apply block, its reboot included, on
+#                  two stock hosts (the optional restorecon line skipped on
+#                  one and taken on the other); then a restart, and a
+#                  maintenance stop and start (S10.1.1-S10.1.3, S10.4.1,
+#                  S10.4.2)
+#   maint-config   one host provisioned the same way, then its configuration
+#                  changed the documented ways while it runs: the captured
+#                  monitor layout pinned, layouts gone wrong and every global
+#                  keyword, the image removed and loaded back, and an upgrade
+#                  to a second image and back by the digest pin and by
+#                  re-tagging, with a client running throughout (S10.3.1-
+#                  S10.3.4)
+#   maint-session  one host provisioned the same way; Host Terminal switched
+#                  off the documented way and a reboot, then on again from
+#                  its own failure screen; and README.md's look-and-feel
+#                  loops: ~/.mwmrc and Restart mwm, ~/.Xdefaults and a new
+#                  xterm, a repo file rebuilt and deployed (S10.3.5-S10.3.7).
+#                  The menu clicks are operator-e2e.py's (--maint), through
+#                  QEMU's own input devices
+#   maint-faults   one host provisioned the same way; four README.md
+#                  "Troubleshooting" faults staged on it, each diagnosed from
+#                  the first stops and its entry's own checks, remedied the
+#                  entry's way and measured at the screen: SELinux labels
+#                  under a running client, input devices on another seat, a
+#                  process holding DRM master, a device group out of step
+#                  (S10.5.1-S10.5.4)
+#   maint-live     the two live paths, each on its own stock host whose sshd
+#                  runs from boot: README.md's Install block, and
+#                  deploy/README.md's rsync and live sequence with its
+#                  `systemctl reload sshd`; then S10.1.2's end state with no
+#                  reboot (S10.1.4)
+#   maint-gdm      a host with gdm installed and graphical.target the default
+#                  (a profile the harness applies), booted to the greeter,
+#                  converted with deploy/README.md's live sequence; the
+#                  outcome classified against the document's two, and its
+#                  reboot taken if the second (S10.1.5)
+#   maint-k8s      one host provisioned the same way, with k3s and CRI-O
+#                  (installed as ci.yml's k8s shard installs them: README.md
+#                  takes both as given), then README.md's Kubernetes steps as
+#                  written - its CRI-O drop-in, the three helm installs, the
+#                  describe and apply lines - and the demo xterm typed into;
+#                  then the node staged as one the desktop never provisioned,
+#                  and a client needing the toolkit, Pending until the
+#                  desktop's start publishes it (S10.6.1, S10.6.2)
+# The gate then holds this workflow's stories (their Coverage lines name
+# it: "(workflow `maintainer.yml`)") to the evidence the run left.
+#
+# Weekly, on demand, and on the pull requests that change what the journeys
+# run - the documents whose commands they execute, and the journeys
+# themselves - rather than on every pull request: a journey provisions hosts
+# from nothing and reboots them, on the runners every pull request waits for.
+# The deploy tree itself is ci.yml's to test on every pull request.
+name: maintainer
+on:
+  schedule:
+    # Tuesdays, the morning after base-rebuild.yml refreshes the bases.
+    - cron: "41 5 * * 2"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - README.md
+      - deploy/README.md
+      - deploy/HOST-REQUIRES.md
+      - ci/doc-blocks.py
+      - ci/vm/maint-*.sh
+      # what maint-k8s's steps apply: README.md's chart and example, and
+      # S10.6.2's client
+      - charts/cdi-device-plugin/**
+      - examples/x11-client-pod.yaml
+      - ci/vm/unprovisioned-pod.yaml
+      # maint-session's menu steps (--maint), and the terminal the
+      # documented commands run at
+      - ci/vm/operator-e2e.py
+      - ci/vm/pty-answer.py
+      - .github/workflows/maintainer.yml
+permissions:
+  contents: read
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+jobs:
+  # Named apart from ci.yml's checks, which run on the same pull requests.
+  images:
+    name: maintainer images
+    # ci.yml's images job: the same images, built the same way, handed to
+    # every shard.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: ghcr login (base cache)
+        # --password-stdin, never -p: an argument would put the token in the
+        # process list and in podman's own error output on a failed login.
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: build images (reuse GHCR bases when possible)
+        env:
+          PUSH_BASES: "0"
+        run: |
+          sudo -E ci/build-bases.sh
+          # The offline gate, as in ci.yml; the screenshot image first, since
+          # the desktop image stages the client tools out of it.
+          sudo podman build --network=none -t localhost/screenshot:latest -f Containerfile.screenshot .
+          sudo podman build --network=none -t localhost/desktop-container:latest -f Containerfile .
+          sudo podman build --network=none -t localhost/cdi-device-plugin:latest -f Containerfile.plugin .
+          sudo podman build -t localhost/desktop-testclient:latest -f Containerfile.testclient .
+          # maint-config's upgrade target (S10.3.3): this desktop with another
+          # root colour, which the screen shows, and a toolkit binary with
+          # another checksum (a trailing byte; a Go binary runs unchanged),
+          # which the published copy shows.
+          sudo podman build --network=none -t localhost/desktop-container:alt -f - . <<'EOF'
+          FROM localhost/desktop-container:latest
+          RUN sed -i 's/#101216/#2b1b17/' /etc/X11/xinit/xinitrc.desktop && grep -q '#2b1b17' /etc/X11/xinit/xinitrc.desktop && printf '\n' >> /usr/libexec/desktop-tools/screenshot
+          EOF
+          # One archive per image: a multi-image docker-archive collapses into
+          # its first image with every tag attached.
+          mkdir -p vm-images
+          sudo podman save -o vm-images/images-desktop.tar localhost/desktop-container:latest
+          sudo podman save -o vm-images/images-plugin.tar localhost/cdi-device-plugin:latest
+          sudo podman save -o vm-images/images-testclient.tar localhost/desktop-testclient:latest
+          # The shards that need more get it as an artifact of its own:
+          # maint-config the second image, maint-session the bases a
+          # maintainer's earlier build leaves (README.md's rebuild loop
+          # builds on them).
+          mkdir -p vm-images-alt vm-images-bases
+          sudo podman save -o vm-images-alt/images-desktop-alt.tar localhost/desktop-container:alt
+          sudo podman save -o vm-images-bases/images-desktop-base.tar localhost/desktop-container-base:latest
+          sudo podman save -o vm-images-bases/images-screenshot.tar localhost/screenshot:latest
+          sudo chmod 644 vm-images*/*.tar
+          for i in desktop-container:latest cdi-device-plugin:latest desktop-testclient:latest desktop-container:alt \
+                   desktop-container-base:latest screenshot:latest; do
+            printf '%s %s\n' "$i" "$(sudo podman image inspect "localhost/$i" --format '{{.Id}}')"
+          done | tee vm-images/image-ids.txt
+      - name: hand the images to the VM shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images
+          path: vm-images/
+          retention-days: 1
+          compression-level: 1
+      - name: hand maint-config its second image
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images-alt
+          path: vm-images-alt/
+          retention-days: 1
+          compression-level: 1
+      - name: hand maint-session the bases
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images-bases
+          path: vm-images-bases/
+          retention-days: 1
+          compression-level: 1
+
+  vm:
+    name: maintainer (${{ matrix.shard }})
+    needs: images
+    runs-on: ubuntu-latest
+    # maint-docpath: two stock hosts provisioned from nothing, each with a
+    # reboot, and a maintenance stop held for two minutes. maint-config: one
+    # host, and about fifteen desktop restarts. maint-session: one host, a
+    # reboot, three desktop restarts and an image build. maint-live: two
+    # stock hosts provisioned from nothing, no reboot. maint-gdm: one host,
+    # gdm and its desktop installed, and up to two reboots. maint-k8s: one
+    # host, CRI-O and k3s installed, and a desktop stop and start.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: maint-docpath
+            extra: ""
+          - shard: maint-config
+            extra: vm-images-alt
+          - shard: maint-session
+            extra: vm-images-bases
+          - shard: maint-faults
+            extra: ""
+          - shard: maint-live
+            extra: ""
+          - shard: maint-gdm
+            extra: ""
+          - shard: maint-k8s
+            extra: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable kvm access
+        run: |
+          test -e /dev/kvm || { echo "no /dev/kvm on runner"; exit 1; }
+          sudo chmod 666 /dev/kvm
+      - name: install qemu + tools
+        # Retries and a transfer timeout, as in ci.yml: a stalled mirror
+        # otherwise hangs silently until the job's cap.
+        run: |
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS update -q
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS install -y -q qemu-system-x86 qemu-utils cloud-image-utils socat imagemagick
+      - name: cache rocky cloud image
+        id: rocky
+        uses: actions/cache@v4
+        with:
+          path: ci/vm/Rocky-9-GenericCloud.qcow2
+          key: rocky9-genericcloud-v1
+      - name: download rocky cloud image
+        if: steps.rocky.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o ci/vm/Rocky-9-GenericCloud.qcow2 \
+            https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+      - name: fetch the images built once for every shard
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-images
+          path: ci/vm/
+      - name: fetch what this shard needs beside them
+        if: matrix.extra != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.extra }}
+          path: ci/vm/
+      - name: run the maintainer's journey (${{ matrix.shard }})
+        env:
+          EV_SOURCE: "maintainer.yml vm (${{ matrix.shard }})"
+        run: ci/vm/vm-e2e.sh "${{ matrix.shard }}"
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-vm-${{ matrix.shard }}
+          path: ci/vm/artifacts/
+          if-no-files-found: ignore
+
+  coverage-gate:
+    name: maintainer coverage-gate
+    # ci.yml's gate, for this workflow's stories only: every story directory
+    # complete, and every story whose Coverage line names maintainer.yml and
+    # is marked ✅ backed by passing evidence from this run.
+    needs: vm
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: gather every shard's evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: evidence-*
+          path: evidence/
+      - name: check it against Requirements.md
+        run: |
+          rc=0
+          python3 ci/evlib.py gate --workflow maintainer.yml --requirements Requirements.md \
+            --report coverage-gate.md --json coverage-gate.json evidence/ || rc=$?
+          cat coverage-gate.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: upload the gate's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-gate
+          path: |
+            coverage-gate.md
+            coverage-gate.json
+          if-no-files-found: ignore

@@ -1,0 +1,42 @@
+# The client journeys' pod (Requirements.md F7.5, F7.6, F7.8; test-only).
+#
+# A long-running client of the desktop that lives through the desktop's own
+# events - an X server killed, PipeWire killed, desktop.service restarted -
+# and must come out of each the same container: restartPolicy Always, so a
+# container that had died would show as a restartCount above 0 rather than
+# as a pod that simply failed. Like x11-testclient it declares nothing but
+# the three capabilities: DISPLAY, the audio sockets and the toolkit come
+# only from the CDI specs.
+#
+# Its main process is an agent, and every application the test starts in the
+# pod is the agent's child: a script dropped into /tmp/run/<name>.sh (written
+# whole, then renamed into place; vm-guest.sh's journey_run) runs in the
+# background with its output in /tmp/run/<name>.out. Started from a kubectl
+# exec instead, an application would last only as long as the exec.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: journey
+spec:
+  restartPolicy: Always
+  containers:
+    - name: client
+      image: localhost/desktop-container:latest
+      imagePullPolicy: Never
+      command: ["sh", "-c"]
+      args:
+        - |
+          mkdir -p /tmp/run
+          while :; do
+            for f in /tmp/run/*.sh; do
+              [ -e "$f" ] || continue
+              mv "$f" "$f.started"
+              sh "$f.started" > "${f%.sh}.out" 2>&1 &
+            done
+            sleep 0.2
+          done
+      resources:
+        limits:
+          desktop.local/display: 1
+          desktop.local/audio: 1
+          desktop.local/tools: 1

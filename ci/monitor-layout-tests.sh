@@ -32,7 +32,8 @@ trap 'rm -rf "$TMP"' EXIT
 fails=0
 
 log()  { echo "== $*"; }
-fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); ev_fail "$*"; }
+fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); failed+=("$*"); ev_fail "$*"; }
+failed=()
 ok()   { ev_pass "$*"; }
 
 # The container's own layout, under the temporary directory: the host's
@@ -71,9 +72,10 @@ run() {
         ls -l "$TMP/xorg.conf.d" >/dev/null || true
     ev_copy "$TMP/log" "$1-log" "the generator's log (EV-LOG-DESKTOP in the container)"
 }
-# has <file> <text> <claim>: the text is in the file.
-has()   { if grep -qF "$2" "$1"; then ok "$3"; else fail "NOT: $3"; fi; }
-hasnt() { if grep -qF "$2" "$1"; then fail "NOT: $3"; else ok "$3"; fi; }
+# has <file> <text> <claim>: the text is in the file, its comment lines aside
+# (a comment naming the text does not count: Requirements.md S9.1.2).
+has()   { if gen_grep -qF -- "$2" "$1"; then ok "$3"; else fail "NOT: $3"; fi; }
+hasnt() { if gen_grep -qF -- "$2" "$1"; then fail "NOT: $3"; else ok "$3"; fi; }
 absent()  { if [ -e "$MONITORS_OUT" ]; then fail "NOT: $1"; else ok "$1"; fi; }
 logged()  { if grep -qF "$1" "$TMP/log"; then ok "$2"; else fail "NOT: $2"; fi; }
 
@@ -121,7 +123,7 @@ has "$MONITORS_OUT" 'Option      "PreferredMode" "1920x1080_60.00"' "DP-1 prefer
 has "$MONITORS_OUT" 'Option      "PreferredMode" "1280x1024_60.00"' "DP-2 prefers its generated mode"
 has "$MONITORS_OUT" 'Option      "Position" "1920 0"' "the second output is positioned at +1920+0"
 has "$MONITORS_OUT" 'Option      "Primary" "true"' "the primary output is marked"
-[ "$(grep -c 'Option      "Primary"' "$MONITORS_OUT")" = 1 ] \
+[ "$(gen_grep -c 'Option      "Primary"' "$MONITORS_OUT")" = 1 ] \
     && ok "exactly one primary" || fail "NOT: exactly one primary"
 has "$MONITORS_OUT" 'Virtual 3200 1080' "the framebuffer is pinned to the layout's extents (3200x1080)"
 has "$MONITORS_OUT" 'Device      "gpu0"' "the Screen section references the GPU device gpu0"
@@ -267,5 +269,7 @@ watch-line|a watch line, which the generator does not know|watch 5\nDP-1 1920x10
 EOF
 ev_end
 
-[ "$fails" = 0 ] || { echo "monitor layout tests: $fails failure(s)" >&2; exit 1; }
+# Each failure again, last, where the end of the job log shows it
+# (Requirements.md S9.2.3).
+[ "$fails" = 0 ] || { printf 'FAIL: %s\n' "${failed[@]}" >&2; echo "monitor layout tests: $fails failure(s)" >&2; exit 1; }
 echo "monitor layout tests passed"

@@ -8,9 +8,24 @@
 # the plugin is the single piece that lets them name a CDI device.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# gen_grep_text: the rendered chart read without its comment lines, so a
+# comment that names what is asserted cannot answer it (Requirements.md S9.1.2).
+# shellcheck source=ci/evidence.sh
+. ci/evidence.sh
+# A command that fails where nothing handles it would end the script, under
+# errexit, with no word of why: say which, and where (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    trap - ERR
+    echo "FAIL: helm-assertions.sh: unhandled failure (exit $1) at $3: $2" >&2
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 
-ck() { echo "$2" | grep -q "$1" && echo "PASS: $3" || { echo "FAIL: $3"; exit 1; }; }
-nk() { echo "$2" | grep -q "$1" && { echo "FAIL: $3"; exit 1; } || echo "PASS: $3"; }
+ck() { if gen_grep_text -q -- "$1" "$2"; then echo "PASS: $3"; else echo "FAIL: $3"; exit 1; fi; }
+nk() { if gen_grep_text -q -- "$1" "$2"; then echo "FAIL: $3"; exit 1; else echo "PASS: $3"; fi; }
 
 DP=$(helm template p charts/cdi-device-plugin --set cdiDevice=desktop.local/display=all --set count=10)
 DPA=$(helm template a charts/cdi-device-plugin --set cdiDevice=desktop.local/audio=all --set count=10)
@@ -51,20 +66,31 @@ helm template p charts/cdi-device-plugin --set cdiDevice=missing-equals >/dev/nu
 # The resource names are a contract between the plugin releases, the CDI
 # generator and every client manifest; nothing at template time would catch
 # them drifting apart, so read them back from the rendered chart.
-DISPLAY_RES=$(echo "$DP" | sed -n 's/.*value: "\(desktop\.local\/display\)"$/\1/p' | head -1)
-AUDIO_RES=$(echo "$DPA" | sed -n 's/.*value: "\(desktop\.local\/audio\)"$/\1/p' | head -1)
+DISPLAY_RES=$(sed -n 's/^[[:space:]]*value: "\(desktop\.local\/display\)"$/\1/p' <<<"$DP")
+DISPLAY_RES=${DISPLAY_RES%%$'\n'*}
+AUDIO_RES=$(sed -n 's/^[[:space:]]*value: "\(desktop\.local\/audio\)"$/\1/p' <<<"$DPA")
+AUDIO_RES=${AUDIO_RES%%$'\n'*}
 [ -n "$DISPLAY_RES" ] && [ -n "$AUDIO_RES" ] \
     || { echo "FAIL: could not read the advertised resource names from the chart"; exit 1; }
 echo "PASS: plugin advertises $DISPLAY_RES and $AUDIO_RES"
 
-# The generator is the other end of that contract: the kinds it writes must
-# be exactly the resources the manifests request.
+# The generator is the other end of that contract: the kinds in the specs it
+# writes must be exactly the resources the manifests request. Read from specs
+# it generates, not from its source (Requirements.md S9.1.2): it runs as it
+# ships, with only its output directory moved to a scratch one and its host
+# config file pointed at one that does not exist.
 GEN=deploy/host/usr/local/libexec/desktop-client-cdi
-for kindvar in DISPLAY_KIND AUDIO_KIND; do
-    k=$(sed -n "s/^$kindvar=\"\(.*\)\"\$/\1/p" "$GEN")
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+sed -e "s|^CDI_DIR=/etc/cdi\$|CDI_DIR=$T/cdi|" -e "s|^CONF=.*|CONF=$T/no-client-cdi.conf|" "$GEN" > "$T/gen"
+grep -qx "CDI_DIR=$T/cdi" "$T/gen" && grep -qx "CONF=$T/no-client-cdi.conf" "$T/gen" \
+    || { echo "FAIL: desktop-client-cdi's output directory or config could not be moved to a scratch one"; exit 1; }
+bash "$T/gen" >/dev/null || { echo "FAIL: desktop-client-cdi did not run"; exit 1; }
+for spec in desktop-display.yaml desktop-audio.yaml; do
+    k=$(sed -n 's/^kind: //p' "$T/cdi/$spec")
     case "$k" in
-        "$DISPLAY_RES"|"$AUDIO_RES") echo "PASS: generator $kindvar=$k matches an advertised resource" ;;
-        *) echo "FAIL: generator $kindvar=$k is not advertised by any plugin release"; exit 1 ;;
+        "$DISPLAY_RES"|"$AUDIO_RES") echo "PASS: the generated $spec's kind, $k, is an advertised resource" ;;
+        *) echo "FAIL: the generated $spec's kind, ${k:-none}, is not advertised by any plugin release"; exit 1 ;;
     esac
 done
 
@@ -95,8 +121,23 @@ nk "$AUDIO_RES"      "$DO" "display-only: does NOT request audio"
 AO=$(grep -v '^[[:space:]]*#' ci/vm/audio-only-pod.yaml)
 ck "$AUDIO_RES: 1"   "$AO" "audio-only: requests audio"
 nk "$DISPLAY_RES"    "$AO" "audio-only: does NOT request display"
-for m in ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml ci/vm/testpattern-pod.yaml; do
-    nk 'securityContext' "$(grep -v '^[[:space:]]*#' "$m")" "$m: no securityContext (stays confined)"
+
+# Every client manifest - the example, the whole-desktop and narrow fixtures,
+# the test pattern and the journey pods - declares nothing of its own: no
+# securityContext (it stays a confined container_t), no volumes, mounts or
+# env, no CDI annotation, nothing privileged. All it gets comes from the CDI
+# specs through its resource requests (Requirements.md S7.3.3).
+for m in examples/x11-client-pod.yaml ci/vm/cdi-verify-pod.yaml ci/vm/testclient-pod.yaml \
+         ci/vm/display-only-pod.yaml ci/vm/audio-only-pod.yaml ci/vm/testpattern-pod.yaml \
+         ci/vm/journey-pod.yaml ci/vm/early-pod.yaml; do
+    M=$(grep -v '^[[:space:]]*#' "$m")
+    ck 'desktop\.local/'              "$M" "$m: requests a desktop.local resource"
+    nk 'securityContext'               "$M" "$m: no securityContext (stays a confined container_t)"
+    nk 'volumeMounts'                  "$M" "$m: no volumeMounts of its own"
+    nk '^  volumes:'                   "$M" "$m: no volumes of its own"
+    nk '^      env:'                   "$M" "$m: no env of its own"
+    nk 'cdi\.k8s\.io'                  "$M" "$m: no CDI annotation"
+    nk 'privileged'                    "$M" "$m: not privileged"
 done
 
 echo "== all helm assertions passed"

@@ -288,17 +288,20 @@ depend on it:
 
 ```sh
 restorecon -R /etc/systemd /etc/ssh /etc/desktop-container \
-              /usr/local/bin /usr/local/libexec /var/lib/desktop-container
+              /usr/local/bin /usr/local/libexec
 ```
 
 (RPM-based provisioning sets labels correctly on its own; this is an
-rsync-specific step.)
+rsync-specific step. It names only what the rsync copied:
+`/var/lib/desktop-container` is not in the tree; tmpfiles creates it at
+the next boot, and `desktop-selinux` labels its `bin` directory for the
+clients.)
 
 `--chown=root:root` matters: `rsync -a` would otherwise preserve the repo
-checkout's owner on files under `/etc`. `-a` also copies the two symlinks
-in the tree as symlinks — keep that in mind if your provisioning tool
-flattens links (`default.target` and the `getty@tty1.service` mask are
-symlinks, see below).
+checkout's owner on files under `/etc`. `-a` also copies the symlinks in
+the tree as symlinks — keep that in mind if your provisioning tool
+flattens links (`default.target`, the `getty@tty1.service` mask and the
+five user-unit masks under `etc/systemd/user` are symlinks, see below).
 
 A reboot is the clean path and the honest production test — everything is
 wired into the boot transaction, and a host that only works after manual
@@ -323,8 +326,9 @@ point of the declarative form — the file list above *is* the state).
 | `etc/containers/systemd/desktop.container` | the quadlet unit that becomes `desktop.service`; `[Install]` is honored by the quadlet generator, so there is no `systemctl enable` |
 | `etc/systemd/system/default.target` → `multi-user.target` | the default boot target, as a symlink rather than `systemctl set-default` |
 | `etc/systemd/system/getty@tty1.service` → `/dev/null` | masks the getty (frees the VT), as a symlink rather than `systemctl mask` |
+| `etc/systemd/user/{pipewire,pipewire-pulse}.{socket,service}`, `etc/systemd/user/wireplumber.service` → `/dev/null` | masks a host PipeWire server in every user session (the container owns `/dev/snd`). `alsa-plugins-pulseaudio` pulls `pipewire-pulseaudio` and `wireplumber` in on EL9, and systemd's user presets enable their sockets and WirePlumber for every user. The desktop user's host login session would then listen on `/run/user/61000/pipewire-0` and `/run/user/61000/pulse/native`, the paths the container's PipeWire serves in the same runtime dir, and socket activation would start a second server and session manager the moment a client connects. Masks rather than package removals: the tree states the end state, whatever the host's packages pulled in |
 | `etc/systemd/logind.conf.d/50-desktop-container.conf` | logind `NAutoVTs=0` / `ReserveVT=0` drop-in |
-| `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix`; `/dev/snd` so its bind mount resolves on a soundless host |
+| `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix`; `/dev/snd` so its bind mount resolves on a soundless host; at boot, removes the last boot's Host Terminal key and trust entry (see "Host Terminal" below) |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
 | `etc/alsa/conf.d/99-zz-desktop-container.conf` | host ALSA clients → pulse plugin → container socket. Named to load after `alsa-plugins-pulseaudio`'s own `99-pulseaudio-default.conf`, whose server-less `pcm.!default` would otherwise win. A drop-in rather than `/etc/asound.conf`, so a host-local `asound.conf` still wins; the `/etc/alsa/conf.d` mechanism is EL/Fedora packaging |
 | `usr/local/bin/desktop-preflight` | read-only debug tool: PASS/WARN/FAIL per host-side assumption; not wired into boot |
@@ -402,21 +406,32 @@ convenience + audit trail, not a boundary). Three properties are worth calling o
 
 - **Fresh key every boot.** `desktop-host-shell.service` regenerates the
   ed25519 keypair under `/etc/desktop-container` on every boot; key
-  material never outlives the boot that made it, and there is no rotation
-  procedure to remember.
+  material never outlives the boot that made it (tmpfiles.d removes the
+  last boot's pair and trust entry early in every boot, whether or not the
+  unit runs after), and there is no rotation procedure to remember.
 - **Root-owned trust.** The restricted entry (`from=` loopback only, no
   forwarding) is written to `/etc/ssh/authorized_keys.d/desktop-shell`,
   wired by the sshd_config.d drop-in — nothing under `/home` is touched
   and the account cannot extend its own access.
 - **Always on.** No per-host input. The off-switch is in
   `etc/containers/systemd/desktop.container`: comment out the two
-  `Wants=`/`After=desktop-host-shell.service` lines. With no key
-  generated, nothing can log into the account and the container's menu
-  entry degrades gracefully.
+  `Wants=`/`After=desktop-host-shell.service` lines, `systemctl
+  daemon-reload`, and reboot. The reboot is what revokes: it removes the
+  last boot's key and trust entry, and with no key generated, nothing can
+  log into the account and the container's menu entry degrades
+  gracefully. Until then the running container keeps a working key.
 
 sshd itself: the unit `Wants=sshd.service` (started each boot while the
 desktop is deployed), but whether sshd is *enabled* on the host stays the
 admin's/provisioning's call.
+
+Turning it on while the desktop runs: `systemctl start
+desktop-host-shell.service` (what the menu entry's failure screen says to
+run; `restart` rotates a key the unit already made this boot) makes a fresh
+key and hands it to the running desktop as well (`podman exec` of the
+image's `host-shell-setup.sh`), so the next Host Terminal works without
+restarting the desktop. At boot the unit runs before the desktop and has
+nothing to hand over.
 
 ## Input and audio hotplug, and KVM switches
 

@@ -49,7 +49,8 @@ the wrong reason.
 qemu-system-x86_64 \
     -enable-kvm -cpu host -m 6144 -smp 3 \
     -drive "file=$DISK,if=virtio" -drive "file=seed.img,if=virtio,format=raw" \
-    -device virtio-vga,max_outputs=2 -display none \
+    -device virtio-vga,max_outputs=2,id=vga0 -display none \
+    -vnc "unix:$VNC1,display=vga0,head=1" \
     -device virtio-keyboard-pci -device virtio-tablet-pci \
     -device qemu-xhci,id=xhci -device usb-kbd,id=kvmkbd,bus=xhci.0 \
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -77,8 +78,12 @@ The parts that matter for hotplug:
 - **`intel-hda` + `hda-duplex`** — the built-in, boot-time sound card (playback
   and capture).
 - **`virtio-vga,max_outputs=2`** — two DRM connectors, `Virtual-1` (connected)
-  and `Virtual-2` (permanently disconnected under `-display none`). §4.3
-  explains why that is both a limitation and a gift.
+  and `Virtual-2` (disconnected: under `-display none` nothing enables a
+  second scanout). §4.3 explains why that is both a limitation and a gift.
+- **`-vnc unix:…,display=vga0,head=1`** — a VNC server bound to the second
+  head, which nothing talks to until the monitor stories under autodetection.
+  `ci/vm/vnc-head.py` asks it for a size, and QEMU plugs a monitor into
+  `Virtual-2` (§4.3.1).
 - Default machine type (i440fx). PCI hot-add via `device_add` works there
   (ACPI PCI hotplug); PCI hot-*remove* asks the guest to eject and waits for an
   acknowledgement a busy device may never send. USB removal is immediate and
@@ -162,17 +167,18 @@ ci/vm/vm-e2e.sh            # every shard in one VM; or: ci/vm/vm-e2e.sh core
 
 ---
 
-## 3. Tooling the probes need and do not yet have
+## 3. Tooling the probes need, and where it is
 
 | Need | Why | Where to add it |
 |---|---|---|
-| `xinput` | the only clean way to list X input devices by name and to stream events from **one specific device** (`xinput test <id>`); replaces counting `Adding input device` log lines, which also fire for devices Xorg then ignores | `Containerfile.testclient` (CI-only, networked build; run it as a podman client with `--device desktop.local/display=all` in phase-deploy, or from the `x11-testclient` pod in phase 2). Adding it to `Containerfile.base` also works but forces a base rebuild. |
-| `xev` | optional: root-window event stream for pointer motion | same |
+| `xinput` | the only clean way to list X input devices by name and to stream events from **one specific device** (`xinput test <id>`); replaces counting `Adding input device` log lines, which also fire for devices Xorg then ignores | **already in the desktop image**: on Rocky 9 `xorg-x11-server-utils` provides it, the package the image's `xrandr`, `xset`, `xsetroot` and `xhost` resolve to. Run it in the desktop as the session user (`podman exec -u desktop -e DISPLAY=:0 desktop xinput …`, `vm-guest.sh`'s `desk xinput`). `Containerfile.testclient` does not carry it. |
+| `xev` | optional: root-window event stream for pointer motion | **already in the desktop image**: `xorg-x11-utils` provides it, the package the image's `xdpyinfo` resolves to, with `xwininfo` and `xprop` |
 | `pw-cli`, `wpctl`, `pactl`, `pw-play`, `paplay`, `parec`, `aplay`, `arecord` | already in the desktop image and in the testclient | — |
 | `alsa-utils` + `alsa-plugins-pulseaudio` on the VM **host** | host-side ALSA probes (Requirements S4.2.2); not hotplug-specific | `vm-guest.sh phase_deploy` dnf line |
 
-Package names on Rocky 9 AppStream: `xinput`, `xev` (split out of the old
-`xorg-x11-utils`; confirm with `dnf provides '*/xinput'` on first use).
+On Rocky 9 `xinput` and `xev` are not packages of their own: they are names
+that `xorg-x11-server-utils` and `xorg-x11-utils` provide (checked with
+`rpm -q --whatprovides` in the desktop's base image, `base-bcf0dfd55ad0e461`).
 
 ---
 
@@ -218,7 +224,7 @@ sudo podman exec desktop ls -l /dev/input/
 # layer 4 (Xorg)
 sudo podman exec desktop grep -E 'Adding input device|removing device|XINPUT: Adding' \
     /home/desktop/.local/share/xorg/Xorg.0.log
-sudo podman run --rm --device desktop.local/display=all localhost/desktop-testclient xinput list
+sudo podman exec -u desktop -e DISPLAY=:0 desktop xinput list
 ```
 
 Removal in the Xorg log looks like:
@@ -248,8 +254,9 @@ unbound ones. That needs an `id=` on the e2e's `-device virtio-vga`:
 Extend `ci/vm/qmp-type.py` with an optional `--device <display id>` argument
 that adds that field to the command. Then, after the re-add, type `kvmdev`
 through `kvmkbd` and read it back from the sink xterm — or run
-`xinput test <id-of-"QEMU QEMU USB Keyboard">` in the background from the
-testclient and assert `key press`/`key release` lines appear.
+`xinput test <id-of-"QEMU QEMU USB Keyboard">` in the background in the
+desktop (`vm-guest.sh`'s `xi_test_start`) and assert `key press`/`key release`
+lines appear.
 
 #### 4.1.5 Gotchas
 
@@ -308,23 +315,45 @@ delivery to X (via `xinput test`) but not to an application; a click does.
 
 `virtio-gpu` reports a connector as *connected* exactly when QEMU has that
 scanout enabled. QEMU enables scanout 0 at realize and enables further
-scanouts only when a UI frontend reports geometry for them. Under
-`-display none` nothing ever does, so with `max_outputs=2`:
+scanouts only when a display frontend reports a size for them. Under
+`-display none`, with `max_outputs=2`:
 
 - `Virtual-1` is connected from boot and carries an EDID (virtio-gpu
   `edid=on` is the default since QEMU 5.0).
-- `Virtual-2` is **permanently disconnected**: a monitor-shaped hole, with no
-  EDID, that no QMP or HMP command can fill.
+- `Virtual-2` is **disconnected**: a monitor-shaped hole, with no EDID, that
+  no QMP or HMP command can fill.
 
-So QMP cannot stage "a second monitor is plugged in". QEMU itself can: it
+That hole is the hard half of the problem for free — an output that must be
+driven with nothing on the other end — and the fixed-layout e2e uses it
+(S3.4.9).
+
+QMP cannot stage "a second monitor is plugged in", but QEMU itself can: it
 enables or disables a virtio-gpu head, and gives it an EDID of the requested
 size, whenever a display frontend reports a size for that head. Two frontends
 need no window: a VNC server bound to the head (`-vnc …,display=<vga id>,head=1`)
-receiving SetDesktopSize (0x0 unplugs), or `-display dbus` with SetUIInfo.
-That route is untested here. What it gives
-for free is the hard half of the problem — an output that must be driven with
-nothing on the other end — and that is what the fixed-layout e2e uses
-(S3.4.9).
+receiving RFB SetDesktopSize (0x0 unplugs), or `-display dbus` with
+SetUIInfo. The e2e uses the first. QEMU starts with
+`-vnc unix:vnc-head1.sock,display=vga0,head=1`, and the host runs
+
+```sh
+python3 ci/vm/vnc-head.py vnc-head1.sock 1024 768   # plug a 1024x768 monitor in
+python3 ci/vm/vnc-head.py vnc-head1.sock 0 0        # take it away
+```
+
+which prints QEMU's answer (`status 4 (request forwarded)`) and exits 1 on any
+other. virtio-gpu then raises a display event, and the guest's driver reads
+every head's EDID and geometry again and reports a hotplug (S3.10.5, S3.10.7).
+
+virtio-gpu reads EDIDs **only at boot and on that display event**. Two things
+seen in the runs go with it:
+
+- A connector force (4.3.2) on `Virtual-1` costs it its EDID, and only the
+  next display event gives it back. After `off` and back to `detect`, X
+  reports it at 0mm x 0mm, offering virtio-gpu's own mode list (its
+  preferred mode the scanout's 1280x800), until S3.10.7's plug-in (S3.10.6's
+  and S3.10.7's `xrandr`).
+- An EDID override, or a firmware EDID set after boot, takes effect only at
+  the next display event; a connector forced on does not get it (4.3.4).
 
 #### 4.3.2 The DRM connector force interface (what the e2e uses for plug-out)
 
@@ -333,7 +362,7 @@ Every connector has `/sys/class/drm/card<N>-<name>/status`, writable by root:
 | Write | Effect |
 |---|---|
 | `off` | force **disconnected**: every probe from now on reports disconnected (plug-**out**) |
-| `on` | force **connected** (plug-**in** at the DRM level; no EDID, so no modes unless supplied) |
+| `on` | force **connected** (plug-**in** at the DRM level, with whatever modes the driver's probe gives: on virtio-gpu its own list and no EDID, 4.3.3) |
 | `on-digital` | force connected, digital |
 | `detect` | clear the force; go back to real detection |
 
@@ -351,7 +380,7 @@ Observation recorded in the run logs: the force reaches Xorg as an event
 client asked). The assertion is still made after an explicit `xrandr --query`
 (`RRGetInfo` → `xf86ProbeOutputModes`) so it does not rest on that timing.
 
-#### 4.3.3 Staging plug-**in** on the empty connector (S3.10.4, S3.10.5)
+#### 4.3.3 Forcing the empty connector on (S3.10.4)
 
 ```sh
 conn2=$(ls -d /sys/class/drm/card*-Virtual-2 | head -n1)
@@ -362,45 +391,83 @@ xrandr --query                   # Virtual-2 connected …
 echo detect > "$conn2/status"    # back to disconnected (scanout still disabled)
 ```
 
-Expected results, which the stories pin:
+Forced on, `Virtual-2` reads connected with no EDID and virtio-gpu's own
+mode list, not a monitor's: 24 mode sizes, the largest 4096x2160, in the
+S3.10.7 run, which records it with an EDID override set (the force ignores
+it, 4.3.4).
 
-- **Layout declared** (the e2e's `Virtual-1`/`Virtual-2` config): nothing moves.
-  `Virtual-2` was already enabled at `1024x768+1024+0`; it now reads
-  `connected` instead of `disconnected`. Dims stay `2048x768`.
-- **No layout (autodetect)**: `xrandr` lists `Virtual-2 connected` with no
-  modes (no EDID) and leaves it off. The screen size and `Virtual-1` do not
-  change, because nothing in this session listens to RandR and Xorg does not
-  auto-enable outputs on hotplug. This is the documented limitation made
-  observable.
+- **Layout declared** (S3.10.4, the e2e's `Virtual-1`/`Virtual-2` config):
+  the force is how the e2e plugs in. Nothing moves. `Virtual-2` was already
+  enabled at `1024x768+1024+0`; it now reads `connected` instead of
+  `disconnected`. Dims stay `2048x768`.
+- **No layout (autodetect, S3.10.5)**: the e2e plugs the monitor in through
+  QEMU instead (4.3.1), so `Virtual-2` arrives with an EDID, as a real monitor
+  would. `xrandr` lists `Virtual-2 connected` and leaves it off. The screen
+  size and `Virtual-1` do not change, because nothing in this session
+  listens to RandR and Xorg does not auto-enable outputs on hotplug. This is
+  the documented limitation made observable.
 
 #### 4.3.4 Giving the plugged-in monitor an EDID (S3.10.7)
 
-The kernel can attach a firmware EDID to a connector:
+The kernel can read an EDID of your choosing in place of the monitor's own.
+The e2e uses the connector's debugfs override, then has QEMU plug the
+monitor in, because virtio-gpu reads the EDID only at the display event
+(4.3.1):
 
 ```sh
-# at boot, kernel command line:
-drm_kms_helper.edid_firmware=Virtual-2:edid/1280x1024.bin
-# or at runtime, before forcing the connector on:
-echo 'Virtual-2:edid/1280x1024.bin' > /sys/module/drm_kms_helper/parameters/edid_firmware
+dbg=$(ls -d /sys/kernel/debug/dri/*/Virtual-2 | head -n1)
+cat edid.bin > "$dbg/edid_override"   # a 128-byte EDID
+# host: python3 ci/vm/vnc-head.py vnc-head1.sock 1024 768
+od -An -tx1 -v /sys/class/drm/card0-Virtual-2/edid   # the injected bytes
+cat /sys/class/drm/card0-Virtual-2/modes             # exactly the EDID's modes
+# … host: vnc-head.py … 0 0 …
+printf reset > "$dbg/edid_override"   # printf, not echo
 ```
 
+`reset` must be exactly five bytes. With echo's newline the kernel reads the
+write as an EDID, refuses it, and keeps the override.
+
+The other route, a firmware EDID, is the `drm.edid_firmware` parameter
+(older kernels and guides name it `drm_kms_helper.edid_firmware`), for example
+`drm.edid_firmware=Virtual-2:edid/1024x768.bin` on the kernel command line.
 Built-in EDIDs (no file needed): `edid/800x600.bin`, `edid/1024x768.bin`,
 `edid/1280x1024.bin`, `edid/1600x1200.bin`, `edid/1680x1050.bin`,
-`edid/1920x1080.bin`. A custom one can be dropped in `/lib/firmware/edid/`.
-Requires `CONFIG_DRM_LOAD_EDID_FIRMWARE` in the guest kernel — **confirm on
-the Rocky 9 kernel** (`grep DRM_LOAD_EDID_FIRMWARE /boot/config-$(uname -r)`)
-before building a test on it. With it, `xrandr --verbose` shows the EDID's
-modes on `Virtual-2`, and under autodetection
-`xrandr --output Virtual-2 --auto --right-of Virtual-1` from a client enables
-it — which is also the only way an output gets enabled in this session, since
-no desktop environment runs.
+`edid/1920x1080.bin`; a custom one goes in `/lib/firmware/edid/`. It needs
+`CONFIG_DRM_LOAD_EDID_FIRMWARE`, which the CI's kernel has
+(`CONFIG_DRM_LOAD_EDID_FIRMWARE=y`, recorded by S3.10.7). On virtio-gpu it
+too is read only at boot and at a display event.
+
+Forcing the connector on instead does not work: forced on, `Virtual-2` gets
+virtio-gpu's own mode list and no EDID, override or not (4.3.3). That list
+includes the test EDID's three modes, so a check on those three alone could
+not fail; S3.10.7 checks the kernel's whole list, X's whole list, and X's
+EDID property against the injected bytes.
+
+The test EDID (`write_edid` in `vm-guest.sh`) has 1024x768@60 preferred,
+640x480@60 and 800x600@60 established, and no continuous-frequency flag, so
+the kernel infers no modes from its range limits. X adds none of its own:
+its default modes only when the driver gives none, and modesetting's only on
+an output with a panel fitter (a `scaling mode` property), which virtio-gpu's
+connectors lack. With it in place, under autodetection,
+`xrandr --output Virtual-2 --auto` from a client enables it — which is also
+the only way an output gets enabled in this session, since no desktop
+environment runs.
+
+Read X's modes for an output from `xrandr`'s plain query, not `--verbose`.
+After its last output xrandr prints every mode no output offers (its
+`ModeShown` loop), and the server keeps a CRTC's mode in the screen's
+resources even when no output offers it. `--verbose` prints those modes as
+it prints an output's own, so they read as the last output's. The plain
+query prints an output's modes three spaces in and those two in, with their
+ids. In the S3.10.7 run that trailing mode was `1280x800 (0x44)`, which
+`Virtual-1` still ran from its time without an EDID.
 
 Note the 1024x768 quirk in `vm-guest.sh`'s `verify_fixed_layout`: virtio-gpu
 accepts a *preferred* mode on a never-enabled scanout only if it is exactly
 `XRES_DEF x YRES_DEF` (1024x768) or within 16 px of the scanout's size, which
-a disabled scanout does not have. A firmware EDID whose preferred mode is
-anything else may be listed and still refused at modeset. Prefer
-`edid/1024x768.bin` for `Virtual-2`.
+a disabled scanout does not have. An injected EDID whose preferred mode is
+anything else may be listed and still refused at modeset. The test EDID's
+preferred mode is 1024x768, and the host asks QEMU for a 1024x768 head.
 
 #### 4.3.5 What stays on hardware (S3.10.8, S8.2.2)
 
@@ -591,7 +658,7 @@ sudo podman exec desktop tail -50 /home/desktop/.local/share/xorg/Xorg.0.log
 sudo podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop desktop \
     sh -c 'wpctl status; pw-cli ls Device; pactl list short sinks sources'
 sudo podman exec -u desktop -e DISPLAY=:0 desktop xrandr --query --verbose
-sudo podman run --rm --device desktop.local/display=all localhost/desktop-testclient xinput list
+sudo podman exec -u desktop -e DISPLAY=:0 desktop xinput list
 
 # audio stack health across an event
 sudo podman exec desktop sh -c 'pgrep -x pipewire; pgrep -x wireplumber; pgrep -x pipewire-pulse'
@@ -668,7 +735,9 @@ facts observed in this repository's CI:
    bus refuses `device_add`, and `usb-audio` is playback-only. Still to try:
    a PCI hot-add of `AC97` or `ES1370` (both capture), if the guest image has
    the driver. If not, capture hotplug is T4 only.
-5. Package names `xinput` and `xev` on Rocky 9 AppStream.
+5. ~~Package names `xinput` and `xev` on Rocky 9 AppStream~~: settled.
+   `xorg-x11-server-utils` and `xorg-x11-utils` provide them, and both are in
+   the desktop image (§3).
 6. The runner's QEMU version supports `screendump -f png` (the script already
    falls back to PPM). `input-send-event`'s `"device"` routes by display
    device, not by input device id (§4.1.4); `usb-mouse` cannot be routed that

@@ -12,7 +12,10 @@
 # The container-side half is image/session/host-shell-setup.sh.
 set -euo pipefail
 
-DIR=/etc/desktop-container
+# Both overridable for tests only; unset in the unit, so production always
+# uses these paths.
+DIR=${DESKTOP_CONTAINER_DIR:-/etc/desktop-container}
+AK_DIR=${HOST_SHELL_AK_DIR:-/etc/ssh/authorized_keys.d}
 
 # The tree ships shell-user, so a missing one means the tree was not (fully)
 # applied - not a way to turn the feature off. Say so, rather than leave the
@@ -40,8 +43,8 @@ ssh-keygen -q -t ed25519 -N '' -C desktop-container-host-shell \
 chmod 0400 "$DIR/host-shell-key"
 chmod 0644 "$DIR/host-shell-key.pub"
 
-mkdir -p /etc/ssh/authorized_keys.d
-ak="/etc/ssh/authorized_keys.d/$user"
+mkdir -p "$AK_DIR"
+ak="$AK_DIR/$user"
 printf 'from="127.0.0.1,::1",no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' \
     "$(cat "$DIR/host-shell-key.pub")" > "$ak"
 chmod 0644 "$ak"
@@ -53,3 +56,17 @@ if command -v restorecon >/dev/null; then
     restorecon -R "$DIR" "$ak" || true
 fi
 echo "host shell converged: fresh key for '$user', trust at $ak"
+
+# A desktop already running installed what it found when it started (the
+# last key, or none), and installs again only at its next start. Hand it this
+# key too, so "Host Terminal" works without a desktop restart: starting this
+# unit by hand is what the menu entry's failure screen says to do. At boot the
+# unit runs before desktop.service, and there is no desktop yet.
+ctr=${DESKTOP_CONTAINER:-desktop}
+if [ "$(podman container inspect -f '{{.State.Running}}' "$ctr" 2>/dev/null)" = true ]; then
+    if timeout 60 podman exec -u 0 "$ctr" /usr/local/bin/host-shell-setup.sh; then
+        echo "handed the new key to the running desktop ($ctr)"
+    else
+        echo "the running desktop ($ctr) did not take the new key; it will at its next start" >&2
+    fi
+fi
