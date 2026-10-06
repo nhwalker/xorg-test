@@ -2008,8 +2008,12 @@ deploy_reboot() {
         [ "$st" = active/success ] || fail "$u.service is $st after the reboot"
     done
     ev_pass "after the reboot desktop.service is active, X answers, mwm runs, and the five boot oneshots are active and succeeded"
-    wait_for 60 2 "the tools spec, advertised this boot" test -s /etc/cdi/desktop-tools.yaml
+    # The spec persists across the reboot, so its presence says nothing about
+    # this boot: wait for the rewrite itself (the toolkit's publish triggers
+    # the .path unit some time after desktop.service is active).
     boot_epoch=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))
+    spec_this_boot() { [ -s /etc/cdi/desktop-tools.yaml ] && [ "$(stat -c %Y /etc/cdi/desktop-tools.yaml)" -ge "$boot_epoch" ]; }
+    wait_for 60 2 "the tools spec, rewritten this boot" spec_this_boot
     mt=$(stat -c %Y /etc/cdi/desktop-tools.yaml)
     [ "$mt" -ge "$boot_epoch" ] || fail "the tools spec was not rewritten this boot (mtime $mt, boot $boot_epoch)"
     [ "$(systemctl show -p Result --value desktop-tools-cdi.service)" = success ] || fail "desktop-tools-cdi.service did not succeed this boot"
