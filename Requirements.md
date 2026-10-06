@@ -1061,7 +1061,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `rsync -a --chown=root:root deploy/host/ /` and `systemctl daemon-reload` from `deploy/README.md` "Apply", run as written, install everything (the `reboot` that completes the block is S5.1.3); the two symlinks and the four `multi-user.target.wants` symlinks survive as symlinks.
 - Acceptance: symlink checks; `is-enabled` = `enabled` for `desktop-client-cdi`, `desktop-selinux`, `desktop-session`, `desktop-tools-cdi.path`.
 - Evidence: `find /etc/systemd/system -maxdepth 2 -type l -ls` (EV-STATE); `systemctl is-enabled` output; `systemctl list-units 'desktop*'` (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke` asserts both symlinks and all four `is-enabled` results (`guest:phase_deploy` only `desktop-client-cdi`), but after its own copy of the live-apply commands, not the `deploy/README.md` "Apply" block.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_applied`, in phase-deploy, reads `deploy/README.md`'s "Apply" block and checks it is still `rsync`, `daemon-reload` and `reboot`; phase-deploy runs the first two as written. It checks the two symlinks and the four `multi-user.target.wants` links arrived as symlinks and the four units read `enabled`, and saves the block, `find /etc/systemd/system -maxdepth 2 -type l -ls`, `systemctl is-enabled` of the four and `systemctl list-units --all 'desktop*'` under `artifacts/S5.1.1/` (artifact `evidence-vm-core`). `smoke` asserts the symlinks and `is-enabled` on the runner (job log only).
 
 **S5.1.2 Files land root-owned with correct modes**
 - Requirement: every file from the tree is `root:root`; scripts are executable.
@@ -1073,7 +1073,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: after a reboot with no manual starts, `desktop.service` is active, all oneshots succeeded, the session is up and visible, the tools spec is rewritten, labels are present, and `seat-prep` changed nothing.
 - Acceptance: T3 variant: reboot the VM after phase-deploy and assert the above.
 - Evidence: EV-SHOT of the desktop after reboot; `systemctl status` of every unit (EV-STATE); EV-LOG-JOURNAL `-b` for `desktop-seat-prep` (no `seat-prep:` lines); `ls -Z` of the three dirs; `ls /etc/cdi` with mtimes.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `e2e` reboots the VM last in the core shard, after `guest:deploy_tail`, and nothing touches it afterwards. `guest:deploy_reboot` checks a new boot id; `desktop.service` active with X answering and mwm running; the five boot oneshots active and succeeded, and no desktop unit failed; the tools spec rewritten that boot; the three client directories `container_file_t` again; `desktop-seat-prep` logging nothing. It saves the units' status, `systemctl --failed`, `ls -Zd` of the three directories, `ls -l --full-time /etc/cdi`, seat-prep's journal for the boot and `loginctl list-sessions`, and the VM host adds a screendump of the desktop after the reboot, under `artifacts/S5.1.3/` (artifact `evidence-vm-core`).
 
 ### F5.2 Quadlet unit
 
@@ -1105,13 +1105,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `desktop.service` cannot run alongside `getty@tty1.service` or `display-manager.service`.
 - Acceptance: unmask and start `getty@tty1` → desktop stops; restore. Destructive; run last.
 - Evidence: EV-LOG-JOURNAL for both units; `systemctl status` pair.
-- Tier: T3 · Coverage: ❌ no test; `guest:phase_deploy` only shows that starting the desktop stops getty, which seat-prep also does, so it does not isolate `Conflicts=`.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail`, with the desktop running, starts `getty@tty1` (unmasked for the test) and then a stand-in `display-manager.service`: each stops `desktop.service`. Both are then put back: the getty masked again, no display manager, the desktop running. The generated unit's `Conflicts=`, `systemctl status` for each case and the three units' journal through the test are under `artifacts/S5.2.5/` (artifact `evidence-vm-core`).
 
 **S5.2.6 Image pin drop-in**
 - Requirement: on podman ≥ 5.0 a `desktop.container.d/50-image.conf` `Image=` override lands in the generated unit.
 - Acceptance: on the Rocky VM: add a drop-in, `daemon-reload`, `systemctl cat` shows it, restart works; `desktop-preflight` reports the drop-in as merged.
 - Evidence: `systemctl cat desktop.service` (EV-CONFIG); `podman inspect desktop --format '{{.ImageName}}'`; preflight row.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` writes `desktop.container.d/50-image.conf` pinning `localhost/desktop-container:ev-pinned`, a second name for the same image, runs `daemon-reload` and restarts the desktop: the generated unit carries the pin, the desktop runs the pinned image, and `desktop-preflight` reports the drop-in merged and the pinned image in storage. With the drop-in removed the desktop runs `:latest` again. `podman --version`, the drop-in, `systemctl cat desktop.service`, `podman inspect desktop --format '{{.ImageName}}'` and the preflight report are under `artifacts/S5.2.6/` (artifact `evidence-vm-core`).
 
 ### F5.3 Seat convergence (`seat-prep.sh`)
 
@@ -1119,7 +1119,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: seat rules removed, display manager disabled and stopped, default target set, getty masked and stopped, logind restarted only if something changed.
 - Acceptance: `smoke` staged seat rule + fake DM; `guest:phase_deploy`: start `desktop-seat-prep` on its own before `desktop.service`, and assert `getty@tty1` stopped and the `seat-prep: stopping running getty@tty1.service` journal line. (Starting the desktop proves nothing here: its `Conflicts=getty@tty1.service` stops the getty in the same transaction.)
 - Evidence: EV-LOG-JOURNAL of `desktop-seat-prep` and `systemd-logind` (restart present on the dirty run, absent on steady state); `systemctl status getty@tty1 display-manager` before/after (EV-DIFF); `systemctl get-default`.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke` and `dryrun` assert the seat-rule removal, DM stop, default target and getty mask, but not the logind restart. `guest:phase_deploy`'s getty eviction does not show seat-prep working, because the quadlet's `Conflicts=` stops that getty anyway.
+- Tier: T2/T3 · Coverage: 🟡 ✅ the getty, the default target and logind: `guest:seat_prep_dirty`, in phase-deploy, starts `desktop-seat-prep` on its own on the stock host, before the desktop. `getty@tty1` stops, the journal says `stopping running getty@tty1.service` and `seat converged`, `systemd-logind` restarts (a new MainPID), and the default target is `multi-user.target`. `guest:deploy_reboot` adds the steady half: on the rebooted, converged host seat-prep logs nothing and logind starts once. Both halves' evidence is under `artifacts/S5.3.1/` (artifact `evidence-vm-core`): `getty@tty1`'s and `display-manager`'s status before and after with their diff, seat-prep's and logind's journals, `get-default`. 🟡 the seat-rule and display-manager clauses: the stock VM has neither. `smoke` stages a `72-seat-*.rules` file and a running fake display manager, and asserts seat-prep's lines for both, the rule file gone and the fake manager stopped. Seat-prep's output for that run is kept under `artifacts/S5.3.5/` (artifact `evidence-smoke`); the after-state is job log only.
 
 **S5.3.2 Steady state is silent and idempotent**
 - Requirement: a second run changes nothing and prints nothing.
@@ -1129,9 +1129,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.3.3 The gate names a culprit and fails**
 - Requirement: a process holding `/dev/dri/card*` or `/dev/tty1` after convergence → exit 1 naming it; `desktop.service` still starts.
-- Acceptance: stop `desktop.service`; hold `/dev/dri/card0` from a background `sleep`; `systemctl restart desktop-seat-prep` fails naming that pid; `systemctl start desktop.service` still starts it; release; `systemctl restart desktop-seat-prep` succeeds. (`start` is a no-op on the already-active `RemainAfterExit=yes` unit, and while the desktop runs Xorg holds `card0` too.)
+- Acceptance: stop `desktop.service`; hold `/dev/dri/card0` from a background `sleep`; `systemctl restart desktop-seat-prep` fails naming that pid; `systemctl start desktop.service` still starts it, and its Xorg meets the conflict the gate named: the sleep opened card0 first, so it is card0's DRM master and the rootless Xorg's `drmSetMaster` fails, as `desktop-seat-prep.service` says it will; release; `systemctl restart desktop-seat-prep` succeeds and the desktop comes up. (`start` is a no-op on the already-active `RemainAfterExit=yes` unit, and while the desktop runs Xorg holds `card0` too.)
 - Evidence: EV-LOG-JOURNAL with the `ERROR: devices still held` line and the `fuser -v` table; `systemctl status` of both units.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` stops the desktop and holds `/dev/dri/card0` from a root `sleep`. `systemctl restart desktop-seat-prep` exits 1, its journal naming card0, the sleep's pid and fuser's table. `desktop.service` still starts (the quadlet only `Wants=` seat-prep), and the Xorg log shows `drmSetMaster` failing. With the sleep gone, seat-prep succeeds and the desktop comes up with X answering. Under `artifacts/S5.3.3/` (artifact `evidence-vm-core`): the holders, seat-prep's journal, the Xorg log's DRM-master lines, both units' status, and what the host's `fuser` shows with the desktop running. Recorded there: the host's `fuser` does not list the container's Xorg, because podman gives the container device nodes of its own and `fuser` matches an open file by its node. The gate runs before the desktop starts, so that does not weaken it, but no host-side `fuser` can show whether the desktop itself holds the card.
 
 **S5.3.4 Degrades without `psmisc`**
 - Requirement: without `fuser`, the gate is skipped with a notice, exit 0.
@@ -1195,13 +1195,13 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: the service stays active; removing the spec does not re-advertise until the service is stopped; a reboot with a populated dir rewrites it.
 - Acceptance: `rm` the spec; still absent after 5 s; `systemctl stop desktop-tools-cdi.service`; spec reappears; `.path` unit not failed. The reboot half runs in the T3 reboot sub-phase.
 - Evidence: `systemctl status desktop-tools-cdi.{path,service}` at each step (EV-STATE); `ls -l /etc/cdi/desktop-tools.yaml` with mtime; EV-LOG-JOURNAL.
-- Tier: T2/T3 · Coverage: ❌.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_tail` removes the tools spec while `desktop-tools-cdi.service` is active: still absent 5 s later. `systemctl stop desktop-tools-cdi.service` lets the `.path` unit fire again: the spec is back, and the `.path` unit is active, not failed. `guest:deploy_reboot` adds the reboot half: the spec rewritten that boot. The units' and the spec's state at each step, their journal since the removal and their state after the reboot are under `artifacts/S5.5.5/` (artifact `evidence-vm-core`).
 
 **S5.5.6 Specs are host state, independent of the desktop and of kubernetes**
 - Requirement: display/audio specs exist before the desktop is up and survive `helm uninstall`.
 - Acceptance: with `desktop.service` stopped, remove both specs and `systemctl restart desktop-client-cdi`: both reappear; `guest:verify_teardown` with `ls -l --full-time /etc/cdi` before and after `helm uninstall`. (`guest:phase2` checks the specs only once the desktop is already running.)
 - Evidence: `ls -l /etc/cdi` with mtimes before/after (EV-DIFF empty for the two specs).
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_teardown` asserts the specs survive `helm uninstall`, but nothing shows they exist before the desktop is up (`guest:phase2` checks them with the desktop running).
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail`, with `desktop.service` stopped, removes both client specs and restarts `desktop-client-cdi`: both are back, byte for byte the same. `ls -l --full-time /etc/cdi` before, removed and after, with the diffs, are under `artifacts/S5.5.6/` (artifact `evidence-vm-core`). The `helm uninstall` half is `guest:verify_teardown`'s, its evidence under `artifacts/S7.3.6/` (artifact `evidence-vm-k8s`): `/etc/cdi` before and after the uninstall, EV-DIFF empty.
 
 ### F5.6 SELinux labeling (`desktop-selinux`)
 
@@ -1215,31 +1215,31 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: full context `system_u:object_r:container_file_t:s0` (no categories) on all three dirs and the binary, before any client runs.
 - Acceptance: `ls -Zd`.
 - Evidence: `ls -Zd` of the three and `ls -Z` of the binary (EV-STATE); `getenforce`.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:phase_deploy` asserts the type only, so a label carrying categories still passes.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks` checks the full context, `system_u:object_r:container_file_t:s0` with no categories, on the three client directories and on the published `screenshot` binary; `getenforce` and the `ls -Zd`/`ls -Z` listing are under `artifacts/S5.6.2/` (artifact `evidence-vm-core`).
 
 **S5.6.3 The label is policy, including the `/run` equivalency workaround**
-- Requirement: an fcontext rule governs each dir (for `/run/desktop-audio`, under whichever of `/run` or `/var/run` the policy accepts: `desktop-selinux` tries `/run` first, and which spelling Rocky 9 stores has not been recorded yet); `restorecon -R` keeps the labels.
+- Requirement: an fcontext rule governs each dir (for `/run/desktop-audio`, under whichever of `/run` or `/var/run` the policy accepts: `desktop-selinux` tries `/run` first; Rocky 9 stores it under `/var/run`); `restorecon -R` keeps the labels.
 - Acceptance: `semanage fcontext -l -C` lists three rules; `restorecon -Rv` changes nothing.
 - Evidence: the `semanage` listing and `restorecon -Rv` output (EV-STATE); `ls -Zd` after.
-- Tier: T3 · Coverage: ❌ no test; `guest:phase_deploy`'s type check passes the same way when `semanage` fails and the `chcon` fallback does the labeling.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks`: `semanage fcontext -l -C` lists a local `container_file_t` rule for each of the three directories, `/run/desktop-audio`'s stored under `/var/run`, and `restorecon -Rv` of the three relabels nothing. The listing, the `restorecon` output and `ls -Zd` after are under `artifacts/S5.6.3/` (artifact `evidence-vm-core`).
 
 **S5.6.4 chcon fallback without semanage**
 - Requirement: without `semanage` on `PATH`, the dirs are still labelled and the policy note printed.
 - Acceptance: run with a stubbed `PATH` against a probe dir.
 - Evidence: stdout; `ls -Zd` of the probe dir.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` runs `desktop-selinux` on a probe directory with `PATH=/usr/bin:/bin`, so no `semanage`, `restorecon` or `selinuxenabled`: it prints the policy note, labels the probe `container_file_t` with `chcon`, exits 0 and adds no policy rule. `ls -Zd` before and after and the run's output are under `artifacts/S5.6.4/` (artifact `evidence-vm-core`).
 
 **S5.6.5 Verification fails the unit when a label does not land**
 - Requirement: a dir still lacking the type → `FAILED to label` naming it, exit 1.
 - Acceptance: a dir on a filesystem that refuses relabeling.
 - Evidence: stdout/exit code; `ls -Zd`; `mount` line of the probe fs.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` points `desktop-selinux` at a directory on a tmpfs mounted with `context=`, which nothing can relabel (a `chcon` by hand is refused too): it says `FAILED to label`, names the directory with its `tmp_t` label and exits 1. `findmnt`, the refused `chcon`, the run and `ls -Zd` after are under `artifacts/S5.6.5/` (artifact `evidence-vm-core`).
 
 **S5.6.6 Missing directories are reported, not invented**
 - Requirement: a missing dir is warned and skipped; none present → exit 1.
 - Acceptance: two bogus paths → exit 1; one bogus + one real → warning, labelled, exit 0.
 - Evidence: stdout and exit codes for both runs.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_tail` runs `desktop-selinux` on two missing paths: both named in the warning, then `none of the client directories exist yet`, exit 1. Then on one missing and one real: the missing one warned about and not created, the real one labelled, exit 0. Both runs' output and exit status are under `artifacts/S5.6.6/` (artifact `evidence-vm-core`).
 
 **S5.6.7 The host keeps full access after relabeling**
 - Requirement: an unconfined host process can connect to the X and audio sockets and execute the toolkit.
@@ -1253,7 +1253,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: ed25519 keypair under `/etc/desktop-container` (0400/0644), `authorized_keys.d/desktop-shell` (0644) with the `from=` and `no-*-forwarding` options.
 - Acceptance: `dryrun`/`smoke`; `guest:phase_deploy` under enforcing.
 - Evidence: `ls -l /etc/desktop-container /etc/ssh/authorized_keys.d` (EV-STATE); the authorized_keys line (EV-CONFIG).
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `dryrun` asserts the `from=` loopback restriction and `smoke` the key's 0400 mode, but nothing checks the `no-*-forwarding` options, the key type or the other files' modes.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_checks` checks the private key 0400 root, and the public key and the `authorized_keys.d` entry 0644 root. The entry is one line: `from="127.0.0.1,::1"`, `no-port-forwarding`, `no-agent-forwarding`, `no-X11-forwarding`, then an `ssh-ed25519` key, the one in `host-shell-key.pub`. `guest:deploy_reboot` adds that the reboot makes a new key and the entry carries it. `ls -l` of both directories, the entry and the key's fingerprint before and after the reboot are under `artifacts/S5.7.1/` (artifact `evidence-vm-core`). `dryrun` and `smoke` assert the loopback restriction and the key's mode on the runner (job log only).
 
 **S5.7.2 Login works both directions, and the operator gets a host shell from the menu**
 - Requirement: `ssh -i <key> desktop-shell@127.0.0.1 whoami` from the host and `ssh host whoami` from the container return `desktop-shell`; the "Host Terminal" menu entry shows a prompt on the host.
@@ -1263,9 +1263,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.7.3 Restrictions are enforced**
 - Requirement: the key is refused from a non-loopback source; port forwarding is refused.
-- Acceptance: ssh to the VM's non-loopback IP fails; `-L` with `ExitOnForwardFailure=yes` exits nonzero.
+- Acceptance: ssh to the VM's non-loopback IP fails; `-R` with `ExitOnForwardFailure=yes` exits nonzero when the forward is set up; a connection through a `-L` forward is refused when it is made. `ExitOnForwardFailure` does not see that refusal: sshd refuses the channel, not the forward, so `-L` itself exits 0.
 - Evidence: both ssh transcripts with exit codes; EV-LOG-JOURNAL of `sshd` showing the refusals.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks`: the key is accepted from 127.0.0.1 and refused from the VM's own non-loopback address (ssh exit 255). `ssh -R` with `ExitOnForwardFailure=yes` exits 255 at setup. A connection through an `ssh -L` forward gets nothing back: the channel is administratively prohibited. Recorded: the `-L` ssh itself exited 0. The transcripts and sshd's journal are under `artifacts/S5.7.3/` (artifact `evidence-vm-core`).
 
 **S5.7.4 Re-running rotates the key and invalidates the old one**
 - Requirement: a second run writes a different key; the old private key no longer authenticates; the container regains access after `desktop.service` restarts.
@@ -1301,9 +1301,9 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 
 **S5.8.1 A real logind session on seat0/tty1**
 - Requirement: `loginctl` shows `desktop` on `seat0`; `/run/user/61000` mounted by logind; utmp has an entry for tty1.
-- Acceptance: `smoke`, `guest:phase_deploy`; ❌ utmp.
+- Acceptance: `smoke`, `guest:deploy_checks` (tty1, the logind mount and utmp included).
 - Evidence: `loginctl list-sessions` and `loginctl show-session <id>` (EV-STATE); `who`; `findmnt /run/user/61000`.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke` and `guest:phase_deploy` assert a `desktop` session on `seat0` and that `/run/user/61000` exists, but not tty1, the logind mount or utmp.
+- Tier: T2/T3 · Coverage: ✅ `guest:deploy_checks`: logind holds a user session for `desktop` on `seat0`, on `tty1`; `/run/user/61000` is a tmpfs mounted by `user-runtime-dir@61000.service`; utmp records `desktop` on `tty1`. `loginctl list-sessions`, `loginctl show-session`, `findmnt` with the unit that mounted it and `who` are under `artifacts/S5.8.1/` (artifact `evidence-vm-core`). `smoke` asserts the session on the runner (job log only).
 
 **S5.8.2 Moves with the container**
 - Requirement: `PartOf=desktop.service` restarts the session with the container.
@@ -1315,7 +1315,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: the container's `setsid -c` on tty1 succeeds.
 - Acceptance: X comes up and `podman logs` has no `failed to set the controlling terminal`.
 - Evidence: EV-LOG-DESKTOP grep (empty); `ps -o tty= -p <desktop-session-lead>` is `?`.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:phase_deploy` asserts only that X comes up, not that the desktop log lacks `failed to set the controlling terminal` or that the session lead has no tty.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks`: the host session's lead (`desktop-session-lead`) has no controlling tty, and the desktop's log never says `failed to set the controlling terminal`. The lead's `ps` line, the (empty) grep and Xorg's controlling tty in the container are under `artifacts/S5.8.3/` (artifact `evidence-vm-core`).
 
 **S5.8.4 The desktop runs with the unit disabled**
 - Requirement: see S2.2.2.
@@ -1368,7 +1368,7 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: no `preflight: FAIL:` lines on the VM.
 - Acceptance: grep.
 - Evidence: EV-LOG-DESKTOP preflight block.
-- Tier: T3 · Coverage: ❌ nothing asserts it: no test greps the desktop log for `preflight: FAIL:`, and `guest:fail` prints the preflight block only after another check has failed.
+- Tier: T3 · Coverage: ✅ `guest:deploy_checks` reads the container preflight's lines from the desktop's log: it ran (16 lines) and reported no FAIL. The lines are under `artifacts/S5.11.1/` (artifact `evidence-vm-core`).
 
 **S5.11.2 Each check fires**
 - Requirement: every FAIL/WARN in the script fires when staged (omitted mounts/devices/flags via `podman run`).
@@ -2305,12 +2305,12 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | E2 Boot & supervision | 25 | 22 | 1 | 2 | 0 |
 | E3 Display & session | 62 | 54 | 1 | 4 | 3 |
 | E4 Audio | 23 | 18 | 0 | 4 | 1 |
-| E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
+| E5 Deploy tree | 50 | 42 | 2 | 5 | 1 |
 | E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 39 | 0 | 1 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **184** | **3** | **58** | **6** |
+| **Total** | **251** | **201** | **4** | **40** | **6** |
 
 Regenerate after editing with:
 
