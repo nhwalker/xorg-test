@@ -324,7 +324,7 @@ point of the declarative form — the file list above *is* the state).
 | `etc/systemd/system/default.target` → `multi-user.target` | the default boot target, as a symlink rather than `systemctl set-default` |
 | `etc/systemd/system/getty@tty1.service` → `/dev/null` | masks the getty (frees the VT), as a symlink rather than `systemctl mask` |
 | `etc/systemd/logind.conf.d/50-desktop-container.conf` | logind `NAutoVTs=0` / `ReserveVT=0` drop-in |
-| `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix`; `/dev/snd` so its bind mount resolves on a soundless host |
+| `etc/tmpfiles.d/desktop-container.conf` | shared socket dirs `/run/desktop-audio`, `/tmp/.X11-unix`; `/dev/snd` so its bind mount resolves on a soundless host; at boot, removes the last boot's Host Terminal key and trust entry (see "Host Terminal" below) |
 | `etc/pulse/client.conf.d/50-desktop-container.conf` | host Pulse clients → container socket |
 | `etc/alsa/conf.d/60-desktop-container.conf` | host ALSA clients → pulse plugin → container socket. A drop-in rather than `/etc/asound.conf`, so a host-local `asound.conf` still wins; the `/etc/alsa/conf.d` mechanism is EL/Fedora packaging |
 | `usr/local/bin/desktop-preflight` | read-only debug tool: PASS/WARN/FAIL per host-side assumption; not wired into boot |
@@ -402,17 +402,20 @@ convenience + audit trail, not a boundary). Three properties are worth calling o
 
 - **Fresh key every boot.** `desktop-host-shell.service` regenerates the
   ed25519 keypair under `/etc/desktop-container` on every boot; key
-  material never outlives the boot that made it, and there is no rotation
-  procedure to remember.
+  material never outlives the boot that made it (tmpfiles.d removes the
+  last boot's pair and trust entry early in every boot, whether or not the
+  unit runs after), and there is no rotation procedure to remember.
 - **Root-owned trust.** The restricted entry (`from=` loopback only, no
   forwarding) is written to `/etc/ssh/authorized_keys.d/desktop-shell`,
   wired by the sshd_config.d drop-in — nothing under `/home` is touched
   and the account cannot extend its own access.
 - **Always on.** No per-host input. The off-switch is in
   `etc/containers/systemd/desktop.container`: comment out the two
-  `Wants=`/`After=desktop-host-shell.service` lines. With no key
-  generated, nothing can log into the account and the container's menu
-  entry degrades gracefully.
+  `Wants=`/`After=desktop-host-shell.service` lines, `systemctl
+  daemon-reload`, and reboot. The reboot is what revokes: it removes the
+  last boot's key and trust entry, and with no key generated, nothing can
+  log into the account and the container's menu entry degrades
+  gracefully. Until then the running container keeps a working key.
 
 sshd itself: the unit `Wants=sshd.service` (started each boot while the
 desktop is deployed), but whether sshd is *enabled* on the host stays the
