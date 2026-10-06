@@ -926,7 +926,11 @@ maint_gdm() {
     guest_ev "" maint packages || fail "S10.1.5: the documented package line did not provision the host"
     guest_ev "" maint image || fail "S10.1.5: the desktop image could not be loaded"
     b0=$(vm_ssh_quick 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | tail -n1)
-    mg_reboot gdm-profile && rc=0 || rc=$?
+    # The profile installs gdm and the GNOME stack it pulls in, hundreds of
+    # packages: 17.5 minutes on one run's mirrors, past vm_ssh's 15-minute
+    # bound, which cut the step's connection mid-install, and the step died
+    # with it before its reboot. 40 minutes, inside the job's 60.
+    VM_SSH_TIMEOUT=2400 mg_reboot gdm-profile && rc=0 || rc=$?
     [ "$rc" != 1 ] || { ev_pull; fail "S10.1.5: the gdm profile could not be applied"; }
     mt_wait_boot "$b0" || fail "S10.1.5: the host did not come back from the profile's reboot"
     mg gdm-greeter || fail "S10.1.5: the host does not show gdm's greeter"
