@@ -3,12 +3,13 @@
 
   S9.1.1  (its static half) the checks are seen to fail: each tree guard
           the static job runs (GUARDS: client-guard, e9-guard, script-list,
-          layout-keywords) runs there with its self-test, which plants what
-          its checks must catch; the static job runs no checker GUARDS does
-          not name; every rule here plants a violation it must flag and a
-          form it must pass, and so does client-guard's self-test. Whether a
-          pull request names the mutation its new assertions were tried
-          against is not read here;
+          layout-keywords, pr-mutations) runs there with its self-test,
+          which plants what its checks must catch; the static job runs no
+          checker GUARDS does not name; every rule here plants a violation
+          it must flag and a form it must pass, and so does client-guard's
+          self-test. Whether a pull request names the mutation its new
+          assertions were tried against is ci/pr-mutations.py's to read, on
+          the pull request's own run;
   S9.1.2  an assertion over a generated artefact (a CDI spec, 20-gpu.conf or
           30-monitors.conf, a unit as systemctl cat or quadlet's dry run
           prints it, a rendered chart) reads it so that a comment cannot
@@ -88,6 +89,13 @@
           the gate's audio check fails a recording with no plot, no verdict,
           a plot and verdict that do not name it, a name that says nothing
           of what to hear, or a source's tone at another source's pitch;
+  S9.3.5  each recording (ev_video_start to ev_video_stop in the shell, a
+          `with ctx.video(...)` block in the Python) marks its event
+          (ev_mark, .mark, or a function that marks), the recorders name
+          the event frames on the gif's line, the gate's video check fails
+          a video that names no event frame or one its frames lack, and the
+          gate fails a story its document asks to record (EV-VIDEO in its
+          own lines or its feature's common set) that holds no video;
   S9.3.6  ci/evidence.sh wraps podman and kubectl so each call is a line of
           the timeline, ev_log stamps each line and keeps it to one, every
           ssh, scp, socat or nc in the shell is logged first or kept by
@@ -2943,7 +2951,8 @@ def rule_s914(root, rep):
 # self-test: a planted violation each check must flag, the guard failing if
 # one is missed (client-guard and e9-guard also plant forms that must pass).
 GUARDS = {"ci/client-guard.py": "--self-test", "ci/e9-guard.py": "--self-test",
-          "ci/script-list.py": "self-test", "ci/layout-keywords.py": "self-test"}
+          "ci/script-list.py": "self-test", "ci/layout-keywords.py": "self-test",
+          "ci/pr-mutations.py": "--self-test"}
 
 
 def static_job_runs(root):
@@ -3433,15 +3442,161 @@ def rule_s936(root, rep):
             f"{len(cases)} planted story directories judged; {len(rep.violations('S9.3.6'))} violation(s)")
 
 
-RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931, "S9.3.2": rule_s932, "S9.3.3": rule_s933, "S9.3.4": rule_s934, "S9.3.6": rule_s936}
+# --- S9.3.5: every recording names its event frames ---------------------------------
+
+VIDEO_START = re.compile(r"\bev_video_start\b(?!\s*\(\))")
+VIDEO_STOP = re.compile(r"\bev_video_stop\b(?!\s*\(\))")
+EV_MARK = re.compile(r"\bev_mark\s")
+
+
+def py_marks(node):
+    """Whether a node holds a call to a .mark() method."""
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "mark"
+               for n in ast.walk(node))
+
+
+def called_names(node):
+    return {n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+            for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))}
+
+
+def rule_s935(root, rep):
+    """S9.3.5: each recording marks its event and names its event frames, and
+    the gate holds every story whose event changes the screen to a video."""
+    spans = 0
+    for rel in shell_files(root):
+        lines = read(os.path.join(root, rel)).split("\n")
+        code = [code_of(l) for l in lines]
+        for i, l in enumerate(code):
+            if not VIDEO_START.search(l) or re.search(r"\bev_video_start\s*\(\)", l):
+                continue
+            spans += 1
+            j = next((k for k in range(i + 1, len(code)) if VIDEO_STOP.search(code[k])
+                      and not re.search(r"\bev_video_stop\s*\(\)", code[k])), None)
+            if j is None:
+                rep.flag("S9.3.5", rel, i + 1, lines[i].strip()[:120], "a recording that is never stopped",
+                         "stop it with ev_video_stop, which names its event frames")
+            elif any(EV_MARK.search(c) for c in code[i:j]):
+                rep.ok("S9.3.5", rel, i + 1, "the recording marks its event (ev_mark) before it stops")
+            else:
+                rep.flag("S9.3.5", rel, i + 1, lines[i].strip()[:120],
+                         "a recording with no ev_mark before its ev_video_stop: nothing names the event's frame",
+                         "ev_mark \"<what the harness does>\" as it sets the event off")
+    for rel in py_files(root):
+        text = read(os.path.join(root, rel))
+        try:
+            tree = ast.parse(text, rel)
+        except SyntaxError:
+            continue
+        markers = {f.name for f in py_functions(tree) if py_marks(f)}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.With):
+                continue
+            if not any(isinstance(it.context_expr, ast.Call) and isinstance(it.context_expr.func, ast.Attribute)
+                       and it.context_expr.func.attr == "video" for it in node.items):
+                continue
+            spans += 1
+            body = ast.Module(body=node.body, type_ignores=[])
+            via = sorted(called_names(body) & markers)
+            if py_marks(body):
+                rep.ok("S9.3.5", rel, node.lineno, "the recording marks its event (.mark) inside its block")
+            elif via:
+                rep.ok("S9.3.5", rel, node.lineno, f"the recording's block calls {', '.join(via)}, which marks the event")
+            else:
+                rep.flag("S9.3.5", rel, node.lineno, (ast.get_source_segment(text, node) or "with video")[:120],
+                         "a recording whose block marks no event: nothing names the event's frame",
+                         "ctx.mark(\"<what the harness does>\") as it sets the event off")
+    helpers = (("ci/vm/vm-e2e.sh", r"^ev_video_stop\(\) \{.*?^\}", r"video-events.*?\n(?:.*\n)*?.*ev_attach \"\$EV_VID\.gif\" \"\$what; \$EV_VID_EVENTS\"",
+                "ev_video_stop runs evlib.py video-events and puts its sentence on the gif's line"),
+               ("ci/vm/operator-e2e.py", r"def video\(self.*?(?=\n    def |\n    # -- )", r"evlib\.video_events\((?:.*\n)*?.*attach\(gif, f\"\{what\}; \{events\}\"\)",
+                "Ctx.video runs evlib.video_events and puts its sentence on the gif's line"))
+    for rel, body_re, uses, what in helpers:
+        if not os.path.exists(os.path.join(root, rel)):
+            continue                                    # the self-test's planted tree
+        m = re.search(body_re, read(os.path.join(root, rel)), re.S | re.M)
+        if m and re.search(uses, m.group(0)):
+            rep.ok("S9.3.5", rel, 0, what)
+        else:
+            rep.flag("S9.3.5", rel, 0, what, f"not so: {what}", "name the event frames on the recording's line")
+    evlib = evlib_module(root)
+    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as d:
+        def frames(st, moment, line, names=("frame-0001.png", "frame-0002.png")):
+            name = st.name(moment, "")
+            os.makedirs(st.path(name))
+            with open(os.path.join(st.path(name), "index.txt"), "w") as f:
+                f.write("".join(f"{n} 2026-10-06T10:00:0{k}.000Z (QEMU wrote it in 5 ms)\n" for k, n in enumerate(names)))
+            for n in names:
+                open(os.path.join(st.path(name), n), "wb").close()
+            st.attach(name + "/", "EV-VIDEO raw frames")
+            with open(st.path(name + ".gif"), "wb") as f:
+                f.write(b"GIF89a")
+            st.attach(name + ".gif", line)
+            return name
+
+        def cited(st):
+            src = evlib.StoryWriter(st.root, "S9.1.4", "planted", "T0", "e9-guard.py")
+            name = frames(src, "event", "EV-VIDEO: the event; event frames: frame-0002.png: the kill (S9.1.4)")
+            src.finish()
+            with open(st.path("01-event.gif"), "wb") as f:
+                f.write(b"GIF89a")
+            st.attach("01-event.gif", f"EV-VIDEO: the event (S9.1.4's recording: its frames are in S9.1.4/{name}/); "
+                      "event frames: frame-0002.png: the kill (S9.1.4)")
+        cases = [
+            ("a video naming its event frame", lambda st: frames(st, "event", "EV-VIDEO: the event; event frames: "
+                                                                 "frame-0002.png (10:00:01.000Z): the kill (S9.1.5)"), False),
+            ("a copy naming the frames directory of the story it came from", cited, False),
+            ("a video whose line names no event frame", lambda st: frames(st, "event", "EV-VIDEO: the event"), True),
+            ("a video naming a frame its frames directory lacks",
+             lambda st: frames(st, "event", "EV-VIDEO: the event; event frames: frame-0009.png: the kill (S9.1.5)"), True),
+            ("a video whose event frames are none", lambda st: frames(st, "event", "EV-VIDEO: the event; event frames: "
+                                                                       "none: no mark fell within the recording"), True),
+        ]
+        judge_planted(rep, "S9.3.5", planted_dirs(evlib, d, cases), "the gate's video check")
+        # The gate's other half: a story whose event changes the screen (its
+        # own lines or its feature's common set ask for EV-VIDEO) holds a video.
+        req = os.path.join(d, "Requirements.md")
+        with open(req, "w", encoding="utf-8") as f:
+            f.write("## E9 Planted\n\n### F9.8 Screen events\n\n**Common set**: EV-VIDEO of the display across the event.\n\n"
+                    "**S9.8.1 An event that changes the screen, recorded**\n- Tier: T3 · Coverage: ✅ planted\n\n"
+                    "**S9.8.2 An event that changes the screen, not recorded**\n- Tier: T3 · Coverage: ✅ planted\n\n"
+                    "### F9.9 Quiet events\n\n**S9.9.1 An event that changes nothing on the screen**\n"
+                    "- Tier: T3 · Coverage: ✅ planted\n")
+        ev = os.path.join(d, "gate")
+        for sid, video in (("S9.8.1", True), ("S9.8.2", False), ("S9.9.1", False)):
+            st = evlib.StoryWriter(ev, sid, "planted", "T3", "e9-guard.py")
+            st.check(True, "the planted story ran")
+            if video:
+                frames(st, "event", "EV-VIDEO: the event; event frames: frame-0001.png: the event (S9.8.1)")
+            st.finish()
+        out = os.path.join(d, "gate.json")
+        with open(os.devnull, "w") as null:
+            saved, sys.stdout = sys.stdout, null
+            try:
+                evlib.main(["gate", "--requirements", req, "--json", out, ev])
+            finally:
+                sys.stdout = saved
+        import json
+        errors = json.load(open(out))["errors"]
+        flagged = sorted({e.split(":")[0] for e in errors if "S9.3.5" in e})
+        if flagged == ["S9.8.2"]:
+            rep.ok("S9.3.5", "ci/evlib.py", 0, "the gate fails a story its document asks to record that holds no video "
+                   "(S9.8.2), and passes one that holds its video (S9.8.1) and one asked for none (S9.9.1)")
+        else:
+            rep.flag("S9.3.5", "ci/evlib.py", 0, "gate", f"the gate's video check flagged {flagged or 'nothing'}, "
+                     "want only S9.8.2", "the gate must hold each story whose event changes the screen to a video")
+    return (f"S9.3.5: {spans} recording(s) in the harness, {len(cases)} planted story directories and a planted "
+            f"document judged; {len(rep.violations('S9.3.5'))} violation(s)")
+
+
+RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931, "S9.3.2": rule_s932, "S9.3.3": rule_s933, "S9.3.4": rule_s934, "S9.3.5": rule_s935, "S9.3.6": rule_s936}
 
 # --- the self-test --------------------------------------------------------------------
 
 PLANTS = {
     "S9.1.1": [
-        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py >/dev/null || rc=$?\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
-        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/new-check.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
-        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/script-list.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', False),
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py >/dev/null || rc=$?\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/pr-mutations.py --self-test\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/pr-mutations.py --self-test\n          python3 ci/new-check.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/pr-mutations.py --self-test\n          python3 ci/script-list.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', False),
     ],
     "S9.1.5": [
         ("ci/p1.sh", "#!/bin/bash\nset -euo pipefail\nx=$(podman ps | grep -q y)\n", True),
@@ -3506,6 +3661,15 @@ PLANTS = {
         ('ci/vm/a4.py', 'import subprocess\n\n\ndef rec(st):\n    n = st.name("tone-440hz", "wav")\n    st.attach(n, "EV-AUDIO: a tone")\n'
                         '    subprocess.run(["python3", "check-audio.py", "--report", "r.txt", "--plot", "p.png", n, "1", "0.05", "440"])\n',
          False),
+    ],
+    "S9.3.5": [
+        ('ci/r1.sh', '#!/bin/bash\nev_video_start restart\nvm_ssh "sudo systemctl restart desktop.service"\n'
+                     'ev_video_stop "EV-VIDEO: the restart"\n', True),
+        ('ci/r2.sh', '#!/bin/bash\nev_video_start restart\nev_mark "systemctl restart desktop.service"\n'
+                     'vm_ssh "sudo systemctl restart desktop.service"\nev_video_stop "EV-VIDEO: the restart"\n', False),
+        ('ci/vm/r3.py', 'def s(ctx):\n    with ctx.video("drag", "a drag"):\n        ctx.drag(1, 2, 3, 4)\n', True),
+        ('ci/vm/r4.py', 'def cycle(ctx):\n    ctx.mark("device_del kbd")\n\n\ndef s(ctx):\n'
+                        '    with ctx.video("cycle", "a cycle"):\n        cycle(ctx)\n', False),
     ],
     "S9.3.6": [
         ('ci/t1.sh', '#!/bin/bash\nprobe() { ssh -p 22 rocky@127.0.0.1 true; }\n', True),
