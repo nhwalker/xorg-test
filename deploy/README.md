@@ -288,11 +288,14 @@ depend on it:
 
 ```sh
 restorecon -R /etc/systemd /etc/ssh /etc/desktop-container \
-              /usr/local/bin /usr/local/libexec /var/lib/desktop-container
+              /usr/local/bin /usr/local/libexec
 ```
 
 (RPM-based provisioning sets labels correctly on its own; this is an
-rsync-specific step.)
+rsync-specific step. It names only what the rsync copied:
+`/var/lib/desktop-container` is not in the tree; tmpfiles creates it at
+the next boot, and `desktop-selinux` labels its `bin` directory for the
+clients.)
 
 `--chown=root:root` matters: `rsync -a` would otherwise preserve the repo
 checkout's owner on files under `/etc`. `-a` also copies the two symlinks
