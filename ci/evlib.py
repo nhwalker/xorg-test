@@ -357,7 +357,7 @@ def cmd_check(args):
 def cmd_gate(args):
     stories = parse_requirements(args.requirements)
     found = collect(args.roots)
-    errors, upgrades, rows = [], [], []
+    errors, upgrades, rows, elsewhere = [], [], [], []
     for sid, dirs in sorted(found.items()):
         if sid not in stories:
             errors.append(f"{sid}: evidence for a story that Requirements.md does not define ({dirs[0]})")
@@ -375,6 +375,14 @@ def cmd_gate(args):
             dirs = dirs + [d for d in found.get(other, []) if d not in dirs]
         results = [read_result(d)[0] for d in dirs]
         passed = bool(results) and all(r == "PASS" for r in results)
+        # A story whose evidence another workflow keeps names it on its
+        # Coverage line ("(workflow `base-rebuild.yml`)"): a run of this one
+        # need not carry it, but any evidence it does carry still counts.
+        other = re.search(r"\(workflow `([\w.-]+\.yml)`\)", s["coverage"])
+        if s["mark"] == "✅" and not passed and not dirs and other:
+            elsewhere.append(f"{sid}: its evidence is kept by {other.group(1)}")
+            rows.append((sid, s["mark"], f"workflow {other.group(1)}", "-"))
+            continue
         if s["mark"] == "✅" and not passed:
             errors.append(f"{sid}: marked ✅ in Requirements.md but this run has "
                           + ("no evidence for it" if not dirs else "no passing evidence for it"))
@@ -388,6 +396,7 @@ def cmd_gate(args):
              f"{len(found)}.", "",
              "| Mark | Stories |", "|---|---|"] + [f"| {m} | {n} |" for m, n in marks.items()]
     lines += ["", f"## Errors ({len(errors)})", ""] + ([f"- {e}" for e in errors] or ["none"])
+    lines += ["", f"## Evidence kept by another workflow ({len(elsewhere)})", ""] + ([f"- {e}" for e in elsewhere] or ["none"])
     lines += ["", f"## Evidence that would support a better mark ({len(upgrades)})", ""]
     lines += ([f"- {u} (marked {stories[u]['mark']})" for u in upgrades] or ["none"])
     lines += ["", "## Every story", "", "| Story | Mark | Evidence | Result |", "|---|---|---|---|"]
@@ -398,7 +407,7 @@ def cmd_gate(args):
             f.write(report)
     if args.json:
         with open(args.json, "w") as f:
-            json.dump({"errors": errors, "upgrades": upgrades, "marks": marks,
+            json.dump({"errors": errors, "upgrades": upgrades, "elsewhere": elsewhere, "marks": marks,
                        "stories": {r[0]: {"mark": r[1], "evidence": r[2], "result": r[3]} for r in rows}},
                       f, indent=1, ensure_ascii=False)
     print("\n".join(lines[:lines.index("## Every story")]))

@@ -64,20 +64,51 @@ jobs:
             image/xorg/*.sh image/session/host-shell-setup.sh \
             image/session/start-session image/session/start-audio \
             image/session/session-postmortem image/init/desktop-init \
-            image/session/host-terminal image/tools/publish-tools.sh \
+            image/session/host-terminal image/session/xinitrc.desktop \
+            image/tools/publish-tools.sh \
             deploy/host/usr/local/libexec/desktop-cdi-refresh \
             deploy/host/usr/local/libexec/desktop-client-cdi \
             deploy/host/usr/local/libexec/desktop-tools-cdi \
             deploy/host/usr/local/libexec/desktop-host-shell-setup \
             deploy/host/usr/local/libexec/desktop-selinux \
+            deploy/host/usr/local/libexec/desktop-session-lead \
             deploy/host/usr/local/libexec/seat-prep.sh \
             deploy/host/usr/local/bin/desktop-preflight \
             deploy/host/usr/local/bin/desktop-monitors-capture
+      - name: every shipped script is shellchecked (S1.2.6's list)
+        # The step above names its scripts by hand. Every shell script git
+        # tracks under image/ and deploy/host/usr/local/ (found by its #!
+        # line) must be among them; the self-test first shows the check
+        # names a script taken out of the step.
+        env:
+          EV_ROOT: artifacts
+          EV_SOURCE: "ci.yml static (ci/script-list.py)"
+        run: |
+          . ci/evidence.sh
+          mkdir -p "$EV_ROOT"
+          ev_begin S1.2.6 "All shipped scripts are executable and shellcheck-clean" T0
+          rc=0
+          ev_save self-test "EV-STATE: script-list.py self-test: the check run against the shellcheck step with one listed script taken out, which it must name" \
+            python3 ci/script-list.py self-test >/dev/null || rc=1
+          [ "$rc" = 0 ] && ev_pass "the check names a script taken out of the step" || ev_fail "the check did not name a script taken out of the step"
+          found=$(python3 ci/script-list.py found) || rc=1
+          listed=$(python3 ci/script-list.py listed) || rc=1
+          ev_text found "EV-STATE: every shell script git tracks under image/ and deploy/host/usr/local/, found by its #! line (script-list.py found)" "$found"
+          a=$EV_LAST
+          ev_text listed "EV-STATE: the scripts the shellcheck step names under image/ and deploy/host/usr/local/, its globs expanded (script-list.py listed)" "$listed"
+          ev_diff lists "EV-DIFF: the scripts found against the scripts the shellcheck step names (empty: every shipped script is shellchecked)" "$a" "$EV_LAST"
+          if python3 ci/script-list.py check; then
+            ev_pass "the shellcheck step names every one of the $(grep -c . <<<"$found") shipped shell scripts, and nothing else there"
+          else
+            ev_fail "the shellcheck step's list and the shipped shell scripts differ (see the diff)"; rc=1
+          fi
+          ev_end
+          exit "$rc"
       - name: python syntax (VM harness, evidence library)
         # The VM harness's Python runs only in the vm jobs, after the image
         # builds and the VM boot; a syntax error there should cost seconds
         # here, not that whole run. The runner's python3 is all it needs.
-        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py
+        run: python3 -m py_compile ci/vm/*.py ci/evlib.py ci/unit-directives.py ci/client-guard.py ci/script-list.py ci/preflight-rows.py
       - name: fixed monitor layout branch tests
         # Pure logic (no root, no X, no container): the boot-time generator's
         # driver paths and rejections, and the derived CVT timings against the
@@ -294,7 +325,7 @@ jobs:
             img 'ls -l /usr/share/pipewire' >/dev/null || true
           ev_end
           [ "$f" = 0 ]
-      - name: the built image's contents (S1.1.5, S1.1.6, S1.2.1, S1.2.2, S1.2.5, S1.2.7, S1.2.8)
+      - name: the built image's contents (S1.1.5, S1.1.6, S1.2.1, S1.2.2, S1.2.5, S1.2.6, S1.2.7, S1.2.8)
         # Read out of the images this job just built, in scratch containers
         # of them (no desktop-init, so nothing is renumbered or published);
         # each story keeps what it read.
@@ -398,7 +429,43 @@ jobs:
           check "STOPSIGNAL is SIGTERM" grep -q '^SIGTERM ' <<<"$cfg"
           check "CMD is /usr/local/bin/desktop-init, alone" grep -q ' \[/usr/local/bin/desktop-init\]$' <<<"$cfg"
           ev_end
+
+          ev_begin S1.2.6 "All shipped scripts are executable and shellcheck-clean" T2
+          modes=$(ev_save modes "EV-STATE: stat -c '%a %U:%G %n' of every file under /usr/local/bin and of /etc/X11/xinit/xinitrc.desktop, in a scratch container of the image" \
+            img "find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f -exec stat -c '%a %U:%G %n' {} +") || f=1
+          odd=$(ev_save not-0755 "EV-STATE: find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755, in a scratch container of the image (empty)" \
+            img 'find /usr/local/bin /etc/X11/xinit/xinitrc.desktop -type f ! -perm 0755') || f=1
+          check "find read the image's scripts: $(grep -c . <<<"$modes") files under /usr/local/bin and xinitrc.desktop" test -n "$modes"
+          check "every one of them is mode 0755" test -z "$odd"
+          ev_end
           [ "$f" = 0 ]
+      - name: align-device-groups' branches (S3.2.2's T1 half)
+        # Each branch in a scratch container of the image just built, with
+        # its own /etc/group and a node fabricated for it: renumber, a gid
+        # another group holds (and 60000 too), a missing group, a root-group
+        # node, no node, the boot path already aligned, the narrow form and
+        # an unknown name.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/align-groups-tests.sh)"
+        run: ci/align-groups-tests.sh
+      - name: host-shell-setup's cases (S5.7.7's T1 half)
+        # The container side of the Host Terminal in scratch containers of
+        # the image: no key material, a key with no or an empty shell-user,
+        # and both, with the preflight's host-shell row in each.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/host-shell-setup-tests.sh)"
+        run: ci/host-shell-setup-tests.sh
+      - name: every row of the container preflight fires (S5.11.2)
+        # preflight-check.sh in scratch containers of the image: the image
+        # alone (none of the quadlet's devices or mounts), then one case per
+        # remaining row. The rows are read from the script, so one added
+        # later fails this until a case stages it.
+        env:
+          EV_ROOT: ${{ github.workspace }}/artifacts
+          EV_SOURCE: "ci.yml build-smoke (ci/preflight-rows.py container)"
+        run: python3 ci/preflight-rows.py container
       - name: deploy tree quadlet dry-run + CDI spec checks
         env:
           EV_ROOT: ${{ github.workspace }}/artifacts

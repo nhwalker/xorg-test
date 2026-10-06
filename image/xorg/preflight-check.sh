@@ -99,9 +99,11 @@ fi
 # regression is invisible in normal use - everything works either way - so
 # report it where verify-privileges is not running.
 sysopts=$(awk '$2=="/sys"{print $4; exit}' /proc/self/mounts)
+# The commas make ro match as a whole option; no /sys line at all leaves just
+# the two of them.
 case ",$sysopts," in
+    ,,)     warn "/sys not found in /proc/self/mounts" ;;
     *,ro,*) pass "/sys is read-only ($sysopts)" ;;
-    "")     warn "/sys not found in /proc/self/mounts" ;;
     *)      fail "/sys is mounted WRITABLE ($sysopts): the quadlet's Mount= for /sys did not apply - a writable /sys is one of the grants --privileged bundles" ;;
 esac
 
