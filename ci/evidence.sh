@@ -46,6 +46,14 @@
 #   ev_attach <file> <what>           index a file already in the directory
 #   ev_end [reason]                   settle PASS/FAIL, render evidence.md
 #   ev_abort <reason>                 record a failure and end (for fail())
+#   ev_log <kind> <text>              one line of the timeline (EV-TIMELINE):
+#                                     the run's and the open story's
+#
+# Sourcing it also wraps podman and kubectl: each call a script makes while
+# evidence is on is a line of the timeline before it runs (Requirements.md
+# S9.3.6). The binary runs as ever; a call inside sh -c, timeout or xargs
+# runs it directly and is not logged (ev_save, which keeps such a command,
+# logs the file it writes).
 #
 # Human-readable progress goes to stderr, never stdout: callers capture
 # stdout with $(...) and must get only the command output they asked for.
@@ -60,6 +68,8 @@ EV_FAILED=()
 EV_LIB_DIR="${EV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 _ev_ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+podman() { ev_log podman "$*"; command podman "$@"; }
+kubectl() { ev_log kubectl "$*"; command kubectl "$@"; }
 # One TSV field: no tab, newline or carriage return inside it (ssh ends its
 # messages with \r\n, and a reader splitting on \r would break the row).
 _ev_one() { printf '%s' "$*" | tr '\t\n\r' '   '; }
@@ -108,8 +118,11 @@ ev_log() { # <kind> <text>
     [ -n "$EV_ROOT" ] || return 0
     local line
     line="$(_ev_ts) $(printf '%-8s' "${EV_STORY:--}") $(printf '%-6s' "$1") $(_ev_one "$2")"
-    printf '%s\n' "$line" >> "$EV_ROOT/timeline.log"
-    [ -z "$EV_DIR" ] || printf '%s\n' "$line" >> "$EV_DIR/${EV_SIDE}timeline.log"
+    # The timeline never fails its caller: a podman call a script makes
+    # before its first story (whose ev_begin makes $EV_ROOT) still runs.
+    [ -d "$EV_ROOT" ] || mkdir -p "$EV_ROOT" 2>/dev/null || true
+    { printf '%s\n' "$line" >> "$EV_ROOT/timeline.log"; } 2>/dev/null || true
+    [ -z "$EV_DIR" ] || { printf '%s\n' "$line" >> "$EV_DIR/${EV_SIDE}timeline.log"; } 2>/dev/null || true
 }
 
 ev_begin() { # <story> <title> [tier]

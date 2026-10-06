@@ -130,7 +130,9 @@ class Run:
 
     def log(self, kind, text, echo=False):
         sid = self.story.sid if self.story else "-"
-        line = f"{stamp()} {sid:<8} {kind:<6} {text}"
+        # One line per entry, however many the text has (Requirements.md
+        # S9.3.6: every line of the timeline starts with its timestamp).
+        line = f"{stamp()} {sid:<8} {kind:<6} {evlib.one_line(text)}"
         with self._lock:
             self._timeline.write(line + "\n")
             if self.story:
@@ -2039,6 +2041,16 @@ def s7_7_8(ctx, st):
             m.hmp("stopcapture 0")
         st.attach(wav_name, "EV-AUDIO: the machine's output while the audio client played its 1100 Hz tone "
                   "through the switch - listen for the tone before and after")
+        rep, plot = st.name("through-kvm-verdict", "txt"), st.name("through-kvm-level", "png")
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-audio.py"),
+                        "--report", st.path(rep), "--plot", st.path(plot), wav, "1", "0.05", "1100"],
+                       capture_output=True, timeout=120)
+        for n, w in ((rep, f"check-audio.py's verdict on {wav_name}: its duration, peak and dominant frequency "
+                           "(want 1100 Hz); recorded, the story judges the tone's level after the switch"),
+                     (plot, f"the level at 1100 Hz across {wav_name}, one bar per 0.1 s on a -60..0 dBFS scale: "
+                            "the tone before, through and after the switch")):
+            if os.path.exists(st.path(n)) and os.path.getsize(st.path(n)):
+                st.attach(n, w)
         st.check(away and back, "the keyboard, tablet and sound card left together and came back, every count "
                  "back to its value before")
         sink = stream_sink(ctx)
@@ -2049,7 +2061,7 @@ def s7_7_8(ctx, st):
         tail = [a for t, a in tone_levels(wav, 1100) if t >= max(0.0, (os.path.getsize(wav) - 44) / 176400 - 2.5)]
         lv = sorted(tail)[len(tail) // 2] if tail else 0.0
         st.write("tail-level", f"median 1100 Hz level over the capture's last 2.5 s: {lv:.4f} of full scale "
-                 f"({20 * math.log10(max(lv, 1e-9)):.1f} dBFS)\n", "the tone's level at the end of the capture, "
+                 f"({20 * math.log10(max(lv, 1e-9)):.1f} dBFS)\n", f"the 1100 Hz level at the end of {wav_name}, "
                  "after the switch")
         st.check(lv >= 0.01, "and it is heard at the end of the capture, after the switch",
                  f"median level {lv:.4f} (-40 dBFS is 0.01)")
@@ -3216,9 +3228,10 @@ def analyse_capture(ctx, st, wav, marks, wall):
              for (label, at), (_, (r, g, b)) in zip(marks, legend)]
     text += ["", "check-audio.py (whole capture, loudest 0.75 s window):",
              (checker.stdout + checker.stderr).rstrip()]
-    st.attach(plot, "the tone's level over the capture: one green bar per 0.1 s on a -60..0 dBFS scale "
-              "(grey lines at -20 and -40), a coloured line at each mark (legend in the analysis file)")
-    st.write("analysis", "\n".join(text) + "\n", "the analyser's reading of the capture, phase by phase")
+    st.attach(plot, f"the tone's level across {os.path.basename(wav)}: one green bar per 0.1 s on a -60..0 dBFS "
+              "scale (grey lines at -20 and -40), a coloured line at each mark (legend in the analysis file)")
+    st.write("analysis", "\n".join(text) + "\n",
+             f"the analyser's reading of {os.path.basename(wav)}, phase by phase, check-audio.py's verdict last")
     st.record(f"the built-in output (QEMU's emulated HDA) read {b_start:.4f} as found, {b100:.4f} at 100% "
               f"and {b50:.4f} at 50%: recorded, not asserted")
     st.check(checker.returncode == 0, "the capture carries the client's 1100 Hz tone")

@@ -105,6 +105,7 @@ trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 # wedged guest without bounding legitimate work, and the poll loops use
 # vm_ssh_quick, which is where a hang actually needs catching fast.
 vm_ssh() {
+    ev_log ssh "$*"
     timeout "${VM_SSH_TIMEOUT:-900}" ssh -q -p "$SSHPORT" -i id_ed25519 \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
@@ -115,6 +116,7 @@ vm_ssh() {
 vm_ssh_quick() { VM_SSH_TIMEOUT=20 vm_ssh "$@"; }
 
 mon_cmd() {
+    ev_log qemu "$1"
     echo "$1" | socat - "UNIX-CONNECT:$MON" >/dev/null
 }
 
@@ -181,6 +183,19 @@ ev_audio_check() { # <moment> <wav name in the story dir> <min seconds> <min pea
     [ -s "$EV_DIR/$rep" ] && ev_attach "$rep" "check-audio.py's verdict on $2: its duration, peak and dominant frequency (want $5 Hz)"
     [ -s "$EV_DIR/$plot" ] && ev_attach "$plot" "the level at $5 Hz across $2, one bar per 0.1 s on a -60..0 dBFS scale (the picture of the tone; no spectrogram tool is installed)"
     return "$rc"
+}
+# EV-AUDIO-REC of a recording that is silence by design (QEMU's "none"
+# audiodev gives a capture nothing else, so its frames are the proof):
+# check-audio.py's report on it and its broadband level plot, beside the WAV
+# (S9.3.4: a recording is heard, seen and judged).
+ev_audio_silence() { # <wav name in the story dir>
+    local m=${1%.wav} rep plot
+    m=${m#*-}
+    rep=$(ev_name "$m-verdict" txt)
+    plot=$(ev_name "$m-level" png)
+    python3 check-audio.py --report "$EV_DIR/$rep" --plot "$EV_DIR/$plot" "$EV_DIR/$1" 0 0 >/dev/null 2>&1 || true
+    [ -s "$EV_DIR/$rep" ] && ev_attach "$rep" "check-audio.py's report on $1: its duration and peak (silence: a peak of 0)"
+    [ -s "$EV_DIR/$plot" ] && ev_attach "$plot" "the broadband (RMS) level across $1, one bar per 0.1 s on a -60..0 dBFS scale: silence is a line at the floor"
 }
 
 # EV-SHOT into the open story: a QEMU screendump, indexed with what to look for.
@@ -925,6 +940,7 @@ git -C ../.. archive --format=tar.gz -o "$PWD/repo.tgz" HEAD
 # Every image archive the workflow handed over: ci.yml's three, and what a
 # maintainer.yml shard gets beside them (maint-config's second desktop
 # image, maint-session's bases).
+ev_log scp "repo.tgz $(echo images-*.tar) to the guest's /tmp"
 scp -q -P "$SSHPORT" -i id_ed25519 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null repo.tgz images-*.tar \
     rocky@127.0.0.1:/tmp/
@@ -2132,12 +2148,13 @@ else
     ev_begin S4.7.9 "Recording from a hot-added capture device works" T3
     rec=$(ev_save recorder "EV-LOG-CLIENT: the session user's parecord from $new_src for 3 s (SIGINT ends it, so the WAV is finished): its command, its output, its exit status and the file" \
         gq rec-source "$new_src" 3 s479) || true
-    rname=$(ev_name rec-from-capture-card wav)
+    rname=$(ev_name rec-from-capture-card-silence wav)
     vm_ssh_quick 'sudo podman exec desktop cat /tmp/s479.wav' > "$EV_DIR/$rname" 2>/dev/null || true
     [ -s "$EV_DIR/$rname" ] && ev_attach "$rname" "EV-AUDIO-REC: what the session user's parecord recorded from $new_src: silence, which is all QEMU's none backend gives a capture, so its frames are the proof"
+    [ -s "$EV_DIR/$rname" ] && ev_audio_silence "$rname"
     rfacts_ok=yes
     rfacts=$(rec_facts "$EV_DIR/$rname" 2 2>&1) || rfacts_ok=no
-    ev_text rec-facts "EV-AUDIO-REC: the recording's frames, duration, format and peak (python's wave module)" "$rfacts"
+    ev_text rec-facts "EV-AUDIO-REC: $rname's frames, duration, format and peak (python's wave module)" "$rfacts"
     grep -q '^parecord exited 0$' <<<"$rec" || fail "parecord from $new_src did not exit 0: $(grep '^parecord exited' <<<"$rec")"
     ev_pass "the session user's parecord opened $new_src and exited 0"
     [ "$rfacts_ok" = yes ] || fail "the recording from $new_src holds less than 2 s of its 3: $rfacts"
@@ -3611,12 +3628,13 @@ else
     ev_pass "the $cap_model card brought a capture source: $r_src"
     rec=$(ev_save recorder "EV-LOG-CLIENT: parecord from $r_src for 3 s, a new process in the journey pod (SIGINT ends it, so the WAV is finished): its command, its output, its exit status and the file" \
         gq journey-rec "$r_src" 3 s777) || true
-    rname=$(ev_name rec-in-pod wav)
+    rname=$(ev_name rec-in-pod-silence wav)
     vm_ssh_quick 'sudo repo/ci/vm/vm-guest.sh journey-file /tmp/s777.wav' > "$EV_DIR/$rname" 2>/dev/null || true
     [ -s "$EV_DIR/$rname" ] && ev_attach "$rname" "EV-AUDIO-REC: what the pod's parecord recorded from $r_src: silence, which is all QEMU's none backend gives a capture, so its frames are the proof"
+    [ -s "$EV_DIR/$rname" ] && ev_audio_silence "$rname"
     rfacts_ok=yes
     rfacts=$(rec_facts "$EV_DIR/$rname" 2 2>&1) || rfacts_ok=no
-    ev_text rec-facts "EV-AUDIO-REC: the recording's frames, duration, format and peak (python's wave module)" "$rfacts"
+    ev_text rec-facts "EV-AUDIO-REC: $rname's frames, duration, format and peak (python's wave module)" "$rfacts"
     snd_keep
     ev_qemu device-del "EV-QEMU: device_del s777cap and QEMU's reply (empty: accepted; the PCI unplug then waits on the guest)" \
         "device_del s777cap" >/dev/null || fail "QEMU refused device_del s777cap"
