@@ -2238,14 +2238,14 @@ mt_k8s_plugins() {
     ev_end
 }
 
-# S10.6.1: README.md's apply line as written; the example pod running, the
-# image CRI-O resolved its unqualified name to, and its xterm on the screen.
+# S10.6.1: README.md's apply line as written; the example pod running on the
+# desktop's own image, unpulled, and its xterm on the screen.
 mt_k8s_apply() {
     local line rc=0 phase="" img imgid id dg same=no title
     mt_k8s_begin S10.6.1
     line=$(mt_get k8s-apply)
     [ -n "$line" ] || fail "no apply line kept from README.md's block"
-    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, applied as it stands: its image the unqualified desktop-container:latest with imagePullPolicy IfNotPresent, and the display and audio resource requests"
+    ev_copy examples/x11-client-pod.yaml demo-manifest "EV-CONFIG: examples/x11-client-pod.yaml, applied as it stands: its image, the desktop's own localhost/desktop-container:latest, with imagePullPolicy IfNotPresent, and the display and audio resource requests"
     ev_save apply "EV-PROCEDURE: \`$line\`, as written: its output and exit status" sh -c "$line" >/dev/null || rc=$?
     [ "$rc" = 0 ] || fail "\`$line\` exited $rc"
     ev_pass "\`$line\` exited 0"
@@ -2257,7 +2257,7 @@ mt_k8s_apply() {
     ev_save demo-describe "EV-STATE: kubectl describe pod $MT_DEMO: its events, scheduled to started" kubectl describe pod "$MT_DEMO" >/dev/null || true
     [ "$phase" = Running ] || fail "the demo pod is '${phase:-absent}', not Running, 90 s after the apply line (its events are in the evidence)"
     ev_pass "the demo pod is Running"
-    ev_save demo-image "EV-STATE: the demo pod's image: the name its spec gives (the example's, unqualified), and the name and image ID kubelet reports from CRI-O" \
+    ev_save demo-image "EV-STATE: the demo pod's image: the name its spec gives (the example's), and the name and image ID kubelet reports from CRI-O" \
         kubectl get pod "$MT_DEMO" -o jsonpath='spec: {.spec.containers[0].image}{"\n"}status: {.status.containerStatuses[0].image}{"\n"}imageID: {.status.containerStatuses[0].imageID}{"\n"}' >/dev/null || true
     img=$(mt_saved "$EV_LAST")
     ev_save local-image "EV-STATE: the desktop image in the storage CRI-O shares with podman: podman image inspect localhost/desktop-container:latest, its id and digests" \
@@ -2269,7 +2269,7 @@ mt_k8s_apply() {
     [ -z "$dg" ] || case "$imgid" in *"$dg"*) same=yes ;; esac
     [ -n "$imgid" ] && [ "$same" = yes ] \
         || fail "the demo pod runs image '${imgid:-unknown}', not this host's localhost/desktop-container:latest (id $id, digest $dg)"
-    ev_pass "CRI-O resolved the example's unqualified desktop-container:latest to this host's localhost/desktop-container:latest, unpulled: $imgid"
+    ev_pass "the demo pod runs this host's localhost/desktop-container:latest, unpulled, the image the desktop runs: $imgid"
     for _ in $(seq 20); do
         pod_window_up "$MT_DEMO" && break
         sleep 1
