@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Requirements.md E9, the test-suite rules a read of the tree can hold.
 
+  S9.1.1  (its static half) the checks are seen to fail: each tree guard
+          the static job runs (GUARDS: client-guard, e9-guard, script-list,
+          layout-keywords) runs there with its self-test, which plants what
+          its checks must catch; the static job runs no checker GUARDS does
+          not name; every rule here plants a violation it must flag and a
+          form it must pass, and so does client-guard's self-test. Whether a
+          pull request names the mutation its new assertions were tried
+          against is not read here;
   S9.1.2  an assertion over a generated artefact (a CDI spec, 20-gpu.conf or
           30-monitors.conf, a unit as systemctl cat or quadlet's dry run
           prints it, a rendered chart) reads it so that a comment cannot
@@ -11,6 +19,15 @@
           gives it a generated artefact;
   S9.1.3  the desktop's processes are found through /run/desktop-init.pid,
           never /proc/1 or a lookup by name;
+  S9.1.4  a log line an assertion reads is polled: every read of a
+          container log, the journal or a pod log in ci/'s shell (podman
+          logs, journalctl, kubectl logs, or a helper that prints one)
+          whose text an assertion reads goes through ci/evidence.sh's
+          log_wait, runs in a poll (a for over $(seq ...) or ((...)), a
+          while or until loop, or a function a poller runs), or follows a
+          poll of the same log in its function, or within 20 commands at a
+          script's top level (the log current to a line it waited for: how
+          an absence is read);
   S9.1.5  no reader that stops early (grep -q/-m/-l, head, sed q, awk exit,
           read, cmp, a loop or python that breaks) on a live pipeline under
           pipefail;
@@ -25,6 +42,15 @@
           are not seen;
   S9.2.2  the narrow fixtures stay narrow: an *-only pod requests exactly one
           desktop.local resource, and no pod declares more than requests;
+  S9.2.3  a failure says why in the job log, its message last: each
+          exiting fail() prints its message, diagnostics it also keeps
+          (ev_text) and the message again; a script under errexit reports
+          a command that fails where nothing handles it through an ERR trap,
+          which the rule runs against handled and unhandled failures; a
+          count of failures is repeated before the script or step fails on
+          it; a check in a workflow step says why it failed; ci/evidence.sh's
+          ev_save prints a failed command's output to the log too (run), and
+          operator-e2e.py prints the diagnostics it keeps;
   S9.2.4  a count read from the guest is an integer or a failed read (one
           that fails, or a poll that retries), never a number standing in
           for one: no `|| echo 0` on the read, no `${n:-0}` in a comparison,
@@ -73,6 +99,9 @@ import tempfile
 # Exceptions, keyed on content, never on line numbers. Each must excuse a
 # finding in the tree (the self-test checks), so none outlives its reason.
 ALLOW = [
+    ("S9.1.4", "ci/smoke-deploy.sh", r"^cursor=\$\(journalctl -q -n 1 -o cat --show-cursor",
+     "the journal's position (its cursor), read once to bound the slice read after the unit's second run: "
+     "state, not a log line, which S9.1.4 lets be read directly"),
     ("S9.1.3", "ci/vm/vm-guest.sh", r"readlink /proc/1/ns/cgroup",
      "the host's pid 1 on purpose: its cgroup namespace is compared with the container's"),
     ("S9.1.3", "ci/vm/vm-guest.sh", r"cat /proc/1/environ 2>&1 > /dev/null; echo rc=",
@@ -2313,11 +2342,640 @@ def rule_s912(root, rep):
             f"gen_grep_text), {seen} judged by their pattern; {len(rep.violations('S9.1.2'))} violation(s)")
 
 
-RULES = {"S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
+# --- S9.2.3: a failure is diagnosable from the job log ---------------------------------
+
+ERREXIT_OPT = re.compile(r"^-[a-zA-Z]*e[a-zA-Z]*$")
+ERRTRACE_OPT = re.compile(r"^-[a-zA-Z]*E[a-zA-Z]*$")
+CHECK_WORDS = {"test", "[", "[[", "grep", "egrep", "fgrep", "cmp", "diff", "false"}
+CHAIN_PREFIX = {"sudo", "env", "command", "exec", "time", "{", "(", "then", "do", "else"}
+# A handler that ends the step and says nothing: `|| exit 1`, `|| false`.
+SILENT_HANDLER = re.compile(r"^(?:\{\s*)?(?:exit(?:\s+\d+)?|false|return(?:\s+\d+)?)\s*;?\s*(?:\})?\s*$")
+REPEAT = re.compile(r"\bev_failures\b|\bprintf\b[^\n]*\"\$\{\w+\[@\]\}\"")
+
+# The ERR trap, run: handled failures (a condition, an || list, a failure
+# inside a substitution that the substitution goes on past, a substitution
+# whose assignment is handled, a function called as a condition) stay quiet,
+# and the one that nothing handles is reported once, with its line. fail() is
+# a stand-in that says it was called; the real one prints diagnostics.
+TRAP_CASES = [
+    "x=$(false || true)",
+    "w=$(grep -q nothing /dev/null; echo went-on)",
+    "y=$(grep -q nothing /dev/null) || true",
+    "if false; then :; fi",
+    "false || true",
+    "g() { false; echo went-on; }",
+    "if g >/dev/null; then :; fi",
+    "z=$(sh -c 'exit 3') || true",
+    "grep -q nothing /dev/null",
+    "echo NOT-REACHED",
+]
+
+# What ci/evidence.sh gives a failure, run: ev_save prints the end of a failed
+# command's output to stderr (the job log) as well as keeping it, and
+# ev_failures repeats each failed claim.
+FAILURE_CHECK = r"""
+. "$1/ci/evidence.sh"
+t=$(mktemp -d)
+EV_ROOT=$t
+r=""
+ev_begin S0.0.0 "a story" T0 2>/dev/null
+err=$( { ev_save step "a failing step" sh -c 'echo first; echo "the reason"; exit 3' >/dev/null; } 2>&1 ) \
+    && r="$r ev_save-hid-the-status"
+case "$err" in *"the reason"*) ;; *) r="$r ev_save-kept-the-output-out-of-the-log" ;; esac
+ev_check "a failing claim" false 2>/dev/null || true
+ev_end 2>/dev/null
+out=$(ev_failures 2>&1)
+case "$out" in *"FAIL: S0.0.0: a failing claim"*) ;; *) r="$r ev_failures-did-not-repeat-the-claim" ;; esac
+rm -rf "$t"
+echo "${r:-ok}"
+"""
+
+
+def body_lines(lines):
+    return [l for l in lines if not l.strip().startswith("#")]
+
+
+def fail_shape(lines):
+    """What an exiting fail() lacks: the message printed, diagnostics captured,
+    printed and kept in the story (ev_text), and the message again, last."""
+    body = body_lines(lines)
+    text = "\n".join(body)
+    m = re.search(r"\b(\w+)=\"FAIL\b", text)
+    msg = rf"\becho\s+\"\$\{{?{m.group(1)}\}}?\"" if m else r"\becho\s+\"FAIL\b"
+    says = [i for i, l in enumerate(body) if re.search(msg, l)]
+    d = next(((i, mm.group(1), mm.group(2)) for i, l in enumerate(body)
+              for mm in [re.search(r"\b(\w+)=\$\(\s*([\w-]*diagnostics[\w-]*)\b[^)]*\)", l)] if mm), None)
+    exits = [i for i, l in enumerate(body) if re.search(r"\bexit\b", l)]
+    missing = []
+    if not says:
+        missing.append("prints no message")
+    if not d:
+        missing.append("captures no diagnostics (d=$(...diagnostics 2>&1))")
+    else:
+        at, var, _ = d
+        shown = [i for i, l in enumerate(body) if i > at and re.search(rf"\b(?:printf|echo)\b[^\n]*\"\$\{{?{var}\}}?\"", l)
+                 and "ev_text" not in l]
+        kept = [i for i, l in enumerate(body) if i > at and re.search(rf"\bev_text\b[^\n]*\"\$\{{?{var}\}}?\"", l)]
+        if not shown:
+            missing.append("does not print the diagnostics it captured")
+        if not kept:
+            missing.append("does not keep them in the story (ev_text)")
+        after = max(shown + kept + [at])
+        if not any(after < i and (not exits or i < exits[-1]) for i in says):
+            missing.append("does not print its message again after them, last before it exits")
+    return missing, d
+
+
+def errexit_at_top(cg, rel, text):
+    """The line of a top-level `set -e` (or -o errexit), and of `set -E`."""
+    e = t = None
+    for n, line, toks in cg.logical_commands(rel, source=text):
+        if not toks or toks[0] != "set":
+            continue
+        opts = toks[1:]
+        if any(ERREXIT_OPT.match(o) for o in opts) or "errexit" in opts:
+            e = e or n
+        if any(ERRTRACE_OPT.match(o) for o in opts) or "errtrace" in opts:
+            t = t or n
+    return e, t
+
+
+def run_trap(root, setline, handler, trapline):
+    """The trap's verdict on TRAP_CASES: 'ok', or what it got wrong."""
+    # stderr: a report from inside a substitution must not vanish into it
+    pre = ["set -euo pipefail", 'fail() { echo "REPORTED: $*" >&2; exit 1; }', "EV_STORY=S0.0.0"]
+    script = pre + [setline] + handler + [trapline] + TRAP_CASES
+    unhandled = len(script) - 1                      # the grep with nothing handling it
+    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as d:
+        path = os.path.join(d, "trap.sh")
+        with open(path, "w") as f:
+            f.write("\n".join(script) + "\n")
+        run = subprocess.run(["bash", path], capture_output=True, text=True, timeout=30)
+    out = run.stdout + run.stderr
+    reports = [l for l in out.split("\n") if "unhandled failure" in l]
+    wrong = []
+    if run.returncode == 0 or "NOT-REACHED" in out:
+        wrong.append("the unhandled failure did not end the script")
+    if len(reports) != 1:
+        wrong.append(f"{len(reports)} report(s) where one is due (a handled failure, or one in a substitution, reported)")
+    elif f":{unhandled}: grep -q nothing /dev/null" not in reports[0] or "(exit 1)" not in reports[0]:
+        wrong.append(f"the report does not name the command, its line and its status: {reports[0][:100]}")
+    return "; ".join(wrong) or "ok"
+
+
+ASSIGN = re.compile(r"\b([A-Za-z_]\w*)=(?:(1)\b|\$\(\(\s*\$?(\w+)\s*\+\s*1\s*\)\)|\"\$\{?(\w+)\}?\s)")
+FAILURE_CONTEXT = re.compile(r"FAIL|\bev_fail\b|\bev_abort\b|\bbad\b")
+
+
+def counters(text):
+    """{variable: "count" or "list"} for each variable that counts failures:
+    set to 1, incremented or appended to where a failure is recorded (after
+    ||, beside FAIL or ev_fail, or in a function that records one)."""
+    recording = set()
+    for _, first, lines in shell_functions(text):
+        if FAILURE_CONTEXT.search("\n".join(body_lines(lines))):
+            recording.update(range(first, first + len(lines)))
+    out = {}
+    for n, l in enumerate(text.split("\n"), 1):
+        if l.strip().startswith("#"):
+            continue
+        for m in ASSIGN.finditer(l):
+            v = m.group(1)
+            if m.group(3) not in (None, v) or m.group(4) not in (None, v):
+                continue
+            if n in recording or "||" in l[:m.start()] or FAILURE_CONTEXT.search(l):
+                out[v] = "list" if m.group(4) else "count"
+        for v in re.findall(r"\(\(\s*([A-Za-z_]\w*)\+\+\s*\)\)", l):
+            if n in recording or FAILURE_CONTEXT.search(l):
+                out[v] = "count"
+    return out
+
+
+def verdicts(lines, names):
+    """(index, line) of each logical line that fails on a failure count."""
+    out = []
+    for i, l in enumerate(lines):
+        for v in names:
+            ref = rf"\"?\$\{{?{v}\}}?\"?"
+            test = re.search(rf"\[\s+(?:{ref}\s+(?:=|!=|-eq|-ne|-gt|-lt|-ge|-le)\s+\d+|-[zn]\s+{ref})\s+\]", l)
+            if re.search(rf"\bexit\s+{ref}(?:\s|;|$)", l):
+                out.append((i, l))
+                break
+            if test and (re.search(r"\bexit\b|\bfail\b", l) or l.strip() == test.group(0)
+                         or (l.lstrip().startswith("if ") and any(re.search(r"\bexit\s+[1-9]", x) for x in lines[i + 1:i + 4]))):
+                out.append((i, l))
+                break
+    return out
+
+
+def statements(toks):
+    """A command line's statements (split at ;), each as its && / || chain."""
+    out, cur = [], []
+    for t in toks + [";"]:
+        if t in (";", "&", ";;"):
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    return out
+
+
+def chain_parts(stmt):
+    parts, ops, cur = [], [], []
+    for t in stmt:
+        if t in ("&&", "||"):
+            parts.append(cur)
+            ops.append(t)
+            cur = []
+        else:
+            cur.append(t)
+    parts.append(cur)
+    return parts, ops
+
+
+def silent_check(words):
+    """The check a statement's last command is, if it fails the step unsaid
+    (a pipeline's status is its last command's)."""
+    w = list(words)
+    while "|" in w:
+        w = w[w.index("|") + 1:]
+    while w and w[0] in CHAIN_PREFIX:
+        w = w[1:]
+    while w and re.match(r"^[A-Za-z_]\w*=", w[0]):
+        w = w[1:]
+    if not w:
+        return None
+    if w[0] == "!":
+        return "negated"
+    if w[0] in CHECK_WORDS:
+        return w[0]
+    if len(w) > 1 and w[0] in ("podman", "docker") and w[1] == "run":
+        return f"{w[0]} run"
+    return None
+
+
+def rule_s923(root, rep):
+    """S9.2.3: a failure says why in the job log, and the message is last."""
+    cg = client_guard()
+    handlers = traps = counted = checks = 0
+    for rel in shell_files(root):
+        text = read(os.path.join(root, rel))
+        funcs = {name: (first, lines) for name, first, lines in shell_functions(text)}
+        fail = funcs.get("fail")
+        exits = bool(fail) and any(re.search(r"\bexit\b", l) for l in body_lines(fail[1]))
+        if exits:
+            handlers += 1
+            missing, _ = fail_shape(fail[1])
+            if missing:
+                rep.flag("S9.2.3", rel, fail[0], "fail()", "fail() " + "; ".join(missing),
+                         "print the message, then diagnostics (printed and kept with ev_text), then the message again, then exit")
+            else:
+                rep.ok("S9.2.3", rel, fail[0], "fail() prints its message, its diagnostics (kept with ev_text) and its message again, last")
+        if rel in SOURCED_BY:
+            continue
+        e, t = errexit_at_top(cg, rel, text)
+        if not e:
+            continue
+        traps += 1
+        lines = text.split("\n")
+        trap = next(((n, l) for n, l in enumerate(lines, 1)
+                     if re.match(r"^trap\s+'([A-Za-z_][\w-]*)\s[^']*\$\?[^']*\$BASH_COMMAND[^']*\$LINENO[^']*'\s+ERR\s*$", l)), None)
+        if not trap or not t:
+            rep.flag("S9.2.3", rel, e, "errexit, no ERR trap",
+                     "under errexit, a command that fails where nothing handles it ends the script with no word of why "
+                     + ("(no ERR trap reporting $?, $BASH_COMMAND and $LINENO)" if not trap else "(no set -E: functions do not inherit the trap)"),
+                     "set -E and trap 'handler $? \"$BASH_COMMAND\" \"${BASH_SOURCE[0]}:$LINENO\"' ERR, the handler reporting through fail() or a FAIL line")
+            continue
+        hname = re.match(r"^trap\s+'([A-Za-z_][\w-]*)", trap[1]).group(1)
+        h = funcs.get(hname)
+        if not h:
+            rep.flag("S9.2.3", rel, trap[0], "ERR trap", f"the ERR trap calls {hname}, which this file does not define",
+                     "define the handler beside the trap")
+            continue
+        hbody = "\n".join(body_lines(h[1]))
+        if exits and not re.search(r"\bfail\b", hbody):
+            rep.flag("S9.2.3", rel, h[0], hname, f"{hname} does not report through fail(), which prints the diagnostics",
+                     "call fail with the command, its line and its status")
+            continue
+        if not exits and not re.search(r"\becho\s+\"FAIL\b", hbody):
+            rep.flag("S9.2.3", rel, h[0], hname, f"{hname} prints no FAIL line", "echo a FAIL line naming the command, its line and its status")
+            continue
+        setline = "set -E" if t else ""
+        verdict = run_trap(root, setline, h[1], trap[1])
+        if verdict != "ok":
+            rep.flag("S9.2.3", rel, trap[0], "ERR trap, run", f"the ERR trap, run on handled and unhandled failures: {verdict}",
+                     "return from the handler in a subshell ([ \"$BASH_SUBSHELL\" = 0 ] || return 0) and report once")
+        else:
+            rep.ok("S9.2.3", rel, trap[0], "the ERR trap, run, reports the one unhandled failure, with its line, and stays quiet for handled ones")
+    # A script or a workflow step that goes on past its failures repeats them,
+    # last, before it fails.
+    units = [(rel, 1, read(os.path.join(root, rel))) for rel in shell_files(root)]
+    units += [(rel, start, text) for rel, start, text, _ in workflow_runs(root)]
+    for rel, start, text in units:
+        names = counters(text)
+        if not names:
+            continue
+        lines = [l for _, l, _ in cg.logical_commands(rel, source=text)]
+        nums = [n for n, _, _ in cg.logical_commands(rel, source=text)]
+        for i, l in verdicts(lines, names):
+            counted += 1
+            window = "\n".join(lines[max(0, i - 3):i + 4])
+            named = any(k == "list" and re.search(rf"\b(?:fail|echo)\b[^\n]*\$\{{?{v}\b", l) for v, k in names.items())
+            if REPEAT.search(window) or named:
+                rep.ok("S9.2.3", rel, start + nums[i] - 1, "a count of failures repeats them, last, before it fails")
+            else:
+                rep.flag("S9.2.3", rel, start + nums[i] - 1, " ".join(l.split())[:80],
+                         f"fails on a count of failures without repeating them: {' '.join(l.split())[:70]}",
+                         "print each failure again just before (ev_failures, or printf of the array that keeps them)")
+    # A check in a workflow step says why it failed: errexit ends the step on
+    # it with nothing said.
+    for rel, start, text, _ in workflow_runs(root):
+        inside = set()
+        for _, first, lines in shell_functions(text):
+            inside.update(range(first, first + len(lines)))
+        for n, line, toks in cg.logical_commands(rel, source=text):
+            if not toks or toks[0] in ("if", "elif", "while", "until", "for", "case", "then", "do", "else"):
+                continue
+            if n in inside or (len(toks) > 2 and toks[1:3] == ["(", ")"]):
+                continue                    # a function's body: its last check is what it returns
+            for stmt in statements(toks):
+                parts, ops = chain_parts(stmt)
+                kind = silent_check(parts[-1]) if "||" not in ops else None
+                where = start + n - 1
+                if kind:
+                    checks += 1
+                    what = ("a negated check never ends the step under errexit, so it cannot fail" if kind == "negated"
+                            else f"a check ({kind}) that ends the step with no word of why")
+                    rep.flag("S9.2.3", rel, where, " ".join(" ".join(stmt).split())[:80], what,
+                             "add || { echo \"FAIL: <what did not hold>\"; exit 1; }")
+                elif "||" in ops:
+                    tail = " ".join(parts[-1])
+                    if SILENT_HANDLER.match(tail) and silent_check(parts[ops.index("||")]):
+                        checks += 1
+                        rep.flag("S9.2.3", rel, where, " ".join(" ".join(stmt).split())[:80],
+                                 "a check whose failure ends the step with no word of why (|| exit)",
+                                 "echo a FAIL line saying what did not hold before the exit")
+    # The Python harness prints the diagnostics it keeps.
+    op = os.path.join(root, "ci", "vm", "operator-e2e.py")
+    if os.path.exists(op):
+        src = read(op)
+        m = re.search(r"\n    def diagnostics\(self\):\n(.*?)(?=\n    def |\nclass |\n[A-Za-z#])", src, re.S)
+        if not m or "print(" not in m.group(1):
+            rep.flag("S9.2.3", "ci/vm/operator-e2e.py", 0, "diagnostics()",
+                     "operator-e2e.py's diagnostics() keeps the failure's evidence but prints none of it to the job log",
+                     "print what it kept (the head of each text file)")
+        else:
+            rep.ok("S9.2.3", "ci/vm/operator-e2e.py", 0, "diagnostics() prints what it keeps")
+    run = subprocess.run(["bash", "-c", FAILURE_CHECK, "e9-guard", root], capture_output=True, text=True)
+    verdict = run.stdout.strip() or f"no verdict ({run.stderr.strip()[:120]})"
+    if verdict != "ok":
+        rep.flag("S9.2.3", "ci/evidence.sh", 0, "ev_save/ev_failures",
+                 f"ev_save and ev_failures, run on a failing command and a failing claim: {verdict}",
+                 "print a failed command's output tail to stderr in ev_save; repeat each FAIL in ev_failures")
+    else:
+        rep.ok("S9.2.3", "ci/evidence.sh", 0, "ev_save, run, prints a failed command's output to the log as well as "
+               "keeping it; ev_failures repeats a failed claim")
+    return (f"S9.2.3: {handlers} exiting fail() handler(s); {traps} script(s) under errexit, each trap run; "
+            f"{counted} verdict(s) on a count of failures; {checks} silent workflow check(s); "
+            f"{len(rep.violations('S9.2.3'))} violation(s)")
+
+
+# --- S9.1.4: a log line is polled ------------------------------------------------------
+
+LOG_READ = re.compile(r"\b(?:podman|docker)\s+(?:container\s+)?logs\b|\bjournalctl\b|\b(?:k3s\s+)?kubectl\s+logs\b")
+POLLERS = {"log_wait", "wait_for", "wait_until"}
+# What an assertion does with log text: match it, count it, cut it, test it.
+# A line that only says something: a message is not an assertion.
+MESSAGE = re.compile(r"^\s*(?:ev_text|ev_note|ev_pass|ev_fail|echo|printf|log)\b")
+ASSERTS = r"\b(?:grep|egrep|awk|sed|wc|case|cut|tail|head|test)\b|=~|\[\[?\s|<<<"
+
+
+def code_of(line):
+    """A line without its comment (a # that starts a word, outside quotes)."""
+    out, q = [], None
+    for i, c in enumerate(line):
+        if q:
+            if c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (i == 0 or line[i - 1] in " \t;"):
+            break
+        out.append(c)
+    return "".join(out)
+
+
+def poll_lines(lines):
+    """Line numbers (1-based) inside a polling loop: a for over $(seq ...) or
+    ((...)), a while or an until (not `while read`, which walks text), from
+    its head to its done."""
+    inside, stack = set(), []
+    for n, l in enumerate(lines, 1):
+        c = code_of(l)
+        if any(stack):
+            inside.add(n)
+        for m in re.finditer(r"(?:^\s*|[;&|{(]\s*|\b(?:then|do|else)\s+)(for|while|until)\b", c):
+            rest = c[m.start(1):]
+            poll = bool(re.match(r"for\s+\w+\s+in\s+\$\(\s*seq\b|for\s+\(\(|until\b", rest)) or (
+                rest.startswith("while") and not re.match(r"while\s+(?:IFS=\S*\s+)?read\b", rest))
+            stack.append(poll)
+            if poll:
+                inside.add(n)
+        for _ in re.findall(r"(?:^|[;&|]\s*|\s)done\b", c):
+            if stack:
+                stack.pop()
+    return inside
+
+
+def strip_desc(text):
+    """A command without its evidence descriptions ("EV-..."), which name the
+    command they describe."""
+    return re.sub(r'"EV-(?:[^"\\]|\\.)*"', '""', text)
+
+
+def log_source(text):
+    """(verb, name) of the first log read in a command: the container, pod or
+    unit whose log it reads."""
+    text = strip_desc(text)
+    m = LOG_READ.search(text)
+    if not m:
+        return None
+    verb = "journalctl" if "journalctl" in m.group(0) else m.group(0).split()[-2] if "kubectl" not in m.group(0) else "kubectl logs"
+    rest = text[m.end():]
+    try:
+        words = shlex.split(rest, comments=False)
+    except ValueError:
+        words = rest.split()
+    if verb == "journalctl":
+        for i, w in enumerate(words):
+            if w == "-u" and i + 1 < len(words):
+                return (verb, re.split(r"[\s|;)'\"]", words[i + 1])[0])
+            if re.match(r"^(?:--unit|_SYSTEMD_UNIT|UNIT)=", w):
+                return (verb, re.split(r"[\s|;)'\"]", w.split("=", 1)[1])[0])
+        return (verb, "")
+    skip_value = {"--since", "--until", "--tail", "-n", "--container", "-c", "--namespace", "-l"}
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w in skip_value:
+            i += 2
+            continue
+        if w.startswith("-") or w in ("2>&1", "2>/dev/null"):
+            i += 1
+            continue
+        return (verb, re.split(r"[\s|;)'\"]", w)[0])
+    return (verb, "")
+
+
+def log_helpers(funcs):
+    """Functions whose own output is a log: one command, a log read neither
+    captured nor sent elsewhere (desktop_log, sl_clog, pod_logs, ...)."""
+    out = set()
+    for name, first, flines in funcs:
+        body = [code_of(l) for l in flines]
+        if len(flines) == 1:
+            m = re.match(r"^[A-Za-z_][\w-]*\s*\(\)\s*\{(.*)\}\s*$", body[0])
+            cmds = [m.group(1)] if m else []
+        else:
+            cmds = [l for l in body[1:-1] if l.strip()]
+        if len(cmds) != 1 or "diagnostics" in name:
+            continue
+        c = cmds[0]
+        bare = re.sub(r"\d?>&\d|2>\s*/dev/null", "", c)
+        if LOG_READ.search(c) and not re.search(r"\w+=\$\(|>\s*\S|\bev_save\b|\bgrep\s+-\w*q", bare):
+            out.add(name)
+    return out
+
+
+def rule_s914(root, rep):
+    """S9.1.4: a log line an assertion reads is polled."""
+    cg = client_guard()
+    reads = polled = evidence = 0
+    for rel in shell_files(root):
+        if rel == "ci/evidence.sh":
+            continue
+        text = read(os.path.join(root, rel))
+        lines = text.split("\n")
+        funcs = shell_functions(text)
+        owner = {}
+        for f in funcs:
+            for k in range(f[1], f[1] + len(f[2])):
+                owner[k] = f
+        loops = poll_lines(lines)
+        helpers = log_helpers(funcs)
+        cmds = [(n, line, toks) for n, line, toks in cg.logical_commands(rel, source=text)]
+        # functions a poll runs: the command a poller is given, or one run in
+        # a polling loop
+        polled_fns = set()
+        for n, line, toks in cmds:
+            c = code_of(line)
+            for m in re.finditer(r"\b(?:log_wait|wait_for|wait_until)\s+(?:(?:\S+|\"[^\"]*\")\s+){2,3}?([A-Za-z_][\w-]*)\b", c):
+                polled_fns.add(m.group(1))
+            if n in loops:
+                polled_fns.update(re.findall(r"(?:^|[\s;&|(!])([A-Za-z_][\w-]*)\b", c))
+
+        def reads_log(c, toks):
+            c = strip_desc(c)
+            if LOG_READ.search(c):
+                return LOG_READ.search(c).group(0)
+            for t in toks or []:
+                for h in helpers:
+                    if t == h or t.startswith(f"$({h}") or re.search(rf"(?:^|[\s(`]){re.escape(h)}(?:\s|$|\))", t):
+                        return h
+            return None
+
+        helper_src = {}
+        for name, first, flines in funcs:
+            if name in helpers:
+                helper_src[name] = log_source(code_of(" ".join(flines)))
+
+        def source_of(c, toks):
+            h = reads_log(c, toks)
+            return log_source(c) or helper_src.get(h)
+
+        def judge(i, n, c, toks, src, fn):
+            """polled, or the same log waited on earlier: in the function, or
+            within the 20 commands before at a script's top level"""
+            if n in loops or (fn and fn[0] in polled_fns):
+                return True
+            if re.search(r"\b(?:log_wait|wait_for|wait_until)\b", c.split(src)[0]):
+                return True
+            mine = source_of(c, toks)
+            earlier = [x for x in cmds[:i] if (fn and fn[1] <= x[0]) or (not fn and x[0] not in owner)]
+            if not fn:
+                earlier = earlier[-20:]
+            for k, l2, t2 in earlier:
+                u = code_of(l2)
+                if k in loops or re.search(r"\b(?:log_wait|wait_for|wait_until)\b", u):
+                    theirs = source_of(u, t2)
+                    if mine and theirs and mine[1] == theirs[1] and mine[1]:
+                        return True
+            return False
+
+        for i, (n, line, toks) in enumerate(cmds):
+            c = code_of(line)
+            if not c.strip() or toks is None or CASE_LABEL.match(c):
+                continue
+            fn = owner.get(n)
+            if fn and (fn[0] in helpers or "diagnostics" in fn[0] or fn[0] in ("fail", "log_wait")):
+                continue
+            src = reads_log(c, toks)
+            if not src:
+                continue
+            reads += 1
+            one = " ".join(c.split())[:90]
+            cap = re.match(r"^\s*(?:local\s+)?([A-Za-z_]\w*)=\$\(", c)
+            after = c[c.index(src) + len(src):]
+            to_check = re.search(r"\|\s*(?:grep|egrep|awk|wc|sed\s+-n)\b", after) and not re.search(r">\s*/dev/null|>&2|\|\s*tee\b", after)
+            asserted = False
+            if cap:
+                v = cap.group(1)
+                end = (fn[1] + len(fn[2])) if fn else n + 60
+                for k, l2, _ in cmds[i + 1:]:
+                    if k > end:
+                        break
+                    u = code_of(l2)
+                    if re.match(rf"^\s*(?:local\s+)?{v}=", u) and not re.search(rf"\$\{{?{v}\b", u.split("=", 1)[1]):
+                        break
+                    if re.search(rf"\$\{{?{v}\b", u) and re.search(ASSERTS, u) and not MESSAGE.match(u):
+                        asserted = True
+                        break
+            elif to_check and not MESSAGE.match(c):
+                asserted = True
+            if not asserted:
+                evidence += 1
+                rep.ok("S9.1.4", rel, n, f"a log read kept as evidence, or for a later read, not asserted on here: {one}")
+                continue
+            if judge(i, n, c, toks, src, fn):
+                polled += 1
+                rep.ok("S9.1.4", rel, n, f"a log read an assertion reads, polled: {one}")
+            else:
+                rep.flag("S9.1.4", rel, n, one, f"a log read once that an assertion then reads: {one}",
+                         "read it with log_wait (ci/evidence.sh) for the line asserted, or, for an absence, after a "
+                         "log_wait on the same log for a line it writes later")
+    return (f"S9.1.4: {reads} read(s) of a container log, the journal or a pod log in ci/'s shell: {evidence} kept "
+            f"as evidence or not asserted on, {polled} that an assertion reads, polled; "
+            f"{len(rep.violations('S9.1.4'))} violation(s)")
+
+
+# --- S9.1.1's static half: the guards see their own checks fail ----------------------
+
+# Each tree guard the static job runs, and the argument that runs its
+# self-test: a planted violation each check must flag, the guard failing if
+# one is missed (client-guard and e9-guard also plant forms that must pass).
+GUARDS = {"ci/client-guard.py": "--self-test", "ci/e9-guard.py": "--self-test",
+          "ci/script-list.py": "self-test", "ci/layout-keywords.py": "self-test"}
+
+
+def static_job_runs(root):
+    """(first line, text) of each run: block of ci.yml's static job."""
+    rel = ".github/workflows/ci.yml"
+    path = os.path.join(root, rel)
+    if not os.path.exists(path):
+        return []
+    lines = read(path).split("\n")
+    start = next((i for i, l in enumerate(lines) if re.match(r"^  static:\s*$", l)), None)
+    if start is None:
+        return []
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^  [\w-]+:\s*$", lines[i])), len(lines))
+    return [(first, text) for r, first, text, _ in workflow_runs(root) if r == rel and start < first <= end]
+
+
+def rule_s911(root, rep):
+    """S9.1.1's static half: every tree guard the static job runs runs its
+    self-test; the static job runs no checker GUARDS does not name; every
+    e9-guard rule plants a violation it must flag and a form it must pass."""
+    rel = ".github/workflows/ci.yml"
+    invoked = {}
+    for first, text in static_job_runs(root):
+        for n, l in enumerate(text.split("\n")):
+            for m in re.finditer(r"\bpython3\s+(ci/[\w-]+\.py)((?:\s+[^\s;|&>()]+)*)", l):
+                invoked.setdefault(m.group(1), (first + n, set()))[1].update(m.group(2).split())
+    for g, arg in GUARDS.items():
+        if g not in invoked:
+            rep.flag("S9.1.1", rel, 0, g, f"the static job does not run {g}",
+                     f"run {g} {arg} in the static job, and fail the step on its status")
+        elif arg not in invoked[g][1]:
+            rep.flag("S9.1.1", rel, invoked[g][0], g, f"the static job runs {g} without its self-test ({arg})",
+                     f"run {g} {arg}: the checks are seen to fail on what it plants before they judge the tree")
+        else:
+            rep.ok("S9.1.1", rel, invoked[g][0], f"the static job runs {g} {arg}")
+    for g, (line, _) in sorted(invoked.items()):
+        if g not in GUARDS:
+            rep.flag("S9.1.1", rel, line, g, f"the static job runs {g}, a checker with no self-test GUARDS names",
+                     "give it a self-test that plants what it must catch, run it in the static job, and add it to GUARDS")
+    for r in RULES:
+        wants = [w for _, _, w in PLANTS.get(r, [])]
+        if not any(wants) or all(wants):
+            rep.flag("S9.1.1", "ci/e9-guard.py", 0, r,
+                     f"e9-guard's rule {r} plants {'no violation it must flag' if not any(wants) else 'no form it must pass'}",
+                     "add a planted file to PLANTS for each kind")
+        else:
+            rep.ok("S9.1.1", "ci/e9-guard.py", 0, f"rule {r} plants {sum(wants)} violation(s) it must flag and "
+                   f"{len(wants) - sum(wants)} form(s) it must pass")
+    expected = [e for _, e in client_guard().SELF_TEST.values()]
+    if not any(expected) or all(expected):
+        rep.flag("S9.1.1", "ci/client-guard.py", 0, "SELF_TEST",
+                 "client-guard's self-test plants no " + ("violation" if not any(expected) else "allowed form"),
+                 "add a planted file of each kind to SELF_TEST")
+    else:
+        rep.ok("S9.1.1", "ci/client-guard.py", 0, f"its self-test plants {sum(1 for e in expected if e)} violation(s) "
+               f"and {sum(1 for e in expected if not e)} allowed form(s)")
+    return (f"S9.1.1 (static half): {len(GUARDS)} guard(s) named, {len(invoked)} checker(s) the static job runs, "
+            f"{len(RULES)} e9-guard rule(s) with their plants; {len(rep.violations('S9.1.1'))} violation(s)")
+
+
+RULES = {"S9.1.1": rule_s911, "S9.1.2": rule_s912, "S9.1.3": rule_s913, "S9.1.4": rule_s914, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.3": rule_s923, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.2.6": rule_s926, "S9.3.1": rule_s931}
 
 # --- the self-test --------------------------------------------------------------------
 
 PLANTS = {
+    "S9.1.1": [
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py >/dev/null || rc=$?\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/new-check.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', True),
+        ('.github/workflows/ci.yml', 'name: ci\non: push\njobs:\n  static:\n    runs-on: ubuntu-latest\n    steps:\n      - name: guards\n        run: |\n          python3 ci/client-guard.py --self-test\n          python3 ci/e9-guard.py --self-test\n          python3 ci/script-list.py self-test\n          python3 ci/layout-keywords.py self-test\n          python3 ci/script-list.py check\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n', False),
+    ],
     "S9.1.5": [
         ("ci/p1.sh", "#!/bin/bash\nset -euo pipefail\nx=$(podman ps | grep -q y)\n", True),
         ("ci/p2.sh", "#!/bin/bash\nset -euo pipefail\nfoo | head -n1 || true\n", True),
@@ -2328,6 +2986,17 @@ PLANTS = {
         ("ci/p7.sh", "#!/bin/bash\nset -euo pipefail\nn=$(ls | wc -l)  # a | grep -q in a comment\ncase \"$x\" in head|tail) : ;; esac\n", False),
         ("ci/p8.sh", "#!/bin/bash\nset -euo pipefail\npodman logs d 2>&1 | while read -r l; do [ \"$l\" = x ] && break; done\n", True),
         ("ci/p9.sh", "#!/bin/bash\nset -euo pipefail\npodman logs d 2>&1 | grep -c x\npodman ps | sort | head -n -1\n", False),
+    ],
+    "S9.1.4": [
+        ('ci/l1.sh', '#!/bin/bash\nset -euo pipefail\nout=$(podman logs desktop 2>&1)\ngrep -q \'^ready\' <<<"$out" || fail \'not ready\'\n', True),
+        ('ci/l2.sh', '#!/bin/bash\nset -euo pipefail\nn=$(journalctl -u x.service --no-pager | grep -c started || true)\n[ "$n" -gt 0 ] || fail \'never started\'\n', True),
+        ('ci/l3.sh', '#!/bin/bash\nset -euo pipefail\ndlog() { podman logs desktop 2>&1; }\nx=$(dlog)\ngrep -q \'^ready\' <<<"$x" || fail \'not ready\'\n', True),
+        ('ci/l4.sh', '#!/bin/bash\nset -euo pipefail\ncheck() {\n    local l\n    l=$(kubectl logs pod-a)\n    grep -q \'capture ok\' <<<"$l"\n}\ncheck || fail \'no capture\'\n', True),
+        ('ci/l5.sh', '#!/bin/bash\nset -euo pipefail\nout=$(log_wait 30 1 \'^ready\' podman logs desktop) || true\ngrep -q \'^ready\' <<<"$out" || fail \'not ready\'\n', False),
+        ('ci/l6.sh', '#!/bin/bash\nset -euo pipefail\nfor _ in $(seq 10); do\n    out=$(podman logs d 2>&1)\n    grep -q x <<<"$out" && break\n    sleep 1\ndone\n', False),
+        ('ci/l7.sh', '#!/bin/bash\nset -euo pipefail\nev_save log "EV-LOG: podman logs desktop" podman logs desktop >/dev/null || true\npodman logs desktop 2>&1 | tail -n 5 >&2 || true\n', False),
+        ('ci/l8.sh', '#!/bin/bash\nset -euo pipefail\nf() {\n    local out\n    log_wait 30 1 \'^done\' podman logs desktop >/dev/null || true\n    out=$(podman logs desktop 2>&1)\n    ! grep -q bad <<<"$out" || fail \'bad\'\n}\n', False),
+        ('ci/l9.sh', '#!/bin/bash\nset -euo pipefail\nseen() { local l; l=$(podman logs d 2>&1); grep -q x <<<"$l"; }\nwait_for 10 1 \'x in the log\' seen\n', False),
     ],
     "S9.1.3": [
         ("ci/i1.sh", "podman exec desktop cat /proc/1/environ\n", True),
@@ -2393,6 +3062,19 @@ PLANTS = {
         ("ci/p6.sh", "#!/bin/bash\nset -e\nout=$(ls -l /etc/X11/xorg.conf.d)\ngrep -q 20-gpu.conf <<<\"$out\"\n", False),
         ("ci/p7.sh", "#!/bin/bash\nset -e\nc=$(systemctl cat desktop.service)\ngrep -q 'Image=x' <<<\"$c\"\n", True),
         ("ci/p8.sh", "#!/bin/bash\nset -e\nr=$(sed -n 's/.*value: \"\\(x\\)\"$/\\1/p' <<<\"$(helm template a b)\")\n", True),
+    ],
+    "S9.2.3": [
+        ('ci/t1.sh', '#!/bin/bash\nset -euo pipefail\n. ci/evidence.sh\nt_diagnostics() { echo "the state"; }\nfail() {\n    trap - ERR\n    local msg="FAIL: $*" d\n    echo "$msg" >&2\n    d=$(t_diagnostics 2>&1)\n    printf \'%s\\n\' "$d" >&2\n    ev_text failure-diagnostics "what fail() printed" "$d"\n    ev_abort "$*"\n    echo "$msg" >&2\n    exit 1\n}\ngrep -q x /etc/hostname\n', True),
+        ('ci/t2.sh', '#!/bin/bash\nset -euo pipefail\n. ci/evidence.sh\nfail() { echo "FAIL: $*" >&2; ev_abort "$*"; exit 1; }\nset -E\non_unhandled() {\n    [ "$BASH_SUBSHELL" = 0 ] || return 0\n    trap - ERR\n    fail "unhandled failure (exit $1) at $3: $2"\n}\ntrap \'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"\' ERR\n', True),
+        ('ci/t3.sh', '#!/bin/bash\nset -euo pipefail\n. ci/evidence.sh\nt_diagnostics() { echo "the state"; }\nfail() {\n    trap - ERR\n    local msg="FAIL: $*" d\n    echo "$msg" >&2\n    d=$(t_diagnostics 2>&1)\n    printf \'%s\\n\' "$d" >&2\n    ev_text failure-diagnostics "what fail() printed" "$d"\n    ev_abort "$*"\n    echo "$msg" >&2\n    exit 1\n}\nset -E\non_unhandled() {\n    trap - ERR\n    fail "unhandled failure (exit $1) at $3: $2"\n}\ntrap \'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"\' ERR\n', True),
+        ('ci/t4.sh', '#!/bin/bash\nfails=0\ncheck() { "$@" || { echo "FAIL: $*"; fails=$((fails + 1)); }; }\ncheck test -s /etc/hostname\nexit "$fails"\n', True),
+        ('.github/workflows/t5.yml', 'name: t\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - name: checks\n        run: |\n          out=$(cat /etc/hostname)\n          [ -n "$out" ]\n          grep -q x /etc/hostname || exit 1\n', True),
+        ('.github/workflows/t6.yml', 'name: t\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - name: checks\n        run: |\n          ! grep -q secret /etc/hostname\n', True),
+        ('ci/t7.sh', '#!/bin/bash\nset -euo pipefail\n. ci/evidence.sh\nt_diagnostics() { echo "the state"; }\nfail() {\n    trap - ERR\n    local msg="FAIL: $*" d\n    echo "$msg" >&2\n    d=$(t_diagnostics 2>&1)\n    printf \'%s\\n\' "$d" >&2\n    ev_text failure-diagnostics "what fail() printed" "$d"\n    ev_abort "$*"\n    echo "$msg" >&2\n    exit 1\n}\nset -E\non_unhandled() {\n    [ "$BASH_SUBSHELL" = 0 ] || return 0\n    trap - ERR\n    fail "unhandled failure (exit $1) at $3: $2"\n}\ntrap \'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"\' ERR\nx=$(grep -c x /etc/hostname || true)\n', False),
+        ('ci/t8.sh', '#!/bin/bash\n. ci/evidence.sh\nf=0\ncheck() { ev_check "$@" || f=1; }\ncheck "the host has a name" test -s /etc/hostname\nev_failures\nexit "$f"\n[ -s /etc/hostname ]\n', False),
+        ('ci/t9.sh', '#!/bin/bash\nfails=0\nfailed=()\nbad() { echo "FAIL $*"; fails=$((fails + 1)); failed+=("$*"); }\ntest -s /etc/hostname || bad "no hostname"\nif [ "$fails" -gt 0 ]; then\n    printf \'FAIL: %s\\n\' "${failed[@]}"\n    exit 1\nfi\n', False),
+        ('.github/workflows/t10.yml', 'name: t\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - name: checks\n        run: |\n          out=$(cat /etc/hostname)\n          [ -n "$out" ] || { echo "FAIL: no hostname"; exit 1; }\n          if grep -q x /etc/hostname; then echo has-x; fi\n          for c in a b; do [ -x "$c" ] && break; done\n          sudo podman run --rm img sh -c \'test -f /x\' || { echo "FAIL: no /x in the image"; exit 1; }\n', False),
+        ('ci/t11.sh', '#!/bin/bash\nset -euo pipefail\nset -E\non_unhandled() {\n    [ "$BASH_SUBSHELL" = 0 ] || return 0\n    trap - ERR\n    echo "FAIL: t11.sh: unhandled failure (exit $1) at $3: $2" >&2\n}\ntrap \'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"\' ERR\ntrue\n', False),
     ],
     "S9.2.6": [
         ("ci/d1.sh", "#!/bin/bash\nset -e\nrsync -a --chown=root:root deploy/host/ /\nsystemctl daemon-reload\n", True),
@@ -2516,7 +3198,12 @@ def main():
     for r, s in zip(rules, summaries):
         print("\n".join(rep.lines(r)))
         print(s)
-    bad = sum(len(rep.violations(r)) for r in rules)
+    bad = [l for r in rules for l in rep.lines(r) if l.startswith("VIOLATION")]
+    # Each violation again, last, where the end of the job log shows it
+    # (Requirements.md S9.2.3).
+    if bad or not ok:
+        print(f"e9-guard: FAIL: {len(bad)} violation(s)" + ("; the self-test failed (above)" if not ok else ""))
+        print("\n".join(bad))
     return 0 if ok and not bad else 1
 
 

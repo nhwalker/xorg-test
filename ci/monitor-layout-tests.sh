@@ -32,7 +32,8 @@ trap 'rm -rf "$TMP"' EXIT
 fails=0
 
 log()  { echo "== $*"; }
-fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); ev_fail "$*"; }
+fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); failed+=("$*"); ev_fail "$*"; }
+failed=()
 ok()   { ev_pass "$*"; }
 
 # The container's own layout, under the temporary directory: the host's
@@ -268,5 +269,7 @@ watch-line|a watch line, which the generator does not know|watch 5\nDP-1 1920x10
 EOF
 ev_end
 
-[ "$fails" = 0 ] || { echo "monitor layout tests: $fails failure(s)" >&2; exit 1; }
+# Each failure again, last, where the end of the job log shows it
+# (Requirements.md S9.2.3).
+[ "$fails" = 0 ] || { printf 'FAIL: %s\n' "${failed[@]}" >&2; echo "monitor layout tests: $fails failure(s)" >&2; exit 1; }
 echo "monitor layout tests passed"

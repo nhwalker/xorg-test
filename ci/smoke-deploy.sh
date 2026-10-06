@@ -26,7 +26,39 @@ log()  { echo "== $*"; }
 # an open story records that story as FAIL before the script exits.
 # shellcheck source=ci/evidence.sh
 . ci/evidence.sh
-fail() { echo "FAIL: $*" >&2; ev_abort "$*"; exit 1; }
+# What fail() prints and keeps: the containers, the desktop's log and its
+# unit's journal, as the job's "collect diagnostics" step prints them.
+smoke_diagnostics() {
+    echo "---- diagnostics: podman ps -a ----"
+    podman ps -a 2>&1 || true
+    echo "---- diagnostics: podman logs desktop (tail) ----"
+    podman logs desktop 2>&1 | tail -n 100 || true
+    echo "---- diagnostics: journalctl -u desktop.service (tail) ----"
+    journalctl -u desktop.service --no-pager 2>&1 | tail -n 50 || true
+}
+fail() {
+    trap - ERR
+    local msg="FAIL: $*" d
+    echo "$msg" >&2
+    d=$(smoke_diagnostics 2>&1)
+    printf '%s\n' "$d" >&2
+    ev_text failure-diagnostics "what fail() printed when this story failed: the containers, the desktop's log and its unit's journal" "$d"
+    ev_abort "$*"
+    echo "$msg" >&2
+    exit 1
+}
+# A command that fails where nothing handles it (errexit would end the
+# script with no word of why) reports through fail(): the command, its line,
+# the diagnostics, and the message repeated last (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    trap - ERR
+    fail "unhandled failure (exit $1) at $3: $2"
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 # First line of <text> matching <regex>, as a line number (empty when none:
 # under pipefail grep's no-match status would otherwise end the script, with
 # no FAIL saying why, at the caller's assignment).
@@ -471,7 +503,9 @@ ev_save restart "EV-STATE: systemctl restart desktop-seat-prep.service, the seco
     || fail "the second run of desktop-seat-prep.service did not exit 0"
 ev_pass "the second run, as the unit, exits 0"
 journalctl --sync 2>/dev/null || true
-slice=$(journalctl --after-cursor="$cursor" _SYSTEMD_UNIT=desktop-seat-prep.service -o cat --no-pager 2>/dev/null || true)
+# An absence, polled: any line of the unit's own, looked for over 5 s (none is
+# the pass), so a line the journal had not yet taken in cannot slip past.
+slice=$(log_wait 5 1 . journalctl -q --after-cursor="$cursor" _SYSTEMD_UNIT=desktop-seat-prep.service -o cat --no-pager) || true
 ev_text journal "EV-LOG-JOURNAL: everything desktop-seat-prep.service's own process logged on the second run (journalctl _SYSTEMD_UNIT=desktop-seat-prep.service after a cursor taken just before it)" \
     "${slice:-(nothing)}"
 # Nothing at all, not even seat-prep's "fuser not available": this runner
@@ -811,7 +845,9 @@ fi
 
 log "E2 on the first boot: the X session is up"
 wait_x_up "first boot"
-boot_log=$(desktop_log)
+# start-audio's line is the last of the first boot's prefixes the stories
+# below look for (the audio stack starts with the X session).
+boot_log=$(log_wait 30 1 '^start-audio: ' desktop_log) || true
 
 log "logging: every part of the desktop writes to its console log"
 ev_begin S2.6.1 "Everything lands in podman logs" T2
@@ -1031,7 +1067,9 @@ ev_save pids-after "EV-PIDS: the same after the session restarted: new Xorg and 
 ev_pass "a SIGTERM to mwm ended the session: Xorg $x_term_before -> $(first_xorg), a new mwm, and the display answers"
 [ -d "/proc/$initpid" ] || fail "desktop-init (pid $initpid) did not survive the session's end"
 ev_pass "desktop-init carried on (pid $initpid)"
-term_log=$(podman logs --since "$since_term" desktop 2>/dev/null | tr -d '\r' || true)
+# The session's exit line is the last of its end: a postmortem would come
+# before it.
+term_log=$(log_wait 30 1 '^desktop-init: session exited \(rc=' podman logs --since "$since_term" desktop) || true
 ev_text log "EV-LOG-DESKTOP: the desktop's log from just before the SIGTERM: the session's clean end and the new session" "$term_log"
 grep -q '^desktop-init: session exited (rc=0)' <<<"$term_log" || fail "desktop-init did not log the session's end"
 if grep -q '^postmortem:' <<<"$term_log"; then fail "a postmortem ran for mwm's clean exit"; fi
@@ -1040,7 +1078,10 @@ ev_end
 
 log "session-leader check: silent through the boot and a restart of each tree"
 ev_begin S2.3.4 "Session leader sanity check never fires in a normal boot" T2
-now_log=$(desktop_log)
+# An absence, polled: desktop-init checks a tree's leader within 2 s of its
+# start and says nothing when it passes, so the warning is looked for over
+# 3 s more (none is the pass).
+now_log=$(log_wait 3 1 'is not its own session leader' desktop_log) || true
 ev_text log "EV-LOG-DESKTOP: the desktop's log after its boot, the audio stack's restart (pipewire killed above) and the X session's (mwm killed above)" "$now_log"
 a=$(grep -c '^desktop-init: audio stack exited' <<<"$now_log" || true)
 x=$(grep -c '^desktop-init: session exited' <<<"$now_log" || true)
@@ -1096,7 +1137,7 @@ wait_xorg_conf
 # Captured, not piped into grep -q: this script runs under `set -o pipefail`,
 # and a grep that stops at the first match leaves podman writing into a closed
 # pipe - SIGPIPE, exit 141, and a passing check reported as a failure.
-gen_log=$(podman logs desktop 2>/dev/null || true)
+gen_log=$(log_wait 30 1 '^xorg-monitor-conf: ' podman logs desktop) || true
 case "$gen_log" in
     *xorg-monitor-conf*) ;;
     *) fail "the layout generator never ran" ;;
@@ -1120,7 +1161,7 @@ log "xorg-gpu-conf: the evidence lines come before the decision"
 ev_begin S3.1.5 "Evidence is logged before the decision" T2
 # Read whole, then cut: an awk that exits at the decision inside the pipe
 # would leave tr writing into a closed pipe (SIGPIPE, "Broken pipe").
-gpu_block=$(podman logs desktop 2>/dev/null | tr -d '\r' || true)
+gpu_block=$(log_wait 30 1 '^xorg-gpu-conf: decision:' podman logs desktop) || true
 gpu_block=$(awk '/^xorg-gpu-conf: /{print} /^xorg-gpu-conf: decision:/{exit}' <<<"$gpu_block")
 ev_text log "EV-LOG-DESKTOP: xorg-gpu-conf's lines in the desktop's log this boot, up to its decision" "${gpu_block:-(none)}"
 ev_save sysfs "EV-STATE: the runner's DRM connectors, which the container's sysfs shows too (cat /sys/class/drm/card*-*/status)" \
@@ -1309,7 +1350,8 @@ ev_pass "the generated config names the declared outputs"
 gen_grep_text -q 'Option      "Enable" "true"' "$mon" || fail "outputs not forced enabled"
 gen_grep_text -q 'Modeline "1920x1080_60.00"' "$mon" || fail "no derived timing for the declared mode"
 ev_pass "it forces them enabled, with the derived 1920x1080_60.00 timing"
-layout_log=$(podman logs desktop 2>/dev/null | grep 'xorg-monitor-conf: fixed layout' || true)
+layout_log=$(log_wait 30 1 'xorg-monitor-conf: fixed layout' podman logs desktop) || true
+layout_log=$(grep 'xorg-monitor-conf: fixed layout' <<<"$layout_log" || true)
 ev_text generator-log "EV-LOG-DESKTOP: the generator's 'fixed layout' lines in the desktop's log (one per start that applied a layout)" \
     "${layout_log:-(none)}"
 [ -n "$layout_log" ] || fail "the generator did not log the fixed layout it applied"
@@ -1324,7 +1366,8 @@ ev_save drm "EV-STATE: ls /sys/class/drm on the runner: the connectors the decla
 if ls -d /sys/class/drm/card*-DP-1 /sys/class/drm/card*-DP-2 >/dev/null 2>&1; then
     fail "the runner has a DP-1 or DP-2 connector, so the WARN cannot show here"
 fi
-pf=$(podman logs desktop 2>/dev/null | tr -d '\r' | grep '^preflight: .*monitor layout' | tail -n1 || true)
+pf=$(log_wait 30 1 '^preflight: .*monitor layout' podman logs desktop) || true
+pf=$(grep '^preflight: .*monitor layout' <<<"$pf" | tail -n1 || true)
 ev_text preflight "EV-LOG-DESKTOP: the container preflight's monitor-layout line at this start, DP-1 and DP-2 declared" "${pf:-(none)}"
 case "$pf" in
     "preflight: WARN: fixed monitor layout names output(s) DP-1 DP-2 with no matching DRM connector"*) ;;
@@ -1374,7 +1417,8 @@ ev_diff bin "EV-DIFF: the toolkit dir with the planted files, then after the rep
 ev_pass "the unshipped regular file is gone"
 [ -e /var/lib/desktop-container/bin/.keep ] || fail "the dotfile was removed"
 ev_pass "the dotfile is left alone"
-pr=$(desktop_log | grep '^pruned ' || true)
+pr=$(log_wait 30 1 '^pruned ' desktop_log) || true
+pr=$(grep '^pruned ' <<<"$pr" || true)
 ev_text log "EV-LOG-DESKTOP: publish-tools' 'pruned' lines in the desktop's log" "${pr:-(none)}"
 grep -qx 'pruned stale-tool (no longer shipped by this image)' <<<"$pr" || fail "no 'pruned stale-tool' line"
 ev_pass "publish-tools logged 'pruned stale-tool (no longer shipped by this image)'"
@@ -1458,7 +1502,7 @@ ev_note "desktop-host-shell.service after the start: $ks"
 [ "$ks" != active ] || fail "desktop-host-shell.service ran with the desktop, off-switch notwithstanding"
 [ ! -e /etc/desktop-container/host-shell-key ] || fail "a host-shell key appeared though nothing should have made one"
 ev_pass "nothing made a key: desktop-host-shell.service is $ks and /etc/desktop-container has no host-shell-key"
-off_log=$(desktop_log)
+off_log=$(log_wait 30 1 '^preflight: (PASS|WARN): .*host shell material' desktop_log) || true
 hs=$(grep -E '^host-shell-setup: |^preflight: (PASS|WARN): .*host shell material' <<<"$off_log" || true)
 ev_text log-off "EV-LOG-DESKTOP: host-shell-setup's lines and the preflight's host-shell row from this start's log" "${hs:-(none)}"
 grep -qx "host-shell-setup: no host shell key at /etc/desktop-container/host-shell-key; the 'Host Terminal' menu entry will not work" <<<"$hs" \
@@ -1479,7 +1523,7 @@ systemctl daemon-reload
 systemctl restart desktop.service || fail "desktop.service did not restart with the quadlet put back"
 wait_x_up "the Host Terminal back on"
 [ -f /etc/desktop-container/host-shell-key ] || fail "no fresh host-shell key once the quadlet was put back"
-on_log=$(desktop_log)
+on_log=$(log_wait 30 1 '^host-shell-setup: ' desktop_log) || true
 ev_text log-on "EV-LOG-DESKTOP: host-shell-setup's lines from the next start, the quadlet put back" \
     "$(grep -E '^host-shell-setup: ' <<<"$on_log" || echo '(none)')"
 grep -q "^host-shell-setup: host shell configured: 'ssh host' connects to 127.0.0.1 as " <<<"$on_log" \
@@ -1730,7 +1774,7 @@ ev_pass "xdpyinfo answers on it"
 ev_end
 
 ev_begin S2.3.4 "Session leader sanity check never fires in a normal boot" T2
-restart_log=$(desktop_log)
+restart_log=$(log_wait 3 1 'is not its own session leader' desktop_log) || true
 ev_text log-restarted "EV-LOG-DESKTOP: the log of the desktop's start after the stop" "$restart_log"
 warn=$(grep 'is not its own session leader' <<<"$restart_log" || true)
 [ -z "$warn" ] || fail "the session-leader warning fired after the restart: $warn"

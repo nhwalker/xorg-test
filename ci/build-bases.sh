@@ -3,6 +3,17 @@
 # A base is reused from GHCR when nothing that goes into it changed;
 # otherwise it is rebuilt (and pushed when PUSH_BASES=1).
 set -euo pipefail
+# A command that fails where nothing handles it would end the script, under
+# errexit, with no word of why: say which, and where (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    trap - ERR
+    echo "FAIL: build-bases.sh: unhandled failure (exit $1) at $3: $2" >&2
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 
 REG="${REGISTRY:?REGISTRY must be set, e.g. ghcr.io/owner}"
 PUSH="${PUSH_BASES:-0}"

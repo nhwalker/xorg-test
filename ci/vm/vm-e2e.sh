@@ -54,7 +54,40 @@ log()  { echo "== vm-e2e: $*"; }
 # Pitch each audio path plays (must match gen_tone in vm-guest.sh), so the
 # capture check can confirm the RIGHT tone came through, not just some sound.
 freq_for() { case "$1" in pulse) echo 440;; pipewire) echo 880;; alsa) echo 1320;; *) echo 0;; esac; }
-fail() { echo "FAIL: vm-e2e: $*" >&2; ev_abort "$*"; exit 1; }
+# What vm-e2e.sh's fail() prints and keeps: the guest's own diagnostics
+# (vm-guest.sh's: the desktop log, Xorg log, preflight, audio, SELinux and k3s
+# state) and the tail of the VM's serial console.
+host_diagnostics() {
+    if [ "$VM_UP" = 1 ]; then
+        echo "---- diagnostics: the guest (vm-guest.sh diag) ----"
+        VM_SSH_TIMEOUT=60 vm_ssh 'sudo repo/ci/vm/vm-guest.sh diag' 2>&1 | tail -n 200 || true
+    fi
+    echo "---- diagnostics: the serial console (tail) ----"
+    tail -n 40 "${VM_SERIAL:-/dev/null}" 2>&1 || true
+}
+fail() {
+    trap - ERR
+    local msg="FAIL: vm-e2e: $*" d
+    echo "$msg" >&2
+    d=$(host_diagnostics 2>&1)
+    printf '%s\n' "$d" >&2
+    ev_text failure-diagnostics "what fail() printed when this story failed: the guest's diagnostics and the serial console's tail" "$d"
+    ev_abort "$*"
+    echo "$msg" >&2
+    exit 1
+}
+# A command that fails where nothing handles it (errexit would end the
+# script with no word of why) reports through fail(): the command, its line,
+# the diagnostics, and the message repeated last (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    trap - ERR
+    fail "unhandled failure (exit $1) at $3: $2"
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 
 # ConnectTimeout only bounds the handshake, so a guest that accepts the
 # connection and then wedges would hang here indefinitely - and inside a
@@ -1124,9 +1157,10 @@ eff=$(ev_save sshd-config "EV-STATE: sshd -T's authorizedkeysfile: what sshd mak
 grep -qix 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u' <<<"$eff" \
     || fail "sshd's AuthorizedKeysFile is '$eff', want the stock .ssh/authorized_keys first and /etc/ssh/authorized_keys.d/%u after it"
 ev_pass "sshd reads both paths, the stock home-dir one first: $eff"
+# The journal is polled (log_wait): a login's own "Accepted" line can lag it.
 login=$(ev_save login "EV-STATE: a fresh ssh login as rocky, its home-dir key file, and from sshd's journal this boot: the reload, then the newest accepted key login for rocky" \
-    vm_ssh_quick 'echo "logged in as $(id -un)"; ls -l ~/.ssh/authorized_keys; sudo journalctl -u sshd -b --no-pager -o short-iso | grep -m1 "Received SIGHUP"; sudo journalctl -u sshd -b --no-pager -o short-iso | grep "Accepted publickey for rocky" | tail -1') \
-    || fail "ssh as rocky failed with the drop-in active"
+    log_wait 10 1 'Accepted publickey for rocky' vm_ssh_quick 'echo "logged in as $(id -un)"; ls -l ~/.ssh/authorized_keys; sudo journalctl -u sshd -b --no-pager -o short-iso | grep -m1 "Received SIGHUP"; sudo journalctl -u sshd -b --no-pager -o short-iso | grep "Accepted publickey for rocky" | tail -1') \
+    || fail "ssh as rocky failed with the drop-in active, or sshd's journal shows no key login accepted for rocky"
 grep -qx 'logged in as rocky' <<<"$login" || fail "the login did not land as rocky"
 hup=$(grep -m1 'Received SIGHUP' <<<"$login" | cut -d' ' -f1)
 acc=$(grep 'Accepted publickey for rocky' <<<"$login" | tail -1 | cut -d' ' -f1)

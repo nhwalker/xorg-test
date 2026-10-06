@@ -241,6 +241,10 @@ def main():
     n_cmd = sum(1 for r in report if re.search(r": podman (run|create)\b", r))
     n_man = sum(1 for r in report if "manifest" in r or r.endswith(("spc_t", "privileged: true")))
     print(f"client-guard: {n_cmd} podman run/create command(s) and {n_man} client manifest(s) read; {errors} violation(s)")
+    # Each violation again, last, where the end of the job log shows it
+    # (Requirements.md S9.2.3).
+    if errors:
+        print("\n".join(r for r in report if r.startswith("VIOLATION")))
     return 1 if errors else 0
 
 

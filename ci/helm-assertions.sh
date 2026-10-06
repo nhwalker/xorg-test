@@ -12,6 +12,17 @@ cd "$(dirname "$0")/.."
 # comment that names what is asserted cannot answer it (Requirements.md S9.1.2).
 # shellcheck source=ci/evidence.sh
 . ci/evidence.sh
+# A command that fails where nothing handles it would end the script, under
+# errexit, with no word of why: say which, and where (Requirements.md S9.2.3).
+# The main shell reports; a substitution's subshell leaves it to the
+# assignment that then fails.
+set -E
+on_unhandled() {
+    [ "$BASH_SUBSHELL" = 0 ] || return 0
+    trap - ERR
+    echo "FAIL: helm-assertions.sh: unhandled failure (exit $1) at $3: $2" >&2
+}
+trap 'on_unhandled $? "$BASH_COMMAND" "${BASH_SOURCE[0]}:$LINENO"' ERR
 
 ck() { if gen_grep_text -q -- "$1" "$2"; then echo "PASS: $3"; else echo "FAIL: $3"; exit 1; fi; }
 nk() { if gen_grep_text -q -- "$1" "$2"; then echo "FAIL: $3"; exit 1; else echo "PASS: $3"; fi; }

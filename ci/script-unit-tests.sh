@@ -17,7 +17,8 @@ trap 'rm -rf "$TMP"' EXIT
 fails=0
 
 log()  { echo "== $*"; }
-fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); ev_fail "$*"; }
+fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); failed+=("$*"); ev_fail "$*"; }
+failed=()
 ok()   { ev_pass "$*"; }
 want() { # <claim> <cmd...>: a check that must hold
     if "${@:2}"; then ok "$1"; else fail "NOT: $1"; fi
@@ -407,7 +408,10 @@ for what in "DRM nodes:" "connector card0-DP-1: connected" "connector card0-HDMI
 done
 ev_end
 
+# Each failure again, last, where the end of the job log shows it
+# (Requirements.md S9.2.3).
 if [ "$fails" -gt 0 ]; then
+    printf 'FAIL: %s\n' "${failed[@]}" >&2
     echo "script unit tests: $fails failure(s)" >&2
     exit 1
 fi
