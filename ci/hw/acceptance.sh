@@ -556,6 +556,9 @@ video_cycle() { # <story> <title> <what the tester does>
     ev_save xorg "EV-LOG-XORG: the Xorg log's lines from the cycle (connector events)" xorg_since "$lines" >/dev/null || true
     observe "the panel shows the picture again, unchanged, after the link retrained"
     media EV-PHONEVIDEO cycle "the monitor through the whole cycle"
+    if [ "$story" = S3.10.8 ]; then
+        media EV-PHOTO after "the desktop after the cable went back in"
+    fi
     ev_end
 }
 
