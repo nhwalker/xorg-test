@@ -559,8 +559,9 @@ capture_layout() {
         ev_note "the captured layout stays installed; the shipped file is at $HW_STATE/monitors.conf.before"
     else
         cp -a "$HW_STATE/monitors.conf.before" /etc/desktop-container/monitors.conf
-        restart_desktop restore || true
-        ev_note "monitors.conf put back as it was, and the desktop restarted"
+        if cmp -s "$HW_STATE/monitors.conf.before" /etc/desktop-container/monitors.conf && restart_desktop restore; then
+            ev_pass "monitors.conf put back as it was, and the desktop restarted on it"
+        else ev_fail "monitors.conf is not back as it was, or the desktop did not restart on it"; fi
     fi
     ev_end
 }

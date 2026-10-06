@@ -246,6 +246,8 @@ jobs:
             "each *-only pod requests exactly one desktop.local resource, and no client pod declares more than its requests"
           rule S9.2.4 "Probes yield integers, or fail" \
             "each counter read from the guest is an integer, or a failed read that fails or retries, before it is compared: never a stand-in number"
+          rule S9.2.5 "Restore what you changed" \
+            "each write under /etc in ci/'s shell and the workflows is one the guard's registry names: put back, or undone by the product, with a check of the restore after the write; or one that needs none (a scratch file, the shipped file itself, a container's own file, a VM discarded after the run)"
           rule S9.3.1 "Every story emits its named evidence on pass and on fail" \
             "every story the harness begins is one Requirements.md defines, and the evidence check fails each of five incomplete story directories and passes a complete one"
           exit "$f"
@@ -707,6 +709,9 @@ jobs:
             localhost/desktop-container:latest sh -c 'test "$DISPLAY" = :7'
           sudo rm -f /etc/desktop-container/client-cdi.conf
           sudo deploy/host/usr/local/libexec/desktop-client-cdi
+          sudo podman run --rm --device desktop.local/display=all \
+            localhost/desktop-container:latest sh -c 'test "$DISPLAY" = :0' \
+            || { echo "FAIL: with the override removed, the default :0 is not back"; exit 1; }
           # seat-prep: converges the runner's seat state and must be
           # idempotent (second run silent, exit 0)
           sudo deploy/host/usr/local/libexec/seat-prep.sh

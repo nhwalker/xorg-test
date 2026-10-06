@@ -776,6 +776,8 @@ desktop_up() {
         podman exec -u desktop -e DISPLAY=:0 desktop xdpyinfo
 }
 
+# A file's sha256, or "absent": what a restore is compared with.
+file_state() { if [ -e "$1" ]; then sha256sum < "$1" | cut -d' ' -f1; else echo absent; fi; }
 conn_connected() { [ "$(cat "$1/status")" = connected ]; }
 
 # The two connectors' sysfs directories, into conn and conn2.
@@ -1503,7 +1505,9 @@ monitors_set() { # two|shipped
     case "${1:-}" in
         two) printf 'Virtual-1  1024x768@60  +0+0      primary\nVirtual-2  1024x768@60  +1024+0\n' \
                 > /etc/desktop-container/monitors.conf ;;
-        shipped) install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf ;;
+        shipped) install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf
+            cmp -s deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf \
+                || fail "monitors-set shipped: the shipped file is not back" ;;
         *) fail "monitors-set: two or shipped" ;;
     esac
     systemctl restart desktop.service
@@ -1983,6 +1987,7 @@ deploy_tail() {
     systemctl stop display-manager.service
     rm -f /etc/systemd/system/display-manager.service
     systemctl daemon-reload
+    ! systemctl cat display-manager.service >/dev/null 2>&1 || fail "a display-manager.service is still installed"
     systemctl start desktop.service
     desk_back
     ev_save journal "EV-LOG-JOURNAL: desktop, getty@tty1 and display-manager through the test" \
@@ -2490,6 +2495,7 @@ host_audio() { # pulse-play|autospawn|alsa-setup|alsa-play|alsa-control|null-on|
         null-on) # S4.2.3
             ev_begin S4.2.3 "A host-local asound.conf still wins" T3
             [ ! -e /etc/asound.conf ] || cp -a /etc/asound.conf /etc/asound.conf.ev-saved
+            file_state /etc/asound.conf > /run/ev-asound-before
             printf 'pcm.!default {\n    type null\n}\n' > /etc/asound.conf
             ev_copy /etc/asound.conf asound-conf "EV-CONFIG: the host-local /etc/asound.conf: default routed to null"
             ev_end
@@ -2503,11 +2509,15 @@ host_audio() { # pulse-play|autospawn|alsa-setup|alsa-play|alsa-control|null-on|
             rm -f /etc/asound.conf
             [ -e /etc/asound.conf.ev-saved ] && mv /etc/asound.conf.ev-saved /etc/asound.conf
             ev_text removed "EV-STATE: /etc/asound.conf after the test" "$(ls -l /etc/asound.conf 2>&1 || true)"
+            want=$(cat /run/ev-asound-before) || fail "the state of /etc/asound.conf before the test was not kept"
+            got=$(file_state /etc/asound.conf)
+            [ "$got" = "$want" ] || fail "/etc/asound.conf is not back as it was: $got, before the test $want"
+            ev_pass "/etc/asound.conf is back as it was before the test: $got"
             ev_end
             ;;
         cleanup)
             pa_stub_remove
-            rm -f /run/ev-pulseaudio-starts.log /run/ev-empty-client.conf /tmp/s421.wav /tmp/s422.wav
+            rm -f /run/ev-pulseaudio-starts.log /run/ev-empty-client.conf /run/ev-asound-before /tmp/s421.wav /tmp/s422.wav
             ;;
         *) fail "host-audio: pulse-play, autospawn, alsa-setup, alsa-play, alsa-control, null-on, null-play, null-off or cleanup" ;;
     esac

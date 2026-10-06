@@ -1729,6 +1729,7 @@ def s3_11_2(ctx, st):
                  f"F3.10's common set {when}: every connector's sysfs status, then xrandr --query --verbose")
 
     seen = {}
+    found = dims()
     try:
         g.sh("repo/ci/vm/vm-guest.sh monitors-set two", timeout=240, label="declare two monitors, restart the desktop")
         ctx.measure_screen()
@@ -1825,6 +1826,12 @@ def s3_11_2(ctx, st):
              label="the shipped monitors.conf back, restart the desktop")
         with contextlib.suppress(Exception):
             ctx.measure_screen()
+    # The restore is checked, not assumed (Requirements.md S9.2.5).
+    back = g.sh("cmp -s repo/deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf "
+                "&& echo shipped || echo changed", check=False, label="monitors.conf against the shipped file").strip()
+    same = bool(re.fullmatch(r"\d+x\d+", found)) and wait_until(lambda: dims() == found, 30, 1)
+    st.check(back == "shipped" and same, f"restored: the shipped monitors.conf is back, and the screen is the "
+             f"{found} the story found", f"{back}; the screen {dims()}")
 
 
 def s7_7_1(ctx, st):
@@ -2822,6 +2829,16 @@ def s11_3_1(ctx, st):
             wpctl(ctx, "set-mute", "@DEFAULT_AUDIO_SINK@", "0")
             audio_snapshot(ctx, "end", "the audio state handed to the next phase: the built-in "
                            "output at the volume the story found it at")
+    # The restore is checked, not assumed (Requirements.md S9.2.5).
+    def restored():
+        gone = held["card"] is None or not any(node_name(ctx, i) == held["card"]
+                                               for i in wp_sinks(wpctl(ctx, "status")))
+        vol = wpctl(ctx, "get-volume", "@DEFAULT_AUDIO_SINK@").strip()
+        return gone and "MUTED" not in vol and (held["volume"] is None or vol == f"Volume: {held['volume']}"), gone, vol
+    ok = wait_until(lambda: restored()[0], 10, 0.5)
+    _, gone, vol = restored()
+    st.check(ok, "restored: the hot-added card is gone, and the built-in output is back at the volume the story "
+             "found it at, unmuted", f"card gone: {gone}; {vol}")
 
 
 # Marks the analysis reads the capture against. The built-in output's own

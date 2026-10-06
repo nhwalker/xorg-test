@@ -21,6 +21,10 @@
           that fails, or a poll that retries), never a number standing in
           for one: no `|| echo 0` on the read, no `${n:-0}` in a comparison,
           no Python handler that returns one;
+  S9.2.5  each write under /etc is put back, and the restore checked: the
+          RESTORES registry names, for every write, how (restored, undone
+          by the product, a scratch file, the shipped file, a discarded VM)
+          and the check, which must come after the write;
   S9.3.1  every story the harness begins is one Requirements.md defines, and
           the evidence check (ci/evlib.py check) fails each kind of
           incomplete story directory.
@@ -912,7 +916,9 @@ PREFIXES = {"sudo", "env", "exec", "command", "nice", "nohup", "time", "!", "{",
             "if", "then", "elif", "else", "while", "until", "do"}
 WRAPPERS_WITH_OPTIONS = {"sudo", "env", "nice", "nohup", "exec", "command"}
 EVERY_OPERAND = {"rm", "rmdir", "mkdir", "touch", "truncate", "tee", "chmod", "chown", "chcon", "unlink"}
-LAST_OPERAND = {"cp", "mv", "install", "ln", "rsync"}
+LAST_OPERAND = {"cp", "install", "ln", "rsync"}
+# The harness's functions that run a command after arguments of their own.
+RUNNERS = {"ev_save": 2, "ev_check": 1, "wait_for": 3}
 # podman run/create/exec options that take no value; every other one does.
 BOOL_OPTS = {"--rm", "--detach", "--interactive", "--tty", "--privileged", "--init", "--replace",
              "--read-only", "--quiet", "--latest", "--rmi", "--no-hosts"}
@@ -961,7 +967,7 @@ def cdi_edits(root, rep):
     return out
 
 
-def token_lists(cg, toks, held, depth=0):
+def token_lists(cg, toks, held, depth=0, extra=None):
     """A command's tokens, and those of every quoted string in it that holds
     a command line of its own (ssh, sh -c, undo_later's, a description that
     names one: the same line either way)."""
@@ -970,12 +976,13 @@ def token_lists(cg, toks, held, depth=0):
         return
     for t in toks:
         if re.search(r"\s", t) and (re.search(r"\b(podman|setenforce)\b", t) or QUADLET.search(t)
+                                    or (extra is not None and extra.search(t))
                                     or any(re.search(rf"\$\{{?{h}\b", t) for h in held)):
             try:
                 sub = cg.tokens(t)
             except ValueError:
                 continue
-            yield from token_lists(cg, sub, held, depth + 1)
+            yield from token_lists(cg, sub, held, depth + 1, extra)
 
 
 def simple_commands(cg, toks):
@@ -1007,6 +1014,9 @@ def command_word(words):
             k += 1
         elif wrapper and w.startswith("-"):
             k += 2 if w in ("-u", "-g", "-n", "--user", "--group") else 1
+        elif w in RUNNERS:
+            k += 1 + RUNNERS[w]            # the harness's own: the command follows its arguments
+            wrapper = False
         else:
             return os.path.basename(w), words[k + 1:]
     return "", []
@@ -1030,7 +1040,7 @@ def write_targets(words):
         k += 1
     verb, args = command_word(rest)
     operands = [a for a in args if not a.startswith("-")]
-    if verb in EVERY_OPERAND:
+    if verb in EVERY_OPERAND or verb == "mv":     # mv writes its source too: it is gone
         out += operands
     elif verb in LAST_OPERAND:
         out += operands[-1:] + [args[n + 1] for n, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")]
@@ -1264,7 +1274,191 @@ def rule_s921(root, rep):
             f"checked, from the generators' specs: {kinds or 'none found'}; {len(rep.violations('S9.2.1'))} violation(s)")
 
 
-RULES = {"S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.4": rule_s924, "S9.3.1": rule_s931}
+# S9.2.5: what each write under /etc in the tests changes, and what shows it
+# is back. An entry covers the writes whose logical line its regex matches;
+# its check (a regex) must match a line of the same file after the first
+# write it covers. The kinds:
+#   restored   the test puts the shipped state back, and checks it;
+#   product    the change is a condition the product under test undoes or
+#              regenerates itself, and the story checks that it did;
+#   scratch    a file the test created and removes again (rm -f under
+#              errexit fails loudly when it cannot);
+#   shipped    the write installs the deploy tree's own file;
+#   container  the write is a command line run in a scratch container, which
+#              the line hands to a helper of the test's (scenario, in_scratch);
+#   discarded  setup of a VM or runner that is thrown away after the run.
+RESTORES = [
+    # ci/hw/acceptance.sh (T4: undo_all runs each undo, the story then checks)
+    ("ci/hw/acceptance.sh", r"\$DROPIN(_DIR)?\b", "restored",
+     r"undone: the (toolkit's own spec back|drop-in gone)", "S8.1.4", "README.md's fallback drop-in, removed by undo_all"),
+    ("ci/hw/acceptance.sh", r"\$SPEC\b", "restored",
+     r"undone: the toolkit back, a real spec regenerated|the remedy regenerated a real spec",
+     "S8.1.2, S5.4.3", "the real spec moved away or made stale; put back by undo_all, or regenerated by README.md's remedy"),
+    ("ci/hw/acceptance.sh", r"/etc/desktop-container/monitors\.conf", "restored",
+     r"monitors\.conf is not back as it was", "S8.2.3",
+     "the captured layout installed; put back unless the tester keeps it for the KVM stories, which the evidence notes"),
+    # ci/host-shell-setup-tests.sh (T1: each scenario's setup runs in a scratch container)
+    ("ci/host-shell-setup-tests.sh", r"^scenario |^for c in \"missing-user", "container", None, "S5.7.7 (T1 half)",
+     "scenario hands its setup to in_scratch, which runs it in a scratch container of the image"),
+    # ci/smoke-deploy.sh (T2, the runner)
+    ("ci/smoke-deploy.sh", r'rm -f "\$SPEC"', "product", r"back to the stub", "S5.4.2",
+     "the NVIDIA spec removed: the converger writes it again"),
+    ("ci/smoke-deploy.sh", r'rm -f "\$DISPLAY_SPEC" "\$AUDIO_SPEC"', "product", r"display spec kind wrong", "S5.5.1",
+     "the client specs removed: the generator writes them again"),
+    ("ci/smoke-deploy.sh", r"/etc/cdi/desktop\.yaml", "product", r"legacy combined spec survived", "S5.5.1",
+     "the superseded combined spec planted: the generator removes it"),
+    ("ci/smoke-deploy.sh", r"DISPLAY_VALUE|cat > /etc/desktop-container/client-cdi\.conf|rm -f /etc/desktop-container/client-cdi\.conf$|mkdir -p /etc/desktop-container$",
+     "restored", r"defaults not restored after removing the override", "S5.5.2", "the override file written and removed: the defaults return"),
+    ("ci/smoke-deploy.sh", r"TOOLS_DIR=|rm -f \"\$TOOLS_SPEC\" /etc/desktop-container/client-cdi\.conf", "scratch", None, "S5.5.4",
+     "the override file and the spec the case wrote, removed again (the desktop's first publish writes the spec)"),
+    ("ci/smoke-deploy.sh", r"72-seat-ci-test|ci-fake-dm|display-manager\.service", "product", r"seat-prep second run not silent", "S5.3.1",
+     "a dirty seat staged: seat-prep walks it back, the fake units go, and a second seat-prep run is silent"),
+    ("ci/smoke-deploy.sh", r"/etc/desktop-container/monitors\.conf", "restored", r"the shipped monitors\.conf is not back", "S3.4.8, S3.4.11",
+     "a declared layout, then the shipped file put back"),
+    ("ci/smoke-deploy.sh", r'"\$QL"', "restored", r"desktop\.service did not restart with the quadlet put back", "S5.7.7",
+     "deploy/README.md's Host Terminal off-switch, then the saved quadlet put back"),
+    ("ci/smoke-deploy.sh", r"host-shell-key", "restored", r"no fresh host-shell key once the quadlet was put back", "S5.7.7",
+     "the key material removed: the next start makes a fresh key"),
+    # ci/vm/maint-guest.sh (maintainer journeys, a stock VM per shard)
+    ("ci/vm/maint-guest.sh", r"\$MT_MONCONF\b", "restored", r"the shipped monitors\.conf still generated a layout", "S10.3.1, S10.3.2",
+     "the captured layout and each S10.3.2 case; the shipped file put back"),
+    ("ci/vm/maint-guest.sh", r'"\$MT_PIN"', "restored", r"the published toolkit is not the \$1 image's", "S10.3.3",
+     "the documented digest pin, then removed: the route back runs the first image"),
+    ("ci/vm/maint-guest.sh", r"sed -i -E 's/\^\(Wants\|After\)=desktop-host-shell|rm -f \$MT_HSKEY", "discarded", None, "S10.3.5, S10.3.6",
+     "the documented off-switch, and the material it should have left gone, are the journey's end state: S10.3.6 turns the "
+     "Host Terminal on from its screen through the product, and the shard's VM is discarded"),
+    ("ci/vm/maint-guest.sh", r"rm -f /etc/udev/rules\.d/72-seat-\*\.rules", "restored", r"no staged node is tagged for seat1 any more", "S10.5.2",
+     "the seat rule the fault staged, removed by hand after a remedy that did not bring input back"),
+    ("ci/vm/maint-guest.sh", r"rm /etc/cdi/desktop-tools\.yaml", "product", r"after the start the node has no tools spec or no published toolkit", "S10.6.2",
+     "a never-provisioned node staged: the desktop's start publishes the toolkit and the watcher writes the spec again"),
+    # ci/vm/vm-guest.sh (the VM shards)
+    ("ci/vm/vm-guest.sh", r"/etc/cdi/desktop\.yaml", "product", r"the superseded combined spec survived", "S5.5.1",
+     "the superseded combined spec planted: desktop-client-cdi removes it"),
+    ("ci/vm/vm-guest.sh", r"cat > /etc/desktop-container/monitors\.conf|\"\$lines\" > /etc/desktop-container/monitors\.conf|^install -m644 deploy/host/etc/desktop-container/monitors\.conf",
+     "restored", r"the shipped monitors\.conf still generated a layout - it is not a no-op", "S3.4.9-S3.4.12",
+     "a declared layout (layout-declare, layout-roundtrip); layout-restore puts the shipped file back"),
+    ("ci/vm/vm-guest.sh", r"^(two|shipped)\) ", "restored", r"monitors-set shipped: the shipped file is not back", "S3.11.2",
+     "the operator phase's two-monitor layout, then the shipped file back"),
+    ("ci/vm/vm-guest.sh", r"rm -f /etc/cdi/desktop-display\.yaml", "product", r"came back different", "S5.5.6",
+     "the client specs removed: desktop-client-cdi.service writes them again, byte for byte"),
+    ("ci/vm/vm-guest.sh", r'rm -f "\$spec"', "product", r"the tools spec to come back", "S5.5.5",
+     "the tools spec removed: the .path unit has it written again"),
+    ("ci/vm/vm-guest.sh", r"/etc/containers/systemd/desktop\.container\.d", "restored", r"with the drop-in removed the desktop runs", "S5.2.6",
+     "deploy/README.md's image pin, then removed: the desktop runs :latest again"),
+    ("ci/vm/vm-guest.sh", r"getty@tty1\.service", "restored", r"getty@tty1 is not masked again", "S5.2.5",
+     "getty@tty1 unmasked and started on purpose, then masked again"),
+    ("ci/vm/vm-guest.sh", r"/etc/systemd/system/display-manager\.service", "restored", r"a display-manager\.service is still installed", "S5.2.5",
+     "a stand-in display manager, then removed"),
+    ("ci/vm/vm-guest.sh", r"\$SESSION_(AWAY|UNIT|WANTS)\b", "restored", r"desktop-session is not enabled again", "S5.8.4",
+     "desktop-session's unit moved away, then back"),
+    ("ci/vm/vm-guest.sh", r"/etc/asound\.conf", "restored", r"/etc/asound\.conf is not back as it was", "S4.2.3",
+     "a host-local asound.conf routing default to null, then the host's own back (or none)"),
+    ("ci/vm/vm-guest.sh", r"/etc/yum\.repos\.d/cri-o\.repo|/etc/crio/crio\.conf\.d", "discarded", None, "S7.3.x (k8s shard setup)",
+     "CRI-O's repository and its k3s drop-ins: the k8s shard's environment, on a VM discarded after the run"),
+    # .github/workflows/ci.yml (the dry-run step, on the runner)
+    (".github/workflows/ci.yml", r"DISPLAY_VALUE=:7|rm -f /etc/desktop-container/client-cdi\.conf|install -d /etc/desktop-container$",
+     "restored", r"the default :0 is not back", "S5.5.2 (T0 half)", "the DISPLAY override, then removed: the default comes back"),
+    (".github/workflows/ci.yml", r"install -Dm644 deploy/host/etc/desktop-container/shell-user", "shipped", None, "S5.7.x",
+     "the deploy tree's own shell-user file"),
+]
+RESTORE_KINDS = {"restored": True, "product": True, "scratch": False, "shipped": False, "container": False, "discarded": False}
+PLANT_RESTORES = []                     # the self-test's own entries, for its planted files
+ETC = re.compile(r"(?<![\w.~-])/etc/")
+
+
+def etc_holders(text):
+    """Variables that hold a path under /etc: assigned one, or built on one."""
+    held = set(re.findall(r"^\s*(?:local\s+|readonly\s+)?([A-Za-z_]\w*)=[\"']?/etc/", text, re.M))
+    built = re.findall(r"^\s*(?:local\s+|readonly\s+)?([A-Za-z_]\w*)=[\"']?\$\{?(\w+)\}?/", text, re.M)
+    for _ in range(3):
+        held |= {name for name, base in built if base in held}
+    return held
+
+
+def host_token_lists(cg, toks, held, depth=0, inside=False):
+    """token_lists, each list with whether it runs in a container: a quoted
+    command line given to podman run, create or exec runs there, not on
+    the host."""
+    yield toks, inside
+    if depth > 2:
+        return
+    podman = False
+    for k, t in enumerate(toks):
+        if t in cg.OPS:
+            podman = False
+        elif (t == "podman" or t.endswith("/podman")) and k + 1 < len(toks) and toks[k + 1] in ("run", "create", "exec"):
+            podman = True
+        elif re.search(r"\s", t) and (ETC.search(t) or any(re.search(rf"\$\{{?{h}\b", t) for h in held)):
+            try:
+                sub = cg.tokens(t)
+            except ValueError:
+                continue
+            yield from host_token_lists(cg, sub, held, depth + 1, inside or podman)
+
+
+def etc_writes(cg, rel, start, text):
+    """(line, logical line, target) of each write under /etc on the host."""
+    held = etc_holders(text)
+    seen = set()
+    for line, ltext, toks in cg.logical_commands(rel, text):
+        if toks is None:
+            continue
+        at = start + line - 1
+        code = " ".join(ltext.split())
+        for tl, inside in host_token_lists(cg, toks, held):
+            if inside:
+                continue
+            for words in simple_commands(cg, tl):
+                for t in write_targets(words):
+                    if (ETC.search(t) or any(re.search(rf"\$\{{?{h}\b", t) for h in held)) and (at, t) not in seen:
+                        seen.add((at, t))
+                        yield at, code, t
+
+
+def rule_s925(root, rep):
+    """S9.2.5: each write under /etc is restored, and the restore checked."""
+    cg = client_guard()
+    entries = [(f, re.compile(w, re.M), k, re.compile(c) if c else None, s, why)
+               for f, w, k, c, s, why in RESTORES + PLANT_RESTORES]
+    first, writes = {}, 0
+    for rel, start, text in shell_units(root):
+        for at, code, t in etc_writes(cg, rel, start, text):
+            writes += 1
+            hit = [i for i, e in enumerate(entries) if e[0] == rel and e[1].search(code)]
+            if not hit:
+                rep.flag("S9.2.5", rel, at, code, f"writes {t}, and no RESTORES entry says how it is put back: {code[:90]}",
+                         "restore it, check the restore, and add a RESTORES entry naming the check")
+                continue
+            i = hit[0]
+            first[i] = min(first.get(i, at), at)
+            f, w, k, c, s, why = entries[i]
+            rep.ok("S9.2.5", rel, at, f"writes {t} ({k}, {s}): {code[:80]}")
+    checked = 0
+    for i, (f, w, k, c, s, why) in enumerate(entries):
+        if k not in RESTORE_KINDS:
+            rep.flag("S9.2.5", f, 0, "", f"RESTORES entry for {s} has no kind {k!r}", f"one of {', '.join(RESTORE_KINDS)}")
+            continue
+        if i not in first:
+            rep.flag("S9.2.5", f, 0, w.pattern, f"the RESTORES entry for {s} ({w.pattern}) covers no write", "remove the entry, or fix its regex")
+            continue
+        if not RESTORE_KINDS[k]:
+            rep.ok("S9.2.5", f, first[i], f"{s}: {k}: {why}")
+            continue
+        lines = read(os.path.join(root, f)).split("\n")
+        at = next((n for n, l in enumerate(lines, 1) if n > first[i] and c and c.search(l)), None)
+        if at is None:
+            rep.flag("S9.2.5", f, first[i], c.pattern if c else "",
+                     f"{s}: no check matching /{c.pattern if c else ''}/ after the write at line {first[i]}",
+                     "check that the restore took effect, after the write")
+        else:
+            checked += 1
+            rep.ok("S9.2.5", f, at, f"{s}: {k}, checked here: {why}")
+    return (f"S9.2.5: {writes} write(s) under /etc read in ci/'s shell and the workflows; {len(entries)} RESTORES "
+            f"entr{'y' if len(entries) == 1 else 'ies'}, {checked} with a check found after its first write; "
+            f"{len(rep.violations('S9.2.5'))} violation(s)")
+
+
+RULES = {"S9.1.3": rule_s913, "S9.1.5": rule_s915, "S9.2.1": rule_s921, "S9.2.2": rule_s922, "S9.2.4": rule_s924, "S9.2.5": rule_s925, "S9.3.1": rule_s931}
 
 # --- the self-test --------------------------------------------------------------------
 
@@ -1322,6 +1516,17 @@ PLANTS = {
         (".github/workflows/w.yml", "on: push\njobs:\n  j:\n    runs-on: x\n    steps:\n"
                                     "      - run: sudo podman run --rm --device desktop.local/display=all -e DISPLAY=:0 img true\n", True),
     ],
+    "S9.2.5": [
+        ("ci/r1.sh", "#!/bin/bash\nset -e\necho 'x=1' > /etc/foo.conf\n", True),
+        ("ci/r2.sh", "#!/bin/bash\nset -e\nev_save edit \"the edit\" sed -i 's/a/b/' /etc/foo.conf\n", True),
+        ("ci/r3.sh", "#!/bin/bash\nset -e\nvm_ssh \"sudo tee /etc/foo.conf </dev/null\"\nmv /etc/bar.conf /tmp/bar\n", True),
+        ("ci/r4.sh", "#!/bin/bash\nset -e\ncp /etc/foo.conf /tmp/x\ngrep -q x /etc/foo.conf >/dev/null\n"
+                     "install -m644 deploy/host/etc/foo.conf \"$tmp/\"\n", False),
+        ("ci/r5.sh", "#!/bin/bash\nset -e\necho 'x=1' > /etc/plant.conf\nrm -f /etc/plant.conf\n"
+                     "[ ! -e /etc/plant.conf ] || fail \"the plant is still there\"\n", False),
+        ("ci/r6.sh", "#!/bin/bash\nset -e\n[ ! -e /etc/plant6.conf ] || fail \"the plant6 is still there\"\n"
+                     "echo 'x=1' > /etc/plant6.conf\nrm -f /etc/plant6.conf\n", True),
+    ],
     "S9.2.2": [
         ("ci/vm/x-only-pod.yaml", "apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - name: c\n      image: i\n      resources:\n"
                                   "        limits:\n          desktop.local/display: 1\n          desktop.local/tools: 1\n", True),
@@ -1331,12 +1536,20 @@ PLANTS = {
     ],
 }
 
+# RESTORES entries for the planted files: r5 checks its restore after the
+# write, r6 only before it.
+PLANT_ENTRIES = [
+    ("ci/r5.sh", r"/etc/plant\.conf", "restored", r"the plant is still there", "S0.0.1", "a planted write, restored and checked"),
+    ("ci/r6.sh", r"/etc/plant6\.conf", "restored", r"the plant6 is still there", "S0.0.2", "a planted write, checked before it was made"),
+]
+
 
 def self_test(root, rules):
     ok = True
     for rule, plants in PLANTS.items():
         if rule not in rules:
             continue
+        PLANT_RESTORES[:] = PLANT_ENTRIES if rule == "S9.2.5" else []
         for path, body, want in plants:
             with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as d:
                 os.makedirs(os.path.join(d, ".github", "workflows"))
@@ -1363,6 +1576,7 @@ def self_test(root, rules):
                     if path in l:
                         print(f"    {l}")
                 ok &= got == want
+    PLANT_RESTORES[:] = []
     # Every allow-list entry of these rules excuses something in the tree.
     rep = Report(ALLOW)
     for rule in rules:

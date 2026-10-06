@@ -1333,8 +1333,11 @@ esac
 ev_pass "the preflight warns about both names: $pf"
 ev_end
 # Put the shipped default back, so nothing after this point sees a layout the
-# tree does not actually ship.
+# tree does not actually ship; the desktop's next start (S5.7.7's, below)
+# reads it.
 install -m644 deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf
+cmp -s deploy/host/etc/desktop-container/monitors.conf /etc/desktop-container/monitors.conf \
+    || fail "the shipped monitors.conf is not back in /etc/desktop-container"
 
 # After the restart above: what it changed.
 log "after the restart: both units moved, the toolkit republished, the container's key renewed"
