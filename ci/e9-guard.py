@@ -48,7 +48,7 @@ ALLOW = [
     ("S9.1.3", "ci/vm/vm-guest.sh", r"readlink /proc/1/ns/cgroup",
      "the host's pid 1 on purpose: its cgroup namespace is compared with the container's"),
     ("S9.1.3", "ci/vm/vm-guest.sh", r"cat /proc/1/environ 2>&1 > /dev/null; echo rc=",
-     "S6.x: container root must be refused the host's pid 1"),
+     "S6.2.1: container root must be refused the host's pid 1"),
     ("S9.1.3", "ci/vm/vm-guest.sh", r"dd if=/proc/1/mem", "the same refusal, for /proc/1/mem"),
     ("S9.1.3", "ci/vm/vm-guest.sh", r"\"EV-STATE: reading /proc/1/(environ|mem)",
      "the evidence's description of those two refusals, not a read"),
@@ -329,6 +329,11 @@ def early_reader(reader, after):
     return None
 
 
+# A print of a variable already captured is the requirement's own remedy: the
+# shell writes the value at once, and no live process is left to be killed.
+# (Past the 64 KiB pipe buffer a reader that has stopped could still cut the
+# write short: an audit measured 0 failures in 300 up to 16 KiB, 2 at 60 KiB.
+# What is printed this way here is a command's short output.)
 PRINT_OF_VARIABLE = re.compile(
     r"""^(?:printf\s+(?:'[^']*'|"[^"$`]*")|echo(?:\s+-[neE]+)?)"""
     r"""(?:\s+(?:"\$(?:\{[^}]*\}|\w+)"|'[^']*'|"[^"$`]*"))+\s*$""")
