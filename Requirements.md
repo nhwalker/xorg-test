@@ -347,19 +347,19 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `start-session` runs via `setsid -c` as uid 61000 with the documented environment and tty1 as controlling tty.
 - Acceptance: `ps -o sess=,tty= -p <Xorg pid>` shows sid == the session leader pid and `tty1`; the leader's environment (the leader is `startx`) holds exactly the variables `run_session` in `image/init/desktop-init` sets, plus the `PWD` and `SHLVL` bash adds to anything it execs, and no `NVIDIA_*` or other container variables.
 - Evidence: EV-PIDS with sid and tty columns; `tr '\0' '\n' < /proc/<leader>/environ` (EV-STATE).
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: Xorg is in the process session `startx` leads, with tty1 as its controlling tty, and the leader's environment is exactly `run_session`'s ten variables plus the `PWD` and `SHLVL` bash adds, with no container variable. `artifacts/S2.3.1/` (artifact `evidence-vm-core`) holds the session's processes with their session ids and ttys (`ps -s`) and the leader's environment.
 
 **S2.3.2 The session restarts after Xorg exits, and the operator gets the desktop back**
 - Requirement: when the session exits, desktop-init logs `session exited (rc=N); restarting in 3s`, a new session starts, and within ~45 s the operator sees the desktop again (root colour, initial xterm, mwm frames).
 - Acceptance: kill Xorg as uid desktop; new Xorg and mwm pids; display answers.
 - Evidence: EV-VIDEO of the display through the restart (blank → desktop back); EV-PIDS before/after (Xorg and mwm changed, desktop-init unchanged); EV-LOG-DESKTOP.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_x_restart` (S4.5.1's step) kills Xorg and waits for a new Xorg pid and a running mwm, but keeps nothing of the restart for this story. The restart is proven with saved evidence only for "Quit session" (`operator-e2e:menu_quit_session`, in `artifacts/S11.1.1/`).
+- Tier: T3 · Coverage: ✅ `guest:verify_session_restart` kills Xorg as the desktop user, the console moved to tty2 first: within 45 s a new Xorg and mwm are up under the same desktop-init and the display answers, and desktop-init has logged the session's exit and its restart in 3 s; `e2e` records the display from before the kill until the desktop is back. `artifacts/S2.3.2/` (artifact `evidence-vm-core`) holds desktop-init, Xorg and mwm before and after with the diff, the desktop's log from the kill on, and the video.
 
 **S2.3.3 Session cleanup is scoped by session id and session tag, never by uid**
 - Requirement: after a session exits, every pid in that session id, and every desktop-user process whose environment carries that run's `DESKTOP_SESSION_TAG`, is TERMed then KILLed after 5 s; same-uid processes outside it (the audio tree, the host's `desktop-session-lead`, any other uid-61000 process on the host, processes started by `podman exec`) are untouched. The session id is the one `startx`, `xinit` and Xorg share; xinit starts the X client in a session of its own, which mwm leads (and each xterm's shell leads another), and the tag is what reaches those and whatever was started from them. A process that starts itself with a scrubbed environment escapes the tag, and so the cleanup unless it is in the server's session.
-- Acceptance: start a `nohup sleep` from the session's xterm, then kill Xorg; within 6 s no process carries the old leader's session id or the old tag; the old mwm, xterm and `sleep` are gone; PipeWire pid unchanged; host `desktop-session-lead` pid unchanged; a deliberately spawned uid-61000 `sleep` on the host survives.
+- Acceptance: start a `sleep` carrying the session's `DESKTOP_SESSION_TAG` (`podman exec -e`, as a process started from the session's xterm inherits it), a `podman exec` `sleep` without it, and a uid-61000 `sleep` on the host; kill Xorg; within 6 s no process carries the old leader's session id or the old tag; the old mwm, xterm and tagged `sleep` are gone; PipeWire pid unchanged; host `desktop-session-lead` pid unchanged; the untagged `sleep` and the host's survive.
 - Evidence: EV-PIDS before/after listing every uid-61000 process on the **host**, the index marking which must persist.
-- Tier: T3 · Coverage: ❌ evidence not saved; `guest:verify_audio_x_restart` asserts only that PipeWire keeps its pid when Xorg is killed, and nothing checks the host's other uid-61000 processes.
+- Tier: T3 · Coverage: ✅ `guest:verify_session_restart`: before the kill a `sleep` carrying the session's tag, a `podman exec` `sleep` without it and a uid-61000 `sleep` on the host are started; within 6 s of the kill no process of the old session id or with the old tag is left, the old mwm and the tagged `sleep` among them, while the untagged `sleep`, the host's, PipeWire and `desktop-session-lead` keep their pids. `artifacts/S2.3.3/` (artifact `evidence-vm-core`) holds what each probe must do, every uid-61000 process on the host before and after with its session id, and the diff (the old session, its xterm and the tagged `sleep` gone, the rest unchanged).
 
 **S2.3.4 Session leader sanity check never fires in a normal boot**
 - Requirement: `WARNING: ... is not its own session leader` never appears in a normal boot or after a restart of either tree.
@@ -389,9 +389,9 @@ the same directory also receives the diagnostics the harness already prints
 
 **S2.4.2 Any daemon exiting restarts the whole stack**
 - Requirement: `start-audio` returns on the *first* of the three exiting, logs which, TERMs the survivors, and a complete new set starts after 3 s.
-- Acceptance: kill pipewire → three new pids, line logged, export reachable (✅). Kill wireplumber alone → same with `wireplumber exited` (❌). Kill pipewire-pulse alone → same (❌).
+- Acceptance: kill pipewire, then wireplumber, then pipewire-pulse, each alone → each time three new pids, `<name> exited` and the restart logged, the export reachable.
 - Evidence: EV-PIDS before/after for the three daemons; EV-LOG-DESKTOP with the `<name> exited` and `restarting in 3s` lines; EV-AUDIO of a tone after recovery.
-- Tier: T2/T3 · Coverage: ❌ evidence not saved; `smoke`, `guest:verify_audio_lifecycle` and `operator-e2e:sound_persistence` kill only pipewire and check only its new pid.
+- Tier: T3 · Coverage: ✅ `guest:verify_audio_restarts` kills pipewire, wireplumber and pipewire-pulse in turn, each alone, as the desktop user: each time start-audio logs `<name> exited`, desktop-init logs the stack's restart in 3 s, all three daemons come back with new pids, and the export answers; `e2e` then hears a pulse client's 440 Hz tone through the restarted stack. `artifacts/S2.4.2/` (artifact `evidence-vm-core`) holds the daemons before and after each kill with the diffs, the desktop's log from each kill on, and the capture with its verdict and level plot.
 
 **S2.4.3 Stale export sockets are cleared before every audio start**
 - Requirement: the socket and lock files are removed before each start so PipeWire can re-bind.
@@ -421,7 +421,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `umask 0000` makes the exported sockets world-connectable.
 - Acceptance: as the unprivileged `rocky` user on the VM host, `pactl info` succeeds and `paplay` of a tone is heard.
 - Evidence: `ls -l /run/desktop-audio` (EV-STATE); `id` of the probe user; EV-AUDIO.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:play_as_rocky`: as the unprivileged `rocky` user on the VM host, `pactl info` answers over the export, and `paplay` of an 880 Hz tone is heard at the machine's output. `artifacts/S2.4.7/` (artifact `evidence-vm-core`) holds rocky's `id`, `ls -l /run/desktop-audio`, the `pactl info` and `paplay` transcript, and the capture with its verdict and level plot.
 
 ### F2.5 Shutdown
 
@@ -511,13 +511,13 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `-nolisten tcp`; nothing listens on 6000+ on the host network.
 - Acceptance: `ss -ltn` on the VM host shows no 6000-range listener.
 - Evidence: `ss -ltnp` (EV-STATE); `ps -o args= -C Xorg` showing `-nolisten tcp`.
-- Tier: T3 · Coverage: ❌.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: Xorg's command line carries `-nolisten tcp`, and `ss -ltnp` on the VM host, whose network the container shares, lists no listener on TCP 6000–6063. `artifacts/S3.2.4/` (artifact `evidence-vm-core`) holds `ss -ltnp` and Xorg's command line.
 
 **S3.2.5 The session activates its VT, so the operator sees it**
 - Requirement: Xorg `VT_ACTIVATE`s tty1 at start; the desktop is visible even if the console was on another VT.
-- Acceptance: `fgconsole` is `1` after boot; `chvt 2`, kill Xorg, after restart `fgconsole` is `1` and the display shows the desktop.
-- Evidence: `fgconsole` before/after (EV-STATE); EV-SHOT after restart showing the desktop, not a text console.
-- Tier: T3 · Coverage: ❌.
+- Acceptance: the active VT (`/sys/class/tty/tty0/active`, what `fgconsole` reports) is tty1 after boot; switch the console to tty2, kill Xorg; after the restart the active VT is tty1 and the display shows the desktop.
+- Evidence: the active VT before, after the switch and after the restart (EV-STATE); EV-SHOT after restart showing the desktop, not a text console.
+- Tier: T3 · Coverage: ✅ `guest:verify_session_restart`: the active VT is tty1, the console is switched to tty2 before Xorg is killed, and the new session takes it back to tty1 by itself; `e2e` then shoots the display, the desktop on tty1. `artifacts/S3.2.5/` (artifact `evidence-vm-core`) holds the active VT before, after the switch and after the restart, and the screenshot.
 
 **S3.2.6 The X socket is shared through the host directory**
 - Requirement: Xorg's socket appears at the host's `/tmp/.X11-unix/X0`; a host process can render/capture.
@@ -531,7 +531,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `xhost +local:` ran; any local uid connects without a cookie.
 - Acceptance: `xhost` lists `LOCAL:`; a client with only the socket connects.
 - Evidence: `xhost` output (EV-STATE).
-- Tier: T3 · Coverage: ❌ `xhost` is never run or saved; `guest:phase_deploy` asserts only that a confined client holding just the socket opens `:0`.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: `xhost` as the session user lists `LOCAL:`, and a confined client of uid 4321 with no passwd entry, no cookie and no `XAUTHORITY`, given only `desktop.local/display=all`, opens `:0` with `xdpyinfo`. `artifacts/S3.3.1/` (artifact `evidence-vm-core`) holds the `xhost` output and the client's run.
 
 **S3.3.2 Screensaver and DPMS are off, so the screen never blanks on the user**
 - Requirement: `xset s off` and `xset -dpms` took effect.
@@ -708,7 +708,7 @@ the same directory also receives the diagnostics the harness already prints
 - Requirement: `/run/udev` is mounted `ro` and non-empty; no udevd process shares the container's mount namespace (a process listing proves nothing: under `--pid=host` the host's `systemd-udevd` shows up inside).
 - Acceptance: mount line shows `ro`; preflight PASS.
 - Evidence: `/proc/self/mounts` line and `ls /run/udev/data | wc -l` (EV-STATE); EV-LOG-DESKTOP preflight line.
-- Tier: T3 · Coverage: ❌ nothing asserts the mount, the database or the preflight line; typing working (`e2e` "input: type into an xterm") implies only that Xorg can read the udev database.
+- Tier: T3 · Coverage: ✅ `guest:verify_runtime`: `/run/udev` is mounted `ro` in the container's own mount table and holds the host's database (`/run/udev/data` is not empty), the preflight logs `PASS: host udev database mounted at /run/udev`, and no udevd on the host is in the container's mount namespace. `artifacts/S3.8.5/` (artifact `evidence-vm-core`) holds the mount line, the database's entry count, the preflight's lines, and every udevd with its mount namespace beside desktop-init's.
 
 **S3.8.6 Foreign seat tags are detected and undone**
 - Requirement: a device attached to another seat is reported by preflight as a WARN until `seat-prep` removes the rule and re-triggers udev.
@@ -922,7 +922,7 @@ event, EV-TIMELINE.
 - Requirement: `RLIMIT_RTPRIO` hard = 95, memlock 64 MiB, nice 31 on the PipeWire process itself.
 - Acceptance: `/proc/<pipewire>/limits`.
 - Evidence: the limits file (EV-STATE).
-- Tier: T3 · Coverage: ❌ evidence not saved (the limits file); `guest:verify_privileges` asserts only the rtprio hard limit, not memlock or nice.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges` reads `/proc/<pipewire>/limits`: realtime priority 95, locked memory 64 MiB (67108864 bytes) and nice 31, each soft and hard. `artifacts/S4.3.1/` (artifact `evidence-vm-core`) holds the limits file.
 
 **S4.3.2 PipeWire holds SCHED_FIFO above priority 1 without rtkit**
 - Requirement: no `rtkit-daemon`; ≥ 1 PipeWire thread is `FF` with rtprio > 1.
@@ -1395,19 +1395,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: `CapEff` decodes to exactly the nine granted capabilities.
 - Acceptance: `capsh --decode` equals the set.
 - Evidence: the decode output vs the quadlet's `AddCapability` lines (EV-DIFF).
-- Tier: T3 · Coverage: ❌ no test; `guest:verify_privileges` reads `CapEff` but checks only the forbidden bits.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges` decodes desktop-init's `CapEff` bit by bit and compares it with the installed quadlet's `AddCapability` lines: the same nine, no difference. `artifacts/S6.1.3/` (artifact `evidence-vm-core`) holds the quadlet's capability lines, both sorted lists and the empty diff.
 
 **S6.1.4 Device cgroup is bounded**
 - Requirement: `/dev/mem` cannot be read; the five allowed majors can.
 - Acceptance: a `c 1:1` node created in the container's own `/dev` cannot be opened (EPERM), and one node of each allowed major (13, 116, 226, 4, 5) can. Not under `/tmp`: podman mounts `Tmpfs=` `nodev` by default, so a node there is refused whatever the device cgroup allows.
-- Evidence: the `mknod`/`dd` transcript with errno (EV-STATE); `cat /sys/fs/cgroup/.../devices.list` or the eBPF equivalent where readable.
-- Tier: T3 · Coverage: ❌ evidence not saved, and `guest:verify_privileges` cannot tell a device-cgroup denial from the nodev on `/tmp` (podman's default for `Tmpfs=`), where it makes the `/dev/mem` node; the allowed majors are exercised only as side effects of the X, input and audio tests.
+- Evidence: the `mknod`/`dd` transcript with errno (EV-STATE); the quadlet's `--device-cgroup-rule` flags and the device list of the container's OCI spec, which crun compiles into the cgroup v2 BPF program (cgroup v2 has no `devices.list`).
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`, as container root in the container's own `/dev`: a `c 1:1` node is refused (`Operation not permitted`) and a node of each allowed major (13, 116, 226, 4, 5) opens; the container's OCI spec lists the quadlet's five rules after its deny-all. `artifacts/S6.1.4/` (artifact `evidence-vm-core`) holds the quadlet's rules, the spec's device list in order, and each probe with its error.
 
 **S6.1.5 `/sys` is read-only and non-recursive**
-- Requirement: `/sys` mount is `ro`; nothing is mounted at `/sys/fs/cgroup` or `/sys/fs/selinux` inside (the empty mountpoint directories remain under a non-recursive bind).
-- Acceptance: `guest:verify_privileges` (ro); ❌ submounts.
-- Evidence: `/proc/<init>/mounts` filtered to `/sys` (EV-STATE); `ls /sys/fs`.
-- Tier: T3 · Coverage: ❌ submounts untested and evidence not saved; `guest:verify_privileges` asserts `ro` from the init's own mount table.
+- Requirement: `/sys` mount is `ro`, and the bind is non-recursive: none of the host's mounts under `/sys` (its cgroup2, selinuxfs, debugfs and the rest) is in the container. The only mounts under the container's `/sys` are podman's own, from the container's OCI spec: the container's own cgroup2 at `/sys/fs/cgroup`, read-only, and empty read-only tmpfs masks over the spec's masked paths (`/sys/firmware`, `/sys/fs/selinux`).
+- Acceptance: `guest:verify_privileges`: `/sys` is `ro` in the container's own mount table; every mount under it is one the OCI spec makes, in the form the spec gives it (its cgroup mount a read-only cgroup2, each masked path an empty read-only tmpfs); none of the VM host's mounts under `/sys` is among them.
+- Evidence: `/proc/<init>/mounts` filtered to `/sys` (EV-STATE); the OCI spec's mounts, masked and read-only paths under `/sys` (EV-CONFIG); the VM host's own mounts under `/sys` (EV-STATE); the masks' listing and `ls /sys/fs`; the container's and the host's cgroup namespaces.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`: `/sys` is `ro` in the container's own mount table; the mounts under it are the container's own read-only cgroup2 at `/sys/fs/cgroup`, as its OCI spec asks, and podman's empty read-only tmpfs masks over `/sys/firmware` and `/sys/fs/selinux`, the spec's masked paths; none of the VM host's nine mounts under `/sys` is in the container. `artifacts/S6.1.5/` (artifact `evidence-vm-core`) holds the container's `/sys` mounts, the spec's, the host's, the masks' listing, `/sys/fs`, and the two cgroup namespaces (they differ: the container sees only its own cgroup tree).
 
 ### F6.2 Namespace sharing and mandatory access control
 
@@ -1415,19 +1415,19 @@ daemons, EV-LOG-DESKTOP slice, EV-TIMELINE.
 - Requirement: the container sees host pids but, as container root, cannot signal a host process of another uid (`kill -0 <pid>` → EPERM) nor read pid 1's memory or environ. kill(2) allows a signal between processes of the same uid without `CAP_KILL`, and with no user namespace container root is host uid 0, so signalling host processes that also run as root is not prevented by this design; the original `kill -0 1` → EPERM acceptance could not hold.
 - Acceptance: as stated, as container root.
 - Evidence: the three command transcripts with errno (EV-STATE); `ls /proc | head`.
-- Tier: T3 · Coverage: ❌ negatives untested and evidence not saved; `smoke` and `guest:verify_privileges` assert visibility (the recorded init pid resolves to `desktop-init` on the host).
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`, as container root: `/proc` lists the host's pids, but `kill -0` on a `sleep` of the unprivileged `rocky` user is refused (`Operation not permitted`), and pid 1's `environ` and `mem` cannot be read (`Permission denied`). `artifacts/S6.2.1/` (artifact `evidence-vm-core`) holds the target process, `ls /proc`, and the three transcripts with their exit statuses.
 
 **S6.2.2 Host network namespace**
 - Requirement: the container's interfaces equal the host's.
 - Acceptance: `readlink /proc/self/ns/net` inside equals the host's, and the interface names in `/proc/net/dev` match (the image may not ship `ip`).
 - Evidence: both outputs (EV-DIFF empty).
-- Tier: T3 · Coverage: ❌ no direct test and no evidence; shared networking is exercised only as a side effect, by the container's `ssh host` (to `127.0.0.1`) reaching the host's sshd in `smoke` and `guest:phase_deploy`.
+- Tier: T3 · Coverage: ✅ `guest:verify_privileges`: `readlink /proc/self/ns/net` is the same inside the container as on the VM host, and so are the interface names in `/proc/net/dev`. `artifacts/S6.2.2/` (artifact `evidence-vm-core`) holds both namespace links, both interface lists and their empty diff.
 
 **S6.2.3 SELinux separation off for the desktop, AppArmor unconfined**
 - Requirement: desktop processes run `spc_t`/unconfined; on an AppArmor host the profile is `unconfined`.
 - Acceptance: `ps -Z -p <init>` on the VM; `podman inspect … AppArmorProfile` on the runner.
 - Evidence: both outputs (EV-STATE).
-- Tier: T2/T3 · Coverage: ❌ no test of the running labels; `dryrun` checks only that `label=disable` reaches the generated `ExecStart`, and `apparmor=unconfined` is not checked anywhere.
+- Tier: T2/T3 · Coverage: ✅ the T3 half: `guest:verify_privileges` finds desktop-init running as `system_u:system_r:spc_t:s0` on the VM, SELinux enforcing; `artifacts/S6.2.3/` (artifact `evidence-vm-core`) holds its label and `podman inspect`'s process label, AppArmor profile and security options. The T2 half: `smoke` on the runner, an AppArmor host, finds `podman inspect` reporting `AppArmorProfile=unconfined` and desktop-init's `/proc/<pid>/attr/current` reading `unconfined`; `artifacts/S6.2.3/` (artifact `evidence-smoke`) holds both.
 
 **S6.2.4 Not systemd mode**
 - Requirement: `--systemd=false`: stop signal SIGTERM; no systemd-mode tmpfs set.
@@ -2299,15 +2299,15 @@ moves to ✅ only when a CI run has saved its evidence, which the
 | Epic | Stories | ✅ | 🟡 | ❌ | 🔧 |
 |---|---|---|---|---|---|
 | E1 Image build | 14 | 12 | 0 | 2 | 0 |
-| E2 Boot & supervision | 25 | 17 | 1 | 7 | 0 |
-| E3 Display & session | 62 | 43 | 1 | 15 | 3 |
-| E4 Audio | 23 | 15 | 0 | 7 | 1 |
+| E2 Boot & supervision | 25 | 22 | 1 | 2 | 0 |
+| E3 Display & session | 62 | 47 | 1 | 11 | 3 |
+| E4 Audio | 23 | 16 | 0 | 6 | 1 |
 | E5 Deploy tree | 50 | 25 | 1 | 23 | 1 |
-| E6 Privileges | 9 | 3 | 0 | 6 | 0 |
+| E6 Privileges | 9 | 9 | 0 | 0 | 0 |
 | E7 Client contract & journeys | 40 | 19 | 1 | 20 | 0 |
 | E10 Maintainer experience | 23 | 0 | 0 | 22 | 1 |
 | E11 Operator experience | 5 | 5 | 0 | 0 | 0 |
-| **Total** | **251** | **139** | **4** | **102** | **6** |
+| **Total** | **251** | **155** | **4** | **86** | **6** |
 
 Regenerate after editing with:
 
