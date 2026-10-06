@@ -344,6 +344,69 @@ ok_if "round trip: DP-2 is placed at 1920,0 and rotated left" "has \"\$gen\" 'Op
 ok_if "round trip: DP-1 is primary at 0,0" "has \"\$gen\" 'Option      \"Position\" \"0 0\"' && has \"\$gen\" 'Option      \"Primary\" \"true\"'"
 ev_end
 
+# --- S3.1.3-S3.1.5: xorg-gpu-conf on a fabricated /dev and sysfs -----------
+G=$TMP/gpu
+gpu_case() { # <case>: make that case's fake /dev and sysfs
+    mkdir -p "$G/$1/dev/dri" "$G/$1/sys" "$G/$1/lib" "$G/$1/etc"
+}
+connector() { # <case> <connector> <status>
+    mkdir -p "$G/$1/sys/$2"
+    echo "$3" > "$G/$1/sys/$2/status"
+}
+gpuconf() { # <case>: run it against that case's fakes
+    GPU_DEV_DIR="$G/$1/dev" GPU_SYS_DRM="$G/$1/sys" GPU_LIB_DIRS="$G/$1/lib" \
+        GPU_OUT="$G/$1/etc/20-gpu.conf" image/xorg/xorg-gpu-conf.sh
+}
+statuses() { # <case>: every fabricated connector and its status, as cat would show
+    for f in "$G/$1"/sys/card*-*/status; do printf '%s: %s\n' "${f#"$G/$1/sys/"}" "$(cat "$f")"; done
+}
+
+ev_begin S3.1.3 "modesetting picks the first connected connector's card" T1
+gpu_case second
+: > "$G/second/dev/dri/card0"; : > "$G/second/dev/dri/card1"
+connector second card0-DP-1 disconnected
+connector second card1-HDMI-A-1 connected
+ev_text second-sysfs "EV-STATE: the fabricated connectors (cat <sysfs>/card*-*/status): card0's disconnected, card1's connected" "$(statuses second)"
+out=$(ev_save second "xorg-gpu-conf with card0's connector disconnected and card1's connected" gpuconf second) \
+    || fail "xorg-gpu-conf exited non-zero"
+ev_copy "$G/second/etc/20-gpu.conf" second-config "EV-CONFIG: the 20-gpu.conf it wrote"
+want "card1, whose connector is connected, becomes kmsdev" grep -qF "Option     \"kmsdev\" \"$G/second/dev/dri/card1\"" "$G/second/etc/20-gpu.conf"
+want "and the decision is logged" has "$out" "decision: modesetting driver on $G/second/dev/dri/card1"
+gpu_case none
+: > "$G/none/dev/dri/card0"
+connector none card0-DP-1 disconnected
+ev_text none-sysfs "EV-STATE: the fabricated connectors: none connected" "$(statuses none)"
+out=$(ev_save none "xorg-gpu-conf with no connected connector" gpuconf none) || fail "xorg-gpu-conf exited non-zero"
+ev_copy "$G/none/etc/20-gpu.conf" none-config "EV-CONFIG: the 20-gpu.conf it wrote"
+want "no connected connector: card0 becomes kmsdev" grep -qF "Option     \"kmsdev\" \"$G/none/dev/dri/card0\"" "$G/none/etc/20-gpu.conf"
+want "and it says it defaulted" has "$out" "no connected connector found in sysfs; defaulting to $G/none/dev/dri/card0"
+ev_end
+
+ev_begin S3.1.4 "No KMS device removes the config" T1
+gpu_case gone
+connector gone card0-DP-1 connected      # sysfs names a card whose node is absent
+echo "# a stale config from an earlier boot" > "$G/gone/etc/20-gpu.conf"
+ev_save before "EV-STATE: the config directory before the run: a stale 20-gpu.conf" ls -l "$G/gone/etc" >/dev/null
+out=$(ev_save run "xorg-gpu-conf when the card sysfs names has no device node" gpuconf gone) || fail "xorg-gpu-conf exited non-zero"
+ev_save after "EV-STATE: the config directory after: empty" ls -l "$G/gone/etc" >/dev/null
+want "the stale 20-gpu.conf is removed" [ ! -e "$G/gone/etc/20-gpu.conf" ]
+want "and the removal is logged" has "$out" "does not exist; removing generated config"
+ev_end
+
+ev_begin S3.1.5 "Evidence is logged before the decision" T1
+gpu_case order
+: > "$G/order/dev/dri/card0"
+connector order card0-DP-1 connected
+connector order card0-HDMI-A-1 disconnected
+out=$(ev_save run "xorg-gpu-conf's whole log for one connected and one disconnected connector" gpuconf order) || fail "xorg-gpu-conf exited non-zero"
+line_of() { grep -nF -- "$1" <<<"$out" | head -1 | cut -d: -f1; }
+d=$(line_of "decision:")
+for what in "DRM nodes:" "connector card0-DP-1: connected" "connector card0-HDMI-A-1: disconnected" "NVIDIA nodes:"; do
+    n=$(line_of "$what")
+    ok_if "\"$what\" is logged (line ${n:-none}) before the decision (line ${d:-none})" '[ -n "$n" ] && [ -n "$d" ] && [ "$n" -lt "$d" ]'
+done
+ev_end
+
 if [ "$fails" -gt 0 ]; then
     echo "script unit tests: $fails failure(s)" >&2
     exit 1

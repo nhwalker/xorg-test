@@ -592,6 +592,62 @@ fi
 ev_pass "the shipped comments-only file generated no 30-monitors.conf"
 ev_end
 
+# S3.1.5: xorg-gpu-conf logs what it saw before what it decided. The real
+# container's own log, this boot: every xorg-gpu-conf line up to the first
+# decision. podman's --tty console ends lines with CR, stripped here.
+log "xorg-gpu-conf: the evidence lines come before the decision"
+ev_begin S3.1.5 "Evidence is logged before the decision" T2
+# Read whole, then cut: an awk that exits at the decision inside the pipe
+# would leave tr writing into a closed pipe (SIGPIPE, "Broken pipe").
+gpu_block=$(podman logs desktop 2>/dev/null | tr -d '\r' || true)
+gpu_block=$(awk '/^xorg-gpu-conf: /{print} /^xorg-gpu-conf: decision:/{exit}' <<<"$gpu_block")
+ev_text log "EV-LOG-DESKTOP: xorg-gpu-conf's lines in the desktop's log this boot, up to its decision" "${gpu_block:-(none)}"
+ev_save sysfs "EV-STATE: the runner's DRM connectors, which the container's sysfs shows too (cat /sys/class/drm/card*-*/status)" \
+    sh -c 'for f in /sys/class/drm/card*-*/status; do [ -e "$f" ] && echo "$f: $(cat "$f")"; done; true' >/dev/null || true
+grep -q '^xorg-gpu-conf: decision:' <<<"$gpu_block" || fail "xorg-gpu-conf's log has no decision line"
+dline=$(grep -n '^xorg-gpu-conf: decision:' <<<"$gpu_block" | head -1 | cut -d: -f1)
+for what in "DRM nodes:" "NVIDIA nodes:"; do
+    n=$(grep -nF "xorg-gpu-conf: $what" <<<"$gpu_block" | head -1 | cut -d: -f1)
+    [ -n "$n" ] && [ "$n" -lt "$dline" ] || fail "\"$what\" is not logged before the decision"
+    ev_pass "\"$what\" is logged (line $n) before the decision (line $dline)"
+done
+shopt -s nullglob
+conns=(/sys/class/drm/card*-*/status)
+shopt -u nullglob
+logged=$(grep -c '^xorg-gpu-conf: connector ' <<<"$gpu_block" || true)
+[ "$logged" = "${#conns[@]}" ] || fail "xorg-gpu-conf logged $logged connector line(s) before deciding; the runner has ${#conns[@]}"
+ev_pass "every connector's status is logged before the decision (${#conns[@]} on this runner)"
+ev_end
+
+# S3.1.4: with no KMS device, a stale 20-gpu.conf goes. The production
+# container is recreated at every start and this runner usually has KMS, so
+# neither shows it; a scratch container of the image without /dev/dri does.
+log "xorg-gpu-conf: no KMS device removes a stale config (scratch container)"
+ev_begin S3.1.4 "No KMS device removes the config" T2
+scratch=$(ev_save scratch "a scratch container of the image with no /dev/dri passed in: a stale 20-gpu.conf written, xorg-gpu-conf run, the directory listed before and after" \
+    podman run --rm --network=none --entrypoint /bin/bash localhost/desktop-container:latest -c '
+        mkdir -p /etc/X11/xorg.conf.d
+        echo "# stale, from an earlier boot" > /etc/X11/xorg.conf.d/20-gpu.conf
+        echo "-- before:"; ls -l /etc/X11/xorg.conf.d
+        echo "-- /dev/dri:"; ls -d /dev/dri 2>&1
+        /usr/local/bin/xorg-gpu-conf.sh
+        echo "-- after:"; ls -l /etc/X11/xorg.conf.d') \
+    || fail "the scratch run of xorg-gpu-conf failed"
+ev_text before "EV-STATE: ls /etc/X11/xorg.conf.d in the scratch container before the run: the stale 20-gpu.conf" \
+    "$(sed -n '/^-- before:/,/^-- \/dev\/dri:/p' <<<"$scratch" | sed '1d;$d')"
+ev_text after "EV-STATE: ls /etc/X11/xorg.conf.d after the run: no 20-gpu.conf" \
+    "$(sed -n '/^-- after:/,$p' <<<"$scratch" | sed '1d')"
+grep -q '20-gpu.conf' <<<"$(sed -n '/^-- before:/,/^-- \/dev\/dri:/p' <<<"$scratch")" \
+    || fail "the stale 20-gpu.conf was not in place before the run"
+grep -q 'does not exist; removing generated config' <<<"$scratch" \
+    || fail "xorg-gpu-conf did not log the removal"
+ev_pass "xorg-gpu-conf logs that the card does not exist and the config goes"
+if grep -q '20-gpu.conf' <<<"$(sed -n '/^-- after:/,$p' <<<"$scratch")"; then
+    fail "the stale 20-gpu.conf survived a boot with no KMS device"
+fi
+ev_pass "the stale 20-gpu.conf is gone after the run"
+ev_end
+
 log "fixed monitor layout: a declared layout is applied at the next start"
 cat > /etc/desktop-container/monitors.conf <<'EOF'
 DP-1  1920x1080@60  +0+0     primary

@@ -1192,8 +1192,12 @@ starts write to `/dev/console`, so the console log IS the container's log.
   assumption (devices visible, udev db mounted, gid alignment, seat tags,
   shared socket dirs, NVIDIA coherence) with a remediation hint on each
   failure — `podman logs desktop | grep preflight:`
-- the X session postmortem on every abnormal session exit: tail of the Xorg
-  log plus a `LIKELY CAUSE:` verdict — `podman logs desktop | grep postmortem:`
+- the X session postmortem on every abnormal session end: tail of the Xorg
+  log plus a `LIKELY CAUSE:` verdict — `podman logs desktop | grep postmortem:`.
+  Abnormal includes an X server that was killed or crashed mid-session,
+  although the session then exits 0 (xinit's status); desktop-init checks
+  the server's log for its clean-shutdown line, and logs `the X server did
+  not shut down cleanly` first.
 
 - **Xorg: "cannot open /dev/tty1"** — something on the host owns the VT;
   check `getty@tty1` is masked and no host display manager is running.

@@ -1750,6 +1750,13 @@ def menu_quit_session(ctx, st, state):
     ctx.save_cmd("desktop-log", f"podman logs --since {state['since']} desktop 2>&1 | tail -80",
                  "the desktop's log for this story (EV-LOG-DESKTOP): the session's exit and restart",
                  label="podman logs desktop")
+    # S2.3.5's other half: a clean end runs no postmortem. desktop-init calls
+    # it only for a nonzero exit, and Quit session is the clean end.
+    full = ctx.g.sh(f"podman logs --since {state['since']} desktop 2>&1; true")
+    exits = re.findall(r"desktop-init: session exited \(rc=(\d+)\)", full)
+    st.check(exits == ["0"] and "postmortem:" not in full,
+             "Quit session is a clean end: desktop-init logs 'session exited (rc=0)' and no postmortem runs (S2.3.5)",
+             f"session exits logged: {exits or 'none'}; postmortem lines: {full.count('postmortem:')}")
 
 
 # --- S11.3.1: sound under the operator's control ---------------------------------
