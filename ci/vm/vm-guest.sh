@@ -611,13 +611,18 @@ phase_deploy() {
     ev_pass "the superseded combined spec is removed"
     ev_end
 
-    verify_fixed_layout
+    # The fixed monitor layout follows as its own steps (layout-declare,
+    # layout-roundtrip, layout-unplug, layout-restore), which vm-e2e.sh runs
+    # one by one so it can look at the display between them; then
+    # deploy-proof puts a window up for its screendump.
+    log pd "phase-deploy passed"
+}
 
+deploy_proof() {
     log pd "spawn an xterm so the screendump shows a window"
     podman exec -d -u desktop -e DISPLAY=:0 -e HOME=/home/desktop desktop \
         xterm -T deploy-proof -geometry 80x24+80+80
     sleep 3
-    log pd "phase-deploy passed"
 }
 
 # --- fixed monitor layout ------------------------------------------------------
@@ -717,14 +722,53 @@ desktop_up() {
 
 conn_connected() { [ "$(cat "$1/status")" = connected ]; }
 
-verify_fixed_layout() {
-    local conn conn2 dims out before
-
-    log pd "fixed monitor layout: the VM has a second connector, and it is disconnected"
+# The two connectors' sysfs directories, into conn and conn2.
+layout_connectors() {
     conn=$(ls -d /sys/class/drm/card*-Virtual-1 2>/dev/null | head -n1)
     conn2=$(ls -d /sys/class/drm/card*-Virtual-2 2>/dev/null | head -n1)
     [ -n "$conn" ] || fail "no Virtual-1 DRM connector: the virtio GPU is not what this expects"
     [ -n "$conn2" ] || fail "no Virtual-2 connector: vm-e2e.sh must boot virtio-vga with max_outputs=2"
+}
+
+# F3.10's common set, less the video (the host records that): the connectors'
+# sysfs status, xrandr --verbose and the window tree, kept under
+# $LAYOUT_TMP/<moment>-*.txt - what the checks read, with evidence on or off
+# - and copied into the open story.
+LAYOUT_TMP=/run/ev-layout
+xrv() { podman exec -u desktop -e DISPLAY=:0 desktop xrandr --query --verbose; }
+xtree() { podman exec -u desktop -e DISPLAY=:0 desktop xwininfo -root -tree; }
+layout_set() { # <moment> <when>
+    mkdir -p "$LAYOUT_TMP"
+    sh -c 'grep -H . /sys/class/drm/card*-*/status' > "$LAYOUT_TMP/$1-sysfs.txt" 2>&1 || true
+    xrv > "$LAYOUT_TMP/$1-xrandr.txt" 2>&1 || true
+    xtree > "$LAYOUT_TMP/$1-tree.txt" 2>&1 || true
+    layout_copy "$1" "$2"
+}
+# A layout_set's files (this story's or an earlier one's) into the open story.
+layout_copy() { # <moment> <when>
+    ev_copy "$LAYOUT_TMP/$1-sysfs.txt" "$1-sysfs" "EV-STATE: every DRM connector's status in sysfs (grep -H . .../status), $2"
+    ev_copy "$LAYOUT_TMP/$1-xrandr.txt" "$1-xrandr" "EV-STATE: xrandr --query --verbose, $2"
+    ev_copy "$LAYOUT_TMP/$1-tree.txt" "$1-tree" "EV-STATE: xwininfo -root -tree, $2"
+}
+# EV-DIFF of two files anywhere (ev_diff takes names inside the story).
+ev_diff_paths() { # <moment> <what> <path a> <path b>
+    [ -n "$EV_DIR" ] || return 0
+    local name
+    name=$(ev_name "$1" diff)
+    diff -u "$3" "$4" > "$EV_DIR/$name" || true
+    [ -s "$EV_DIR/$name" ] || echo "(no differences between $3 and $4)" > "$EV_DIR/$name"
+    ev_attach "$name" "$2"
+}
+# The client windows in a saved xwininfo -root -tree (the ones with a
+# WM_CLASS), each with its id, size and absolute position: what "no window
+# moved" compares.
+client_windows() { grep -E '^ +0x[0-9a-f]+ "[^"]*": \("' "$1" | sed 's/^ *//' | sort; }
+
+layout_declare() {
+    local dims out before
+
+    log pd "fixed monitor layout: the VM has a second connector, and it is disconnected"
+    layout_connectors
     [ "$(cat "$conn/status")" = connected ] \
         || fail "Virtual-1 is not connected; nothing below would mean anything"
     [ "$(cat "$conn2/status")" = disconnected ] \
@@ -754,6 +798,7 @@ verify_fixed_layout() {
     # has no bearing on the rule above, and the restore check at the end
     # compares against whatever it actually is.
     before=$(dpy_dims)
+    echo "$before" > /run/ev-layout-before-dims
     log pd "fixed monitor layout: declare both connectors side by side (display is $before)"
     cat > /etc/desktop-container/monitors.conf <<'EOF'
 Virtual-1  1024x768@60  +0+0      primary
@@ -762,8 +807,11 @@ EOF
     systemctl restart desktop.service
     desktop_up
 
+    ev_begin S3.4.9 "A declared output comes up on a disconnected connector" T3
+    ev_copy /etc/desktop-container/monitors.conf monitors-conf "EV-CONFIG: the declared monitors.conf: Virtual-1 primary at +0+0, Virtual-2 at +1024+0, both 1024x768@60"
     log pd "fixed monitor layout: the generator wrote the modesetting config"
-    out=$(podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf 2>/dev/null || true)
+    out=$(ev_save generated "EV-CONFIG: the 30-monitors.conf the generator wrote from it" \
+        podman exec desktop cat /etc/X11/xorg.conf.d/30-monitors.conf 2>/dev/null || true)
     if [ -z "$out" ]; then
         podman logs desktop 2>&1 | grep xorg-monitor-conf >&2 || true
         fail "the declared layout generated no /etc/X11/xorg.conf.d/30-monitors.conf"
@@ -774,12 +822,17 @@ EOF
         || fail "no derived timing for the declared mode"
     echo "$out" | grep -q 'Virtual 2048 768' \
         || fail "framebuffer not pinned to the declared extents"
+    ev_pass "the generated config forces both outputs enabled, carries a derived 1024x768_60.00 Modeline and pins the framebuffer at 2048x768"
+    ev_save sysfs "EV-STATE: every DRM connector's status in sysfs: Virtual-2 is disconnected" \
+        sh -c 'grep -H . /sys/class/drm/card*-*/status' >/dev/null || true
+    ev_save xrandr "EV-STATE: xrandr --query with the declared layout live" xr >/dev/null || true
 
     # THE ASSERTION THIS WHOLE ARRANGEMENT EXISTS FOR.
     log pd "fixed monitor layout: X came up at the full declared size"
     dims=$(dpy_dims)
     [ "$dims" = 2048x768 ] \
         || fail "screen is $dims, want 2048x768 - the declared layout did not take"
+    ev_pass "X came up at the declared 2048x768"
 
     log pd "fixed monitor layout: the DISCONNECTED output is enabled, where it was declared"
     xr_is Virtual-1 connected 1024x768+0+0 \
@@ -788,13 +841,19 @@ EOF
         "Virtual-1 connected primary "*) ;;
         *) fail "Virtual-1 was declared primary but is not: $(xr_line Virtual-1)" ;;
     esac
+    ev_pass "Virtual-1 is connected, primary, at 1024x768+0+0"
     # One line, and it is the whole point: xrandr says "disconnected" and
     # prints a geometry anyway, because Option "Enable" plus a derived Modeline
     # gave the server a mode it never had to ask a monitor for.
     xr_is Virtual-2 disconnected 1024x768+1024+0 \
         || fail "Virtual-2 is not enabled on a disconnected connector: $(xr_line Virtual-2)"
+    ev_pass "Virtual-2 reads disconnected and scans out 1024x768+1024+0 with nothing plugged into it"
     log pd "  Virtual-2 scans out 1024x768+1024+0 with nothing plugged into it"
+    ev_end
+}
 
+layout_roundtrip() {
+    local dims cap lines xr_declared
     # S3.4.12 on the live layout: the capture tool reads it back as a
     # monitors.conf block, and that block, applied, gives the same geometry.
     log pd "fixed monitor layout: desktop-monitors-capture reads the live layout back"
@@ -828,15 +887,26 @@ EOF
     xr_is Virtual-2 disconnected 1024x768+1024+0 || fail "round trip: Virtual-2 is not at 1024x768+1024+0: $(xr_line Virtual-2)"
     ev_pass "the captured block, applied, reproduces the geometry: 2048x768, Virtual-1 at +0+0, Virtual-2 at +1024+0"
     ev_end
+}
 
+layout_unplug() {
+    local dims xl0 moved T=$LAYOUT_TMP
+    layout_connectors
     # A connector going down UNDER a running X. The force is real: the kernel
     # reports this connector disconnected to every probe from here on. It
     # arrives without the uevent a physical unplug would carry, which is why
     # the probe is driven rather than waited for - see this section's header.
+    #
+    # S3.4.10 holds F3.10's common set (the host adds its video there);
+    # S3.10.1, S3.10.2 and S3.10.3 each judge their own part of it.
     log pd "fixed monitor layout: a live disconnect does not move the geometry"
+    ev_begin S3.4.10 "A live disconnect does not move the geometry" T3
+    layout_set before "with the declared layout live, before Virtual-1 is forced off"
+    xl0=$(xorg_log_lines 2>/dev/null || echo 0)
     echo off > "$conn/status"
     [ "$(cat "$conn/status")" = disconnected ] \
         || fail "forcing $conn off did not take (kernel without connector force?)"
+    ev_note "$conn/status forced off at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     sleep 3
     case "$(xr_line Virtual-1)" in
         "Virtual-1 disconnected "*)
@@ -847,16 +917,80 @@ EOF
     # RRGetInfo -> xf86ProbeOutputModes: X re-reads the connector and sees it
     # disconnected. Nothing about the CRTC configuration may change.
     xr >/dev/null
+    layout_set forced-off "after Virtual-1 was forced off under the running server"
+    xorg_slice "$xl0" "$T/forced-off-xorg-log.txt"
+    ev_copy "$T/forced-off-xorg-log.txt" xorg-log-off "EV-LOG-XORG: the Xorg log's lines since just before the force"
+    ev_diff_paths xrandr-off "EV-DIFF: xrandr --verbose across the force" "$T/before-xrandr.txt" "$T/forced-off-xrandr.txt"
+    ev_diff_paths tree-off "EV-DIFF: the window tree across the force (empty: no window changed)" "$T/before-tree.txt" "$T/forced-off-tree.txt"
     dims=$(dpy_dims)
     [ "$dims" = 2048x768 ] \
         || fail "screen collapsed to $dims when Virtual-1 went down - the layout did not hold"
+    ev_pass "the screen stayed 2048x768 with Virtual-1 forced off"
     xr_is Virtual-1 disconnected 1024x768+0+0 \
         || fail "Virtual-1 lost its geometry on disconnect: $(xr_line Virtual-1)"
+    xr_is Virtual-2 disconnected 1024x768+1024+0 \
+        || fail "Virtual-2 moved when Virtual-1 went down: $(xr_line Virtual-2)"
+    ev_pass "both outputs stayed where they were declared: Virtual-1 at 1024x768+0+0 (now disconnected), Virtual-2 at 1024x768+1024+0"
+    [ -n "$(client_windows "$T/before-tree.txt")" ] || fail "the window tree before the force lists no client window to compare"
+    moved=$(diff <(client_windows "$T/before-tree.txt") <(client_windows "$T/forced-off-tree.txt") || true)
+    [ -z "$moved" ] || fail "a window changed when Virtual-1 went down: $(echo $moved)"
+    ev_pass "no client window moved or resized: the same ids, sizes and positions before and after ($(client_windows "$T/before-tree.txt" | wc -l) windows)"
     log pd "  both outputs now disconnected, both still scanning out where they were declared"
+    ev_end
 
-    log pd "fixed monitor layout: restore the connector and the shipped (empty) config"
+    ev_begin S3.10.1 "Monitor plug-out with a declared layout holds the geometry" T3
+    layout_copy before "before the force (taken in S3.4.10)"
+    layout_copy forced-off "after Virtual-1 was forced off (taken in S3.4.10)"
+    ev_copy "$T/forced-off-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the force (taken in S3.4.10)"
+    ev_diff_paths tree "EV-DIFF: the window tree across the force (empty: no window changed)" "$T/before-tree.txt" "$T/forced-off-tree.txt"
+    ev_pass "the screen size held: 2048x768 before and after (asserted in S3.4.10)"
+    ev_pass "every output's position held: Virtual-1 1024x768+0+0, Virtual-2 1024x768+1024+0 (asserted in S3.4.10)"
+    ev_pass "every client window's id, size and position held (asserted in S3.4.10 on these two trees)"
+    ev_end
+
+    ev_begin S3.10.2 "Monitor plug-out is reported by RandR" T3
+    layout_copy before "before the force (taken in S3.4.10)"
+    layout_copy forced-off "after Virtual-1 was forced off (taken in S3.4.10)"
+    grep -q 'card[0-9]*-Virtual-1/status:disconnected' "$T/forced-off-sysfs.txt" \
+        || fail "sysfs does not read Virtual-1 disconnected after the force"
+    ev_pass "the kernel reports Virtual-1 disconnected (sysfs)"
+    xr_is Virtual-1 disconnected 1024x768+0+0 \
+        || fail "RandR does not report Virtual-1 disconnected and still enabled: $(xr_line Virtual-1)"
+    ev_pass "RandR reports it disconnected while it stays enabled: $(xr_line Virtual-1)"
+    ev_end
+
+    log pd "fixed monitor layout: re-plug Virtual-1 under the running server"
+    ev_begin S3.10.3 "Monitor re-plug after plug-out restores connected status without moving anything" T3
+    layout_copy before "before the force (taken in S3.4.10)"
+    xl0=$(xorg_log_lines 2>/dev/null || echo 0)
     echo detect > "$conn/status"
     wait_for 10 1 "Virtual-1 connected again" conn_connected "$conn"
+    ev_note "$conn/status set back to detect at $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    replugged() { xr_is Virtual-1 connected 1024x768+0+0; }
+    wait_for 10 1 "xrandr to report Virtual-1 connected at 1024x768+0+0 again" replugged
+    layout_set replugged "after Virtual-1 was set back to detect"
+    xorg_slice "$xl0" "$T/replugged-xorg-log.txt"
+    ev_copy "$T/replugged-xorg-log.txt" xorg-log "EV-LOG-XORG: the Xorg log's lines since just before the re-plug"
+    ev_diff_paths xrandr "EV-DIFF: xrandr --verbose before the force and after the re-plug" "$T/before-xrandr.txt" "$T/replugged-xrandr.txt"
+    ev_diff_paths tree "EV-DIFF: the window tree before the force and after the re-plug (empty: no window changed)" "$T/before-tree.txt" "$T/replugged-tree.txt"
+    grep -q 'card[0-9]*-Virtual-1/status:connected' "$T/replugged-sysfs.txt" \
+        || fail "sysfs does not read Virtual-1 connected after the re-plug"
+    ev_pass "RandR reports Virtual-1 connected at 1024x768+0+0 again: $(xr_line Virtual-1)"
+    dims=$(dpy_dims)
+    [ "$dims" = 2048x768 ] || fail "the screen is $dims after the re-plug, want 2048x768"
+    xr_is Virtual-2 disconnected 1024x768+1024+0 \
+        || fail "Virtual-2 moved across the re-plug: $(xr_line Virtual-2)"
+    ev_pass "the screen is still 2048x768 and Virtual-2 still at 1024x768+1024+0"
+    moved=$(diff <(client_windows "$T/before-tree.txt") <(client_windows "$T/replugged-tree.txt") || true)
+    [ -z "$moved" ] || fail "a window changed across the unplug and re-plug: $(echo $moved)"
+    ev_pass "no client window moved or resized across the unplug and re-plug"
+    ev_end
+}
+
+layout_restore() {
+    local dims before
+    before=$(cat /run/ev-layout-before-dims 2>/dev/null || echo unknown)
+    log pd "fixed monitor layout: restore the shipped (empty) config"
     ev_begin S3.4.12 "desktop-monitors-capture prints a valid, round-trippable block" T3
     systemctl stop desktop.service
     rc=0
@@ -1671,6 +1805,15 @@ verify_audio_lifecycle() {
     log al "  pipewire pid $pw_before unchanged, export still reachable"
 
     log al "audio recovers from its own crash"
+    # S4.5.2's "before": the X session's pids as well as the audio stack's, so
+    # a recovery that took the session down with it cannot pass.
+    ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T3
+    ev_save pids-before "EV-PIDS: Xorg, mwm and the three audio daemons before pipewire is killed" \
+        ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    x_pids_before=$(podman exec desktop sh -c 'pgrep -x Xorg; pgrep -x mwm' 2>/dev/null | paste -sd' ' || true)
+    [ "$(wc -w <<<"$x_pids_before")" -ge 2 ] || fail "no Xorg and mwm to compare across the audio crash (found: '$x_pids_before')"
+    pw_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    sleep 1
     ev_begin S2.4.4 "WirePlumber waits for PipeWire's socket" T3
     ev_save pids-boot "EV-PIDS: the audio daemons as booted (pid, ppid, session, user, start time)" \
         podman exec desktop ps -o pid,ppid,sess,user,lstart,comm -C pipewire,wireplumber,pipewire-pulse >/dev/null || true
@@ -1725,11 +1868,30 @@ verify_audio_lifecycle() {
     ev_end
 
     # And the session must not have been collateral damage in the other
-    # direction either - killing audio must not disturb X.
+    # direction either - killing audio must not disturb X: the same Xorg and
+    # mwm, not just a session that is up (a restarted one would be).
+    ev_begin S4.5.2 "Audio recovers from its own crash without disturbing X" T3
+    ev_save pids-after "EV-PIDS: Xorg, mwm and the three audio daemons after pipewire was killed and the stack came back" \
+        ctr_pids Xorg,mwm,pipewire,wireplumber,pipewire-pulse >/dev/null || true
+    ev_save desktop-log "EV-LOG-DESKTOP: the desktop's log since just before pipewire was killed" \
+        podman logs --since "$pw_since" desktop >/dev/null || true
+    ev_pass "pipewire came back as a new process on its own: $pw_before -> $recovered"
+    ev_save pactl-info "EV-STATE: pactl info from the host over the export, after the recovery" \
+        env PULSE_SERVER=unix:/run/desktop-audio/pulse pactl info >/dev/null \
+        || fail "pactl info over the export failed after pipewire's recovery"
+    ev_pass "the export answers pactl info after the recovery"
     session_up \
         || fail "the X session died when the audio stack was killed: the two are still coupled, in the other direction"
+    x_pids_after=$(podman exec desktop sh -c 'pgrep -x Xorg; pgrep -x mwm' 2>/dev/null | paste -sd' ' || true)
+    [ "$x_pids_after" = "$x_pids_before" ] \
+        || fail "the X session's pids changed across the audio crash ($x_pids_before -> $x_pids_after): killing audio disturbed X"
+    ev_pass "Xorg and mwm kept their pids across the audio crash ($x_pids_before), and X answers"
+    ev_end
     log al "  the X session was undisturbed"
+    log al "verify-audio-lifecycle passed"
+}
 
+verify_postmortem() {
     # S2.3.5: an abnormal end leaves a postmortem in the desktop's log. Kill
     # the server outright (SIGKILL: no chance to tidy up), as the desktop uid
     # for the reason above, and read the log from just before the kill.
@@ -1765,7 +1927,7 @@ verify_audio_lifecycle() {
     ev_pass "then desktop-init logged the session's exit (line $n_exit): $(sed -n "${n_exit}p" <<<"$pm")"
     ev_end
 
-    log al "verify-audio-lifecycle passed"
+    log al "verify-postmortem passed"
 }
 
 verify_privileges() {
@@ -2047,6 +2209,28 @@ input_sink_check() { # $1: expected text
         || fail "input sink recorded '$got', want '$expected' (keys did not reach the focused app)"
     log is "the app received the typed text over the real input path: $got"
 }
+
+# --- read-only probes for the host's hotplug evidence -------------------------------
+# What vm-e2e.sh saves before and after a QEMU device_add or device_del (the
+# F3.9 and F4.7 stories), kept here so the host's ssh commands stay unquoted.
+XORG_LOG=/home/desktop/.local/share/xorg/Xorg.0.log
+
+# A command as the session user, with its runtime dir and display (see the
+# podman flag conventions at the top): xinput, wpctl, pw-cli, pactl.
+desk() { podman exec -u desktop -e XDG_RUNTIME_DIR=/run/user/61000 -e HOME=/home/desktop -e DISPLAY=:0 desktop "$@"; }
+
+# The Xorg log's length now, and its lines after a length taken earlier.
+xorg_log_lines() { podman exec desktop sh -c "wc -l < $XORG_LOG"; }
+xorg_log_since() { podman exec desktop tail -n "+$(( ${1:?line count} + 1 ))" "$XORG_LOG"; }
+# The same slice into a file. An empty slice says so, so that the file cannot
+# be taken for a capture that failed.
+xorg_slice() { # <line count> <file>
+    xorg_log_since "$1" > "$2" 2>&1 || true
+    [ -s "$2" ] || echo "(Xorg logged no line after line $1)" > "$2"
+}
+
+# pid, ppid, start time and name of the named processes in the container.
+ctr_pids() { podman exec desktop ps -o pid,ppid,lstart,comm -C "${1:?comm,comm}"; }
 
 # --- operator stories (E11) -------------------------------------------------------
 # ci/vm/operator-e2e.py drives the desktop the way the operator does - every
@@ -2357,7 +2541,7 @@ verify_record() {
     log rec "verify-record passed"
 }
 
-case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state}" in
+case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audio-lifecycle|hotplug-probe|snd-probe|play-audio|play-audio-pod|verify-cdi|verify-split|verify-testclient|verify-record|verify-concurrency|verify-teardown|input-sink-start|input-sink-check|operator-setup|operator-teardown|pod-state|desk|xorg-log-lines|xorg-log-since|ctr-pids|verify-postmortem|layout-declare|layout-roundtrip|layout-unplug|layout-restore|deploy-proof}" in
     phase-deploy) phase_deploy ;;
     phase2) phase2 ;;
     play-audio) play_audio "${2:-}" ;;
@@ -2375,12 +2559,22 @@ case "${1:?phase-deploy|phase2|verify-privileges|verify-pod-identity|verify-audi
     verify-pod-identity) verify_pod_identity ;;
     verify-log-bounds) verify_log_bounds ;;
     verify-audio-lifecycle) verify_audio_lifecycle ;;
+    verify-postmortem) verify_postmortem ;;
+    layout-declare) layout_declare ;;
+    layout-roundtrip) layout_roundtrip ;;
+    layout-unplug) layout_unplug ;;
+    layout-restore) layout_restore ;;
+    deploy-proof) deploy_proof ;;
     hotplug-probe) hotplug_probe ;;
     snd-probe) snd_probe ;;
     input-sink-start) input_sink_start ;;
     input-sink-check) input_sink_check "${2:-}" ;;
     operator-setup) operator_setup ;;
     pod-state) pod_state "${2:?pod}" ;;
+    desk) shift; desk "$@" ;;
+    xorg-log-lines) xorg_log_lines ;;
+    xorg-log-since) xorg_log_since "${2:-}" ;;
+    ctr-pids) ctr_pids "${2:-}" ;;
     operator-teardown) operator_teardown ;;
     *) fail "unknown phase $1" ;;
 esac
